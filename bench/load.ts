@@ -69,16 +69,25 @@ async function oha(path: string, n: number, c: number, cookieHeader: string): Pr
   return { p50: result.metrics.latency_ms.p50, p95: result.metrics.latency_ms.p95, rps: result.metrics.requests_per_sec }
 }
 
-// Highest memory per container while `body` runs, sampled with docker stats.
-async function peakMemory<T>(body: () => Promise<T>): Promise<{ result: T; peakMb: Record<string, number> }> {
+// Peak memory while `body` runs. Two samplers:
+//  - docker stats, for the php/web/db container RSS (context).
+//  - inside the worker container, the sum of Pss and Rss across its whole process tree
+//    (master + forked children) from /proc/<pid>/smaps_rollup. Pss splits shared
+//    copy-on-write pages across the processes that share them, so it is the honest number
+//    for "how much memory the sandbox really uses"; Rss double-counts the shared pages.
+async function peakMemory<T>(body: () => Promise<T>): Promise<{ result: T; peakMb: Record<string, number>; workerPssMb: number; workerRssMb: number }> {
   const peak: Record<string, number> = {}
+  let workerPssMb = 0
+  let workerRssMb = 0
   let running = true
   const sampler = (async () => {
     while (running) {
-      const proc = Bun.spawn(['docker', 'stats', '--no-stream', '--format', '{{.Name}} {{.MemUsage}}'], { stdout: 'pipe' })
-      const text = await new Response(proc.stdout).text()
-      await proc.exited
-      for (const line of text.trim().split('\n')) {
+      const stats = Bun.spawn(['docker', 'stats', '--no-stream', '--format', '{{.Name}} {{.MemUsage}}'], { stdout: 'pipe' })
+      const worker = Bun.spawn([...COMPOSE, 'exec', '-T', 'worker', 'sh', '-c',
+        "awk '/^Pss:/{p+=$2}/^Rss:/{r+=$2}END{print p\" \"r}' /proc/[0-9]*/smaps_rollup 2>/dev/null"], { stdout: 'pipe', stderr: 'ignore' })
+      const [statsText, workerText] = await Promise.all([new Response(stats.stdout).text(), new Response(worker.stdout).text()])
+      await Promise.all([stats.exited, worker.exited])
+      for (const line of statsText.trim().split('\n')) {
         const [name, usage] = line.split(' ')
         if (!name?.startsWith('securecore-')) continue
         const m = /^([\d.]+)(KiB|MiB|GiB)/.exec(usage ?? '')
@@ -86,6 +95,9 @@ async function peakMemory<T>(body: () => Promise<T>): Promise<{ result: T; peakM
         const mb = Number(m[1]) * (m[2] === 'GiB' ? 1024 : m[2] === 'KiB' ? 1 / 1024 : 1)
         peak[name] = Math.max(peak[name] ?? 0, Math.round(mb))
       }
+      const [pssKb, rssKb] = workerText.trim().split(' ').map(Number)
+      if (pssKb) workerPssMb = Math.max(workerPssMb, Math.round(pssKb / 1024))
+      if (rssKb) workerRssMb = Math.max(workerRssMb, Math.round(rssKb / 1024))
     }
   })()
   let result: T
@@ -95,7 +107,7 @@ async function peakMemory<T>(body: () => Promise<T>): Promise<{ result: T; peakM
     running = false
     await sampler
   }
-  return { result, peakMb: peak }
+  return { result, peakMb: peak, workerPssMb, workerRssMb }
 }
 
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor((xs.length - 1) / 2)]
@@ -108,6 +120,7 @@ type Point = { p50: number[]; p95: number[]; rps: number[] }
 const latency: Record<string, Point> = {}
 const throughput: Record<string, Point> = {}
 const memory: Record<string, Record<string, number>> = {}
+const workerMem: Record<string, { pss: number; rss: number }> = {}
 const add = (table: Record<string, Point>, key: string, r: { p50: number; p95: number; rps: number }) => {
   table[key] ??= { p50: [], p95: [], rps: [] }
   table[key].p50.push(r.p50); table[key].p95.push(r.p95); table[key].rps.push(r.rps)
@@ -125,11 +138,14 @@ try {
       for (const c of concurrency) {
         await oha('/', 2 * c, c, header) // warm-up
         const n = c === 1 ? 100 : 200
-        const { result, peakMb } = await peakMemory(() => oha('/', n, c, header))
+        const { result, peakMb, workerPssMb, workerRssMb } = await peakMemory(() => oha('/', n, c, header))
         add(throughput, `${config} c=${c}`, result)
-        if (c === 8) for (const [name, mb] of Object.entries(peakMb)) {
-          memory[config] ??= {}
-          memory[config][name] = Math.max(memory[config][name] ?? 0, mb)
+        if (c === 8) {
+          for (const [name, mb] of Object.entries(peakMb)) {
+            memory[config] ??= {}
+            memory[config][name] = Math.max(memory[config][name] ?? 0, mb)
+          }
+          workerMem[config] = { pss: Math.max(workerMem[config]?.pss ?? 0, workerPssMb), rss: Math.max(workerMem[config]?.rss ?? 0, workerRssMb) }
         }
       }
       console.error(`repeat ${rep + 1}/${repeats} ${config} done`)
@@ -142,7 +158,7 @@ try {
   try { configure('on2'); wp('plugin', 'activate', 'securecore-probe') } catch { /* reported above */ }
 }
 
-writeFileSync(`${out}/load.json`, JSON.stringify({ repeats, latency, throughput, memory }, null, 2))
+writeFileSync(`${out}/load.json`, JSON.stringify({ repeats, latency, throughput, memory, workerMem }, null, 2))
 console.log(`Latency, concurrency 1, 100 requests per run, median of ${repeats} runs (ms)\n`)
 console.log('| page | config | p50 | p95 |\n|---|---|---|---|')
 for (const page of pages) for (const config of configs) {
@@ -158,9 +174,10 @@ for (const config of configs) {
   })
   console.log(`| ${config} | ${cells.join(' | ')} |`)
 }
-console.log('\nPeak memory during the c=8 runs (MiB, docker stats)\n')
-console.log('| config | php (fpm + sandboxes) | web | db |\n|---|---|---|---|')
+console.log('\nPeak memory during the c=8 runs (MiB)\n')
+console.log('| config | worker PSS | worker RSS | php-fpm (docker stats) |\n|---|---|---|---|')
 for (const config of configs) {
-  const m = memory[config] ?? {}
-  console.log(`| ${config} | ${m['securecore-php-1'] ?? '?'} | ${m['securecore-web-1'] ?? '?'} | ${m['securecore-db-1'] ?? '?'} |`)
+  const w = workerMem[config] ?? { pss: 0, rss: 0 }
+  const php = memory[config]?.['securecore-php-1'] ?? '?'
+  console.log(`| ${config} | ${config === 'off' ? '—' : w.pss} | ${config === 'off' ? '—' : w.rss} | ${php} |`)
 }

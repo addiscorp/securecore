@@ -16,16 +16,26 @@
 // through. The securecore binary maps the sandbox's fd 2 to its own stdout.
 namespace SecureCore;
 
-const OUT = STDERR;
+// The line to core. Default: in on STDIN, out on STDERR (the wasm one-shot path; p8 keeps
+// STDOUT buffered until exit). worker.php points both at the request's socket.
+final class Conn
+{
+    /** @var resource */
+    public static $in;
+    /** @var resource */
+    public static $out;
+}
+Conn::$in ??= STDIN;
+Conn::$out ??= STDERR;
 
 function send(array $message): void
 {
-    fwrite(OUT, base64_encode(serialize($message)) . "\n");
+    fwrite(Conn::$out, base64_encode(serialize($message)) . "\n");
 }
 
 function receive(): array
 {
-    $line = fgets(STDIN);
+    $line = fgets(Conn::$in);
     if ($line === false) exit(0);
     $message = unserialize(base64_decode(trim($line)), ['allowed_classes' => false]);
     if (!is_array($message)) exit(1);
@@ -111,41 +121,92 @@ set_error_handler(function (int $level, string $message, string $file, int $line
     return true;
 });
 
-// --- boot -------------------------------------------------------------------------------
-$boot = receive();
-if ($boot[0] !== 'boot') exit(1);
-$context = $boot[1];
+// The WordPress functions a plugin uses: the functions it calls but neither defines nor
+// PHP has. One token_get_all pass over its files (the start of the manifest analyzer).
+// Dynamic calls (call_user_func('x'), $f()) are not seen.
+function called_functions(string $pluginPath): array
+{
+    $files = is_file($pluginPath) ? [$pluginPath] : [];
+    if (is_dir($pluginPath)) {
+        $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($pluginPath, \FilesystemIterator::SKIP_DOTS));
+        foreach ($it as $file) if ($file->getExtension() === 'php') $files[] = $file->getPathname();
+    }
+    $called = $defined = [];
+    foreach ($files as $file) {
+        $tokens = array_values(array_filter(
+            token_get_all((string) file_get_contents($file)),
+            fn ($t) => !is_array($t) || !in_array($t[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true),
+        ));
+        foreach ($tokens as $i => $token) {
+            if (!is_array($token) || !in_array($token[0], [T_STRING, T_NAME_FULLY_QUALIFIED], true)) continue;
+            $name = strtolower(ltrim($token[1], '\\'));
+            $prev = is_array($tokens[$i - 1] ?? null) ? $tokens[$i - 1][0] : ($tokens[$i - 1] ?? null);
+            if ($prev === T_FUNCTION) { $defined[$name] = true; continue; }
+            if (($tokens[$i + 1] ?? null) !== '(') continue;
+            if (in_array($prev, [T_OBJECT_OPERATOR, T_NULLSAFE_OBJECT_OPERATOR, T_DOUBLE_COLON, T_NEW], true)) continue;
+            $called[$name] = true;
+        }
+    }
+    return array_values(array_filter(
+        array_keys(array_diff_key($called, $defined)),
+        fn (string $name) => preg_match('/^[a-z_][a-z0-9_]*$/', $name) && !function_exists($name),
+    ));
+}
 
-// Plugins check ABSPATH before doing anything. It points at a folder that does not exist.
-define('ABSPATH', '/wordpress/');
-define('WPINC', 'wp-includes');
-define('SECURECORE_SANDBOX', true);
+// Serve one request: define the stand-ins, run the plugin, then the hook loop. In the
+// worker this is the child after fork; the connection is already the request's socket.
+// $standins is the list from called_functions(), computed once per plugin in the parent.
+function serve_child(array $context, array $standins): void
+{
+    if (!defined('ABSPATH')) {
+        // Plugins check ABSPATH before anything. It points at a folder that does not exist.
+        define('ABSPATH', '/wordpress/');
+        define('WPINC', 'wp-includes');
+        define('SECURECORE_SANDBOX', true);
+    }
+    $_GET = $context['get'];
+    $_POST = $context['post'];
+    $_REQUEST = array_merge($_GET, $_POST);
+    $_SERVER = array_merge($_SERVER, $context['server']);
 
-$_GET = $context['get'];
-$_POST = $context['post'];
-$_REQUEST = array_merge($_GET, $_POST);
-$_SERVER = array_merge($_SERVER, $context['server']);
-
-// Registering a hook keeps the callback here and tells core its number.
-eval(<<<'PHP'
+    if (!function_exists('add_action')) {
+        // Registering a hook keeps the callback here and tells core its number.
+        eval(<<<'PHP'
 function add_filter($tag, $callback, $priority = 10, $accepted = 1) { return \SecureCore\hook('add_filter', $tag, $callback, $priority, $accepted); }
 function add_action($tag, $callback, $priority = 10, $accepted = 1) { return \SecureCore\hook('add_action', $tag, $callback, $priority, $accepted); }
 PHP);
+        // add_action/add_filter are defined just above; drop them and anything else that
+        // now exists, so a stand-in never redeclares a real function.
+        eval(implode("\n", array_map(
+            fn (string $name) => "function $name(...\$a) { return \\SecureCore\\wp('$name', \$a); }",
+            array_filter($standins, fn (string $name) => !function_exists($name)),
+        )));
+    }
 
-$names = [];
-foreach ($context['functions'] as $name) {
-    if (preg_match('/^[a-z_][a-z0-9_]*$/i', $name) && !function_exists($name)) $names[] = $name;
+    ob_start();
+    $t = hrtime(true);
+    try {
+        require $context['main'];
+    } catch (\Throwable $error) {
+        send(['log', 'plugin failed to load: ' . $error->getMessage()]);
+    }
+    // The cost of including the plugin (with the opcache hit): read by bench/worker-breakdown.
+    fwrite(Conn::$out, '#' . json_encode(['event' => 'timing', 'include_ms' => (hrtime(true) - $t) / 1e6]) . "\n");
+    send(['ready', take_output()]);
+    // Serve core's callbacks (hooks firing) until the request ends. Returns, so a no-fork
+    // worker can reuse the process for the next request (and leak its state).
+    for (;;) {
+        $message = receive();
+        if ($message[0] === 'call') serve($message[1], $message[2]);
+        elseif ($message[0] === 'end') return;
+    }
 }
-eval(implode("\n", array_map(
-    fn (string $name) => "function $name(...\$a) { return \\SecureCore\\wp('$name', \$a); }",
-    $names,
-)));
 
-ob_start();
-try {
-    require $argv[1];
-} catch (\Throwable $error) {
-    send(['log', 'plugin failed to load: ' . $error->getMessage()]);
+// Default path (wasm one-shot): one request on STDIN/STDERR, plugin at argv[1], stand-ins
+// scanned from its folder. worker.php defines SECURECORE_WORKER and drives serve_child.
+if (!defined('SECURECORE_WORKER')) {
+    $boot = receive();
+    if ($boot[0] !== 'boot') exit(1);
+    $main = $boot[1]['main'] ?? ($argv[1] ?? '');
+    serve_child(['main' => $main] + $boot[1], called_functions(dirname($main)));
 }
-send(['ready', take_output()]);
-wait();

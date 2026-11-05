@@ -3,6 +3,7 @@
 !manifests/
 !probe/
 !bench/
+!sandbox/worker.php
+!sandbox/setup.php
+!test/plugin/
 !docker/
-!dist/securecore-linux-x64
-!dist/securecore-tabs-linux-x64

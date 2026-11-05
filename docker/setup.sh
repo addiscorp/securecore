@@ -1,12 +1,8 @@
 #!/bin/sh
-# Start the WordPress stack and install the site. Run from the repo root:
-#   bun install && bun run wasm && bun run build && docker/setup.sh
+# Start the WordPress stack and the SecureCore worker, and install the site. From repo root:
+#   docker/setup.sh
 set -eu
 cd "$(dirname "$0")"
-
-for f in securecore-linux-x64 securecore-tabs-linux-x64; do
-  [ -x "../dist/$f" ] || { echo "missing dist/$f: run bun run wasm && bun run build && bun run build:bench" >&2; exit 1; }
-done
 
 docker compose up -d --build db php web
 
@@ -30,5 +26,10 @@ if ! wp core is-installed >/dev/null 2>&1; then
     --admin_password=securecore-demo --admin_email=admin@example.com --skip-email
 fi
 wp plugin activate hello securecore-probe
+
+# The worker reads the plugins and manifests that install-securecore just wrote, so start it
+# now (and rebuild it so code changes take effect).
+docker compose up -d --build worker
+
 wp core version
 echo "site: http://127.0.0.1:8088/wp-admin/  (admin / securecore-demo)"
