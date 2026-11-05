@@ -6,10 +6,28 @@
       "name": "securecore",
       "dependencies": {
         "@bjorn3/browser_wasi_shim": "0.4.2",
+        "@php-wasm/node-8-3": "3.1.62",
+        "@php-wasm/universal": "3.1.62",
       },
     },
   },
   "packages": {
     "@bjorn3/browser_wasi_shim": ["@bjorn3/browser_wasi_shim@0.4.2", "", {}, "sha512-/iHkCVUG3VbcbmEHn5iIUpIrh7a7WPiwZ3sHy4HZKZzBdSadwdddYDZAII2zBvQYV0Lfi8naZngPCN7WPHI/hA=="],
+
+    "@php-wasm/logger": ["@php-wasm/logger@3.1.62", "", {}, "sha512-MAGvTKPMzPCim45lrXyQXC28/PHIS4kcv2pUDa9TTqA3+jykW9cn0sANajaO+UMPmqAb1ACKbmDCkkw7oZ4jhQ=="],
+
+    "@php-wasm/node-8-3": ["@php-wasm/node-8-3@3.1.62", "", { "dependencies": { "@php-wasm/universal": "3.1.62", "wasm-feature-detect": "1.8.0" } }, "sha512-lv8ijc82QOmODIGqePk28nxtxAg4d0p1RZbMpzOwZOHOHfyRa+PSVKYnoXn+4QjDnqKK9LbMXV67oHdsdhvmJQ=="],
+
+    "@php-wasm/progress": ["@php-wasm/progress@3.1.62", "", { "dependencies": { "@php-wasm/logger": "3.1.62" } }, "sha512-pNMKPl4heXz4EYK34dUC9ciowcK627JsvgKQholM5/l9ylNsKF2IxRMI2aI0pLRvK9Yxurg+hoLJfrF6Y3bONg=="],
+
+    "@php-wasm/stream-compression": ["@php-wasm/stream-compression@3.1.62", "", { "dependencies": { "@php-wasm/util": "3.1.62" } }, "sha512-4azysVnYedVUY2wmPn/eL7sKxT8+sXAOvsY8tbzMugBWNPHOTG2ZaHGfqynLv/evJpKS6d8d3MkK423CqVGusg=="],
+
+    "@php-wasm/universal": ["@php-wasm/universal@3.1.62", "", { "dependencies": { "@php-wasm/logger": "3.1.62", "@php-wasm/progress": "3.1.62", "@php-wasm/stream-compression": "3.1.62", "@php-wasm/util": "3.1.62", "ini": "4.1.2" } }, "sha512-/RVJv7RzEPeyzgJVjs4aPVuTxwNkjFYhVv77K3bkWCdBmQEtqtnNmkcP+r38mC+uSOdXSCw/FQ9RUr6iADx36A=="],
+
+    "@php-wasm/util": ["@php-wasm/util@3.1.62", "", {}, "sha512-fouSzWCuAUycz9s8/C5d5fEtaahj9MVDPJKKKcGID3YcYDqUJYHCnzp6TrFJ1U0IYPsBGAEIOe4ah8Zkx1+JJg=="],
+
+    "ini": ["ini@4.1.2", "", {}, "sha512-AMB1mvwR1pyBFY/nSevUX6y8nJWS63/SzUKD3JyQn97s4xgIdgQPT75IRouIiBAN4yLQBUShNYVW0+UG25daCw=="],
+
+    "wasm-feature-detect": ["wasm-feature-detect@1.8.0", "", {}, "sha512-zksaLKM2fVlnB5jQQDqKXXwYHLQUVH9es+5TOOHwGOVJOCeRBCiPjwSg+3tN2AdTCzjgli4jijCH290kXb/zWQ=="],
   }
 }

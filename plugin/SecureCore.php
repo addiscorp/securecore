@@ -13,6 +13,8 @@
  *   SECURECORE_DISABLED  true: load every plugin normally (baseline)
  *   SECURECORE_ENFORCE   false: allow and log calls the manifest does not grant (observe)
  *   SECURECORE_BINARY    path of the securecore binary (default /usr/local/bin/securecore)
+ *   SECURECORE_ENGINE    'p8' (default) or 'php-wasm' (stock PHP 8.3 in wasm); 'native'
+ *                        runs the php CLI and is NOT a sandbox (benchmark lower bound only)
  *
  * Protocol: see sandbox/setup.php.
  */
@@ -42,14 +44,15 @@ function enforcing(): bool
  */
 function connect(string $plugin)
 {
-    $socket = sys_get_temp_dir() . '/securecore-' . substr(sha1($plugin), 0, 12) . '.sock';
+    $engine = defined('SECURECORE_ENGINE') ? SECURECORE_ENGINE : 'p8';
+    $socket = sys_get_temp_dir() . '/securecore-' . substr(sha1("$engine $plugin"), 0, 12) . '.sock';
     $stream = @stream_socket_client("unix://$socket", $code, $error, 1);
     if ($stream) return $stream;
 
     $binary = defined('SECURECORE_BINARY') ? SECURECORE_BINARY : '/usr/local/bin/securecore';
     $path = WP_PLUGIN_DIR . '/' . $plugin;
     $dir = dirname($plugin) === '.' ? $path : WP_PLUGIN_DIR . '/' . dirname($plugin);
-    $command = implode(' ', array_map('escapeshellarg', [$binary, 'serve', '--socket', $socket, $dir, basename($plugin)]));
+    $command = implode(' ', array_map('escapeshellarg', [$binary, 'serve', '--engine', $engine, '--socket', $socket, $dir, basename($plugin)]));
     // setsid -f: the tab outlives this request and this php-fpm worker.
     exec('setsid -f ' . $command . ' >> ' . escapeshellarg(WP_CONTENT_DIR . '/securecore-sandbox.log') . ' 2>&1 < /dev/null');
     audit($plugin, 'tab.start');

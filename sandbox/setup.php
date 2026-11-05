@@ -10,7 +10,7 @@
 //   sandbox → core: ['wp', fn, args, output]  ['hook', fn, tag, id, priority, accepted]
 //                   ['ready', output]  ['return', value, output]  ['throw', message, output]
 //                   ['log', message]  ['prepared']
-//   tab → sandbox:  ['prepare', ['main' => file]]   (before a request arrives)
+//   tab → sandbox:  ['prepare', ['main' => file, 'scan' => dir]]   (before a request)
 //   core → sandbox: ['boot', context]  ['call', id, args]  ['return', value]
 //                   ['throw', message]  ['end']
 // Messages go out on STDERR: p8 keeps writes to STDOUT buffered until exit, STDERR writes
@@ -117,10 +117,10 @@ set_error_handler(function (int $level, string $message, string $file, int $line
  * the WordPress functions it uses. One token_get_all pass over the plugin's files (the
  * start of the manifest analyzer). Dynamic calls (call_user_func('x'), $f()) are not seen.
  */
-function called_functions(string $dir): array
+function called_functions(string $scan): array
 {
     $called = $defined = [];
-    $files = [];
+    $files = is_file($scan) ? [$scan] : [];
     $walk = function (string $dir) use (&$walk, &$files) {
         foreach (scandir($dir) ?: [] as $name) {
             if ($name === '.' || $name === '..') continue;
@@ -129,7 +129,7 @@ function called_functions(string $dir): array
             elseif (str_ends_with($name, '.php')) $files[] = $path;
         }
     };
-    $walk($dir);
+    if (is_dir($scan)) $walk($scan);
     $skip = [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT];
     foreach ($files as $file) {
         $tokens = array_values(array_filter(
@@ -157,7 +157,10 @@ function called_functions(string $dir): array
 // The tab boots an instance up to here before any request arrives.
 $prepare = receive();
 if ($prepare[0] !== 'prepare') exit(1);
-$main = '/plugin/' . $prepare[1]['main'];
+// In a sandbox: main = /plugin/<file>, scan = /plugin. The native engine (not a sandbox)
+// passes the plugin's real paths.
+$main = $prepare[1]['main'];
+$scan = $prepare[1]['scan'];
 
 // Plugins check ABSPATH before doing anything. It points at a folder that does not exist.
 define('ABSPATH', '/wordpress/');
@@ -174,7 +177,7 @@ PHP);
 // runs, any other is refused and logged.
 eval(implode("\n", array_map(
     fn (string $name) => "function $name(...\$a) { return \\SecureCore\\wp('$name', \$a); }",
-    called_functions('/plugin'),
+    called_functions($scan),
 )));
 send(['prepared']);
 

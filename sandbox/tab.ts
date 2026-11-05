@@ -8,17 +8,23 @@
 // Ring (SharedArrayBuffer): ctrl[0] bytes written by the tab, ctrl[1] bytes read here,
 // ctrl[2] 1 = connection closed, ctrl[3] 1 = tab waits for space. Counters only grow.
 import { readFileSync } from 'node:fs'
-import { Fd, p8, pluginFiles, sandboxRoot, wasi } from './engine'
+import { type Engine, Fd, p8, phpWasm, pluginFiles, prepareLine, sandboxRoot, wasi } from './engine'
 import wasmPath from './php2.wasm' with { type: 'file' }
 import setupPath from './setup.php' with { type: 'file' }
+import phpWasmPath from '../node_modules/@php-wasm/node-8-3/asyncify/8_3_36/php_8_3.wasm' with { type: 'file' }
+// Static, so `bun build --compile` bundles it.
+import * as phpWasmLoader from '../node_modules/@php-wasm/node-8-3/asyncify/php_8_3.js'
 
 declare const self: Worker
 
-type Init = { ctrl: SharedArrayBuffer; data: SharedArrayBuffer; plugin: string; main: string }
+type Init = { ctrl: SharedArrayBuffer; data: SharedArrayBuffer; plugin: string; main: string; engine: string }
 
-const PREPARE_LINE = (main: string) => {
-  const ser = `a:2:{i:0;s:7:"prepare";i:1;a:1:{s:4:"main";s:${Buffer.byteLength(main)}:"${main}";}}`
-  return new Uint8Array(Buffer.from(Buffer.from(ser).toString('base64') + '\n'))
+async function engine(name: string): Promise<Engine> {
+  if (name === 'p8') return p8(new WebAssembly.Module(readFileSync(wasmPath)))
+  if (name === 'php-wasm') {
+    return phpWasm(phpWasmLoader as unknown as Parameters<typeof phpWasm>[0], new WebAssembly.Module(readFileSync(phpWasmPath)))
+  }
+  throw new Error(`unknown engine ${name}`)
 }
 const PREPARED = Buffer.from('a:1:{i:0;s:8:"prepared";}').toString('base64')
 
@@ -50,14 +56,22 @@ class RingStdin extends Fd {
   }
 }
 
-self.onmessage = (event: MessageEvent<Init>) => {
+self.onmessage = async (event: MessageEvent<Init>) => {
   const { plugin, main } = event.data
   const ctrl = new Int32Array(event.data.ctrl)
   const data = new Uint8Array(event.data.data)
-  const engine = p8(new WebAssembly.Module(readFileSync(wasmPath)))
+  let php: Engine
+  try {
+    php = await engine(event.data.engine)
+  } catch (error) {
+    // An async handler's failure never reaches the tab's onerror: report it, then stop.
+    self.postMessage({ type: 'log', line: `engine ${event.data.engine} failed to load: ${error instanceof Error ? error.stack : String(error)}` })
+    self.postMessage({ type: 'done', status: 1, prepared: false })
+    return
+  }
   const files = pluginFiles(plugin)
   const setup = readFileSync(setupPath)
-  const prepare = PREPARE_LINE(main)
+  const prepare = prepareLine(`/plugin/${main}`, '/plugin')
   for (;;) {
     const stdin = new RingStdin(ctrl, data)
     stdin.local.push(prepare)
@@ -81,7 +95,7 @@ self.onmessage = (event: MessageEvent<Init>) => {
     const audit = (e: Record<string, unknown>) => self.postMessage({ type: 'out', bytes: Buffer.from('#' + JSON.stringify(e) + '\n') })
     let status: number
     try {
-      status = engine.run(sandboxRoot(files, setup), stdin, message, audit)
+      status = await php.run(sandboxRoot(files, setup), stdin, message, audit)
     } catch (error) {
       status = 1
       self.postMessage({ type: 'log', line: `instance failed: ${error instanceof Error ? error.message : String(error)}` })

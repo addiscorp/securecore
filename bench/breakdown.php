@@ -3,13 +3,14 @@
 // server. Starts its own tab for the bench plugin, plays core's side of the protocol
 // (sandbox/setup.php) over the tab's socket, and stops the tab at the end.
 //
-//   php bench/breakdown.php [requests] [calls]      inside the php container (bench/run.sh)
+//   php bench/breakdown.php [requests] [calls] [engine]   inside the php container (bench/run.sh)
 //
 // Per request: connect + boot to 'ready', `calls` hook callbacks (core → sandbox) and
 // `calls` forwarded function calls (sandbox → core), end. Also: the tab's start-up time
 // (process start to first request served) and its RSS. JSON out; non-zero exit on failure.
 $requests = (int) ($argv[1] ?? 30);
 $calls = (int) ($argv[2] ?? 1000);
+$engine = $argv[3] ?? 'p8';
 $binary = '/usr/local/bin/securecore';
 $plugin = '/var/www/html/wp-content/plugins/securecore-bench';
 $socket = sys_get_temp_dir() . '/securecore-bench-' . getmypid() . '.sock';
@@ -35,10 +36,17 @@ function reply($s, array &$hooks): array
     throw new RuntimeException('tab closed the connection');
 }
 
+/** MiB of $field for the tab plus its child processes (the native engine's php CLIs). */
 function vm(int $pid, string $field): float
 {
     preg_match("/$field:\\s+(\\d+)/", (string) @file_get_contents("/proc/$pid/status"), $m);
-    return (int) ($m[1] ?? 0) / 1024;
+    $kb = (int) ($m[1] ?? 0);
+    foreach (glob("/proc/$pid/task/*/children") ?: [] as $file) {
+        foreach (preg_split('/\s+/', trim((string) @file_get_contents($file))) as $child) {
+            if ($child !== '') $kb += (int) round(vm((int) $child, $field) * 1024);
+        }
+    }
+    return $kb / 1024;
 }
 
 function request(string $socket, int $calls): array
@@ -84,7 +92,7 @@ function stats(array $rows): array
 $process = null;
 try {
     $started = hrtime(true);
-    $process = proc_open([$binary, 'serve', '--socket', $socket, $plugin, 'securecore-bench.php'], [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['pipe', 'w']], $pipes, null, []);
+    $process = proc_open([$binary, 'serve', '--engine', $engine, '--socket', $socket, $plugin, 'securecore-bench.php'], [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['pipe', 'w']], $pipes, null, []);
     if (!is_resource($process)) throw new RuntimeException('could not start the tab');
     $pid = proc_get_status($process)['pid'];
     $first = null;
@@ -97,7 +105,7 @@ try {
     $rows = [];
     for ($i = 0; $i < $requests; $i++) $rows[] = request($socket, $calls);
     echo json_encode([
-        'requests' => $requests, 'calls' => $calls,
+        'engine' => $engine, 'requests' => $requests, 'calls' => $calls,
         'tab_start_to_first_request_ms' => round($startMs, 1),
         'per_request' => stats($rows),
         'tab_rss_mb' => round(vm($pid, 'VmRSS'), 1),

@@ -45,6 +45,12 @@ A manifest (hand-written for now; generating it with `token_get_all` comes next)
   "hooks": ["admin_notices", "admin_head"] }
 ```
 
+Engines (`SECURECORE_ENGINE` in `wp-config.php`): `p8` (default, php2.wasm), `php-wasm`
+(stock PHP 8.3 compiled to wasm by WordPress Playground, `@php-wasm/node-8-3`, GPL-2.0-or-later),
+and `native` (the php CLI as a child process: a benchmark lower bound, **not a sandbox**).
+Both wasm engines get the same isolation: only the plugin's folder, no env, no network
+(php-wasm's sockets are refused and logged as `net.deny`).
+
 Settings in `wp-config.php`: `SECURECORE_DISABLED` (load plugins normally),
 `SECURECORE_ENFORCE` (`false` = allow and log what the manifest does not grant),
 `SECURECORE_BINARY` (default `/usr/local/bin/securecore`). Every allow/deny lands in
@@ -58,7 +64,7 @@ Settings in `wp-config.php`: `SECURECORE_DISABLED` (load plugins normally),
 | `sandbox/setup.php` | runs inside the sandbox before the plugin: stand-ins, callback table, the call loop |
 | `sandbox/securecore.ts` | the binary: `serve` (the tab: socket, slots) or one instance on stdin/stdout |
 | `sandbox/tab.ts` | one tab slot (a worker thread): fresh instance per request, fed through a shared ring |
-| `sandbox/engine.ts` | what every engine shares: the visible file tree, the path audit; the p8 engine |
+| `sandbox/engine.ts` | what every engine shares (visible file tree, path audit, prepare message); the p8 and php-wasm engines |
 | `probe/securecore-probe.php` | test plugin that behaves like a backdoored update |
 | `manifests/` | manifests for Hello Dolly and the probe |
 | `docker/` | nginx + php-fpm + MariaDB, the real-server test stack |
@@ -80,9 +86,9 @@ test/site.sh baseline # SecureCore off: same notice from a normal plugin
 Benchmarks (on the running stack):
 
 ```sh
-bench/run.sh breakdown   # one tab: per-request cost, call costs, tab RSS
-bench/run.sh load        # latency, throughput, peak memory (oha inside the Docker network)
-bun bench/summary.ts     # breakdown table; load prints its own (.tmp/bench/load.md)
+bench/run.sh breakdown p8,php-wasm,native   # one tab per engine: per-request cost, call costs, tab RSS
+bench/run.sh load p8,php-wasm,native        # latency, throughput, peak memory (oha inside the Docker network)
+bun bench/summary.ts p8,php-wasm,native     # breakdown table; load prints its own (.tmp/bench/load.md)
 ```
 
 Open http://127.0.0.1:8088/wp-admin/ (admin / securecore-demo). Stop with

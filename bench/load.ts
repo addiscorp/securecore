@@ -1,17 +1,18 @@
 // Measurements 2–4: page latency, throughput and memory on the running docker/ stack.
 //
-//   bun bench/load.ts [repeats]          (see bench/run.sh; needs docker/setup.sh first)
+//   bun bench/load.ts [repeats] [engines]   (see bench/run.sh; needs docker/setup.sh first)
 //
 // The load tool (oha) runs in a container on the stack's Docker network, so requests go
 // straight to nginx. Configurations:
-//   off   SECURECORE_DISABLED, Hello Dolly + the bench plugin load as normal plugins
-//   on1   SecureCore on, Hello Dolly sandboxed
-//   on2   SecureCore on, Hello Dolly + the bench plugin sandboxed
-// Every run is checked: all responses 200, else exit 1. Writes .tmp/bench/load.json and
-// prints a markdown table.
+//   off          SECURECORE_DISABLED, Hello Dolly + the bench plugin load as normal plugins
+//   <engine> on1 SecureCore on, Hello Dolly sandboxed
+//   <engine> on2 SecureCore on, Hello Dolly + the bench plugin sandboxed
+// engines: comma-separated SECURECORE_ENGINE values (default p8). Every run is checked:
+// all responses 200, else exit 1. Writes .tmp/bench/load.json and prints markdown tables.
 import { mkdirSync, writeFileSync } from 'node:fs'
 
 const repeats = Number(process.argv[2] ?? 3)
+const engines = (process.argv[3] ?? 'p8').split(',')
 const OHA = 'ghcr.io/hatoo/oha@sha256:3ec3dbf549ea197793482d47a6324797411406bbf438c2fe8b91f244ec641a2f' // oha 1.16.0
 const COMPOSE = ['docker', 'compose', '-f', 'docker/compose.yml']
 const HOST = '127.0.0.1:8088'
@@ -28,14 +29,16 @@ function run(cmd: string[], quiet = true): string {
 }
 const wp = (...args: string[]) => run([...COMPOSE, 'run', '--rm', '-T', 'cli', 'wp', ...args])
 
-function configure(config: 'off' | 'on1' | 'on2') {
+function configure(config: string) {
+  const [engine, plugins] = config === 'off' ? ['', 'on2'] : config.split(' ')
   wp('plugin', 'deactivate', 'securecore-probe')
   if (config === 'off') wp('config', 'set', 'SECURECORE_DISABLED', 'true', '--raw')
   else {
     try { wp('config', 'delete', 'SECURECORE_DISABLED') } catch { /* not set */ }
+    wp('config', 'set', 'SECURECORE_ENGINE', engine)
   }
   wp('plugin', 'activate', 'hello')
-  if (config === 'on1') wp('plugin', 'deactivate', 'securecore-bench')
+  if (plugins === 'on1') wp('plugin', 'deactivate', 'securecore-bench')
   else wp('plugin', 'activate', 'securecore-bench')
   // Restarting php stops the tabs from the previous configuration, so each one is measured
   // (memory included) with only its own tabs; the warm-up requests start them again.
@@ -113,7 +116,7 @@ async function peakMemory<T>(body: () => Promise<T>): Promise<{ result: T; peakM
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor((xs.length - 1) / 2)]
 const r1 = (x: number) => Math.round(x * 10) / 10
 
-const configs = ['off', 'on1', 'on2'] as const
+const configs = ['off', ...engines.flatMap((e) => [`${e} on1`, `${e} on2`])]
 const pages = ['/', '/wp-admin/'] as const
 const concurrency = [1, 4, 8] as const
 type Point = { p50: number[]; p95: number[]; rps: number[] }
@@ -152,7 +155,7 @@ try {
   console.error('load failed:', error instanceof Error ? error.message : error)
   process.exit(1)
 } finally {
-  try { configure('on2'); wp('plugin', 'activate', 'securecore-probe') } catch { /* reported above */ }
+  try { configure('p8 on2'); wp('plugin', 'activate', 'securecore-probe') } catch { /* reported above */ }
 }
 
 writeFileSync(`${out}/load.json`, JSON.stringify({ repeats, latency, throughput, memory }, null, 2))

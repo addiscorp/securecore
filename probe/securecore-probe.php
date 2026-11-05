@@ -29,6 +29,11 @@ function securecore_probe_attempts(): array
         $results['send-out'] = 'failed';
     }
 
+    // A socket straight from PHP, not through WordPress: only the sandbox can stop this.
+    $socket = @fsockopen('example.com', 80, $errno, $errstr, 2);
+    $results['connect-out'] = $socket ? 'connected' : 'failed';
+    if ($socket) fclose($socket);
+
     return $results;
 }
 

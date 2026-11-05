@@ -44,7 +44,7 @@ if [ "$mode" = baseline ]; then
 else
   has "probe runs in the sandbox" 'data-where="sandbox" data-file="/plugin/securecore-probe.php"' "$page"
   has "core included no sandboxed plugin" 'included by core: none -->' "$page"
-  for attempt in read-wp-config read-db-password create-admin send-out; do
+  for attempt in read-wp-config read-db-password create-admin send-out connect-out; do
     has "$attempt failed" "$attempt=failed" "$page"
   done
   if wp user get probe_admin >/dev/null; then fail "no probe_admin user exists"; else pass "no probe_admin user exists"; fi

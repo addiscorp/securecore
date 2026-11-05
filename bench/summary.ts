@@ -1,21 +1,24 @@
-// Print the breakdown results as markdown: median across the 3 repeats of each repeat's
-// p50 (and p95). Reads .tmp/bench/breakdown-*.json. The load results print themselves
-// (.tmp/bench/load.md).
-//   bun bench/summary.ts
+// Print the breakdown results as markdown, one column per engine: median across the 3
+// repeats of each repeat's p50 (p95). Reads .tmp/bench/breakdown-<engine>-*.json. The load
+// results print themselves (.tmp/bench/load.md).
+//   bun bench/summary.ts [engines]     (default p8)
 import { readFileSync } from 'node:fs'
 
-const runs = [1, 2, 3].map((i) => JSON.parse(readFileSync(`.tmp/bench/breakdown-${i}.json`, 'utf8')))
+const engines = (process.argv[2] ?? 'p8').split(',')
+const runs = Object.fromEntries(engines.map((e) => [e, [1, 2, 3].map((i) => JSON.parse(readFileSync(`.tmp/bench/breakdown-${e}-${i}.json`, 'utf8')))]))
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[1]
 const f = (x: number) => (Math.round(x * 10) / 10).toString()
+const first = runs[engines[0]][0]
 
-console.log(`One tab: ${runs[0].requests} requests per repeat × 3 repeats after 5 warm-up; ${runs[0].calls} calls each; median of the repeats\n`)
-console.log('| step | p50 | p95 |\n|---|---|---|')
+console.log(`One tab per engine: ${first.requests} requests per repeat × 3 repeats after 5 warm-up; ${first.calls} calls each; median of the repeats, p50 (p95)\n`)
+console.log(`| step | ${engines.join(' | ')} |\n|---|${engines.map(() => '---').join('|')}|`)
 for (const [key, label, unit] of [
   ['connect_to_ready_ms', 'request: connect + boot plugin → ready', 'ms'],
   ['hook_call_us', 'hook callback, core → sandbox → core', 'µs'],
   ['forwarded_call_us', 'forwarded function, sandbox → core → sandbox', 'µs'],
 ] as const) {
-  console.log(`| ${label} | ${f(median(runs.map((r) => r.per_request[key].p50)))} ${unit} | ${f(median(runs.map((r) => r.per_request[key].p95)))} ${unit} |`)
+  const cells = engines.map((e) => `${f(median(runs[e].map((r) => r.per_request[key].p50)))} ${unit} (${f(median(runs[e].map((r) => r.per_request[key].p95)))})`)
+  console.log(`| ${label} | ${cells.join(' | ')} |`)
 }
-console.log(`| tab start → first request served (once per tab) | ${f(median(runs.map((r) => r.tab_start_to_first_request_ms)))} ms | |`)
-console.log(`| tab RSS (4 slots) | ${f(median(runs.map((r) => r.tab_rss_mb)))} MiB | peak ${f(median(runs.map((r) => r.tab_peak_rss_mb)))} MiB |`)
+console.log(`| tab start → first request served | ${engines.map((e) => `${f(median(runs[e].map((r) => r.tab_start_to_first_request_ms)))} ms`).join(' | ')} |`)
+console.log(`| tab RSS, 4 slots (peak) | ${engines.map((e) => `${f(median(runs[e].map((r) => r.tab_rss_mb)))} MiB (${f(median(runs[e].map((r) => r.tab_peak_rss_mb)))})`).join(' | ')} |`)

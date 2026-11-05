@@ -8,6 +8,8 @@
     "build:local": "bun build sandbox/securecore.ts sandbox/tab.ts --compile --outfile dist/securecore"
   },
   "dependencies": {
-    "@bjorn3/browser_wasi_shim": "0.4.2"
+    "@bjorn3/browser_wasi_shim": "0.4.2",
+    "@php-wasm/node-8-3": "3.1.62",
+    "@php-wasm/universal": "3.1.62"
   }
 }
