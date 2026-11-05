@@ -33,11 +33,14 @@ function log_line(string $line): void
     fwrite(STDERR, gmdate('c') . " securecore-worker " . $line . "\n");
 }
 
-// The stand-in names per plugin, computed once and inherited by every child. Not the
-// plugin's functions themselves: opcache_compile_file would define them in this parent, so
-// each child would redeclare them on require. Instead opcache's shared memory, set up here
-// in the parent and inherited across forks, caches each plugin's compiled code the first
-// time any child requires it; the rest hit that cache.
+// Per plugin, the WordPress functions it calls (stand-ins). The child forwards each to core,
+// which allows it only if the manifest grants it — so an ungranted call (a backdoor's
+// wp_insert_user) is denied and logged, while a native call the launcher disabled fails in
+// the sandbox and is never forwarded (see called_functions). Computed once here, inherited
+// by every child. opcache's shared memory, set up here and inherited across forks, caches
+// each plugin's compiled code the first time any child requires it; the rest hit that cache.
+// (The plugin's own functions are never compiled in the parent — opcache_compile_file would
+// define them here and each child would then redeclare them on require.)
 $standins = [];
 $mains = [];
 foreach (glob("$manifestsDir/*.json") ?: [] as $file) {

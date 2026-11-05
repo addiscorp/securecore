@@ -16,6 +16,8 @@
 // through. The securecore binary maps the sandbox's fd 2 to its own stdout.
 namespace SecureCore;
 
+require_once __DIR__ . '/scan.php';
+
 // The line to core. Default: in on STDIN, out on STDERR (the wasm one-shot path; p8 keeps
 // STDOUT buffered until exit). worker.php points both at the request's socket.
 final class Conn
@@ -126,30 +128,16 @@ set_error_handler(function (int $level, string $message, string $file, int $line
 // Dynamic calls (call_user_func('x'), $f()) are not seen.
 function called_functions(string $pluginPath): array
 {
-    $files = is_file($pluginPath) ? [$pluginPath] : [];
-    if (is_dir($pluginPath)) {
-        $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($pluginPath, \FilesystemIterator::SKIP_DOTS));
-        foreach ($it as $file) if ($file->getExtension() === 'php') $files[] = $file->getPathname();
-    }
-    $called = $defined = [];
-    foreach ($files as $file) {
-        $tokens = array_values(array_filter(
-            token_get_all((string) file_get_contents($file)),
-            fn ($t) => !is_array($t) || !in_array($t[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true),
-        ));
-        foreach ($tokens as $i => $token) {
-            if (!is_array($token) || !in_array($token[0], [T_STRING, T_NAME_FULLY_QUALIFIED], true)) continue;
-            $name = strtolower(ltrim($token[1], '\\'));
-            $prev = is_array($tokens[$i - 1] ?? null) ? $tokens[$i - 1][0] : ($tokens[$i - 1] ?? null);
-            if ($prev === T_FUNCTION) { $defined[$name] = true; continue; }
-            if (($tokens[$i + 1] ?? null) !== '(') continue;
-            if (in_array($prev, [T_OBJECT_OPERATOR, T_NULLSAFE_OBJECT_OPERATOR, T_DOUBLE_COLON, T_NEW], true)) continue;
-            $called[$name] = true;
-        }
-    }
+    // Stand-ins forward a call to core, which allows it only if the manifest grants it. We
+    // forward only WordPress functions: a name the plugin calls that it does not define
+    // (!function_exists) and that is not a PHP native. The natives to skip are exactly the
+    // ones the launcher disabled (fsockopen, exec, curl_*, …) — ini_get tells us which — so
+    // a dangerous native call fails in the sandbox instead of being forwarded to core.
+    // PHP builtins still available (strlen, …) are function_exists, so they drop out too.
+    $disabled = array_flip(array_filter(array_map('trim', explode(',', (string) ini_get('disable_functions')))));
     return array_values(array_filter(
-        array_keys(array_diff_key($called, $defined)),
-        fn (string $name) => preg_match('/^[a-z_][a-z0-9_]*$/', $name) && !function_exists($name),
+        scan_plugin($pluginPath)['called'],
+        fn (string $name) => !function_exists($name) && !isset($disabled[$name]),
     ));
 }
 

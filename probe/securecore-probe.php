@@ -29,11 +29,16 @@ function securecore_probe_attempts(): array
         $results['send-out'] = 'failed';
     }
 
-    // A socket straight from PHP, not through WordPress: only the sandbox's lack of network
-    // stops this (the manifest can't, since no WordPress call is involved).
-    $socket = @fsockopen('example.com', 80, $errno, $errstr, 2);
-    $results['connect-out'] = $socket ? 'connected' : 'failed';
-    if ($socket) fclose($socket);
+    // A socket straight from PHP, not through WordPress: only the sandbox stops this (the
+    // manifest can't, since no WordPress call is involved). In the sandbox fsockopen is
+    // disabled, so the call is a fatal Error, caught here; in core it connects.
+    try {
+        $socket = @fsockopen('example.com', 80, $errno, $errstr, 2);
+        $results['connect-out'] = $socket ? 'connected' : 'failed';
+        if ($socket) fclose($socket);
+    } catch (\Throwable $error) {
+        $results['connect-out'] = 'failed';
+    }
 
     return $results;
 }

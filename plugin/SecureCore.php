@@ -183,15 +183,157 @@ final class Sandbox
     }
 }
 
+/** Where SecureCore's own code lives: the sandbox scripts, the launcher, the manifests. */
+function home(): string
+{
+    return defined('SECURECORE_HOME') ? SECURECORE_HOME : WP_CONTENT_DIR . '/securecore';
+}
+
+function socket_path(): string
+{
+    return defined('SECURECORE_SOCKET') ? SECURECORE_SOCKET : '/run/securecore/worker.sock';
+}
+
 /** @return array<string, array> manifests keyed by plugin file, e.g. "hello.php" */
 function manifests(): array
 {
     $found = [];
-    foreach (glob(WP_CONTENT_DIR . '/securecore/manifests/*.json') ?: [] as $file) {
+    foreach (glob(home() . '/manifests/*.json') ?: [] as $file) {
         $manifest = json_decode((string) file_get_contents($file), true);
         if (is_array($manifest) && isset($manifest['plugin'])) $found[$manifest['plugin']] = $manifest;
     }
     return $found;
+}
+
+/** Is the worker accepting connections? Used by the admin screen and a future `wp securecore`. */
+function worker_running(): bool
+{
+    $stream = @stream_socket_client('unix://' . socket_path(), $errno, $errstr, 1);
+    if ($stream) { fclose($stream); return true; }
+    return false;
+}
+
+/**
+ * Start the worker if it is not already running. Returns [ok, message]. Works where
+ * proc_open is available in core (a plain or systemd install); under Docker the worker is
+ * its own container and this is not used. The same function backs a future `wp securecore`.
+ */
+function start_worker(): array
+{
+    if (worker_running()) return [true, 'already running'];
+    if (!function_exists('proc_open') || in_array('proc_open', array_map('trim', explode(',', (string) ini_get('disable_functions'))), true)) {
+        return [false, 'proc_open is disabled in core; start the worker yourself (see INSTALL.md)'];
+    }
+    $launcher = home() . '/bin/securecore-worker';
+    if (!is_file($launcher)) return [false, "launcher not found at $launcher"];
+    @mkdir(dirname(socket_path()), 0755, true);
+    $command = implode(' ', array_map('escapeshellarg', [$launcher, socket_path(), WP_PLUGIN_DIR, home() . '/manifests']));
+    // setsid -f: the worker outlives this request and this php-fpm process.
+    @exec('setsid -f ' . $command . ' >> ' . escapeshellarg(WP_CONTENT_DIR . '/securecore-worker.log') . ' 2>&1 < /dev/null');
+    for ($i = 0; $i < 40; $i++) {
+        usleep(50000);
+        if (worker_running()) return [true, 'started'];
+    }
+    return [false, 'worker did not come up; see wp-content/securecore-worker.log'];
+}
+
+/**
+ * Generate a plugin's manifest from its code (the WordPress functions and hooks it uses),
+ * store it, and return it. Run when a plugin is switched on, on its trusted version; a later
+ * update that wants more is then visible as a change. Shares scan_plugin() with the worker.
+ */
+function generate_manifest(string $pluginFile): array
+{
+    require_once home() . '/sandbox/scan.php';
+    $path = WP_PLUGIN_DIR . '/' . $pluginFile;
+    $dir = str_contains($pluginFile, '/') ? dirname($path) : $path;
+    $scan = scan_plugin(is_dir($dir) ? $dir : $path);
+    // Grant only names that are not PHP built-ins: WordPress and plugin functions, never
+    // fsockopen/exec/curl_* (those must fail in the sandbox, not be forwarded to core).
+    $internal = array_flip(get_defined_functions()['internal']);
+    $functions = array_values(array_filter($scan['called'], fn ($n) => !isset($internal[$n])));
+    sort($functions);
+    sort($scan['hooks']);
+    $manifest = ['plugin' => $pluginFile, 'hooks' => $scan['hooks'], 'functions' => $functions]
+        + ($scan['dynamic'] ? ['dynamic_hooks' => true] : []);
+    @mkdir(home() . '/manifests', 0755, true);
+    file_put_contents(home() . '/manifests/' . manifest_name($pluginFile), json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+    return $manifest;
+}
+
+function manifest_name(string $pluginFile): string
+{
+    return preg_replace('/[^a-z0-9._-]+/i', '-', str_replace('/', '-', $pluginFile)) . '.json';
+}
+
+/** The manifest file on disk for a plugin (matched by its "plugin" field), or null. */
+function manifest_file(string $pluginFile): ?string
+{
+    foreach (glob(home() . '/manifests/*.json') ?: [] as $file) {
+        $manifest = json_decode((string) file_get_contents($file), true);
+        if (is_array($manifest) && ($manifest['plugin'] ?? null) === $pluginFile) return $file;
+    }
+    return null;
+}
+
+// --- admin screen -----------------------------------------------------------------------
+// Settings → SecureCore: the worker's status, a Run-in-sandbox switch per installed plugin,
+// and each sandboxed plugin's generated manifest. Always registered, so you can turn the
+// first plugin on. Switching a plugin on generates its manifest from its code; off deletes
+// it. The stored manifest is what the worker enforces.
+add_action('admin_menu', function () {
+    add_options_page('SecureCore', 'SecureCore', 'manage_options', 'securecore', __NAMESPACE__ . '\\admin_page');
+});
+
+function admin_page(): void
+{
+    if (!current_user_can('manage_options')) return;
+    $notice = '';
+    if (($_POST['securecore_action'] ?? '') !== '' && check_admin_referer('securecore')) {
+        if ($_POST['securecore_action'] === 'start') {
+            [$ok, $msg] = start_worker();
+            $notice = ($ok ? 'Worker: ' : 'Could not start the worker: ') . $msg;
+        } elseif ($_POST['securecore_action'] === 'save') {
+            $want = array_map('sanitize_text_field', (array) ($_POST['sandbox'] ?? []));
+            $have = array_keys(manifests());
+            foreach (array_diff($want, $have) as $on) generate_manifest($on);
+            foreach (array_diff($have, $want) as $off) { $f = manifest_file($off); if ($f) @unlink($f); }
+            $notice = 'Saved. Sandboxed: ' . (count($want) ? implode(', ', $want) : 'none') . '.';
+        }
+    }
+    if (!function_exists('get_plugins')) require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    $installed = get_plugins();
+    $manifests = manifests();
+    $running = worker_running();
+    echo '<div class="wrap"><h1>SecureCore</h1>';
+    if ($notice) printf('<div class="notice notice-info"><p>%s</p></div>', esc_html($notice));
+    printf(
+        '<p>Worker: <strong style="color:%s">%s</strong> on <code>%s</code>.</p>',
+        $running ? 'green' : 'crimson', $running ? 'running' : 'not running', esc_html(socket_path()),
+    );
+    if (!$running) {
+        echo '<form method="post">';
+        wp_nonce_field('securecore');
+        echo '<input type="hidden" name="securecore_action" value="start"><p>';
+        submit_button('Start worker', 'secondary', 'submit', false);
+        echo ' <span class="description">Works where core may run <code>proc_open</code>; otherwise start it as in INSTALL.md.</span></p></form>';
+    }
+    echo '<form method="post"><table class="widefat striped"><thead><tr><th>Plugin</th><th>Run in sandbox</th><th>Manifest</th></tr></thead><tbody>';
+    foreach ($installed as $file => $data) {
+        if ($file === 'securecore-probe/securecore-probe.php') continue;
+        $on = isset($manifests[$file]);
+        $m = $manifests[$file] ?? null;
+        printf(
+            '<tr><td><strong>%s</strong></td><td><label><input type="checkbox" name="sandbox[]" value="%s"%s> sandbox</label></td><td>%s</td></tr>',
+            esc_html($data['Name'] ?? $file), esc_attr($file), $on ? ' checked' : '',
+            $m ? '<code>' . esc_html(count($m['functions'] ?? []) . ' functions, ' . count($m['hooks'] ?? []) . ' hooks') . (!empty($m['dynamic_hooks']) ? ' (dynamic hooks — review)' : '') . '</code>' : '—',
+        );
+    }
+    echo '</tbody></table>';
+    wp_nonce_field('securecore');
+    echo '<input type="hidden" name="securecore_action" value="save">';
+    submit_button('Save');
+    echo '</form></div>';
 }
 
 $manifests = manifests();
@@ -204,6 +346,17 @@ if (!$sandboxed) return;
 $hide = fn ($plugins) => array_values(array_diff((array) $plugins, $sandboxed));
 add_filter('option_active_plugins', $hide, PHP_INT_MAX);
 add_action('plugins_loaded', fn () => remove_filter('option_active_plugins', $hide, PHP_INT_MAX), PHP_INT_MIN);
+
+// If the worker is down, the sandboxed plugins don't load; say so in wp-admin.
+if (!worker_running()) {
+    add_action('admin_notices', function () use ($sandboxed) {
+        printf(
+            '<div class="notice notice-error"><p><strong>SecureCore:</strong> the sandbox worker is not running, so these plugins are not active: %s. Start it on the SecureCore settings screen or as in INSTALL.md.</p></div>',
+            esc_html(implode(', ', $sandboxed)),
+        );
+    });
+    return;
+}
 
 // Start the sandboxes where core would have included the plugins.
 add_action('muplugins_loaded', function () use ($sandboxed, $manifests) {
