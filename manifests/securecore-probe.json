@@ -1,0 +1,5 @@
+{
+  "plugin": "securecore-probe/securecore-probe.php",
+  "functions": ["esc_html"],
+  "hooks": ["admin_notices"]
+}
