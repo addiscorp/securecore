@@ -1,0 +1,15 @@
+{
+  "name": "securecore",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "wasm": "bun scripts/fetch-wasm.ts",
+    "build": "bun build sandbox/securecore.ts sandbox/tab.ts --compile --target=bun-linux-x64 --outfile dist/securecore-linux-x64",
+    "build:local": "bun build sandbox/securecore.ts sandbox/tab.ts --compile --outfile dist/securecore"
+  },
+  "dependencies": {
+    "@bjorn3/browser_wasi_shim": "0.4.2",
+    "@php-wasm/node-8-3": "3.1.62",
+    "@php-wasm/universal": "3.1.62"
+  }
+}

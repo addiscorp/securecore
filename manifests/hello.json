@@ -1,0 +1,5 @@
+{
+  "plugin": "hello.php",
+  "functions": ["wptexturize", "get_user_locale", "__", "is_rtl"],
+  "hooks": ["admin_notices", "admin_head"]
+}

@@ -1,0 +1,49 @@
+# A real WordPress install for SecureCore: nginx + php-fpm (stock PHP runs core) + MariaDB.
+# The securecore binary is in the php-fpm image; SecureCore.php starts it.
+name: securecore
+services:
+  db:
+    image: mariadb:11.4
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress-db-password
+      MARIADB_ROOT_PASSWORD: root-db-password
+    volumes:
+      - db:/var/lib/mysql
+
+  php:
+    build: { context: .., dockerfile: docker/php.Dockerfile }
+    depends_on: [db]
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress-db-password
+    volumes:
+      - wp:/var/www/html
+
+  web:
+    build: { context: .., dockerfile: docker/web.Dockerfile }
+    depends_on: [php]
+    ports:
+      - "127.0.0.1:8088:80"
+    volumes:
+      - wp:/var/www/html:ro
+
+  cli:
+    image: wordpress:cli-php8.3
+    profiles: [cli]
+    user: "33:33"
+    depends_on: [db]
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress-db-password
+    volumes:
+      - wp:/var/www/html
+
+volumes:
+  db:
+  wp:
