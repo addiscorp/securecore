@@ -5,7 +5,8 @@
   "scripts": {
     "wasm": "bun scripts/fetch-wasm.ts",
     "build": "bun build sandbox/securecore.ts --compile --target=bun-linux-x64 --outfile dist/securecore-linux-x64",
-    "build:local": "bun build sandbox/securecore.ts --compile --outfile dist/securecore"
+    "build:local": "bun build sandbox/securecore.ts --compile --outfile dist/securecore",
+    "build:bench": "bun build bench/tabs.ts --compile --target=bun-linux-x64 --outfile dist/securecore-tabs-linux-x64"
   },
   "dependencies": {
     "@bjorn3/browser_wasi_shim": "0.4.2"

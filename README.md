@@ -61,9 +61,19 @@ Needs bun and Docker.
 bun install
 bun run wasm          # fetch php2.wasm (24 MB, sha256-pinned) into sandbox/
 bun run build         # dist/securecore-linux-x64 (bun single-file executable)
+bun run build:bench   # dist/securecore-tabs-linux-x64 (bench/tabs.ts; the image includes it)
 docker/setup.sh       # build images, start the stack, install WordPress, activate plugins
 test/site.sh          # SecureCore on: Hello Dolly sandboxed, the probe's attacks fail
 test/site.sh baseline # SecureCore off: same notice from a normal plugin
+```
+
+Benchmarks (on the running stack; `bun run build:bench` first, then `docker/setup.sh` again):
+
+```sh
+bench/run.sh breakdown   # per-step startup, call costs, RSS per sandbox
+bench/run.sh load        # latency, throughput, peak memory (oha inside the Docker network)
+bench/run.sh tabs        # one process: instantiate + boot repeatedly, memory restore
+bun bench/summary.ts     # tables for breakdown + tabs; load prints its own (.tmp/bench/load.md)
 ```
 
 Open http://127.0.0.1:8088/wp-admin/ (admin / securecore-demo). Stop with

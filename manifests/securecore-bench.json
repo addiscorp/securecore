@@ -1,0 +1,5 @@
+{
+  "plugin": "securecore-bench/securecore-bench.php",
+  "functions": ["securecore_bench_noop"],
+  "hooks": ["securecore_bench_hook", "securecore_bench_calls"]
+}
