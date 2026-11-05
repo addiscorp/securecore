@@ -9,5 +9,4 @@ COPY probe/ /usr/src/securecore/securecore-probe/
 COPY bench/plugin/ /usr/src/securecore/securecore-bench/
 COPY bench/breakdown.php /usr/src/securecore/bench/breakdown.php
 COPY dist/securecore-linux-x64 /usr/local/bin/securecore
-COPY dist/securecore-tabs-linux-x64 /usr/local/bin/securecore-tabs
 COPY docker/install-securecore.sh /usr/local/bin/install-securecore

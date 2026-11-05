@@ -9,11 +9,12 @@
 // Line protocol, one message per line: base64(serialize(array)).
 //   sandbox → core: ['wp', fn, args, output]  ['hook', fn, tag, id, priority, accepted]
 //                   ['ready', output]  ['return', value, output]  ['throw', message, output]
-//                   ['log', message]
+//                   ['log', message]  ['prepared']
+//   tab → sandbox:  ['prepare', ['main' => file]]   (before a request arrives)
 //   core → sandbox: ['boot', context]  ['call', id, args]  ['return', value]
 //                   ['throw', message]  ['end']
 // Messages go out on STDERR: p8 keeps writes to STDOUT buffered until exit, STDERR writes
-// through. The securecore binary maps the sandbox's fd 2 to its own stdout.
+// through. The engine maps the sandbox's fd 2 to the message channel.
 namespace SecureCore;
 
 const OUT = STDERR;
@@ -111,20 +112,57 @@ set_error_handler(function (int $level, string $message, string $file, int $line
     return true;
 });
 
-// --- boot -------------------------------------------------------------------------------
-$boot = receive();
-if ($boot[0] !== 'boot') exit(1);
-$context = $boot[1];
+/**
+ * The functions the plugin calls that it does not define and PHP does not have: those are
+ * the WordPress functions it uses. One token_get_all pass over the plugin's files (the
+ * start of the manifest analyzer). Dynamic calls (call_user_func('x'), $f()) are not seen.
+ */
+function called_functions(string $dir): array
+{
+    $called = $defined = [];
+    $files = [];
+    $walk = function (string $dir) use (&$walk, &$files) {
+        foreach (scandir($dir) ?: [] as $name) {
+            if ($name === '.' || $name === '..') continue;
+            $path = "$dir/$name";
+            if (is_dir($path)) $walk($path);
+            elseif (str_ends_with($name, '.php')) $files[] = $path;
+        }
+    };
+    $walk($dir);
+    $skip = [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT];
+    foreach ($files as $file) {
+        $tokens = array_values(array_filter(
+            token_get_all((string) file_get_contents($file)),
+            fn ($t) => !is_array($t) || !in_array($t[0], $skip, true),
+        ));
+        foreach ($tokens as $i => $token) {
+            if (!is_array($token) || !in_array($token[0], [T_STRING, T_NAME_FULLY_QUALIFIED], true)) continue;
+            $name = strtolower(ltrim($token[1], '\\'));
+            $prev = $tokens[$i - 1] ?? null;
+            $prevId = is_array($prev) ? $prev[0] : $prev;
+            if ($prevId === T_FUNCTION) { $defined[$name] = true; continue; }
+            if (($tokens[$i + 1] ?? null) !== '(') continue;
+            if (in_array($prevId, [T_OBJECT_OPERATOR, T_NULLSAFE_OBJECT_OPERATOR, T_DOUBLE_COLON, T_NEW], true)) continue;
+            $called[$name] = true;
+        }
+    }
+    return array_values(array_filter(
+        array_keys(array_diff_key($called, $defined)),
+        fn (string $name) => preg_match('/^[a-z_][a-z0-9_]*$/', $name) && !function_exists($name),
+    ));
+}
+
+// --- prepare: off the request path ------------------------------------------------------
+// The tab boots an instance up to here before any request arrives.
+$prepare = receive();
+if ($prepare[0] !== 'prepare') exit(1);
+$main = '/plugin/' . $prepare[1]['main'];
 
 // Plugins check ABSPATH before doing anything. It points at a folder that does not exist.
 define('ABSPATH', '/wordpress/');
 define('WPINC', 'wp-includes');
 define('SECURECORE_SANDBOX', true);
-
-$_GET = $context['get'];
-$_POST = $context['post'];
-$_REQUEST = array_merge($_GET, $_POST);
-$_SERVER = array_merge($_SERVER, $context['server']);
 
 // Registering a hook keeps the callback here and tells core its number.
 eval(<<<'PHP'
@@ -132,18 +170,26 @@ function add_filter($tag, $callback, $priority = 10, $accepted = 1) { return \Se
 function add_action($tag, $callback, $priority = 10, $accepted = 1) { return \SecureCore\hook('add_action', $tag, $callback, $priority, $accepted); }
 PHP);
 
-$names = [];
-foreach ($context['functions'] as $name) {
-    if (preg_match('/^[a-z_][a-z0-9_]*$/i', $name) && !function_exists($name)) $names[] = $name;
-}
+// A stand-in for each WordPress function the plugin calls. Core decides: a granted one
+// runs, any other is refused and logged.
 eval(implode("\n", array_map(
     fn (string $name) => "function $name(...\$a) { return \\SecureCore\\wp('$name', \$a); }",
-    $names,
+    called_functions('/plugin'),
 )));
+send(['prepared']);
+
+// --- boot: one request ------------------------------------------------------------------
+$boot = receive();
+if ($boot[0] !== 'boot') exit(1);
+$context = $boot[1];
+$_GET = $context['get'];
+$_POST = $context['post'];
+$_REQUEST = array_merge($_GET, $_POST);
+$_SERVER = array_merge($_SERVER, $context['server']);
 
 ob_start();
 try {
-    require $argv[1];
+    require $main;
 } catch (\Throwable $error) {
     send(['log', 'plugin failed to load: ' . $error->getMessage()]);
 }

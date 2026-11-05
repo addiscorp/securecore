@@ -37,6 +37,18 @@ function configure(config: 'off' | 'on1' | 'on2') {
   wp('plugin', 'activate', 'hello')
   if (config === 'on1') wp('plugin', 'deactivate', 'securecore-bench')
   else wp('plugin', 'activate', 'securecore-bench')
+  // Restarting php stops the tabs from the previous configuration, so each one is measured
+  // (memory included) with only its own tabs; the warm-up requests start them again.
+  run([...COMPOSE, 'restart', 'php'])
+}
+
+async function ready() {
+  for (let i = 0; i < 60; i++) {
+    const response = await fetch(`http://${HOST}/`).catch(() => null)
+    if (response?.status === 200) return
+    await Bun.sleep(500)
+  }
+  throw new Error('site did not come back after restarting php')
 }
 
 async function cookie(): Promise<string> {
@@ -117,6 +129,7 @@ try {
   for (let rep = 0; rep < repeats; rep++) {
     for (const config of configs) {
       configure(config)
+      await ready()
       const header = await cookie()
       for (const page of pages) {
         await oha(page, 10, 1, header) // warm-up

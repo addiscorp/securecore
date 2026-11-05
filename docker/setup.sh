@@ -4,9 +4,7 @@
 set -eu
 cd "$(dirname "$0")"
 
-for f in securecore-linux-x64 securecore-tabs-linux-x64; do
-  [ -x "../dist/$f" ] || { echo "missing dist/$f: run bun run wasm && bun run build && bun run build:bench" >&2; exit 1; }
-done
+[ -x ../dist/securecore-linux-x64 ] || { echo "missing dist/securecore-linux-x64: run bun run wasm && bun run build" >&2; exit 1; }
 
 docker compose up -d --build db php web
 

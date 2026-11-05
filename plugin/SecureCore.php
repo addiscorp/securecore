@@ -33,10 +33,37 @@ function enforcing(): bool
     return !defined('SECURECORE_ENFORCE') || SECURECORE_ENFORCE;
 }
 
+/**
+ * The tab for one plugin: a long-running `securecore serve` process, one per sandboxed
+ * plugin, reached over a unix socket. Started on first use; if it has died, the next
+ * request starts it again. Only that plugin's tab restarts.
+ *
+ * @return resource|null
+ */
+function connect(string $plugin)
+{
+    $socket = sys_get_temp_dir() . '/securecore-' . substr(sha1($plugin), 0, 12) . '.sock';
+    $stream = @stream_socket_client("unix://$socket", $code, $error, 1);
+    if ($stream) return $stream;
+
+    $binary = defined('SECURECORE_BINARY') ? SECURECORE_BINARY : '/usr/local/bin/securecore';
+    $path = WP_PLUGIN_DIR . '/' . $plugin;
+    $dir = dirname($plugin) === '.' ? $path : WP_PLUGIN_DIR . '/' . dirname($plugin);
+    $command = implode(' ', array_map('escapeshellarg', [$binary, 'serve', '--socket', $socket, $dir, basename($plugin)]));
+    // setsid -f: the tab outlives this request and this php-fpm worker.
+    exec('setsid -f ' . $command . ' >> ' . escapeshellarg(WP_CONTENT_DIR . '/securecore-sandbox.log') . ' 2>&1 < /dev/null');
+    audit($plugin, 'tab.start');
+    for ($i = 0; $i < 100; $i++) {
+        usleep(50000);
+        $stream = @stream_socket_client("unix://$socket", $code, $error, 1);
+        if ($stream) return $stream;
+    }
+    audit($plugin, 'sandbox.fail', ['reason' => "no tab on $socket: $error"]);
+    return null;
+}
+
 final class Sandbox
 {
-    /** @var resource */
-    private $process;
     /** @var resource */
     private $in;
     /** @var resource */
@@ -45,29 +72,21 @@ final class Sandbox
 
     public function __construct(public readonly string $plugin, private readonly array $manifest)
     {
-        $path = WP_PLUGIN_DIR . '/' . $plugin;
-        $dir = dirname($plugin) === '.' ? $path : WP_PLUGIN_DIR . '/' . dirname($plugin);
-        $binary = defined('SECURECORE_BINARY') ? SECURECORE_BINARY : '/usr/local/bin/securecore';
-        $this->process = proc_open(
-            [$binary, $dir, basename($plugin)],
-            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', WP_CONTENT_DIR . '/securecore-sandbox.log', 'a']],
-            $pipes,
-            null,
-            [],
-        );
-        if (!is_resource($this->process)) {
+        $stream = connect($plugin);
+        if (!$stream) {
             $this->alive = false;
-            audit($plugin, 'sandbox.fail', ['reason' => 'could not start ' . $binary]);
             return;
         }
-        [$this->in, $this->out] = $pipes;
-        stream_set_timeout($this->out, 10);
+        $this->in = $this->out = $stream;
+        // Time limit per call: a plugin that does not answer in 5 s is cut off, and its tab
+        // replaces that instance.
+        stream_set_timeout($stream, 5);
     }
 
-    public function boot(array $functions): void
+    public function boot(): void
     {
+        if (!$this->alive) return;
         $this->send(['boot', [
-            'functions' => $functions,
             'get' => $_GET,
             'post' => $_POST,
             'server' => array_intersect_key($_SERVER, array_flip(['REQUEST_METHOD', 'REQUEST_URI', 'QUERY_STRING', 'HTTP_HOST', 'HTTPS', 'SERVER_NAME', 'HTTP_USER_AGENT'])),
@@ -90,8 +109,6 @@ final class Sandbox
         if (!$this->alive) return;
         $this->send(['end']);
         fclose($this->in);
-        fclose($this->out);
-        proc_close($this->process);
         $this->alive = false;
     }
 
@@ -113,7 +130,7 @@ final class Sandbox
             if ($line === false) {
                 $timeout = stream_get_meta_data($this->out)['timed_out'];
                 audit($this->plugin, $timeout ? 'sandbox.timeout' : 'sandbox.exit');
-                proc_terminate($this->process);
+                fclose($this->in);
                 $this->alive = false;
                 return null;
             }
@@ -199,23 +216,6 @@ function manifests(): array
     return $found;
 }
 
-/**
- * Every WordPress function a plugin could call: the ones defined now, plus pluggable.php's,
- * which load after plugins. The sandbox gets a stand-in for each; the manifest decides.
- */
-function core_functions(): array
-{
-    $names = get_defined_functions()['user'];
-    $tokens = token_get_all((string) file_get_contents(ABSPATH . WPINC . '/pluggable.php'));
-    foreach ($tokens as $i => $token) {
-        if (is_array($token) && $token[0] === T_FUNCTION) {
-            for ($j = $i + 1; isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE; $j++);
-            if (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_STRING) $names[] = strtolower($tokens[$j][1]);
-        }
-    }
-    return array_values(array_unique($names));
-}
-
 $manifests = manifests();
 $active = (array) get_option('active_plugins', []);
 $sandboxed = array_values(array_intersect($active, array_keys($manifests)));
@@ -229,10 +229,9 @@ add_action('plugins_loaded', fn () => remove_filter('option_active_plugins', $hi
 
 // Start the sandboxes where core would have included the plugins.
 add_action('muplugins_loaded', function () use ($sandboxed, $manifests) {
-    $functions = core_functions();
     $sandboxes = [];
     foreach ($sandboxed as $plugin) $sandboxes[] = new Sandbox($plugin, $manifests[$plugin]);
-    foreach ($sandboxes as $sandbox) $sandbox->boot($functions);
+    foreach ($sandboxes as $sandbox) $sandbox->boot();
     add_action('shutdown', function () use ($sandboxes) {
         foreach ($sandboxes as $sandbox) $sandbox->end();
     }, PHP_INT_MAX);
