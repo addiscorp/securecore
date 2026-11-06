@@ -2,5 +2,7 @@
 !plugin/
 !manifests/
 !probe/
+!bench/
 !docker/
 !dist/securecore-linux-x64
+!dist/securecore-tabs-linux-x64

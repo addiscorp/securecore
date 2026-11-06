@@ -75,7 +75,11 @@ function load(dir: string): Directory {
   return new Directory(entries)
 }
 
+const mainAt = Date.now()
 const argv = process.argv.slice(2)
+// --timings (bench/ only): report how long each startup step took, as one audit line.
+const timings = argv[0] === '--timings'
+if (timings) argv.shift()
 const [pluginDir, mainFile] = argv
 if (!pluginDir || !mainFile) {
   writeSync(2, 'usage: securecore <plugin-dir-or-file> <main-file>\n')
@@ -93,7 +97,11 @@ const root = new Directory([
   ['tmp', new Directory([])],
 ])
 
-const module = await WebAssembly.compile(readFileSync(wasmPath))
+const t0 = performance.now()
+const bytes = readFileSync(wasmPath)
+const t1 = performance.now()
+const module = await WebAssembly.compile(bytes)
+const t2 = performance.now()
 const args = ['php2', '-d', 'display_errors=0', '-d', 'log_errors=0', '-d', 'date.timezone=UTC', '/sandbox/setup.php', `/plugin/${mainFile}`]
 // The sandbox's stdout (fd 1) is diagnostics only and goes to our stderr. Its stderr (fd 2)
 // carries the messages and goes to our stdout, the line core reads. See setup.php.
@@ -104,6 +112,13 @@ const runtime = new WASI(args, [], [
   new Root('/', root.contents),
 ], { debug: false })
 const instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: runtime.wasiImport })
+const t3 = performance.now()
+if (timings) {
+  audit({
+    event: 'timing', origin: performance.timeOrigin, main: mainAt, start: Date.now(),
+    load_ms: t0, read_ms: t1 - t0, compile_ms: t2 - t1, instantiate_ms: t3 - t2,
+  })
+}
 let status = 0
 try {
   status = runtime.start(instance as { exports: { memory: WebAssembly.Memory; _start: () => unknown } })
