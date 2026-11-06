@@ -111,6 +111,7 @@ test/install.sh        # install.sh on this site via --from: install, upgrade, t
 test/install-fresh.sh  # install.sh on an unzipped WordPress (debian, apt php-cli + MariaDB, php -S)
 test/full-setup.sh     # install.sh from an empty folder: no PHP, interactive, system PHP without pcntl
 test/woo.sh            # a WooCommerce store walk (needs WooCommerce set up; see docs/woocommerce-survey.md)
+test/compat-all.sh     # the plugin compatibility sweep (test/compat.sh <slug> for one); docs/compatibility.md
 ```
 
 Benchmarks (on the running stack):
