@@ -37,7 +37,7 @@ check "plugin in wp-content/plugins/securecore" "in_php 'test -f /var/www/html/w
 check "loader in mu-plugins" "in_php 'test -f /var/www/html/wp-content/mu-plugins/securecore-loader.php'"
 check "installed version is $version" "in_php 'grep -qx $version /var/www/html/wp-content/plugins/securecore/VERSION'"
 check "says the PHP CLI here has no pcntl (worker runs in its own container)" "grep -q 'has no pcntl' $out/install-1.log"
-check "ends with the next step" "grep -q 'Next: start the sandbox worker' $out/install-1.log"
+check "ends with the next step (the worker command)" "grep -q 'Start the sandbox worker, as this user' $out/install-1.log && grep -qx '  /var/www/html/wp-content/plugins/securecore/bin/securecore-worker' $out/install-1.log"
 check "plugin is active" "compose run --rm -T cli wp plugin is-active securecore >/dev/null 2>&1"
 
 # A manifest from the admin screen must survive an upgrade.

@@ -11,6 +11,8 @@
 #   canary.json                       the newest canary's release.json
 #   latest.json                       the newest stable's (promote.yml)
 #   install.sh                        the installer, from this repo
+#   php.json                          the mirrored PHP builds: sha256, upstream URL + sha256
+#   php/<build>/<version>/<platform>/php.tar.gz   static-php-cli builds, byte for byte
 name: Release (canary)
 
 on:
@@ -95,6 +97,34 @@ jobs:
             echo "::error::publishing needs R2_ENDPOINT, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in the release environment."
             exit 1
           fi
+      # PHP for install.sh, mirrored before the installer that needs it is published:
+      # static-php-cli's prebuilt builds (scripts/php-builds.txt), copied byte for byte into
+      # php/<build>/<version>/<platform>/ with php.json recording our sha256, the upstream URL
+      # and the upstream file's sha256 at mirror time. Entries already in the bucket's
+      # php.json are kept, not downloaded again. We never build PHP.
+      - name: Mirror PHP builds (static-php-cli) into php/
+        run: |
+          set -euo pipefail
+          scripts/mirror-php.sh mirror "https://securecore-releases.addis.gg/php.json?run=${GITHUB_RUN_ID}"
+          if [ -d mirror/php ]; then
+            aws s3 sync mirror/php/ "s3://${R2_BUCKET_RELEASES}/php/" --endpoint-url="${R2_ENDPOINT}" \
+              --content-type "application/gzip"
+          fi
+          aws s3 cp mirror/php.json "s3://${R2_BUCKET_RELEASES}/php.json" --endpoint-url="${R2_ENDPOINT}" \
+            --content-type "application/json" --cache-control "no-cache"
+      - name: Read every PHP build back by its php.json sha256
+        run: |
+          set -euo pipefail
+          bust="?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          for host in securecore-releases.addis.gg securecore.addis.gg; do
+            curl -fsSL "https://${host}/php.json${bust}" -o served-php.json
+            cmp served-php.json mirror/php.json || { echo "::error::https://${host}/php.json does not match"; exit 1; }
+          done
+          jq -r '.builds[][][] | "\(.path) \(.sha256)"' mirror/php.json | while read -r path want; do
+            got="$(curl -fsSL "https://securecore-releases.addis.gg/${path}" | sha256sum | cut -d' ' -f1)"
+            [ "$got" = "$want" ] || { echo "::error::${path} served from R2 does not match php.json"; exit 1; }
+            echo "ok ${path} ${got}"
+          done
       - name: Upload the versioned release
         run: aws s3 sync "release/${VERSION}/" "s3://${R2_BUCKET_RELEASES}/${VERSION}/" --endpoint-url="${R2_ENDPOINT}"
       - name: Publish the installer and point canary.json at this release

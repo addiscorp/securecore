@@ -19,7 +19,14 @@ content=$(CDPATH='' cd "$here/../../.." && pwd)
 sock=${1:-$content/securecore/worker.sock}
 plugins=${2:-$content/plugins}
 manifests=${3:-$content/securecore/manifests}
-php=${4:-php}
+# The PHP: the one given, else the project's worker PHP that install.sh chose or downloaded
+# (<site>/.securecore/bin/php-worker) when it runs here, else `php`.
+php=${4:-}
+if [ -z "$php" ]; then
+  php=php
+  local_php=$(dirname "$content")/.securecore/bin/php-worker
+  if [ -x "$local_php" ] && "$local_php" -v >/dev/null 2>&1; then php=$local_php; fi
+fi
 php=$(command -v "$php") || { echo "securecore-worker: no '$php' command found (needs PHP CLI with pcntl and opcache)" >&2; exit 1; }
 sockdir=$(dirname "$sock")
 mkdir -p "$manifests" "$sockdir"
