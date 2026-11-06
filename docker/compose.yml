@@ -31,15 +31,17 @@ services:
     network_mode: none
     restart: unless-stopped
     environment: {}
+    # The default launcher, hardening the worker through PHP settings (bin/securecore-worker,
+    # installed under wp-content/securecore). The no-network container is the extra layer.
+    # It waits for install-securecore to have written the launcher.
     command:
       - sh
       - -c
       - >
-        exec php
-        -d opcache.enable=1 -d opcache.enable_cli=1 -d opcache.validate_timestamps=0
-        -d disable_functions=exec,shell_exec,system,passthru,proc_open,popen,proc_close,proc_get_status,proc_terminate,pcntl_exec
-        /opt/securecore/worker.php /run/securecore/worker.sock
-        /var/www/html/wp-content/plugins /var/www/html/wp-content/securecore/manifests
+        while [ ! -x /var/www/html/wp-content/securecore/bin/securecore-worker ]; do sleep 1; done;
+        exec /var/www/html/wp-content/securecore/bin/securecore-worker
+        /run/securecore/worker.sock /var/www/html/wp-content/plugins
+        /var/www/html/wp-content/securecore/manifests
     volumes:
       - wp:/var/www/html:ro
       - sock:/run/securecore

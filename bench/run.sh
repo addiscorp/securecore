@@ -13,7 +13,7 @@ compose() { docker compose -f docker/compose.yml "$@"; }
 
 breakdown() {
   for i in 1 2 3; do
-    compose exec -T worker php -d opcache.enable_cli=1 /opt/securecore/worker-breakdown.php \
+    compose exec -T worker php -d opcache.enable_cli=1 /var/www/html/wp-content/securecore/sandbox/worker-breakdown.php \
       /var/www/html/wp-content/plugins /run/securecore/worker.sock 30 1000 > "$out/breakdown-$i.json" 2>"$out/breakdown-$i.err"
     echo "breakdown repeat $i ok"
   done

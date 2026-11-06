@@ -5,5 +5,8 @@
 !bench/
 !sandbox/worker.php
 !sandbox/setup.php
+!sandbox/scan.php
+!bench/worker-breakdown.php
+!bin/
 !test/plugin/
 !docker/
