@@ -189,7 +189,9 @@ php_json() {
 download_php() {
   build=$1
   php_json
-  [ "$os" != other ] && [ "$arch" != other ] || die "no PHP download for $(uname -s) $(uname -m)"
+  if [ "$os" = other ] || [ "$arch" = other ]; then
+    die "no PHP download for $(uname -s) $(uname -m)"
+  fi
   version=$(sed -n "s/.*\"$build\": *\"\\([0-9.]*\\)\".*/\\1/p" "$PHP_JSON" | head -n 1)
   case $PHP_CHOICE in [0-9]*) version=$PHP_CHOICE ;; esac
   path=php/$build/$version/$PLATFORM/php.tar.gz
@@ -307,7 +309,9 @@ if [ "$FRESH" = 1 ]; then
   grep -v '^SECURECORE_ADMIN_PASSWORD=' "$WORK/site.log" || true
   ADMIN_PASSWORD=$(sed -n 's/^SECURECORE_ADMIN_PASSWORD=//p' "$WORK/site.log")
 fi
-[ -f "$WP_ROOT/wp-load.php" ] && [ -d "$CONTENT" ] || die "$WP_ROOT does not look like a WordPress site (no wp-load.php or wp-content/)."
+if [ ! -f "$WP_ROOT/wp-load.php" ] || [ ! -d "$CONTENT" ]; then
+  die "$WP_ROOT does not look like a WordPress site (no wp-load.php or wp-content/)."
+fi
 
 # --- 3. SecureCore ---------------------------------------------------------------------------
 [ -w "$CONTENT/plugins" ] || die "$CONTENT/plugins is not writable by $(id -un). Run this as the user that owns the site's files (no sudo needed if you are that user)."
