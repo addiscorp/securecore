@@ -1,0 +1,30 @@
+# Docker Compose service for the SecureCore worker (the option for a container host).
+# Add the `securecore` service and the `securecore-socket` volume to your stack, and mount
+# the same volume into your PHP-FPM (WordPress) service at /run/securecore. Replace
+# `wordpress` below with the volume (or bind mount) that holds your site's /var/www/html.
+#
+# It runs the same launcher as the plain install (which already forces the worker's PHP
+# isolation) and adds: no network, the site mounted read-only.
+services:
+  securecore:
+    image: php:8.3-cli
+    network_mode: none
+    restart: unless-stopped
+    entrypoint:
+      - sh
+      - -c
+      - >
+        docker-php-ext-install pcntl >/dev/null 2>&1; docker-php-ext-enable opcache >/dev/null 2>&1;
+        exec /var/www/html/wp-content/plugins/securecore/bin/securecore-worker
+        /run/securecore/worker.sock /var/www/html/wp-content/plugins
+        /var/www/html/wp-content/securecore/manifests
+    volumes:
+      - wordpress:/var/www/html:ro
+      - securecore-socket:/run/securecore
+
+  # In your existing WordPress service, add:
+  #   volumes:
+  #     - securecore-socket:/run/securecore
+
+volumes:
+  securecore-socket:

@@ -1,0 +1,57 @@
+# Every push to main becomes a canary (APS 9): the same shape as mirab's tag-canary, but on
+# push rather than nightly — a release here is one small zip.
+#
+#   1. TAG = v<VERSION>-canary-<7-char sha> (scripts/version.sh).
+#   2. Push TAG as an annotated tag. A push made with GITHUB_TOKEN starts no workflow
+#      (GitHub's loop prevention), so:
+#   3. dispatch release.yml against TAG; workflow_dispatch is the exception GITHUB_TOKEN may
+#      start.
+#
+# When v<VERSION> already exists the version was promoted: nothing is built until VERSION is
+# bumped.
+name: Tag canary
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: tag-canary
+  cancel-in-progress: false
+
+jobs:
+  tag-canary:
+    name: Tag canary
+    # Publishing runs on GitHub-hosted runners (APS 11).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Compute, push and dispatch the canary tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="$(scripts/version.sh)"
+          if git rev-parse "v${V}" >/dev/null 2>&1; then
+            echo "::warning::v${V} is already promoted; bump VERSION before the next canary"
+            exit 0
+          fi
+          TAG="v${V}-canary-$(git rev-parse --short=7 HEAD)"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "canary tag ${TAG} already exists (main hasn't changed since); nothing to do"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "securecore canary ${TAG}"
+          git push origin "$TAG"
+          echo "pushed ${TAG}; dispatching release.yml against it"
+          gh workflow run release.yml --repo "${{ github.repository }}" --ref "$TAG"

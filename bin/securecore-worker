@@ -12,7 +12,7 @@ sock=$1
 plugins=$2
 manifests=$3
 php=${4:-php}
-code=$(CDPATH= cd "$(dirname "$0")/../sandbox" && pwd)
+code=$(CDPATH='' cd "$(dirname "$0")/../sandbox" && pwd)
 sockdir=$(dirname "$sock")
 
 # open_basedir: only the worker's code, the plugins (its input), the manifests and the

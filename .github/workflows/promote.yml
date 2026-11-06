@@ -1,0 +1,124 @@
+# Promote a published canary to stable (APS 9): the same bytes, no rebuild. Run by a person:
+# Actions → Promote → Run workflow, with the canary tag (vX.Y.Z-canary-<sha>).
+#
+# Checks the canary's release.json names the tagged commit and that its zip still matches
+# its sha256, copies <canary>/ to <X.Y.Z>/ in securecore-releases (APS 12), rewrites that
+# release.json for the stable channel, points latest.json at it, reads everything back, tags
+# vX.Y.Z on the canary's commit and makes the GitHub release. A version is promoted once; the
+# next needs a VERSION bump.
+name: Promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      canary:
+        description: "Canary tag to promote (e.g. v0.1.0-canary-a1b2c3d)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  R2_BUCKET_RELEASES: securecore-releases
+
+jobs:
+  promote:
+    name: Promote canary to stable
+    runs-on: ubuntu-24.04
+    environment: release
+    env:
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Release keys are present
+        run: |
+          if [ -z "${R2_ENDPOINT:-}" ] || [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::error::promote needs R2_ENDPOINT, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in the release environment."
+            exit 1
+          fi
+      - name: The input is an unpromoted canary of this repository
+        id: validate
+        env:
+          CANARY: ${{ inputs.canary }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANARY" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-canary-[0-9a-f]{7}$ ]]; then
+            echo "::error::'${CANARY}' is not a canary tag. Expected vX.Y.Z-canary-<7-char sha>."
+            exit 1
+          fi
+          V="${BASH_REMATCH[1]}"
+          git rev-parse "$CANARY" >/dev/null 2>&1 || { echo "::error::canary tag ${CANARY} does not exist."; exit 1; }
+          if git rev-parse "v${V}" >/dev/null 2>&1; then
+            echo "::error::v${V} already exists. A version is promoted once; bump VERSION for the next release."
+            exit 1
+          fi
+          {
+            echo "canary=${CANARY}"
+            echo "canary_dir=${CANARY#v}"
+            echo "v=${V}"
+            echo "commit=$(git rev-parse "${CANARY}^{}")"
+          } >> "$GITHUB_OUTPUT"
+      - name: Copy the canary's bytes to the stable path, with a stable manifest
+        run: |
+          set -euo pipefail
+          V="${{ steps.validate.outputs.v }}"
+          C="${{ steps.validate.outputs.canary_dir }}"
+          mkdir -p "stable/${V}"
+          aws s3 cp --recursive "s3://${R2_BUCKET_RELEASES}/${C}/" "stable/${V}/" --endpoint-url="${R2_ENDPOINT}"
+          RECORDED="$(jq -r .commit "stable/${V}/release.json")"
+          if [ "$RECORDED" != "${{ steps.validate.outputs.commit }}" ]; then
+            echo "::error::${C}/release.json records ${RECORDED}, but the tag points at ${{ steps.validate.outputs.commit }}."
+            exit 1
+          fi
+          # The bytes must be the ones the canary recorded.
+          [ "$(sha256sum "stable/${V}/securecore.zip" | cut -d' ' -f1)" = "$(jq -r .sha256 "stable/${V}/release.json")" ] \
+            || { echo "::error::${C}/securecore.zip does not match its release.json"; exit 1; }
+          jq --arg v "$V" --arg canary "${{ steps.validate.outputs.canary }}" \
+            '.version = $v | .tag = ("v" + $v) | .channel = "stable" | .promoted_from = $canary' \
+            "stable/${V}/release.json" > release.tmp && mv release.tmp "stable/${V}/release.json"
+          aws s3 sync "stable/${V}/" "s3://${R2_BUCKET_RELEASES}/${V}/" --endpoint-url="${R2_ENDPOINT}"
+          aws s3 cp "stable/${V}/release.json" "s3://${R2_BUCKET_RELEASES}/latest.json" --endpoint-url="${R2_ENDPOINT}" \
+            --content-type "application/json" --cache-control "no-cache"
+      - name: Read every file back from both hostnames
+        run: |
+          set -euo pipefail
+          V="${{ steps.validate.outputs.v }}"
+          sum() { sha256sum "$1" | cut -d' ' -f1; }
+          for host in securecore-releases.addis.gg securecore.addis.gg; do
+            for f in securecore.zip securecore.zip.sha256 release.json; do
+              curl -fsSL "https://${host}/${V}/${f}" -o served
+              [ "$(sum served)" = "$(sum "stable/${V}/${f}")" ] || { echo "::error::https://${host}/${V}/${f} does not match"; exit 1; }
+              echo "ok https://${host}/${V}/${f}"
+            done
+            curl -fsSL "https://${host}/latest.json?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -o served
+            [ "$(sum served)" = "$(sum "stable/${V}/release.json")" ] || { echo "::error::https://${host}/latest.json does not match"; exit 1; }
+            echo "ok https://${host}/latest.json"
+          done
+      - name: Tag vX.Y.Z and make the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${{ steps.validate.outputs.v }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${V}" "${{ steps.validate.outputs.commit }}" -m "securecore ${V} (promoted from ${{ steps.validate.outputs.canary }})"
+          git push origin "v${V}"
+          gh release create "v${V}" "stable/${V}/release.json" "stable/${V}/securecore.zip" --repo "${{ github.repository }}" \
+            --title "securecore ${V}" \
+            --notes "Promoted from ${{ steps.validate.outputs.canary }}, the same bytes. Install: cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh"
+      - name: Summary
+        run: |
+          V="${{ steps.validate.outputs.v }}"
+          {
+            echo "### securecore ${V} is stable"
+            echo "- https://securecore-releases.addis.gg/${V}/release.json (from ${{ steps.validate.outputs.canary }})"
+            echo "- latest.json points here; every file read back from both hostnames"
+          } >> "$GITHUB_STEP_SUMMARY"

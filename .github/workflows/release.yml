@@ -1,0 +1,153 @@
+# Builds and publishes CANARY releases only (APS 9). tag-canary.yml names the build and
+# dispatches this against its tag. It never creates a stable vX.Y.Z tag or touches
+# latest.json: that is promote.yml.
+#
+# R2 layout (bucket securecore-releases, APS 12, served at https://securecore-releases.addis.gg
+# and, as a stand-in until there is a site, https://securecore.addis.gg). Directories are the
+# release's full version with no "v":
+#   <version>/securecore.zip          the plugin (scripts/package.sh)
+#   <version>/securecore.zip.sha256
+#   <version>/release.json            version, tag, commit, channel, zip + sha256
+#   canary.json                       the newest canary's release.json
+#   latest.json                       the newest stable's (promote.yml)
+#   install.sh                        the installer, from this repo
+name: Release (canary)
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'v*-canary-*'
+
+permissions:
+  contents: read
+
+env:
+  R2_BUCKET_RELEASES: securecore-releases
+
+jobs:
+  resolve:
+    name: Resolve the canary
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: The ref is a canary of this commit and this version
+        id: resolve
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::${TAG} is a stable tag. Stable releases come from promote.yml."
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-canary-([0-9a-f]{7})$ ]]; then
+            echo "::error::${TAG} is not a canary ref. Expected vX.Y.Z-canary-<7-char sha>."
+            exit 1
+          fi
+          BASE_VERSION="${BASH_REMATCH[1]}"
+          SHA7="${BASH_REMATCH[2]}"
+          TREE_VERSION="$(scripts/version.sh)"
+          if [ "$BASE_VERSION" != "$TREE_VERSION" ]; then
+            echo "::error::${TAG} names ${BASE_VERSION} but VERSION at this commit is ${TREE_VERSION}."
+            exit 1
+          fi
+          if [ "$SHA7" != "$(git rev-parse --short=7 HEAD)" ]; then
+            echo "::error::${TAG} names commit ${SHA7} but this ref is $(git rev-parse --short=7 HEAD)."
+            exit 1
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "version=${TAG#v}"
+          } >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build and publish to R2
+    needs: [resolve]
+    # Publishing runs on GitHub-hosted runners (APS 11); the build is one zip, so it happens here.
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    env:
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      VERSION: ${{ needs.resolve.outputs.version }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: The scripts pass shellcheck
+        run: shellcheck -s sh install.sh bin/securecore-worker scripts/*.sh
+      - name: Lay out the release (scripts/release-layout.sh, the same script test/install.sh serves)
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          TMPDIR="$PWD/.tmp" scripts/release-layout.sh "$VERSION" "$TAG" "$GITHUB_SHA" canary release
+          unzip -l "release/${VERSION}/securecore.zip"
+          cat "release/${VERSION}/release.json"
+      - name: Release keys are present
+        run: |
+          if [ -z "${R2_ENDPOINT:-}" ] || [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::error::publishing needs R2_ENDPOINT, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in the release environment."
+            exit 1
+          fi
+      - name: Upload the versioned release
+        run: aws s3 sync "release/${VERSION}/" "s3://${R2_BUCKET_RELEASES}/${VERSION}/" --endpoint-url="${R2_ENDPOINT}"
+      - name: Publish the installer and point canary.json at this release
+        run: |
+          set -euo pipefail
+          aws s3 cp release/install.sh "s3://${R2_BUCKET_RELEASES}/install.sh" --endpoint-url="${R2_ENDPOINT}" \
+            --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
+          aws s3 cp release/canary.json "s3://${R2_BUCKET_RELEASES}/canary.json" --endpoint-url="${R2_ENDPOINT}" \
+            --content-type "application/json" --cache-control "no-cache"
+      # Every uploaded file, read back over HTTPS from both hostnames and compared byte for
+      # byte (sha256) with what was built. curl, like the installer: Cloudflare turns away
+      # Python's default user agent on these domains. The mutable files get a query string
+      # so a cached copy can't pass for the new one.
+      - name: Read every file back from securecore-releases.addis.gg and securecore.addis.gg
+        run: |
+          set -euo pipefail
+          sum() { sha256sum "$1" | cut -d' ' -f1; }
+          bust="?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          for host in securecore-releases.addis.gg securecore.addis.gg; do
+            for f in "${VERSION}/securecore.zip" "${VERSION}/securecore.zip.sha256" "${VERSION}/release.json"; do
+              curl -fsSL "https://${host}/${f}" -o served
+              [ "$(sum served)" = "$(sum "release/${f}")" ] || { echo "::error::https://${host}/${f} does not match what was built"; exit 1; }
+              echo "ok https://${host}/${f} $(sum served)"
+            done
+            for f in install.sh canary.json; do
+              curl -fsSL "https://${host}/${f}${bust}" -o served
+              [ "$(sum served)" = "$(sum "release/${f}")" ] || { echo "::error::https://${host}/${f} does not match what was uploaded"; exit 1; }
+              echo "ok https://${host}/${f} $(sum served)"
+            done
+          done
+          # And the zip matches the sha256 the manifest promises installers.
+          curl -fsSL "https://securecore-releases.addis.gg/${VERSION}/securecore.zip" -o served.zip
+          [ "$(sum served.zip)" = "$(jq -r .sha256 "release/${VERSION}/release.json")" ] || { echo "::error::served zip does not match release.json"; exit 1; }
+      - name: GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          files="release/${VERSION}/release.json release/${VERSION}/securecore.zip"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            # shellcheck disable=SC2086
+            gh release upload "$TAG" $files --repo "${{ github.repository }}" --clobber
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" $files --repo "${{ github.repository }}" \
+              --title "securecore ${VERSION} (canary)" --prerelease \
+              --notes "Canary build of ${GITHUB_SHA}. Install it: cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh -s -- --canary"
+          fi
+      - name: Summary
+        run: |
+          {
+            echo "### securecore ${VERSION} (canary)"
+            echo "- https://securecore-releases.addis.gg/${VERSION}/release.json"
+            echo "- canary.json and install.sh now point here; latest.json was not touched (promote.yml)"
+            echo "- every file read back from both hostnames and matched by sha256"
+          } >> "$GITHUB_STEP_SUMMARY"

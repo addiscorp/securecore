@@ -1,0 +1,28 @@
+# systemd unit for the SecureCore worker (the stronger option for a bare server).
+# Copy to /etc/systemd/system/securecore.service, adjust WP (your WordPress root) and the
+# users, then: systemctl daemon-reload && systemctl enable --now securecore
+#
+# It runs the same launcher as the plain install (which already forces the worker's PHP
+# isolation) and adds: its own user, no network at all, the site read-only.
+[Unit]
+Description=SecureCore worker
+After=network.target
+
+[Service]
+Environment=WP=/var/www/html
+User=securecore
+Group=www-data
+RuntimeDirectory=securecore
+RuntimeDirectoryMode=0750
+ExecStart=/bin/sh -c 'exec "$WP/wp-content/plugins/securecore/bin/securecore-worker" /run/securecore/worker.sock "$WP/wp-content/plugins" "$WP/wp-content/securecore/manifests"'
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/var/www
+ReadWritePaths=/run/securecore
+NoNewPrivileges=yes
+PrivateTmp=yes
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
