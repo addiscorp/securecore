@@ -20,7 +20,26 @@ No PHP, WordPress or database needed beforehand. The installer:
 2. **WordPress:** a version from wordpress.org's list, newest first, checked against wordpress.org's published sha1 (wordpress.org publishes sha1 and md5, not sha256).
 3. **Database:** SQLite by default (the SQLite Database Integration plugin and its `db.php` drop-in, no server), or MySQL/MariaDB. It writes `wp-config.php` and installs the site: title and admin user asked, password asked or generated and printed.
 4. **SecureCore**, as below.
-5. **How to run it:** prints the two commands (PHP's built-in web server and the worker), or writes a Docker Compose file for the same setup.
+5. **The worker and how to run it:** offers to start the sandbox worker in the background, then prints the command that starts the site (PHP's built-in web server, on the port of `--url`) and where to go in wp-admin; or writes a Docker Compose file for the same setup.
+
+The output is one plain line per step, ending with what to run next:
+
+```
+SecureCore installer
+
+✓ PHP 8.4          none found on this computer, downloaded into this folder (verified)
+✓ WordPress 7.1.4  downloaded (verified)
+✓ Database         SQLite, no database server needed
+✓ Site             http://localhost:8080, admin user "admin"
+✓ SecureCore       installed (0.1.0) and switched on
+✓ Sandbox worker   running
+
+Next, start your site (leave it running):
+  .securecore/bin/php-web -S localhost:8080
+Then open http://localhost:8080/wp-admin → Settings → SecureCore to choose plugins to sandbox.
+```
+
+`--verbose` adds the detail: download URLs, sha256/sha1 values, the PHP builds and file paths. When the output isn't a terminal (a log, CI), `✓` is written as `ok`.
 
 It asks on the terminal, which also works under `curl | sh`. Every question has a flag:
 
@@ -29,7 +48,7 @@ curl -fsSL https://securecore.addis.gg/install.sh | sh -s -- --yes \
   --php download --wordpress latest --db sqlite --title "My site" --admin-user admin --admin-email me@example.com
 ```
 
-`--db mysql://user:pass@host[:port]/name` uses MySQL. `--php system` never downloads PHP. `--compose` writes `compose.yml` instead of printing commands. `--yes` takes every default, including downloading PHP if needed. Re-running it on a finished site only upgrades SecureCore.
+`--db mysql://user:pass@host[:port]/name` uses MySQL. `--php system` never downloads PHP. `--compose` writes `compose.yml` instead of printing commands. `--yes` takes every default, including downloading PHP if needed, and starts the worker. `--url http://localhost:8097` sets the site's address, and the printed command uses its port. Re-running it on a finished site only upgrades SecureCore.
 
 There are three ways to run the worker. They use the same code; each adds a layer of
 isolation:
@@ -83,8 +102,8 @@ Deactivating the SecureCore plugin turns it off; plugins then load normally.
 
 ## 2. Start the worker (plain)
 
-install.sh offers to start it for you. Otherwise, from the WordPress root, as the user that
-owns the site's files:
+install.sh offers to start it for you (with `--yes` it just does). Otherwise, from the
+WordPress root, as the user that owns the site's files:
 
 ```
 wp-content/plugins/securecore/bin/securecore-worker

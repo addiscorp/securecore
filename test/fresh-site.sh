@@ -46,7 +46,10 @@ cat /tmp/install.log
 check "one-liner exits 0" "[ $rc = 0 ]"
 check "it edited nothing in wp-config.php" "! grep -q SECURECORE /home/site/wordpress/wp-config.php"
 check "the printed worker command is just the launcher's path" "grep -qx '  /home/site/wordpress/wp-content/plugins/securecore/bin/securecore-worker' /tmp/install.log"
-check "no terminal, so it printed the command instead of asking" "! grep -q 'Start the sandbox worker now' /tmp/install.log"
+worker_owner() { for p in /proc/[0-9]*; do tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q 'sandbox/worker.php' && stat -c %U "$p"; done | sort -u; }
+check "no terminal and no --yes: it didn't ask or start the worker, and printed the command" "! grep -q 'Start it now, in the background' /tmp/install.log && grep -qE '^- Sandbox worker +not started yet' /tmp/install.log && [ -z \"\$(worker_owner)\" ]"
+check "an existing site: SecureCore switched on with WP-CLI" "grep -qE '^ok SecureCore +installed \(.*\) and switched on' /tmp/install.log && su site -c 'cd ~/wordpress && wp plugin is-active securecore'"
+check "Next: where to go, at the site's own address" "grep -q '^Then open http://localhost:8080/wp-admin → Settings → SecureCore' /tmp/install.log"
 
 echo "site\$ cd wordpress && php -S localhost:8080 &"
 su site -c 'cd ~/wordpress && (php -S localhost:8080 > /tmp/webserver.log 2>&1 &)'
@@ -62,7 +65,6 @@ nonce() { sed -n 's/.*name="_wpnonce" value="\([^"]*\)".*/\1/p' "$1" | head -n 1
 echo "browser: Settings → SecureCore → Start worker"
 curl -s -b $J -o /tmp/started.html --data-urlencode "_wpnonce=$(nonce /tmp/screen.html)" -d 'securecore_action=start' 'http://localhost:8080/wp-admin/options-general.php?page=securecore'
 check "Start worker: started, and the screen shows it running" "grep -q 'Worker: started' /tmp/started.html && grep -q 'color:green\">running' /tmp/started.html"
-worker_owner() { for p in /proc/[0-9]*; do tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q 'sandbox/worker.php' && stat -c %U "$p"; done | sort -u; }
 check "the worker runs as the site user, not root" "[ \"\$(worker_owner)\" = site ]"
 
 echo "browser: tick Run in sandbox for Hello Dolly → Save"
@@ -105,11 +107,20 @@ done
 sleep 1
 echo "site\$ cd wordpress && curl -fsSL $FROM/install.sh | sh -s -- --from $FROM    # in a terminal, answering y"
 printf 'y\n' | su site -c "script -qec 'cd ~/wordpress && curl -fsSL $FROM/install.sh | sh -s -- --from $FROM' /dev/null" > /tmp/interactive.log 2>&1
-tr -d '\r' < /tmp/interactive.log | sed -n '/Upgrading/,$p'
-check "interactive: asked to start the worker" "grep -q 'Start the sandbox worker now, in the background? \[y/N\]' /tmp/interactive.log"
-check "interactive: started it" "grep -q 'Started the worker on /home/site/wordpress/wp-content/securecore/worker.sock' /tmp/interactive.log"
+tr -d '\r' < /tmp/interactive.log | sed -n '/^SecureCore installer/,$p'
+check "interactive: asked to start the worker, saying what it is" "grep -q 'The sandbox worker runs the plugins you choose to sandbox' /tmp/interactive.log && grep -q 'Start it now, in the background? \[y/N\]' /tmp/interactive.log"
+check "interactive: started it" "grep -qE '(^|\] )✓ Sandbox worker +running' /tmp/interactive.log && [ \"\$(worker_owner)\" = site ]"
 curl -s -b $J http://localhost:8080/wp-admin/ -o /tmp/after-interactive.html
 check "interactive: the probe is sandboxed again on the next request" "grep -q 'data-where=\"sandbox\"' /tmp/after-interactive.html"
+
+# A second worker on the same socket is refused, and the running one keeps serving.
+su site -c "/home/site/wordpress/wp-content/plugins/securecore/bin/securecore-worker" > /tmp/second.log 2>&1
+rc=$?
+cat /tmp/second.log
+check "a second worker on a live socket: refused" "[ $rc != 0 ] && grep -q 'a worker is already running on /home/site/wordpress/wp-content/securecore/worker.sock' /tmp/second.log"
+curl -s -b $J http://localhost:8080/wp-admin/ -o /tmp/after-second.html
+check "the first worker still serves the probe" "grep -q 'data-where=\"sandbox\"' /tmp/after-second.html"
+check "the worker's log is plain text (no protocol lines)" "grep -q 'securecore-worker listening on' /home/site/wordpress/wp-content/securecore/worker.log && ! grep -qE '^[A-Za-z0-9+/]{16,}=*$' /home/site/wordpress/wp-content/securecore/worker.log"
 
 # A socket path over the unix limit gets a clear message with the constant to set.
 LONG=/tmp/$(printf 'x%.0s' $(seq 1 120))/worker.sock

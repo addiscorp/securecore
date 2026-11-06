@@ -42,6 +42,15 @@ if [ "${#sock}" -gt "$max" ]; then
   exit 1
 fi
 
+# One worker per socket: if one is already answering on it, starting another would take the
+# socket away from it. A socket nobody answers on is left over from a stopped worker, and
+# worker.php replaces it.
+# shellcheck disable=SC2016 # PHP code: $argv is PHP's
+if [ -S "$sock" ] && "$php" -r 'exit(@stream_socket_client("unix://" . $argv[1]) ? 0 : 1);' "$sock" 2>/dev/null; then
+  echo "securecore-worker: a worker is already running on $sock; stop it first to start a new one" >&2
+  exit 1
+fi
+
 # open_basedir: only the worker's code, the plugins (its input), the manifests and the
 # socket dir. wp-config.php and the rest of the site are outside it, so a sandboxed plugin
 # cannot read them. disable_functions: process execution, and every outbound-network call,
