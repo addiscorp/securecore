@@ -33,6 +33,15 @@ function log_line(string $line): void
     fwrite(STDERR, gmdate('c') . " securecore-worker " . $line . "\n");
 }
 
+// In the parent, PHP warnings go to the log as plain text. setup.php's handler (underneath
+// this one) sends them to core over the protocol, which only means something inside a
+// conversation, so each child pops back to it before serving.
+set_error_handler(function (int $level, string $message, string $file, int $line): bool {
+    if (!(error_reporting() & $level)) return true; // silenced with @
+    log_line("php: $message ($file:$line)");
+    return true;
+});
+
 // Per plugin, the WordPress functions it calls (stand-ins). The child forwards each to core,
 // which allows it only if the manifest grants it — so an ungranted call (a backdoor's
 // wp_insert_user) is denied and logged, while a native call the launcher disabled fails in
@@ -98,7 +107,12 @@ function serve_connection($conn, array $cache, string $pluginsDir, string $manif
     serve_child($context, $standins);
 }
 
-@unlink($socketPath);
+// A socket left by a worker that stopped: remove it. (bin/securecore-worker has already
+// refused to start if a worker is still answering on it.)
+if (file_exists($socketPath) && !unlink($socketPath)) {
+    log_line("cannot remove the old socket $socketPath");
+    exit(1);
+}
 $server = stream_socket_server("unix://$socketPath", $errno, $errstr);
 if (!$server) {
     log_line("cannot listen on $socketPath: $errstr");
@@ -111,6 +125,7 @@ log_line("listening on $socketPath" . ($noFork ? ' (NO FORK: state leaks between
 // Children reap themselves.
 if (!$noFork) pcntl_signal(\SIGCHLD, \SIG_IGN);
 
+if ($noFork) restore_error_handler();
 for (;;) {
     $conn = @stream_socket_accept($server, -1);
     if (!$conn) continue;
@@ -123,6 +138,7 @@ for (;;) {
     }
     $pid = pcntl_fork();
     if ($pid === 0) {
+        restore_error_handler();
         fclose($server);
         serve_connection($conn, $cache, $pluginsDir, $manifestsDir);
         exit(0);

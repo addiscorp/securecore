@@ -23,7 +23,7 @@ TMPDIR=$PWD/.tmp scripts/release-layout.sh "$version" "v$version" "$(git rev-par
 
 # Serve it from inside the php container, the way the bucket would.
 compose exec -T php sh -c 'rm -rf /tmp/release && mkdir -p /tmp/release'
-tar -C "$rel" -cf - . | compose exec -T php tar -xf - -C /tmp/release
+COPYFILE_DISABLE=1 tar --no-xattrs -C "$rel" -cf - . | compose exec -T php tar -xf - -C /tmp/release
 compose exec -T php sh -c 'chown -R www-data /tmp/release; (php -S 127.0.0.1:8099 -t /tmp/release >/tmp/release-server.log 2>&1 & echo $! > /tmp/release-server.pid)'
 sleep 1
 FROM=http://127.0.0.1:8099
@@ -36,15 +36,16 @@ check "install exits 0" "[ $rc = 0 ]"
 check "plugin in wp-content/plugins/securecore" "in_php 'test -f /var/www/html/wp-content/plugins/securecore/securecore.php'"
 check "loader in mu-plugins" "in_php 'test -f /var/www/html/wp-content/mu-plugins/securecore-loader.php'"
 check "installed version is $version" "in_php 'grep -qx $version /var/www/html/wp-content/plugins/securecore/VERSION'"
-check "says the PHP CLI here has no pcntl (worker runs in its own container)" "grep -q 'has no pcntl' $out/install-1.log"
-check "ends with the next step (the worker command)" "grep -q 'Start the sandbox worker, as this user' $out/install-1.log && grep -qx '  /var/www/html/wp-content/plugins/securecore/bin/securecore-worker' $out/install-1.log"
+check "says the PHP CLI here has no pcntl, so it did not start the worker (it runs in its own container)" "grep -qE '^! Sandbox worker +not started: this computer.s PHP has no pcntl' $out/install-1.log"
+check "ends with the next step (the worker command)" "grep -q '^Next, start the sandbox worker as www-data' $out/install-1.log && grep -qx '  /var/www/html/wp-content/plugins/securecore/bin/securecore-worker' $out/install-1.log"
+check "plain output: no URLs or checksums" "! grep -qE 'sha256|[0-9a-f]{64}|https?://' $out/install-1.log"
 check "plugin is active" "compose run --rm -T cli wp plugin is-active securecore >/dev/null 2>&1"
 
 # A manifest from the admin screen must survive an upgrade.
 in_php 'echo "{\"plugin\":\"keep-me.php\",\"functions\":[],\"hooks\":[]}" > /var/www/html/wp-content/securecore/manifests/keep-me.json'
 echo "\$ $ONE_LINER   # again: upgrade in place"
 in_php "$ONE_LINER" > "$out/install-2.log" 2>&1; rc=$?
-check "re-run exits 0 and says it is upgrading" "[ $rc = 0 ] && grep -q 'Upgrading SecureCore $version -> $version' $out/install-2.log"
+check "re-run exits 0 and says it reinstalled the same version" "[ $rc = 0 ] && grep -qE '^ok SecureCore +reinstalled \($version, already the newest\)' $out/install-2.log"
 check "manifests kept across the upgrade" "in_php 'test -f /var/www/html/wp-content/securecore/manifests/keep-me.json'"
 in_php 'rm -f /var/www/html/wp-content/securecore/manifests/keep-me.json'
 
@@ -52,7 +53,7 @@ in_php 'rm -f /var/www/html/wp-content/securecore/manifests/keep-me.json'
 compose exec -T php sh -c "cp /tmp/release/$version/securecore.zip /tmp/good.zip && printf x >> /tmp/release/$version/securecore.zip"
 in_php "$ONE_LINER" > "$out/install-tampered.log" 2>&1; rc=$?
 compose exec -T php sh -c "cp /tmp/good.zip /tmp/release/$version/securecore.zip"
-check "tampered zip: fails" "[ $rc != 0 ] && grep -q 'failed its checksum' $out/install-tampered.log"
+check "tampered zip: fails, says nothing was changed and what to do" "[ $rc != 0 ] && grep -q '^error The SecureCore download failed its checksum, so nothing was changed. Run the installer again' $out/install-tampered.log"
 check "tampered zip: installed plugin untouched" "in_php 'grep -qx $version /var/www/html/wp-content/plugins/securecore/VERSION'"
 
 # Not the site owner: a clear message, no sudo.
