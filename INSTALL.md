@@ -3,7 +3,33 @@
 SecureCore runs your WordPress plugins in a separate sandbox process (the **worker**).
 WordPress core keeps running on your web server's PHP; each sandboxed plugin runs in the
 worker, and every call between a plugin and WordPress is checked against the plugin's
-manifest. This guide adds SecureCore to an existing WordPress site.
+manifest. This guide sets up a new site with SecureCore from an empty folder, or adds it to
+an existing WordPress site.
+
+## Quick start: a new site from an empty folder
+
+```
+mkdir mysite && cd mysite && curl -fsSL https://securecore.addis.gg/install.sh | sh
+```
+
+No PHP, WordPress or database needed beforehand. The installer:
+
+1. **PHP:** uses your `php` if it has what's needed. That's pcntl + opcache for the worker, and pdo_sqlite or mysqli for the site. Otherwise it offers to download PHP into `.securecore/php/` inside the project: never system-wide, never sudo.
+   - The builds are static-php-cli's prebuilt binaries, mirrored in SecureCore's release bucket and checked by sha256. `php.json` there records each file's upstream URL and its sha256 when mirrored.
+   - The `bulk` build runs the worker. The site runs on `common` for SQLite or `bulk` for MySQL.
+2. **WordPress:** a version from wordpress.org's list, newest first, checked against wordpress.org's published sha1 (wordpress.org publishes sha1 and md5, not sha256).
+3. **Database:** SQLite by default (the SQLite Database Integration plugin and its `db.php` drop-in, no server), or MySQL/MariaDB. It writes `wp-config.php` and installs the site: title and admin user asked, password asked or generated and printed.
+4. **SecureCore**, as below.
+5. **How to run it:** prints the two commands (PHP's built-in web server and the worker), or writes a Docker Compose file for the same setup.
+
+It asks on the terminal, which also works under `curl | sh`. Every question has a flag:
+
+```
+curl -fsSL https://securecore.addis.gg/install.sh | sh -s -- --yes \
+  --php download --wordpress latest --db sqlite --title "My site" --admin-user admin --admin-email me@example.com
+```
+
+`--db mysql://user:pass@host[:port]/name` uses MySQL. `--php system` never downloads PHP. `--compose` writes `compose.yml` instead of printing commands. `--yes` takes every default, including downloading PHP if needed. Re-running it on a finished site only upgrades SecureCore.
 
 There are three ways to run the worker. They use the same code; each adds a layer of
 isolation:
@@ -26,14 +52,13 @@ isolation:
 
 ## 1. Install the files
 
-From your WordPress root, as the user that owns the site's files (no sudo):
+For an existing site: from your WordPress root, as the user that owns the site's files (no sudo):
 
 ```
 cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh
 ```
 
-It checks for `php` with `pcntl` and opcache (and says exactly what's missing), downloads
-the newest release, checks its sha256, puts the plugin in `wp-content/plugins/securecore/`
+It checks for `php` with `pcntl` and opcache and says exactly what's missing. If they're missing, it offers to download a PHP that has them into `.securecore/php/` for the worker; your site keeps its own PHP. It then downloads the newest release, checks its sha256, puts the plugin in `wp-content/plugins/securecore/`
 and the loader in `wp-content/mu-plugins/securecore-loader.php`, activates the plugin with
 WP-CLI if `wp` is available (otherwise activate **SecureCore** in wp-admin → Plugins), and
 prints the next step. Options: `--path <dir>` (WordPress root), `--canary` (newest canary),

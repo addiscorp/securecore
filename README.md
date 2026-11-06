@@ -86,10 +86,14 @@ it.)
 ## Install it on a site
 
 ```
-cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh
+mkdir mysite && cd mysite && curl -fsSL https://securecore.addis.gg/install.sh | sh     # a new site, from nothing
+cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh        # an existing site
 ```
 
-See INSTALL.md. Releases: `scripts/package.sh` builds the zip (only what a site needs);
+See INSTALL.md. install.sh finds or downloads PHP; `setup/site.php` (in the release) sets up
+WordPress, the database and the site. Releases: `scripts/package.sh` builds the zip (only
+what a site needs); `scripts/mirror-php.sh` mirrors the static-php-cli builds listed in
+`scripts/php-builds.txt` and writes `php.json`;
 `scripts/release-layout.sh` lays out a release as the `securecore-releases` bucket holds it;
 `.github/workflows/` tags a canary on every push to main, publishes it, and promotes a
 canary to stable with the same bytes (APS 9, APS 12).
@@ -104,7 +108,8 @@ test/site.sh           # SecureCore on: plugins sandboxed, the probe's attacks a
 test/site.sh baseline  # SecureCore off: same notices from normal plugins
 test/isolation.sh      # request isolation, with and without the fork
 test/install.sh        # install.sh on this site via --from: install, upgrade, tamper, uninstall, then test/site.sh
-test/install-fresh.sh  # install.sh on a fresh stock WordPress (debian + apt nginx/php-fpm), no repo scripts
+test/install-fresh.sh  # install.sh on an unzipped WordPress (debian, apt php-cli + MariaDB, php -S)
+test/full-setup.sh     # install.sh from an empty folder: no PHP, interactive, system PHP without pcntl
 test/woo.sh            # a WooCommerce store walk (needs WooCommerce set up; see docs/woocommerce-survey.md)
 ```
 

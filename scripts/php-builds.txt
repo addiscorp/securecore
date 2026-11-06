@@ -1,0 +1,8 @@
+# The PHP builds SecureCore mirrors into securecore-releases (php/<build>/<version>/<platform>/),
+# from static-php-cli's prebuilt binaries (https://dl.static-php.dev/static-php-cli/<build>/).
+# We never build PHP ourselves. One line per build and version; every platform is mirrored.
+#   bulk    the worker always (pcntl + opcache), and the web side on MySQL (mysqli)
+#   common  the web side on SQLite (pdo_sqlite; no opcache, no mysqli)
+# The first line of each build is its default version.
+bulk 8.4.23
+common 8.4.23

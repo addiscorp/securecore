@@ -13,7 +13,9 @@ out=$(CDPATH='' cd "$out" && pwd)
 stage=$(mktemp -d "${TMPDIR:-$root/.tmp}/securecore-package.XXXXXX")
 trap 'find "$stage" -mindepth 1 -delete; rmdir "$stage"' EXIT
 pkg="$stage/securecore"
-mkdir -p "$pkg/sandbox" "$pkg/bin" "$pkg/templates"
+mkdir -p "$pkg/sandbox" "$pkg/bin" "$pkg/templates" "$pkg/setup"
+# install.sh's site setup (WordPress, database, wp-config.php), run before the plugin is in place.
+cp "$root/setup/site.php" "$pkg/setup/"
 
 cp "$root/plugin/securecore.php" "$root/plugin/SecureCore.php" "$pkg/"
 # The loader lives one level down so WordPress does not list it as a second plugin.
