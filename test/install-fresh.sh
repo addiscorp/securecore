@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run test/fresh-site.sh in a plain debian:12 container (a stand-in server, nothing from this
+# Run test/fresh-site.sh in a plain debian:12 container (a stand-in machine, nothing from this
 # repo's docker/ stack), with a locally built release served from /release. The container
 # is removed afterwards. Exits non-zero on failure.
 #   DOCKER_CONTEXT=colima test/install-fresh.sh
@@ -18,6 +18,9 @@ trap 'docker rm -f "$name" >/dev/null 2>&1' EXIT
 docker exec "$name" mkdir -p /release
 COPYFILE_DISABLE=1 tar --no-xattrs -C "$rel" -cf - . | docker exec -i "$name" tar -xf - -C /release
 COPYFILE_DISABLE=1 tar --no-xattrs -C test -cf - fresh-site.sh | docker exec -i "$name" tar -xf - -C /root
+docker exec "$name" mkdir -p /probe
+COPYFILE_DISABLE=1 tar --no-xattrs -C probe -cf - . | docker exec -i "$name" tar -xf - -C /probe
+COPYFILE_DISABLE=1 tar --no-xattrs -C manifests -cf - securecore-probe.json | docker exec -i "$name" tar -xf - -C /probe
 docker exec "$name" sh /root/fresh-site.sh > "$out/fresh-site.log" 2>&1; rc=$?
 cat "$out/fresh-site.log"
 exit "$rc"

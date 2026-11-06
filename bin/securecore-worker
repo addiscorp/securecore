@@ -6,14 +6,34 @@
 # and opcache, no Docker. The systemd unit and the Docker Compose service (see INSTALL.md)
 # add outer layers around this same command.
 #
+#   securecore-worker                       inside a site: everything from this file's location
 #   securecore-worker <socket> <plugins-dir> <manifests-dir> [php-binary]
+#
+# With no arguments it assumes the standard layout it is installed in,
+# wp-content/plugins/securecore/bin/, and uses wp-content/securecore/worker.sock (SecureCore's
+# default socket), wp-content/plugins and wp-content/securecore/manifests.
 set -eu
-sock=$1
-plugins=$2
-manifests=$3
+here=$(CDPATH='' cd "$(dirname "$0")" && pwd)
+code=$(CDPATH='' cd "$here/../sandbox" && pwd)
+content=$(CDPATH='' cd "$here/../../.." && pwd)
+sock=${1:-$content/securecore/worker.sock}
+plugins=${2:-$content/plugins}
+manifests=${3:-$content/securecore/manifests}
 php=${4:-php}
-code=$(CDPATH='' cd "$(dirname "$0")/../sandbox" && pwd)
+php=$(command -v "$php") || { echo "securecore-worker: no '$php' command found (needs PHP CLI with pcntl and opcache)" >&2; exit 1; }
 sockdir=$(dirname "$sock")
+mkdir -p "$manifests" "$sockdir"
+
+# Unix socket paths are short (103 usable bytes on macOS, 107 on Linux).
+max=103
+[ "$(uname -s)" = Linux ] && max=107
+if [ "${#sock}" -gt "$max" ]; then
+  echo "securecore-worker: the socket path is ${#sock} characters, over the $max this system allows:" >&2
+  echo "  $sock" >&2
+  echo "Pass a shorter one as the first argument, e.g. /tmp/securecore.sock, and put the same path in" >&2
+  echo "wp-config.php: define( 'SECURECORE_SOCKET', '/tmp/securecore.sock' );" >&2
+  exit 1
+fi
 
 # open_basedir: only the worker's code, the plugins (its input), the manifests and the
 # socket dir. wp-config.php and the rest of the site are outside it, so a sandboxed plugin

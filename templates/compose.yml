@@ -25,6 +25,8 @@ services:
   # In your existing WordPress service, add:
   #   volumes:
   #     - securecore-socket:/run/securecore
+  # and, because the site is read-only to the worker, tell SecureCore where the socket is
+  # (wp-config.php): define( 'SECURECORE_SOCKET', '/run/securecore/worker.sock' );
 
 volumes:
   securecore-socket:

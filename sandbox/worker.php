@@ -41,34 +41,61 @@ function log_line(string $line): void
 // each plugin's compiled code the first time any child requires it; the rest hit that cache.
 // (The plugin's own functions are never compiled in the parent — opcache_compile_file would
 // define them here and each child would then redeclare them on require.)
-$standins = [];
-$mains = [];
-foreach (glob("$manifestsDir/*.json") ?: [] as $file) {
-    $manifest = json_decode((string) file_get_contents($file), true);
-    if (!is_array($manifest) || !isset($manifest['plugin'])) continue;
-    $plugin = $manifest['plugin'];
+/**
+ * The manifests on disk right now, keyed by plugin: [file, content hash]. Read again by each child
+ * at fork time, so switching a plugin on or off in wp-admin takes effect on the next request
+ * without restarting the worker.
+ */
+function manifest_files(string $manifestsDir): array
+{
+    $found = [];
+    foreach (glob("$manifestsDir/*.json") ?: [] as $file) {
+        $manifest = json_decode((string) file_get_contents($file), true);
+        if (is_array($manifest) && isset($manifest['plugin']) && is_string($manifest['plugin'])) {
+            $found[$manifest['plugin']] = [$file, (string) sha1_file($file)];
+        }
+    }
+    return $found;
+}
+
+/** A plugin's main file and its stand-ins (see called_functions). */
+function plugin_entry(string $pluginsDir, string $plugin): array
+{
     $path = $pluginsDir . '/' . $plugin;
     $dir = str_contains($plugin, '/') ? dirname($path) : $path;
-    $mains[$plugin] = $path;
-    $standins[$plugin] = called_functions(is_dir($dir) ? $dir : $path);
+    return [$path, called_functions(is_dir($dir) ? $dir : $path)];
 }
-log_line('ready: ' . count($mains) . ' plugins (' . implode(', ', array_keys($mains)) . ')');
 
-// Serve one connection: one request for one plugin. Returns when the request ends.
-function serve_connection($conn, array $standins, array $mains): void
+// Warm cache, inherited by every child: each manifest's content hash, main file and stand-ins. A child
+// uses an entry only while that manifest file is unchanged; anything new or changed since is
+// read and scanned in the child.
+$cache = [];
+foreach (manifest_files($manifestsDir) as $plugin => [$file, $hash]) {
+    $cache[$plugin] = [$hash, ...plugin_entry($pluginsDir, $plugin)];
+}
+log_line('ready: ' . count($cache) . ' plugins (' . implode(', ', array_keys($cache)) . '); manifests are read per request');
+
+// Serve one connection: one request for one plugin. Returns when the request ends. Only a
+// plugin that has a manifest on disk at this moment is served.
+function serve_connection($conn, array $cache, string $pluginsDir, string $manifestsDir): void
 {
     Conn::$in = $conn;
     Conn::$out = $conn;
     $boot = receive();
     if ($boot[0] !== 'boot') return;
     $context = $boot[1];
-    $plugin = $context['plugin'] ?? '';
-    if (!isset($mains[$plugin])) {
-        send(['log', "unknown plugin $plugin"]);
+    $plugin = (string) ($context['plugin'] ?? '');
+    $current = manifest_files($manifestsDir);
+    if (!isset($current[$plugin])) {
+        send(['log', "no manifest for $plugin: not sandboxed"]);
         return;
     }
-    $context['main'] = $mains[$plugin];
-    serve_child($context, $standins[$plugin] ?? []);
+    [, $hash] = $current[$plugin];
+    [$main, $standins] = isset($cache[$plugin]) && $cache[$plugin][0] === $hash
+        ? [$cache[$plugin][1], $cache[$plugin][2]]
+        : plugin_entry($pluginsDir, $plugin);
+    $context['main'] = $main;
+    serve_child($context, $standins);
 }
 
 @unlink($socketPath);
@@ -90,14 +117,14 @@ for (;;) {
     if ($noFork) {
         // One process reused for every request: statics and globals carry over. For the
         // isolation test, to show what forking prevents. Never use in production.
-        serve_connection($conn, $standins, $mains);
+        serve_connection($conn, $cache, $pluginsDir, $manifestsDir);
         fclose($conn);
         continue;
     }
     $pid = pcntl_fork();
     if ($pid === 0) {
         fclose($server);
-        serve_connection($conn, $standins, $mains);
+        serve_connection($conn, $cache, $pluginsDir, $manifestsDir);
         exit(0);
     }
     fclose($conn);
