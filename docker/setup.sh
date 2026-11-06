@@ -4,6 +4,9 @@
 set -eu
 cd "$(dirname "$0")"
 
+# SecureCore goes in as the release zip, like a real install.
+../scripts/package.sh >/dev/null
+
 docker compose up -d --build db php web
 
 wp() { docker compose run --rm -T cli wp "$@"; }
@@ -25,7 +28,7 @@ if ! wp core is-installed >/dev/null 2>&1; then
   wp core install --url=http://127.0.0.1:8088 --title=SecureCore --admin_user=admin \
     --admin_password=securecore-demo --admin_email=admin@example.com --skip-email
 fi
-wp plugin activate hello securecore-probe
+wp plugin activate securecore hello securecore-probe
 
 # The worker reads the plugins and manifests that install-securecore just wrote, so start it
 # now (and rebuild it so code changes take effect).

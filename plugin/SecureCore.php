@@ -1,23 +1,24 @@
 <?php
 /**
- * Plugin Name: SecureCore
- * Description: Runs plugins that have a SecureCore manifest in a separate sandbox process. Core stays on this PHP; every call between a sandboxed plugin and WordPress crosses here and is checked against the plugin's manifest.
- * Version: 0.1.0
+ * SecureCore's core side. Lives in wp-content/plugins/securecore/ and is loaded early by the
+ * mu-plugin loader (mu-plugins/securecore-loader.php) while the SecureCore plugin is active,
+ * so it can keep sandboxed plugins out of core's plugin loader. (No plugin header here:
+ * securecore.php is the plugin's main file.)
  *
- * Install as a mu-plugin (wp-content/mu-plugins/SecureCore.php). Manifests live in
- * wp-content/securecore/manifests/*.json, one per sandboxed plugin:
+ * Manifests live in wp-content/securecore/manifests/*.json, one per sandboxed plugin:
  *   { "plugin": "hello.php", "hooks": ["admin_notices", ...],
  *     "functions": ["wptexturize", ...] }   // WordPress functions this plugin may call
  * A plugin without a manifest loads normally.
  *
- * The sandbox is the `securecore` worker (sandbox/worker.php) in its own container with no
- * network: one process for all plugins, a fork per request. This mu-plugin connects to its
- * socket per request. If the worker is not up, the plugins it would sandbox do not load.
+ * The sandbox is the worker (sandbox/worker.php, started by bin/securecore-worker): one
+ * process for all plugins, a fork per request. This file connects to its socket per
+ * request. If the worker is not up, the plugins it would sandbox do not load.
  *
  * wp-config.php settings (all optional):
  *   SECURECORE_DISABLED  true: load every plugin normally (baseline)
  *   SECURECORE_ENFORCE   false: allow and log calls the manifest does not grant (observe)
  *   SECURECORE_SOCKET    worker socket path (default /run/securecore/worker.sock)
+ *   SECURECORE_DATA      where manifests live (default wp-content/securecore)
  *
  * Protocol: see sandbox/setup.php.
  */
@@ -183,10 +184,22 @@ final class Sandbox
     }
 }
 
-/** Where SecureCore's own code lives: the sandbox scripts, the launcher, the manifests. */
-function home(): string
+/**
+ * SecureCore's code: this plugin's folder (wp-content/plugins/securecore), holding the
+ * sandbox scripts and the launcher. Replaced as a whole when SecureCore is upgraded.
+ */
+function code_dir(): string
 {
-    return defined('SECURECORE_HOME') ? SECURECORE_HOME : WP_CONTENT_DIR . '/securecore';
+    return __DIR__;
+}
+
+/**
+ * SecureCore's data, kept across upgrades: the manifests (wp-content/securecore/manifests).
+ * SECURECORE_DATA in wp-config.php moves it.
+ */
+function data_dir(): string
+{
+    return defined('SECURECORE_DATA') ? SECURECORE_DATA : WP_CONTENT_DIR . '/securecore';
 }
 
 function socket_path(): string
@@ -198,7 +211,7 @@ function socket_path(): string
 function manifests(): array
 {
     $found = [];
-    foreach (glob(home() . '/manifests/*.json') ?: [] as $file) {
+    foreach (glob(data_dir() . '/manifests/*.json') ?: [] as $file) {
         $manifest = json_decode((string) file_get_contents($file), true);
         if (is_array($manifest) && isset($manifest['plugin'])) $found[$manifest['plugin']] = $manifest;
     }
@@ -224,10 +237,10 @@ function start_worker(): array
     if (!function_exists('proc_open') || in_array('proc_open', array_map('trim', explode(',', (string) ini_get('disable_functions'))), true)) {
         return [false, 'proc_open is disabled in core; start the worker yourself (see INSTALL.md)'];
     }
-    $launcher = home() . '/bin/securecore-worker';
+    $launcher = code_dir() . '/bin/securecore-worker';
     if (!is_file($launcher)) return [false, "launcher not found at $launcher"];
     @mkdir(dirname(socket_path()), 0755, true);
-    $command = implode(' ', array_map('escapeshellarg', [$launcher, socket_path(), WP_PLUGIN_DIR, home() . '/manifests']));
+    $command = implode(' ', array_map('escapeshellarg', [$launcher, socket_path(), WP_PLUGIN_DIR, data_dir() . '/manifests']));
     // setsid -f: the worker outlives this request and this php-fpm process.
     @exec('setsid -f ' . $command . ' >> ' . escapeshellarg(WP_CONTENT_DIR . '/securecore-worker.log') . ' 2>&1 < /dev/null');
     for ($i = 0; $i < 40; $i++) {
@@ -244,7 +257,7 @@ function start_worker(): array
  */
 function generate_manifest(string $pluginFile): array
 {
-    require_once home() . '/sandbox/scan.php';
+    require_once code_dir() . '/sandbox/scan.php';
     $path = WP_PLUGIN_DIR . '/' . $pluginFile;
     $dir = str_contains($pluginFile, '/') ? dirname($path) : $path;
     $scan = scan_plugin(is_dir($dir) ? $dir : $path);
@@ -256,8 +269,8 @@ function generate_manifest(string $pluginFile): array
     sort($scan['hooks']);
     $manifest = ['plugin' => $pluginFile, 'hooks' => $scan['hooks'], 'functions' => $functions]
         + ($scan['dynamic'] ? ['dynamic_hooks' => true] : []);
-    @mkdir(home() . '/manifests', 0755, true);
-    file_put_contents(home() . '/manifests/' . manifest_name($pluginFile), json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+    @mkdir(data_dir() . '/manifests', 0755, true);
+    file_put_contents(data_dir() . '/manifests/' . manifest_name($pluginFile), json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
     return $manifest;
 }
 
@@ -269,7 +282,7 @@ function manifest_name(string $pluginFile): string
 /** The manifest file on disk for a plugin (matched by its "plugin" field), or null. */
 function manifest_file(string $pluginFile): ?string
 {
-    foreach (glob(home() . '/manifests/*.json') ?: [] as $file) {
+    foreach (glob(data_dir() . '/manifests/*.json') ?: [] as $file) {
         $manifest = json_decode((string) file_get_contents($file), true);
         if (is_array($manifest) && ($manifest['plugin'] ?? null) === $pluginFile) return $file;
     }
@@ -320,7 +333,7 @@ function admin_page(): void
     }
     echo '<form method="post"><table class="widefat striped"><thead><tr><th>Plugin</th><th>Run in sandbox</th><th>Manifest</th></tr></thead><tbody>';
     foreach ($installed as $file => $data) {
-        if ($file === 'securecore-probe/securecore-probe.php') continue;
+        if ($file === 'securecore-probe/securecore-probe.php' || $file === 'securecore/securecore.php') continue;
         $on = isset($manifests[$file]);
         $m = $manifests[$file] ?? null;
         printf(

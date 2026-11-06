@@ -24,37 +24,42 @@ isolation:
   ```
   On Debian/Ubuntu: `apt-get install php-cli php-opcache` (pcntl is built into php-cli).
 
-## 1. Copy the files
+## 1. Install the files
 
-SecureCore is one folder plus one mu-plugin. From a release (or this repo), copy them into
-your site's `wp-content`:
+From your WordPress root, as the user that owns the site's files (no sudo):
+
+```
+cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh
+```
+
+It checks for `php` with `pcntl` and opcache (and says exactly what's missing), downloads
+the newest release, checks its sha256, puts the plugin in `wp-content/plugins/securecore/`
+and the loader in `wp-content/mu-plugins/securecore-loader.php`, activates the plugin with
+WP-CLI if `wp` is available (otherwise activate **SecureCore** in wp-admin → Plugins), and
+prints the next step. Options: `--path <dir>` (WordPress root), `--canary` (newest canary),
+`--uninstall`. Re-running it upgrades in place; your manifests are kept.
+
+Without the script: unzip `securecore.zip` from a release into `wp-content/plugins/`, copy
+`wp-content/plugins/securecore/mu-plugin/securecore-loader.php` to `wp-content/mu-plugins/`,
+and activate SecureCore. Either way you get:
 
 ```
 wp-content/
-  mu-plugins/SecureCore.php          # loads automatically; no activation needed
-  securecore/
+  mu-plugins/securecore-loader.php   # loads SecureCore early while the plugin is active
+  plugins/securecore/                # the plugin: replaced as a whole on upgrade
+    securecore.php  SecureCore.php
     sandbox/   worker.php setup.php scan.php gen-manifest.php
-    bin/       securecore-worker       # the launcher (chmod +x)
-    manifests/                         # created as you switch plugins on
+    bin/       securecore-worker     # the launcher
+    templates/ securecore.service compose.yml
+  securecore/manifests/              # your manifests: kept across upgrades
 ```
 
-So:
-
-```
-mkdir -p wp-content/mu-plugins wp-content/securecore
-cp -r securecore/sandbox securecore/bin wp-content/securecore/
-cp securecore/mu-plugins/SecureCore.php wp-content/mu-plugins/
-mkdir -p wp-content/securecore/manifests
-chmod +x wp-content/securecore/bin/securecore-worker
-```
-
-(Match the files' owner to your web server user, e.g. `chown -R www-data:www-data
-wp-content/securecore wp-content/mu-plugins/SecureCore.php`.)
+Deactivating the SecureCore plugin turns it off; plugins then load normally.
 
 ## 2. Start the worker (plain)
 
 ```
-wp-content/securecore/bin/securecore-worker \
+wp-content/plugins/securecore/bin/securecore-worker \
   /run/securecore/worker.sock \
   "$PWD/wp-content/plugins" \
   "$PWD/wp-content/securecore/manifests"
@@ -75,7 +80,9 @@ cannot loosen them:
 - a clean environment (`env -i`).
 
 Leave it running (it is a long-lived process). To run it in the background:
-`setsid -f wp-content/securecore/bin/securecore-worker … >> wp-content/securecore-worker.log 2>&1`.
+`setsid -f wp-content/plugins/securecore/bin/securecore-worker … >> wp-content/securecore-worker.log 2>&1`.
+The worker reads the manifests when it starts, so restart it after switching plugins on or
+off (step 4).
 
 If the web server's PHP may call `proc_open`, you can instead press **Start worker** on the
 SecureCore settings screen (step 4), which runs this same launcher for you.
@@ -103,45 +110,30 @@ load until you start it.
 ## systemd (stronger, for a bare server)
 
 Run the same launcher as a service under its own user, with the unit adding a private
-network and read-only paths. Example `/etc/systemd/system/securecore.service`:
-
-```ini
-[Unit]
-Description=SecureCore worker
-After=network.target
-
-[Service]
-User=securecore
-RuntimeDirectory=securecore
-ExecStart=/var/www/html/wp-content/securecore/bin/securecore-worker \
-  /run/securecore/worker.sock \
-  /var/www/html/wp-content/plugins \
-  /var/www/html/wp-content/securecore/manifests
-PrivateNetwork=yes
-ProtectSystem=strict
-ReadOnlyPaths=/var/www/html
-ReadWritePaths=/run/securecore
-NoNewPrivileges=yes
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
+network and read-only paths. The unit is in the plugin:
+`wp-content/plugins/securecore/templates/securecore.service`. Copy it to
+`/etc/systemd/system/`, set `WP=` to your WordPress root and the users, then
+`systemctl daemon-reload && systemctl enable --now securecore`.
 
 `PrivateNetwork=yes` gives the worker no network at all; `ReadOnlyPaths` and `ProtectSystem`
-keep it off the rest of the disk. The web server's user must be able to read
-`/run/securecore` to reach the socket (add it to the `securecore` group, or widen
-`RuntimeDirectoryMode`). `systemctl enable --now securecore`.
+keep it off the rest of the disk. The web server's user must be able to reach
+`/run/securecore` to connect (the unit's `Group=www-data` and `RuntimeDirectoryMode=0750`
+do that for a `www-data` web server).
 
 ## Docker (for a container host)
 
-Run the same launcher in a container with `network_mode: none`, the plugins mounted
-read-only and a shared socket volume. `docker/compose.yml` in this repo is a working
-example (its `worker` service); copy that service into your stack, pointing its volumes at
-your WordPress files, and mount the same socket volume into your PHP-FPM container at
-`/run/securecore`.
+Run the same launcher in a container with `network_mode: none`, the site mounted read-only
+and a shared socket volume. The service is in the plugin:
+`wp-content/plugins/securecore/templates/compose.yml`. Add it to your stack, point its
+volume at your WordPress files, and mount the same socket volume into your PHP-FPM
+container at `/run/securecore`.
 
 ## Removing SecureCore
 
-Delete `wp-content/mu-plugins/SecureCore.php` (plugins load normally again), stop the
-worker, and delete `wp-content/securecore`.
+```
+cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh -s -- --uninstall
+```
+
+That deactivates and removes the plugin and the loader (plugins load normally again) and
+keeps your manifests in `wp-content/securecore` (delete that folder if you don't need them).
+Stop the worker if it is running.

@@ -38,8 +38,8 @@ services:
       - sh
       - -c
       - >
-        while [ ! -x /var/www/html/wp-content/securecore/bin/securecore-worker ]; do sleep 1; done;
-        exec /var/www/html/wp-content/securecore/bin/securecore-worker
+        while [ ! -x /var/www/html/wp-content/plugins/securecore/bin/securecore-worker ]; do sleep 1; done;
+        exec /var/www/html/wp-content/plugins/securecore/bin/securecore-worker
         /run/securecore/worker.sock /var/www/html/wp-content/plugins
         /var/www/html/wp-content/securecore/manifests
     volumes:

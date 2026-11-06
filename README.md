@@ -28,11 +28,12 @@ only the plugin folder mounted read-only and the socket dir, a clean environment
 
 ## How a request works
 
-1. `SecureCore.php` loads as a mu-plugin. Plugins with a manifest in
-   `wp-content/securecore/manifests/` are hidden from core's plugin loader.
+1. `SecureCore.php` (in the SecureCore plugin) is loaded early by the mu-plugin loader while
+   the plugin is active. Plugins with a manifest in `wp-content/securecore/manifests/` are
+   hidden from core's plugin loader.
 2. For each, it connects to the worker's unix socket. One connection = one `pcntl_fork()` in
    the worker = one child for this request. If the worker is not running, those plugins do
-   not load (core does not start it; the worker container does).
+   not load, and wp-admin says so.
 3. The child includes the plugin. `setup.php` has already, in the worker's parent, scanned
    the plugin with `token_get_all` for the WordPress functions it calls; the child defines a
    stand-in for each. A stand-in sends the call to core, which runs it only if the manifest
@@ -63,7 +64,15 @@ Settings in `wp-config.php`: `SECURECORE_DISABLED` (load plugins normally),
 |---|---|
 | `sandbox/worker.php` | the worker: boots setup.php, listens on the socket, forks per request |
 | `sandbox/setup.php` | the protocol and the per-request work: stand-ins, callbacks, the call loop |
-| `plugin/SecureCore.php` | the mu-plugin: hides sandboxed plugins, connects per request, manifest checks, audit log |
+| `plugin/securecore.php` | the plugin's main file (header, version) |
+| `plugin/SecureCore.php` | core side: hides sandboxed plugins, connects per request, manifest checks, audit log, Settings → SecureCore |
+| `plugin/securecore-loader.php` | the mu-plugin loader (installed to `wp-content/mu-plugins/`) |
+| `bin/securecore-worker` | the launcher: starts the worker with its PHP isolation forced on |
+| `sandbox/scan.php`, `sandbox/gen-manifest.php` | the `token_get_all` scan behind generated manifests |
+| `install.sh` | the one-line installer (POSIX sh) |
+| `templates/` | the systemd unit and Docker Compose service shipped in the zip |
+| `scripts/` | `version.sh`, `package.sh` (the zip), `release-layout.sh` (the bucket layout) |
+| `.github/workflows/` | tag-canary, release (canary → R2), promote (same bytes → stable) |
 | `probe/securecore-probe.php` | test plugin that behaves like a backdoored update |
 | `test/plugin/securecore-state.php` | test plugin for request isolation (a static that would leak without the fork) |
 | `manifests/` | one manifest per sandboxed plugin |
@@ -74,15 +83,29 @@ Settings in `wp-config.php`: `SECURECORE_DISABLED` (load plugins normally),
 (`sandbox/securecore.ts` is the earlier wasm one-shot binary; the worker path does not use
 it.)
 
-## Run it
+## Install it on a site
+
+```
+cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh
+```
+
+See INSTALL.md. Releases: `scripts/package.sh` builds the zip (only what a site needs);
+`scripts/release-layout.sh` lays out a release as the `securecore-releases` bucket holds it;
+`.github/workflows/` tags a canary on every push to main, publishes it, and promotes a
+canary to stable with the same bytes (APS 9, APS 12).
+
+## Run it (dev stack)
 
 Needs Docker.
 
 ```sh
-docker/setup.sh        # build images, start the stack + worker, install WordPress
+docker/setup.sh        # build the zip and images, start the stack + worker, install WordPress
 test/site.sh           # SecureCore on: plugins sandboxed, the probe's attacks all fail
 test/site.sh baseline  # SecureCore off: same notices from normal plugins
 test/isolation.sh      # request isolation, with and without the fork
+test/install.sh        # install.sh on this site via --from: install, upgrade, tamper, uninstall, then test/site.sh
+test/install-fresh.sh  # install.sh on a fresh stock WordPress (debian + apt nginx/php-fpm), no repo scripts
+test/woo.sh            # a WooCommerce store walk (needs WooCommerce set up; see docs/woocommerce-survey.md)
 ```
 
 Benchmarks (on the running stack):
