@@ -2,8 +2,8 @@
 # dispatches this against its tag. It never creates a stable vX.Y.Z tag or touches
 # latest.json: that is promote.yml.
 #
-# R2 layout (bucket securecore-releases, APS 12, served at https://securecore-releases.addis.gg
-# and, as a stand-in until there is a site, https://securecore.addis.gg). Directories are the
+# R2 layout (bucket securecore-releases, APS 12, served at https://securecore-releases.addis.gg;
+# https://securecore.addis.gg is the product site, which redirects /install.sh here). Directories are the
 # release's full version with no "v":
 #   <version>/securecore.zip          the plugin (scripts/package.sh)
 #   <version>/securecore.zip.sha256
@@ -121,10 +121,8 @@ jobs:
         run: |
           set -euo pipefail
           bust="?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          for host in securecore-releases.addis.gg securecore.addis.gg; do
-            curl -fsSL "https://${host}/php.json${bust}" -o served-php.json
-            cmp served-php.json mirror/php.json || { echo "::error::https://${host}/php.json does not match"; exit 1; }
-          done
+          curl -fsSL "https://securecore-releases.addis.gg/php.json${bust}" -o served-php.json
+          cmp served-php.json mirror/php.json || { echo "::error::https://securecore-releases.addis.gg/php.json does not match"; exit 1; }
           jq -r '.builds[][][] | "\(.path) \(.sha256)"' mirror/php.json | while read -r path want; do
             got="$(curl -fsSL "https://securecore-releases.addis.gg/${path}" | sha256sum | cut -d' ' -f1)"
             [ "$got" = "$want" ] || { echo "::error::${path} served from R2 does not match php.json"; exit 1; }
@@ -143,12 +141,12 @@ jobs:
       # byte (sha256) with what was built. curl, like the installer: Cloudflare turns away
       # Python's default user agent on these domains. The mutable files get a query string
       # so a cached copy can't pass for the new one.
-      - name: Read every file back from securecore-releases.addis.gg and securecore.addis.gg
+      - name: Read every file back from securecore-releases.addis.gg
         run: |
           set -euo pipefail
           sum() { sha256sum "$1" | cut -d' ' -f1; }
           bust="?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          for host in securecore-releases.addis.gg securecore.addis.gg; do
+          for host in securecore-releases.addis.gg; do
             for f in "${VERSION}/securecore.zip" "${VERSION}/securecore.zip.sha256" "${VERSION}/release.json"; do
               curl -fsSL "https://${host}/${f}" -o served
               [ "$(sum served)" = "$(sum "release/${f}")" ] || { echo "::error::https://${host}/${f} does not match what was built"; exit 1; }

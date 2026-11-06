@@ -86,12 +86,12 @@ jobs:
           aws s3 sync "stable/${V}/" "s3://${R2_BUCKET_RELEASES}/${V}/" --endpoint-url="${R2_ENDPOINT}"
           aws s3 cp "stable/${V}/release.json" "s3://${R2_BUCKET_RELEASES}/latest.json" --endpoint-url="${R2_ENDPOINT}" \
             --content-type "application/json" --cache-control "no-cache"
-      - name: Read every file back from both hostnames
+      - name: Read every file back from securecore-releases.addis.gg
         run: |
           set -euo pipefail
           V="${{ steps.validate.outputs.v }}"
           sum() { sha256sum "$1" | cut -d' ' -f1; }
-          for host in securecore-releases.addis.gg securecore.addis.gg; do
+          for host in securecore-releases.addis.gg; do
             for f in securecore.zip securecore.zip.sha256 release.json; do
               curl -fsSL "https://${host}/${V}/${f}" -o served
               [ "$(sum served)" = "$(sum "stable/${V}/${f}")" ] || { echo "::error::https://${host}/${V}/${f} does not match"; exit 1; }
