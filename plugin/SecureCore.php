@@ -17,7 +17,7 @@
  * wp-config.php settings (all optional):
  *   SECURECORE_DISABLED  true: load every plugin normally (baseline)
  *   SECURECORE_ENFORCE   false: allow and log calls the manifest does not grant (observe)
- *   SECURECORE_SOCKET    worker socket path (default /run/securecore/worker.sock)
+ *   SECURECORE_SOCKET    worker socket path (default wp-content/securecore/worker.sock)
  *   SECURECORE_DATA      where manifests live (default wp-content/securecore)
  *
  * Protocol: see sandbox/setup.php.
@@ -49,7 +49,7 @@ final class Sandbox
 
     public function __construct(public readonly string $plugin, private readonly array $manifest)
     {
-        $socket = defined('SECURECORE_SOCKET') ? SECURECORE_SOCKET : '/run/securecore/worker.sock';
+        $socket = socket_path();
         $stream = @stream_socket_client("unix://$socket", $errno, $errstr, 5);
         if (!$stream) {
             $this->alive = false;
@@ -202,9 +202,29 @@ function data_dir(): string
     return defined('SECURECORE_DATA') ? SECURECORE_DATA : WP_CONTENT_DIR . '/securecore';
 }
 
+/**
+ * The worker's socket. Default: wp-content/securecore/worker.sock, next to the manifests, so
+ * it works for a normal user on any OS with no setup. SECURECORE_SOCKET in wp-config.php
+ * overrides it (the systemd and Docker templates use /run/securecore/worker.sock).
+ */
 function socket_path(): string
 {
-    return defined('SECURECORE_SOCKET') ? SECURECORE_SOCKET : '/run/securecore/worker.sock';
+    return defined('SECURECORE_SOCKET') ? SECURECORE_SOCKET : data_dir() . '/worker.sock';
+}
+
+/**
+ * Unix socket paths are short: 104 bytes on macOS and the BSDs, 108 on Linux, including the
+ * final NUL. Returns why the socket path cannot work here, or null.
+ */
+function socket_path_problem(): ?string
+{
+    $max = (PHP_OS_FAMILY === 'Linux' ? 108 : 104) - 1;
+    $len = strlen(socket_path());
+    if ($len <= $max) return null;
+    return sprintf(
+        'The worker socket path is %d characters, over the %d this system allows for a unix socket (%s). Add a shorter one to wp-config.php, e.g. define( \'SECURECORE_SOCKET\', \'/tmp/securecore-%s.sock\' );',
+        $len, $max, socket_path(), substr(md5(ABSPATH), 0, 8),
+    );
 }
 
 /** @return array<string, array> manifests keyed by plugin file, e.g. "hello.php" */
@@ -234,6 +254,8 @@ function worker_running(): bool
 function start_worker(): array
 {
     if (worker_running()) return [true, 'already running'];
+    $problem = socket_path_problem();
+    if ($problem) return [false, $problem];
     if (!function_exists('proc_open') || in_array('proc_open', array_map('trim', explode(',', (string) ini_get('disable_functions'))), true)) {
         return [false, 'proc_open is disabled in core; start the worker yourself (see INSTALL.md)'];
     }
@@ -241,13 +263,17 @@ function start_worker(): array
     if (!is_file($launcher)) return [false, "launcher not found at $launcher"];
     @mkdir(dirname(socket_path()), 0755, true);
     $command = implode(' ', array_map('escapeshellarg', [$launcher, socket_path(), WP_PLUGIN_DIR, data_dir() . '/manifests']));
-    // setsid -f: the worker outlives this request and this php-fpm process.
-    @exec('setsid -f ' . $command . ' >> ' . escapeshellarg(WP_CONTENT_DIR . '/securecore-worker.log') . ' 2>&1 < /dev/null');
+    // Detached, so the worker outlives this request and this PHP process: setsid where it
+    // exists (Linux), nohup in the background otherwise (macOS).
+    $log = escapeshellarg(data_dir() . '/worker.log');
+    @exec(trim((string) shell_exec('command -v setsid 2>/dev/null')) !== ''
+        ? "setsid -f $command >> $log 2>&1 < /dev/null"
+        : "nohup $command >> $log 2>&1 < /dev/null &");
     for ($i = 0; $i < 40; $i++) {
         usleep(50000);
         if (worker_running()) return [true, 'started'];
     }
-    return [false, 'worker did not come up; see wp-content/securecore-worker.log'];
+    return [false, 'worker did not come up; see ' . data_dir() . '/worker.log'];
 }
 
 /**
@@ -320,6 +346,8 @@ function admin_page(): void
     $running = worker_running();
     echo '<div class="wrap"><h1>SecureCore</h1>';
     if ($notice) printf('<div class="notice notice-info"><p>%s</p></div>', esc_html($notice));
+    $problem = socket_path_problem();
+    if ($problem) printf('<div class="notice notice-error"><p>%s</p></div>', esc_html($problem));
     printf(
         '<p>Worker: <strong style="color:%s">%s</strong> on <code>%s</code>.</p>',
         $running ? 'green' : 'crimson', $running ? 'running' : 'not running', esc_html(socket_path()),
@@ -329,8 +357,12 @@ function admin_page(): void
         wp_nonce_field('securecore');
         echo '<input type="hidden" name="securecore_action" value="start"><p>';
         submit_button('Start worker', 'secondary', 'submit', false);
-        echo ' <span class="description">Works where core may run <code>proc_open</code>; otherwise start it as in INSTALL.md.</span></p></form>';
+        printf(
+            ' <span class="description">Works where this PHP may run <code>proc_open</code>; otherwise run <code>%s</code> yourself.</span></p></form>',
+            esc_html(code_dir() . '/bin/securecore-worker'),
+        );
     }
+    echo '<p class="description">Switching a plugin on or off takes effect on the next request; the worker does not need a restart.</p>';
     echo '<form method="post"><table class="widefat striped"><thead><tr><th>Plugin</th><th>Run in sandbox</th><th>Manifest</th></tr></thead><tbody>';
     foreach ($installed as $file => $data) {
         if ($file === 'securecore-probe/securecore-probe.php' || $file === 'securecore/securecore.php') continue;

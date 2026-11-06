@@ -29,6 +29,8 @@ if ! wp core is-installed >/dev/null 2>&1; then
     --admin_password=securecore-demo --admin_email=admin@example.com --skip-email
 fi
 wp plugin activate securecore hello securecore-probe
+# The worker container mounts the site read-only, so its socket lives on the shared volume.
+wp config set SECURECORE_SOCKET /run/securecore/worker.sock >/dev/null
 
 # The worker reads the plugins and manifests that install-securecore just wrote, so start it
 # now (and rebuild it so code changes take effect).

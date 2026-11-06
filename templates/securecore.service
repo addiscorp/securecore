@@ -3,7 +3,9 @@
 # users, then: systemctl daemon-reload && systemctl enable --now securecore
 #
 # It runs the same launcher as the plain install (which already forces the worker's PHP
-# isolation) and adds: its own user, no network at all, the site read-only.
+# isolation) and adds: its own user, no network at all, the site read-only. Because the site
+# is read-only to it, its socket is in /run/securecore; tell SecureCore (wp-config.php):
+#   define( 'SECURECORE_SOCKET', '/run/securecore/worker.sock' );
 [Unit]
 Description=SecureCore worker
 After=network.target

@@ -58,16 +58,22 @@ Deactivating the SecureCore plugin turns it off; plugins then load normally.
 
 ## 2. Start the worker (plain)
 
+install.sh offers to start it for you. Otherwise, from the WordPress root, as the user that
+owns the site's files:
+
 ```
-wp-content/plugins/securecore/bin/securecore-worker \
-  /run/securecore/worker.sock \
-  "$PWD/wp-content/plugins" \
-  "$PWD/wp-content/securecore/manifests"
+wp-content/plugins/securecore/bin/securecore-worker
 ```
 
-The first argument is the socket SecureCore will connect to; the socket's directory must be
-writable by the worker's user and readable by the web server's user. Pick a path both can
-reach (e.g. make `/run/securecore` and `chown` it, or use a path under `wp-content`).
+With no arguments it works out everything from where it is installed: the socket
+`wp-content/securecore/worker.sock` (SecureCore's default, so nothing needs configuring),
+the plugins folder and the manifests. Pass `<socket> <plugins-dir> <manifests-dir>` to
+choose them yourself.
+
+Unix socket paths are short (103 usable characters on macOS, 107 on Linux). If your site's
+path makes the default too long, the launcher, install.sh and the settings screen say so;
+use a shorter path, e.g. `securecore-worker /tmp/securecore.sock` and in `wp-config.php`
+`define( 'SECURECORE_SOCKET', '/tmp/securecore.sock' );`.
 
 The launcher forces the worker's isolation through PHP settings, so the site's `php.ini`
 cannot loosen them:
@@ -80,29 +86,21 @@ cannot loosen them:
 - a clean environment (`env -i`).
 
 Leave it running (it is a long-lived process). To run it in the background:
-`setsid -f wp-content/plugins/securecore/bin/securecore-worker … >> wp-content/securecore-worker.log 2>&1`.
-The worker reads the manifests when it starts, so restart it after switching plugins on or
-off (step 4).
+`nohup wp-content/plugins/securecore/bin/securecore-worker >> wp-content/securecore/worker.log 2>&1 &`.
 
-If the web server's PHP may call `proc_open`, you can instead press **Start worker** on the
-SecureCore settings screen (step 4), which runs this same launcher for you.
+If the web server's PHP may call `proc_open` (including `php -S`), you can instead press
+**Start worker** on the SecureCore settings screen, which runs this same launcher for you.
 
-## 3. Tell SecureCore the socket (if not the default)
-
-The default socket path is `/run/securecore/worker.sock`. To use another, add to
-`wp-config.php`:
-
-```php
-define( 'SECURECORE_SOCKET', '/path/you/chose/worker.sock' );
-```
-
-## 4. Choose which plugins to sandbox
+## 3. Choose which plugins to sandbox
 
 In wp-admin, go to **Settings → SecureCore**. It shows whether the worker is running and
 lists your installed plugins with a **Run in sandbox** switch. Turn a plugin on and Save:
 SecureCore reads that plugin's code and writes its manifest (the WordPress functions and
 hooks it uses) under `wp-content/securecore/manifests`. That stored manifest is what the
-worker enforces. Turning a plugin off deletes its manifest.
+worker enforces. Turning a plugin off deletes its manifest. Either takes effect on the next
+request: the worker reads a plugin's manifest each time it serves it, so it never needs a
+restart for this. (After upgrading SecureCore itself, restart the worker to load the new
+code.)
 
 If the worker is not running, the screen says so, and any plugin you have sandboxed does not
 load until you start it.
@@ -118,7 +116,9 @@ network and read-only paths. The unit is in the plugin:
 `PrivateNetwork=yes` gives the worker no network at all; `ReadOnlyPaths` and `ProtectSystem`
 keep it off the rest of the disk. The web server's user must be able to reach
 `/run/securecore` to connect (the unit's `Group=www-data` and `RuntimeDirectoryMode=0750`
-do that for a `www-data` web server).
+do that for a `www-data` web server). Since the site is read-only to the worker, its socket
+is `/run/securecore/worker.sock`; add `define( 'SECURECORE_SOCKET',
+'/run/securecore/worker.sock' );` to `wp-config.php`.
 
 ## Docker (for a container host)
 
@@ -126,7 +126,8 @@ Run the same launcher in a container with `network_mode: none`, the site mounted
 and a shared socket volume. The service is in the plugin:
 `wp-content/plugins/securecore/templates/compose.yml`. Add it to your stack, point its
 volume at your WordPress files, and mount the same socket volume into your PHP-FPM
-container at `/run/securecore`.
+container at `/run/securecore`. As with systemd, add `define( 'SECURECORE_SOCKET',
+'/run/securecore/worker.sock' );` to `wp-config.php`.
 
 ## Removing SecureCore
 

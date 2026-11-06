@@ -196,13 +196,75 @@ else
   say "Activate SecureCore in wp-admin → Plugins (WP-CLI not found)."
 fi
 
+# --- the worker ------------------------------------------------------------------------------
+# SecureCore's default socket is next to the manifests, so nothing needs configuring. Unix
+# socket paths are short (103 usable bytes on macOS, 107 on Linux).
+WORKER=$PLUGIN/bin/securecore-worker
+SOCK=$DATA/worker.sock
+max=103
+[ "$(uname -s)" = Linux ] && max=107
+sock_ok=1
+if [ "${#SOCK}" -gt "$max" ]; then
+  sock_ok=0
+  warn "the default worker socket path is ${#SOCK} characters, over the $max this system allows:"
+  warn "  $SOCK"
+  warn "add a shorter one to wp-config.php, e.g. define( 'SECURECORE_SOCKET', '/tmp/securecore.sock' );"
+  warn "and start the worker with that path: $WORKER /tmp/securecore.sock"
+fi
+
+# shellcheck disable=SC2016 # PHP code: $argv is PHP's
+running() { php -r 'exit(@stream_socket_client("unix://" . $argv[1]) ? 0 : 1);' "$SOCK" 2>/dev/null; }
+start_worker() {
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$WORKER" >> "$DATA/worker.log" 2>&1 < /dev/null
+  else
+    nohup "$WORKER" >> "$DATA/worker.log" 2>&1 < /dev/null &
+  fi
+  i=0
+  while [ "$i" -lt 25 ]; do running && return 0; i=$((i + 1)); sleep 0.2; done
+  return 1
+}
+
+started=0
+if [ "$sock_ok" = 1 ] && [ -z "$missing" ]; then
+  if running; then
+    say ""
+    say "The worker is already running on $SOCK. After an upgrade, restart it to load the new code."
+    started=1
+  else
+    # Ask only when someone can answer: the terminal, even under `curl | sh` (stdin is the
+    # script there, so read /dev/tty). With no terminal, just print the command.
+    answer=
+    # In a subshell: a failed redirect on a special built-in like `:` would end this shell.
+    if (true < /dev/tty) 2>/dev/null; then
+      printf '\nStart the sandbox worker now, in the background? [y/N] ' > /dev/tty
+      read -r answer < /dev/tty || answer=
+    fi
+    case $answer in
+      y|Y|yes|YES)
+        if start_worker; then
+          say "Started the worker on $SOCK (log: $DATA/worker.log)."
+          started=1
+        else
+          warn "the worker did not come up; see $DATA/worker.log"
+        fi
+        ;;
+    esac
+  fi
+fi
+
+if [ "$started" = 0 ]; then
+  cat <<EOF
+
+Next: start the sandbox worker, as this user ($(id -un)), and leave it running:
+  $WORKER
+(or press Start worker on Settings → SecureCore, where your web server's PHP may run proc_open)
+EOF
+fi
 cat <<EOF
 
-Next: start the sandbox worker.
-  - In wp-admin: Settings → SecureCore → Start worker (works where your web server's PHP may run proc_open), or
-  - yourself, as the user that should run it (the socket's folder must be writable by it and readable by the web server):
-      $PLUGIN/bin/securecore-worker /run/securecore/worker.sock $CONTENT/plugins $DATA/manifests
-Then choose plugins to sandbox on Settings → SecureCore.
+Then choose plugins to sandbox on Settings → SecureCore. Switching one on takes effect on the
+next request.
 
 Stronger options, same worker:
   - systemd (own user, no network, read-only site): $PLUGIN/templates/securecore.service
