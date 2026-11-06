@@ -1,25 +1,30 @@
 <?php
 /**
  * Plugin Name: SecureCore
- * Description: Runs plugins that have a SecureCore manifest in their own p8 wasm sandbox. Core stays on this PHP; every call between a sandboxed plugin and WordPress crosses here and is checked against the plugin's manifest.
+ * Description: Runs plugins that have a SecureCore manifest in a separate sandbox process. Core stays on this PHP; every call between a sandboxed plugin and WordPress crosses here and is checked against the plugin's manifest.
  * Version: 0.1.0
  *
  * Install as a mu-plugin (wp-content/mu-plugins/SecureCore.php). Manifests live in
  * wp-content/securecore/manifests/*.json, one per sandboxed plugin:
- *   { "plugin": "hello.php", "functions": ["wptexturize", ...], "hooks": ["admin_notices", ...] }
+ *   { "plugin": "hello.php", "hooks": ["admin_notices", ...],
+ *     "functions": ["wptexturize", ...] }   // WordPress functions this plugin may call
  * A plugin without a manifest loads normally.
+ *
+ * The sandbox is the `securecore` worker (sandbox/worker.php) in its own container with no
+ * network: one process for all plugins, a fork per request. This mu-plugin connects to its
+ * socket per request. If the worker is not up, the plugins it would sandbox do not load.
  *
  * wp-config.php settings (all optional):
  *   SECURECORE_DISABLED  true: load every plugin normally (baseline)
  *   SECURECORE_ENFORCE   false: allow and log calls the manifest does not grant (observe)
- *   SECURECORE_BINARY    path of the securecore binary (default /usr/local/bin/securecore)
+ *   SECURECORE_SOCKET    worker socket path (default /run/securecore/worker.sock)
  *
  * Protocol: see sandbox/setup.php.
  */
 namespace SecureCore;
 
 if (defined('SECURECORE_DISABLED') && SECURECORE_DISABLED) return;
-// wp-cli runs as the site owner, not as a web request. Spike: plugins load normally there.
+// wp-cli runs as the site owner, not as a web request; plugins load normally there.
 if (defined('WP_CLI') && WP_CLI) return;
 
 function audit(string $plugin, string $event, array $detail = []): void
@@ -35,9 +40,7 @@ function enforcing(): bool
 
 final class Sandbox
 {
-    /** @var resource */
-    private $process;
-    /** @var resource */
+    /** @var resource the socket to the worker: one connection = one fork = this request */
     private $in;
     /** @var resource */
     private $out;
@@ -45,29 +48,23 @@ final class Sandbox
 
     public function __construct(public readonly string $plugin, private readonly array $manifest)
     {
-        $path = WP_PLUGIN_DIR . '/' . $plugin;
-        $dir = dirname($plugin) === '.' ? $path : WP_PLUGIN_DIR . '/' . dirname($plugin);
-        $binary = defined('SECURECORE_BINARY') ? SECURECORE_BINARY : '/usr/local/bin/securecore';
-        $this->process = proc_open(
-            [$binary, $dir, basename($plugin)],
-            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', WP_CONTENT_DIR . '/securecore-sandbox.log', 'a']],
-            $pipes,
-            null,
-            [],
-        );
-        if (!is_resource($this->process)) {
+        $socket = defined('SECURECORE_SOCKET') ? SECURECORE_SOCKET : '/run/securecore/worker.sock';
+        $stream = @stream_socket_client("unix://$socket", $errno, $errstr, 5);
+        if (!$stream) {
             $this->alive = false;
-            audit($plugin, 'sandbox.fail', ['reason' => 'could not start ' . $binary]);
+            audit($plugin, 'sandbox.fail', ['reason' => "no worker on $socket: $errstr"]);
             return;
         }
-        [$this->in, $this->out] = $pipes;
-        stream_set_timeout($this->out, 10);
+        $this->in = $this->out = $stream;
+        // Time limit per call: a plugin that does not answer in 5 s is cut off.
+        stream_set_timeout($stream, 5);
     }
 
-    public function boot(array $functions): void
+    public function boot(): void
     {
+        if (!$this->alive) return;
         $this->send(['boot', [
-            'functions' => $functions,
+            'plugin' => $this->plugin,
             'get' => $_GET,
             'post' => $_POST,
             'server' => array_intersect_key($_SERVER, array_flip(['REQUEST_METHOD', 'REQUEST_URI', 'QUERY_STRING', 'HTTP_HOST', 'HTTPS', 'SERVER_NAME', 'HTTP_USER_AGENT'])),
@@ -90,8 +87,6 @@ final class Sandbox
         if (!$this->alive) return;
         $this->send(['end']);
         fclose($this->in);
-        fclose($this->out);
-        proc_close($this->process);
         $this->alive = false;
     }
 
@@ -113,7 +108,7 @@ final class Sandbox
             if ($line === false) {
                 $timeout = stream_get_meta_data($this->out)['timed_out'];
                 audit($this->plugin, $timeout ? 'sandbox.timeout' : 'sandbox.exit');
-                proc_terminate($this->process);
+                fclose($this->in);
                 $this->alive = false;
                 return null;
             }
@@ -199,23 +194,6 @@ function manifests(): array
     return $found;
 }
 
-/**
- * Every WordPress function a plugin could call: the ones defined now, plus pluggable.php's,
- * which load after plugins. The sandbox gets a stand-in for each; the manifest decides.
- */
-function core_functions(): array
-{
-    $names = get_defined_functions()['user'];
-    $tokens = token_get_all((string) file_get_contents(ABSPATH . WPINC . '/pluggable.php'));
-    foreach ($tokens as $i => $token) {
-        if (is_array($token) && $token[0] === T_FUNCTION) {
-            for ($j = $i + 1; isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_WHITESPACE; $j++);
-            if (isset($tokens[$j]) && is_array($tokens[$j]) && $tokens[$j][0] === T_STRING) $names[] = strtolower($tokens[$j][1]);
-        }
-    }
-    return array_values(array_unique($names));
-}
-
 $manifests = manifests();
 $active = (array) get_option('active_plugins', []);
 $sandboxed = array_values(array_intersect($active, array_keys($manifests)));
@@ -229,10 +207,9 @@ add_action('plugins_loaded', fn () => remove_filter('option_active_plugins', $hi
 
 // Start the sandboxes where core would have included the plugins.
 add_action('muplugins_loaded', function () use ($sandboxed, $manifests) {
-    $functions = core_functions();
     $sandboxes = [];
     foreach ($sandboxed as $plugin) $sandboxes[] = new Sandbox($plugin, $manifests[$plugin]);
-    foreach ($sandboxes as $sandbox) $sandbox->boot($functions);
+    foreach ($sandboxes as $sandbox) $sandbox->boot();
     add_action('shutdown', function () use ($sandboxes) {
         foreach ($sandboxes as $sandbox) $sandbox->end();
     }, PHP_INT_MAX);

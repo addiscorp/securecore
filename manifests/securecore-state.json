@@ -1,0 +1,5 @@
+{
+  "plugin": "securecore-state/securecore-state.php",
+  "functions": [],
+  "hooks": ["securecore_state"]
+}

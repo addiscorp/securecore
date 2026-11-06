@@ -42,16 +42,20 @@ if [ "$mode" = baseline ]; then
   wp config delete SECURECORE_DISABLED >/dev/null
   wp user delete probe_admin --yes >/dev/null
 else
-  has "probe runs in the sandbox" 'data-where="sandbox" data-file="/plugin/securecore-probe.php"' "$page"
+  has "probe runs in the sandbox" 'data-where="sandbox"' "$page"
   has "core included no sandboxed plugin" 'included by core: none -->' "$page"
-  for attempt in read-wp-config read-db-password create-admin send-out; do
+  for attempt in read-wp-config read-db-password create-admin send-out connect-out; do
     has "$attempt failed" "$attempt=failed" "$page"
   done
   if wp user get probe_admin >/dev/null; then fail "no probe_admin user exists"; else pass "no probe_admin user exists"; fi
+  # The sandbox worker has no network at all, which is why send-out and connect-out fail.
+  nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$(compose ps -q worker)" 2>/dev/null)
+  if [ "$nm" = none ]; then pass "worker container has no network"; else fail "worker container has no network (NetworkMode=$nm)"; fi
   log=$dir/audit.log
   compose exec -T php cat wp-content/securecore-audit.log > "$log"
-  has "audit: wp-config.php read denied" '"event":"fs.deny","op":"open","path":"/wordpress/wp-config.php"' "$log"
-  has "audit: DB_PASSWORD use failed" 'Undefined constant \"DB_PASSWORD\"' "$log"
+  # Isolation here is the file not existing in the worker (only wp-content/plugins is
+  # mounted), not an audit line, so wp-config.php and DB_PASSWORD show up only as the
+  # failed attempts above. These two are core refusing calls the manifest does not grant.
   has "audit: wp_insert_user denied" '"event":"wp.deny","name":"wp_insert_user"' "$log"
   has "audit: wp_remote_post denied" '"event":"wp.deny","name":"wp_remote_post"' "$log"
 fi
