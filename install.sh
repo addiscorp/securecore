@@ -146,7 +146,9 @@ fi
 VERSION=$(json_field version "$WORK/release.json")
 WANT=$(json_field sha256 "$WORK/release.json")
 ZIP=$(json_field zip "$WORK/release.json")
-[ -n "$VERSION" ] && [ -n "$WANT" ] || die "$BASE does not have a valid release manifest"
+if [ -z "$VERSION" ] || [ -z "$WANT" ]; then
+  die "$BASE does not have a valid release manifest"
+fi
 ZIP=${ZIP:-securecore.zip}
 
 CURRENT=
