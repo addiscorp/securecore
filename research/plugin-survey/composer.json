@@ -1,0 +1,13 @@
+{
+    "name": "addiscorp/securecore-plugin-survey",
+    "description": "Static analysis of popular WordPress plugins (research only, issue #40)",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.3",
+        "nikic/php-parser": "^5.4"
+    },
+    "config": {
+        "platform": { "php": "8.3.0" }
+    }
+}

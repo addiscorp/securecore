@@ -1,0 +1,21 @@
+{
+    "wordpress_version": "7.1.4",
+    "woocommerce_version": "11.2.2",
+    "php_version": "8.3.36",
+    "wp": {
+        "files": 1315,
+        "functions": 4355,
+        "classes": 824,
+        "constants": 694,
+        "globals": 357,
+        "hooks_literal": 2465,
+        "hooks_dynamic": 228
+    },
+    "woo": {
+        "files": 3665,
+        "functions": 1053,
+        "classes": 2942,
+        "constants": 15,
+        "hooks_literal": 2779
+    }
+}
