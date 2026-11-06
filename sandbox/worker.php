@@ -28,6 +28,14 @@ if (!$socketPath || !$pluginsDir || !$manifestsDir) {
     exit(2);
 }
 
+// "Real WordPress" model (addiscorp/securecore#42, part 1): the child boots the site's own
+// WordPress and loads its plugin into it, instead of running the plugin against forwarding
+// stand-ins. Off by default, so the forward-stub worker (#11) stays available to benchmark
+// against. The WordPress root is the parent of wp-content, derived from the plugins dir.
+$realwp = (bool) getenv('SECURECORE_REALWP');
+$wpRoot = $realwp ? dirname($pluginsDir, 2) : '';
+if ($realwp) require __DIR__ . '/realwp.php';
+
 function log_line(string $line): void
 {
     fwrite(STDERR, gmdate('c') . " securecore-worker " . $line . "\n");
@@ -79,10 +87,12 @@ function plugin_entry(string $pluginsDir, string $plugin): array
 // uses an entry only while that manifest file is unchanged; anything new or changed since is
 // read and scanned in the child.
 $cache = [];
-foreach (manifest_files($manifestsDir) as $plugin => [$file, $hash]) {
-    $cache[$plugin] = [$hash, ...plugin_entry($pluginsDir, $plugin)];
+if (!$realwp) {
+    foreach (manifest_files($manifestsDir) as $plugin => [$file, $hash]) {
+        $cache[$plugin] = [$hash, ...plugin_entry($pluginsDir, $plugin)];
+    }
 }
-log_line('ready: ' . count($cache) . ' plugins (' . implode(', ', array_keys($cache)) . '); manifests are read per request');
+log_line(($realwp ? 'ready (real-WordPress model); ' : 'ready: ' . count($cache) . ' plugins (' . implode(', ', array_keys($cache)) . '); ') . 'manifests are read per request');
 
 // Serve one connection: one request for one plugin. Returns when the request ends. Only a
 // plugin that has a manifest on disk at this moment is served.
@@ -132,7 +142,8 @@ for (;;) {
     if ($noFork) {
         // One process reused for every request: statics and globals carry over. For the
         // isolation test, to show what forking prevents. Never use in production.
-        serve_connection($conn, $cache, $pluginsDir, $manifestsDir);
+        if ($realwp) serve_realwp_connection($conn, $wpRoot);
+        else serve_connection($conn, $cache, $pluginsDir, $manifestsDir);
         fclose($conn);
         continue;
     }
@@ -140,7 +151,8 @@ for (;;) {
     if ($pid === 0) {
         restore_error_handler();
         fclose($server);
-        serve_connection($conn, $cache, $pluginsDir, $manifestsDir);
+        if ($realwp) serve_realwp_connection($conn, $wpRoot);
+        else serve_connection($conn, $cache, $pluginsDir, $manifestsDir);
         exit(0);
     }
     fclose($conn);
