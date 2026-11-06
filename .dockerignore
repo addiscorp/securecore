@@ -1,0 +1,6 @@
+*
+!plugin/
+!manifests/
+!probe/
+!docker/
+!dist/securecore-linux-x64
