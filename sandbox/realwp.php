@@ -269,11 +269,14 @@ function serve_realwp_connection($conn, string $wpRoot, bool $preBooted = false)
             // parent's boot would keep querying the dead snapshot and hand back malformed
             // user/term objects (addiscorp/securecore#42, part 1c). Its table names and field
             // types were set by wp_set_wpdb_vars() during the parent's boot and inherited here.
-            // Drop the parent's option cache so options come fresh through the gateway.
+            // Drop the parent's option cache so options come fresh through the gateway, and
+            // drop the snapshot array the inherited $wpdb still holds so this child keeps none
+            // of core's options in memory (addiscorp/securecore#47).
             if (function_exists('wp_cache_delete')) {
                 wp_cache_delete('alloptions', 'options');
                 wp_cache_delete('notoptions', 'options');
             }
+            if (method_exists($GLOBALS['wpdb'], 'drop_snapshot')) $GLOBALS['wpdb']->drop_snapshot();
         } else {
             boot_wordpress($wpRoot, $prefix);
         }

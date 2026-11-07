@@ -338,3 +338,58 @@ per request each child boots its own (73→104).
 core-side changes silently kept running the old bytes until opcache was reset. Fixed:
 `docker/install-securecore.sh` now gives the files it writes a current mtime, and
 `docker/setup.sh` restarts php after installing so the change is live immediately.
+
+## Part 1d: core-only snapshot (#47)
+
+Through 1b/1c the snapshot held **every** autoloaded option except transients and the
+active-plugin lists — which includes every other plugin's own autoloaded settings (license
+keys, SMTP/API credentials). The pre-booted parent loaded all of it into the snapshot `$wpdb`'s
+`$snapshot` property, inherited by every forked child, so a sandboxed plugin could read another
+plugin's options straight out of memory. That contradicts #42's "parent boots with no plugins,
+no plugin options and no secrets", and the gateway's future row policy would not see those reads.
+
+**Fix (#47).**
+1. `write_options_snapshot()` now snapshots only an **allowlist of WordPress's own options** —
+   the names `populate_options()` seeds (parsed from the site's own `wp-admin/includes/schema.php`,
+   so it tracks the version) plus the active theme's `theme_mods_<stylesheet>` — intersected with
+   the autoloaded options. A core option boot needs that is not on the list (e.g. `rewrite_rules`,
+   added after install, not by `populate_options()`) shows up as a parent-boot miss in the worker
+   log; the child reads it fresh through the gateway when it matters, so the miss is harmless.
+2. After the fork the child calls `$wpdb->drop_snapshot()` (sets the `$snapshot` property to
+   `[]`), so it keeps none of core's options in memory either — belt and braces with the gateway
+   forwarding, which never consults the snapshot in a child.
+
+**gelada (later).** When the gelada policy lands, it should **deny the sandbox read access to
+`wp-content/securecore/options-snapshot.php`**. The worker reads the snapshot in the parent,
+before any sandbox profile is applied to a child, so denying the child has no cost; it closes the
+file as a second path to the same data. (The snapshot now holds only core options, but the deny
+is still correct defence in depth.)
+
+**Canary test (`test/canary.sh`, `test/canary-plugin/`).** A secret autoloaded option
+(`securecore_canary_secret`) is set from wp-cli — a non-sandboxed context — then a sandboxed probe
+scans `$GLOBALS` and the `$wpdb` object (private properties included, via reflection) for the
+value. It must not find it, and the value must be absent from the snapshot file.
+
+With the fix:
+
+```
+ok   probe sandboxed (manifest generated)
+ok   snapshot file does not contain the secret
+ok   probe did not find the secret in sandbox memory
+canary: PASS
+```
+
+With the fix reverted (snapshot back to all autoloaded options, and `drop_snapshot()` disabled),
+the same test fails — which is what proves it catches the leak:
+
+```
+ok   probe sandboxed (manifest generated)
+FAIL snapshot file contains the secret
+FAIL probe found the secret in sandbox memory (the leak #47 describes)
+canary: FAIL (2)
+```
+
+Nothing else regressed: under pre-boot `test/compat.sh` still gives the #46 results (Classic Editor
+clean, Yoast and CF7 at their per-request baselines, zero worker re-boots), and `bench/preboot.ts`
+still shows the per-plugin cost as the fork — front p50 pre-boot 110.3 → 113.2 ms for 1 → 2
+plugins (+2.9 ms/plugin) against 165.3 → 228.8 ms (+63.5 ms) for the per-request boot.

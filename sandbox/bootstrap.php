@@ -233,6 +233,14 @@ function make_snapshot_wpdb(string $prefix, array $options): \wpdb
             return true;
         }
 
+        /** Drop the snapshot the parent booted from, so a forked child holds none of it in
+         *  memory (addiscorp/securecore#47). The child forwards to the gateway, never the
+         *  snapshot, so this only frees the inherited copy. */
+        public function drop_snapshot(): void
+        {
+            $this->snapshot = [];
+        }
+
         private function parent_boot_miss($query): void
         {
             // Truncated: a boot query may carry a large value (a theme's block-pattern cache),
