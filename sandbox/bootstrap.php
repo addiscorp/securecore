@@ -133,12 +133,19 @@ function boot_wordpress(string $root, string $prefix, ?\wpdb $wpdb = null): void
 }
 
 /**
- * A $wpdb for the worker parent's one-time pre-boot (addiscorp/securecore#42, part 1b). The
- * parent has no request socket, so there is no gateway to answer queries; instead this $wpdb
- * serves the single query a no-plugin boot makes — wp_load_alloptions()'s autoloaded-options
- * SELECT — from the snapshot core wrote to disk, and treats anything else as empty (logged to
- * the worker log, so an unexpected boot query is visible). It never connects and never writes.
- * Built as an anonymous class so \wpdb is resolved only after class-wpdb.php is loaded.
+ * The $wpdb for the pre-boot model (addiscorp/securecore#42, parts 1b/1c). It is ONE object for
+ * the whole life of the process, and it switches behaviour on Registry::$parentBoot:
+ *
+ *   - While the parent pre-boots (parentBoot true), there is no request socket, so it serves
+ *     the one query a no-plugin boot makes — wp_load_alloptions()'s autoloaded-options SELECT —
+ *     from the snapshot core wrote to disk, and treats anything else as empty (logged).
+ *   - After a child forks (parentBoot false), the SAME object forwards every query to core over
+ *     the request socket (the gateway), exactly like the per-request GatewayWpdb.
+ *
+ * Because it is never swapped out in the child, any WordPress state that captured a reference to
+ * $wpdb during the parent's boot (a query object, a cache primer, a static) keeps working after
+ * the fork instead of querying a dead snapshot — which is what produced the malformed user/term
+ * objects in 1b (part 1c). Built as an anonymous class so \wpdb resolves only after class-wpdb.php.
  */
 function make_snapshot_wpdb(string $prefix, array $options): \wpdb
 {
@@ -148,8 +155,8 @@ function make_snapshot_wpdb(string $prefix, array $options): \wpdb
 
         public function __construct(string $prefix, array $options)
         {
-            // No parent constructor (it would connect). wp-settings.php calls set_prefix()
-            // on us, which fills in the table names; we only need to be "ready".
+            // No parent constructor (it would connect). wp-settings.php calls set_prefix() on
+            // us during the parent's boot, filling in the table names the children inherit.
             $this->ready = true;
             $this->prefix = $prefix;
             $this->base_prefix = $prefix;
@@ -157,44 +164,42 @@ function make_snapshot_wpdb(string $prefix, array $options): \wpdb
             $this->snapshot = $options;
         }
 
-        // wp_load_alloptions() runs "SELECT option_name, option_value ... WHERE autoload IN (...)";
-        // serve it from the snapshot regardless of the exact autoload values (they vary by
-        // WordPress version). Any other get_results during a no-plugin boot is unexpected.
-        public function get_results($query = null, $output = OBJECT)
-        {
-            if (is_string($query) && stripos($query, 'option_name') !== false && stripos($query, 'autoload') !== false) {
-                $rows = [];
-                foreach ($this->snapshot as $name => $value) {
-                    $rows[] = (object) ['option_name' => (string) $name, 'option_value' => $value];
-                }
-                return $rows;
-            }
-            $this->parent_boot_miss($query);
-            return [];
-        }
-
         public function query($query)
         {
-            $this->parent_boot_miss($query);
-            return false;
+            if (Registry::$parentBoot) {
+                $this->parent_boot_miss($query);
+                return false;
+            }
+            // Child: forward to core over the request socket (the gateway).
+            $this->flush();
+            $this->last_query = $query;
+            $answer = db_gateway('query', [(string) $query]);
+            $this->last_result = array_map(static fn ($row) => (object) $row, $answer['last_result'] ?? []);
+            $this->last_error = (string) ($answer['last_error'] ?? '');
+            $this->insert_id = (int) ($answer['insert_id'] ?? 0);
+            $this->rows_affected = (int) ($answer['rows_affected'] ?? 0);
+            $this->num_rows = (int) ($answer['num_rows'] ?? 0);
+            $this->num_queries++;
+            return $answer['return'] ?? false;
         }
 
-        public function get_row($query = null, $output = OBJECT, $y = 0)
+        // wp_load_alloptions() runs "SELECT option_name, option_value ... WHERE autoload IN (...)".
+        // Serve it from the snapshot during the parent's boot; in a child, go through query() to
+        // the gateway like any other read (the parent class's readers all route through query()).
+        public function get_results($query = null, $output = OBJECT)
         {
-            $this->parent_boot_miss($query);
-            return null;
-        }
-
-        public function get_var($query = null, $x = 0, $y = 0)
-        {
-            $this->parent_boot_miss($query);
-            return null;
-        }
-
-        public function get_col($query = null, $x = 0)
-        {
-            $this->parent_boot_miss($query);
-            return [];
+            if (Registry::$parentBoot) {
+                if (is_string($query) && stripos($query, 'option_name') !== false && stripos($query, 'autoload') !== false) {
+                    $rows = [];
+                    foreach ($this->snapshot as $name => $value) {
+                        $rows[] = (object) ['option_name' => (string) $name, 'option_value' => $value];
+                    }
+                    return $rows;
+                }
+                $this->parent_boot_miss($query);
+                return [];
+            }
+            return parent::get_results($query, $output);
         }
 
         public function _real_escape($data)
@@ -205,12 +210,17 @@ function make_snapshot_wpdb(string $prefix, array $options): \wpdb
 
         public function db_version()
         {
-            return '8.0.0';
+            return Registry::$parentBoot ? '8.0.0' : (string) db_gateway('db_version', []);
         }
 
         public function db_server_info()
         {
-            return '8.0.0';
+            return Registry::$parentBoot ? '8.0.0' : (string) db_gateway('db_server_info', []);
+        }
+
+        public function get_col_info($info_type = 'name', $col_offset = -1)
+        {
+            return Registry::$parentBoot ? [] : db_gateway('get_col_info', [$info_type, $col_offset]);
         }
 
         public function check_connection($allow_bail = true)

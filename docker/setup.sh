@@ -23,6 +23,9 @@ until docker compose exec -T php test -f /var/www/html/wp-config.php; do
   sleep 1
 done
 docker compose exec -T php sh /usr/local/bin/install-securecore
+# Reinstalling overwrites core PHP; restart php-fpm so its opcache serves the new bytes right
+# away rather than within its revalidate window (addiscorp/securecore#45).
+docker compose restart php
 
 if ! wp core is-installed >/dev/null 2>&1; then
   wp core install --url=http://127.0.0.1:8088 --title=SecureCore --admin_user=admin \

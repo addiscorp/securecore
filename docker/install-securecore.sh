@@ -19,3 +19,9 @@ cp /usr/src/securecore/securecore-probe/*.php "$content/plugins/securecore-probe
 cp /usr/src/securecore/securecore-bench/*.php "$content/plugins/securecore-bench/"
 cp /usr/src/securecore/securecore-state/*.php "$content/plugins/securecore-state/"
 chown -R www-data:www-data "$content"
+# The release zip freezes file mtimes so it is reproducible (scripts/package.sh). php-fpm's
+# opcache keys on mtime, so without this a reinstall over an earlier one is not picked up until
+# opcache is reset — core-side PHP changes silently keep running the old bytes
+# (addiscorp/securecore#45). Give the freshly written files a current mtime so opcache's
+# validate_timestamps reloads them.
+find "$content/plugins/securecore" "$content/mu-plugins/securecore-loader.php" -exec touch {} + 2>/dev/null || true
