@@ -36,11 +36,20 @@ fn wordpress_example_parses_with_every_field() {
     let vault = c.layer2.vault.as_ref().expect("vault");
     assert_eq!(vault.from, "wp-config.php");
     assert_eq!(vault.secrets.len(), 9);
-    assert_eq!(c.layer2.default.files, Some(Scope::Keyword(ScopeKeyword::Own)));
+    assert_eq!(c.layer2.default.tables, Some(Scope::Keyword(ScopeKeyword::Own)));
+    assert_eq!(c.layer2.default.files, None, "no extra file access by default");
+    assert_eq!(c.layer2.default.exec, None);
     let woo = &c.layer2.components["woocommerce"];
     assert_eq!(woo.tables, Some(Scope::Patterns(vec!["wc_*".into(), "woocommerce_*".into()])));
     assert_eq!(woo.grants.as_deref(), Some(&["users:read".to_string()][..]));
     assert_eq!(woo.files, None, "unset fields inherit from default");
+    assert_eq!(woo.exec, None, "unset exec inherits from default");
+    let cf7 = &c.layer2.components["contact-form-7"];
+    assert_eq!(cf7.files.as_ref().map(|f| f.write.as_slice()), Some(&["wp-content/uploads/wpcf7_uploads".to_string()][..]));
+    assert!(cf7.files.as_ref().expect("cf7 files").read.is_empty());
+    let smush = &c.layer2.components["wp-smushit"];
+    assert_eq!(smush.exec, Some(true), "a component may be granted exec");
+    assert_eq!(smush.files.as_ref().map(|f| f.read.as_slice()), Some(&["/usr/bin".to_string()][..]));
     assert_eq!(c.layer3.isolate, ["contact-form-7"]);
     assert_eq!(c.layer3.limits.timeout_ms.get(), 5000);
     assert_eq!(c.layer3.limits.memory_mb.get(), 256);
@@ -66,8 +75,30 @@ fn unknown_keys_are_rejected_at_every_level() {
     assert!(rejected(&with_layer2(r#","modes":"log""#)).contains("unknown field `modes`"));
     let component = with_layer2(r#","components":{"cf7":{"host":[]}}"#);
     assert!(rejected(&component).contains("unknown field `host`"));
+    let files = with_layer2(r#","components":{"cf7":{"files":{"reads":[]}}}"#);
+    assert!(rejected(&files).contains("unknown field `reads`"), "{}", rejected(&files));
     let l3 = r#"{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false,"limits":{"timeout":1}}}"#;
     assert!(rejected(l3).contains("unknown field `timeout`"));
+}
+
+#[test]
+fn file_and_exec_rules_parse() {
+    let c = parse(&with_layer2(
+        r#","default":{"files":{"read":["/etc/ssl"],"write":["wp-content/x"]},"exec":false},"components":{"p":{"exec":true}}"#,
+    ))
+    .expect("file/exec rules");
+    let d = &c.layer2.default;
+    assert_eq!(d.files.as_ref().expect("files").read, ["/etc/ssl"]);
+    assert_eq!(d.files.as_ref().expect("files").write, ["wp-content/x"]);
+    assert_eq!(d.exec, Some(false));
+    assert_eq!(c.layer2.components["p"].exec, Some(true));
+    // files with neither list: valid, both empty (a component with no extra access).
+    let c = parse(&with_layer2(r#","components":{"p":{"files":{}}}"#)).expect("empty files");
+    let f = c.layer2.components["p"].files.as_ref().expect("files");
+    assert!(f.read.is_empty() && f.write.is_empty());
+    // exec must be a bool, read/write must be arrays of strings.
+    assert!(rejected(&with_layer2(r#","components":{"p":{"exec":"yes"}}"#)).contains("invalid type"));
+    assert!(rejected(&with_layer2(r#","components":{"p":{"files":{"read":"x"}}}"#)).contains("invalid type"));
 }
 
 #[test]
@@ -124,8 +155,14 @@ fn the_array_form_is_rejected_at_every_level() {
     assert!(serde_json::from_str::<Config>(&rules).is_ok());
     assert!(rejected(&rules).contains("layer2.components.cf7 is an array"), "{}", rejected(&rules));
 
-    // Arrays where the schema has arrays stay valid.
-    assert!(parse(&with_layer2(r#","default":{"files":["wp-content/uploads/*"]}"#)).is_ok());
+    // `files` is now an object: its array form is rejected, naming it.
+    let files = with_layer2(r#","default":{"files":[[],[]]}"#);
+    assert!(serde_json::from_str::<Config>(&files).is_ok());
+    assert!(rejected(&files).contains("layer2.default.files is an array"), "{}", rejected(&files));
+
+    // Arrays where the schema has arrays stay valid (files.read, tables patterns).
+    assert!(parse(&with_layer2(r#","default":{"files":{"read":["/srv/certs"]}}"#)).is_ok());
+    assert!(parse(&with_layer2(r#","default":{"tables":["wp_*"]}"#)).is_ok());
     assert!(parse(WORDPRESS).is_ok());
 }
 
@@ -161,7 +198,9 @@ fn port_zero_and_bad_scope_are_rejected() {
     let e = rejected(r#"{"layer1":{"enabled":true,"network":{"connect":[{"port":0}]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#);
     assert!(e.contains("nonzero"), "{e}");
     rejected(r#"{"layer1":{"enabled":true,"network":{"connect":[{"port":65536}]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#);
-    rejected(&with_layer2(r#","default":{"files":"all"}"#));
+    rejected(&with_layer2(r#","default":{"tables":"all"}"#));
+    // `files` is an object now, not a scope keyword/list: a bare string is rejected.
+    rejected(&with_layer2(r#","default":{"files":"own"}"#));
 }
 
 /// One source of truth: the committed schema is exactly what the types generate. To update:

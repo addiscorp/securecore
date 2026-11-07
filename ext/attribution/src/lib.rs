@@ -16,6 +16,7 @@ use std::fs;
 use std::path::{Component as PathPart, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub mod policy;
 pub mod watch;
 
 /// What a file belongs to. Its [`Display`](fmt::Display) form is the token in the log lines:

@@ -16,10 +16,11 @@
 //! charge for every file open. Observation only.
 
 mod attribution;
+mod enforce;
 
 use std::ffi::{CString, c_char, c_int};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use ext_php_rs::error::php_error;
@@ -63,6 +64,12 @@ fn state() -> MutexGuard<'static, Option<Reloader>> {
 /// `f` on the live config, holding the lock only for the call.
 fn with_live<R>(f: impl FnOnce(&Loaded) -> R) -> Option<R> {
     state().as_ref().map(|r| f(r.live()))
+}
+
+/// A cheap clone of the live config (an `Arc` bump), for the enforcement path (E2b): it reads
+/// several fields across one decision without holding the state lock for the whole call.
+pub(crate) fn live_arc() -> Option<Arc<Loaded>> {
+    state().as_ref().map(|r| Arc::clone(r.live()))
 }
 
 unsafe extern "C" {
@@ -111,6 +118,7 @@ extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
 
 extern "C" fn request_startup(_ty: i32, _module_number: i32) -> i32 {
     attribution::request_startup();
+    enforce::request_startup();
     let mut guard = state();
     if let Some(reloader) = guard.as_mut() {
         match reloader.poll(Instant::now()) {
@@ -137,6 +145,13 @@ pub fn securecore_status() -> PhpResult<ZBox<ZendHashTable>> {
     // Who called, before taking the state lock (attribution reads the live config itself).
     let root = with_live(|l| l.root.clone()).ok_or("securecore: no config loaded")?;
     let caller = attribution::who_is_running(&root).to_string();
+    // securecore_status() is for core (E2b): a component's call is refused in enforce mode and
+    // recorded (but allowed) in log mode. "outside" code (not under the root) is let through.
+    if caller != "core" && caller != "outside"
+        && let Some(message) = enforce::status_only_core(&caller)
+    {
+        return Err(message.into());
+    }
     let settings = attribution::settings();
     let guard = state();
     let reloader = guard.as_ref().ok_or("securecore: no config loaded")?;

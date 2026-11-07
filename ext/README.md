@@ -1,14 +1,15 @@
 # SecureCore PHP extension
 
 SecureCore as one PHP extension written in Rust ([ext-php-rs](https://crates.io/crates/ext-php-rs)),
-configured from one file, `securecore.json` (addiscorp/securecore#53). This is phase **E1**:
-the extension loads, validates and reloads the config and reports what it loaded. It enforces
-nothing yet; layer 2 policy (E2–E5), the layer 1 launcher (E6) and layer 3 (E7) build on it.
+configured from one file, `securecore.json` (addiscorp/securecore#53). Phases so far: **E1** loads,
+validates and reloads the config and reports it; **E2a** works out which component is running;
+**E2b** enforces layer 2's file and process rules. Still to come: the vault (E3), the database
+and hostname policy (E4–E5), the layer 1 launcher (E6) and layer 3 (E7).
 
 | crate | what |
 |---|---|
 | `config/` (`securecore-config`) | the config types (serde), the loader, the reloader and the JSON Schema. Plain Rust, no PHP: the `securecore-fpm` launcher (E6) reads the file with the same code. |
-| `attribution/` (`securecore-attribution`) | E2a: path → component (plugin, mu-plugin, theme, core), the two "who is running" rules, the watched file functions, and `securecore-attribution-report`. Plain Rust, no PHP. |
+| `attribution/` (`securecore-attribution`) | E2a: path → component (plugin, mu-plugin, theme, core), the two "who is running" rules, the watched file functions, `securecore-attribution-report`; and E2b: the file/process [`policy`](attribution/src/policy.rs). Plain Rust, no PHP. |
 | `php/` (`securecore-php`) | the extension, built as `securecore.so` |
 
 ## Build
@@ -76,6 +77,13 @@ Beyond the schema's structure, one rule is checked in code and expressed in the 
 from a JSON array (its fields by position), and that form is rejected
 (`layer1 is an array; it must be an object`).
 
+Each entry in `layer2.default` and `layer2.components.<slug>` sets a component's rules; a field
+left out of an entry inherits from `default`. For E2b those fields are `files` — an object with
+`read` (extra readable paths outside the root) and `write` (extra writable paths, on top of
+uploads and cache) — and `exec` (a bool: may the component run programs). See
+[Enforcement (E2b)](#enforcement-e2b) for what each means. (`hosts`, `tables`, `options` and
+`grants` are for later phases.)
+
 ## Reload
 
 Layers 2 and 3 follow the file without a php-fpm restart. At request start (RINIT) each php-fpm
@@ -116,6 +124,10 @@ What this worker is enforcing:
 ```
 
 `phpinfo()` shows the config path and sha256 too.
+
+Since E2b, `securecore_status()` is **callable from core only**. A component that calls it is
+refused in `enforce` mode (a thrown exception) and recorded but allowed in `log` mode, like any
+other layer-2 operation.
 
 ## Attribution (E2a)
 
@@ -168,6 +180,56 @@ nothing. This is observation only: nothing is blocked.
 `research/attribution/measure.sh` runs the measurement on the docker stack and
 `securecore-attribution-report` turns the log into per-component tables.
 
+## Enforcement (E2b)
+
+Layer 2 enforces a file and process policy on each **component** (plugin, mu-plugin or theme),
+by the `component` attribution rule — the one #55's measurement recommended, which charges the
+caller. **Core is never restricted.** The rules (in [`attribution/src/policy.rs`](attribution/src/policy.rs),
+plain Rust, unit-tested):
+
+- **read:** anywhere under the app root, except the two protected files — the vault's `from`
+  file (e.g. `wp-config.php`) and `securecore.json`. Outside the root, only what the component's
+  `files.read` lists. (Reads under the root are open because shared libraries and core APIs
+  routinely read another component's files on its behalf; the secrets are what stay closed.)
+- **write** (create, modify, delete, rename, mkdir): the uploads and cache folders, plus what
+  `files.write` lists. Never a protected file — not even its own folder.
+- **exec** (exec, shell_exec, system, passthru, popen, proc_open, pcntl_exec, and mail when it
+  shells out): refused unless the component's `exec` is `true`.
+
+`mode` decides what a refusal does: `enforce` blocks it and the call fails as PHP fails on a
+permission error (a warning, and `false`; a denied include stops as a missing file would —
+a warning for `include`, a fatal for `require`); `log` writes one line and lets it through;
+`off` does neither. A refusal line is
+
+```
+securecore: layer2 enforce plugin:acme file_put_contents write /var/www/html/wp-includes/x.php
+securecore: layer2 log     plugin:acme exec               exec  /usr/bin/convert input.png
+```
+
+**Where the checks sit.** Every file open PHP code makes is a call to a file function or an
+include. A stream wrapper would see only `file://` and user schemes: a bare path — nearly all
+real paths — is served by the built-in plain-files wrapper, a `const` the engine returns
+directly without consulting any registry, so it cannot be wrapped without rewriting read-only
+memory. The one place every bare-path open passes through is the function it was called from, so
+on the first request of a worker (once layer 2 is active) the extension replaces the handlers of
+the watched file functions and the process functions with one checking handler, and the
+`zend_compile_file` wrapper (shared with E2a) covers include and require. opcache does not touch
+function handlers, and php-fpm forks after this, so one install per worker holds for every
+request.
+
+**Covered** (each fails as PHP would on a permission error): `fopen` (read and write modes),
+`file_get_contents`, `file`, `readfile`, `parse_ini_file`, `md5_file`, `sha1_file`, `hash_file`,
+`opendir`, `scandir`, `dir`, `glob`, `file_put_contents`, `unlink`, `mkdir`, `rmdir`, `touch`,
+`chmod`, `tempnam`, `rename`, `copy`, `move_uploaded_file`; `include`/`require`(`_once`); and the
+process functions above. **Not covered** (documented gaps, not silently missed): opens made
+inside another extension's C code (GD, Zip), metadata-only calls (`file_exists`, `stat`,
+`is_dir` — not opens), and the OO file classes (`SplFileObject`, `DirectoryIterator`), whose
+construct-time open neither returns `false` nor passes through a function handler; these are
+follow-ups, and layer 1 (the kernel) backstops a component that reaches a file another way.
+
+`research/enforce/compat.sh` runs Classic Editor, Yoast SEO and Contact Form 7 in enforce mode
+and lists every refusal; `bench/enforce.sh` is the front-page benchmark.
+
 ## Tests
 
 - `cargo test` (in Docker: the `check` target): the examples parse, unknown keys and bad
@@ -181,6 +243,13 @@ nothing. This is observation only: nothing is blocked.
   files in known ways; checks the component each rule charges, the map (own includes, a
   mu-plugin callback, a symlinked plugin, core including plugins and the theme), the rule
   setting, that logging is off by default and that mode `off` records nothing.
+- `DOCKER_CONTEXT=colima test/ext-enforce.sh` (after ext-config.sh): a probe plugin attempts
+  each file and process operation; checks that enforce mode blocks the forbidden ones (and the
+  refusals are logged), that log mode lets the same ones through (the revert proof), that layer 2
+  off records nothing, and that a granted component gets its grants while the protected file and
+  `securecore_status()` stay refused.
 - `DOCKER_CONTEXT=colima bench/ext.sh`: front-page p50 with the extension loaded vs not.
 - `DOCKER_CONTEXT=colima bench/attribution.sh`: front-page p50 not loaded, loaded with
   attribution logging off, and on.
+- `DOCKER_CONTEXT=colima bench/enforce.sh`: front-page p50 with the three plugins, not loaded vs
+  loaded in enforce mode.
