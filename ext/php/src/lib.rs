@@ -1,0 +1,156 @@
+//! The SecureCore PHP extension (addiscorp/securecore#53), phase E1: the `securecore.config`
+//! ini setting, loading and validating `securecore.json` at module startup, reloading it at
+//! request start, and `securecore_status()`.
+//!
+//! Fail closed: if the file is missing, unreadable or invalid, MINIT fails. PHP then logs
+//! "PHP Startup: securecore: <path>: <problem>" and "Unable to start securecore module" and
+//! the process exits, so php-fpm never serves a request unprotected.
+//!
+//! Reload: layers 2 and 3 follow the file without a php-fpm restart. Each worker process
+//! `stat`s it at most once per [`RELOAD_INTERVAL`], at request start, and reads + hashes +
+//! parses it only when the stat changed. An edit that doesn't load keeps the last valid
+//! config live (never "off") and is logged; a `layer1` change is logged as needing a restart.
+
+use std::ffi::{CString, c_char, c_int};
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+use ext_php_rs::error::php_error;
+use ext_php_rs::ffi::{ZEND_RESULT_CODE_FAILURE, ZEND_RESULT_CODE_SUCCESS};
+use ext_php_rs::flags::IniEntryPermission;
+use ext_php_rs::prelude::*;
+use ext_php_rs::types::ZendHashTable;
+use ext_php_rs::boxed::ZBox;
+use ext_php_rs::zend::{ExecutorGlobals, IniEntryDef, IniEntryDefs, ModuleEntry};
+use ext_php_rs::{info_table_end, info_table_row, info_table_start};
+use securecore_config::{App, Poll, Reloader};
+
+/// The ini setting naming the config file. PHP_INI_SYSTEM: php.ini or conf.d only, read once
+/// at startup.
+const INI_CONFIG: &str = "securecore.config";
+
+/// How often a worker process checks the file for changes.
+pub const RELOAD_INTERVAL: Duration = Duration::from_millis(1000);
+
+static INI: IniEntryDefs<2> = IniEntryDefs::new([
+    IniEntryDef::new(c"securecore.config", c"", IniEntryPermission::System),
+    IniEntryDef::end(),
+]);
+
+/// The live config. php-fpm loads it in the master at MINIT; each worker inherits it at fork
+/// and then reloads on its own.
+static STATE: Mutex<Option<Reloader>> = Mutex::new(None);
+
+fn state() -> MutexGuard<'static, Option<Reloader>> {
+    // A panic while holding the lock can't leave a Reloader half-updated in a way that
+    // matters: every field is replaced whole. Keep serving the last state.
+    STATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+unsafe extern "C" {
+    /// PHP's error log (`error_log`, or the SAPI's log): main/main.c, PHPAPI since 7.x.
+    fn php_log_err_with_severity(message: *const c_char, syslog_type: c_int);
+}
+
+const LOG_WARNING: c_int = 4;
+const LOG_NOTICE: c_int = 5;
+
+/// Writes one line to PHP's error log, never to the response.
+fn log(severity: c_int, message: &str) {
+    if let Ok(line) = CString::new(format!("securecore: {message}")) {
+        // SAFETY: a NUL-terminated string that outlives the call; PHP copies it.
+        unsafe { php_log_err_with_severity(line.as_ptr(), severity) };
+    }
+}
+
+/// Fails module startup with a message naming the file and the problem.
+fn refuse(message: &str) -> i32 {
+    php_error(&ErrorType::CoreWarning, &format!("securecore: {message}; refusing to start"));
+    ZEND_RESULT_CODE_FAILURE
+}
+
+fn ini_config_path() -> Option<String> {
+    ExecutorGlobals::get().ini_values().remove(INI_CONFIG).flatten().filter(|p| !p.trim().is_empty())
+}
+
+extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
+    IniEntryDef::register(INI.as_slice(), module_number);
+    let Some(path) = ini_config_path() else {
+        return refuse(&format!("{INI_CONFIG} is not set; point it at securecore.json"));
+    };
+    match Reloader::start(Path::new(&path), RELOAD_INTERVAL, Instant::now()) {
+        Ok(reloader) => {
+            *state() = Some(reloader);
+            ZEND_RESULT_CODE_SUCCESS
+        }
+        Err(e) => refuse(&e.to_string()),
+    }
+}
+
+extern "C" fn request_startup(_ty: i32, _module_number: i32) -> i32 {
+    let mut guard = state();
+    if let Some(reloader) = guard.as_mut() {
+        match reloader.poll(Instant::now()) {
+            Poll::Unchanged => {}
+            Poll::Reloaded { layer1_changed } => {
+                let live = reloader.live();
+                log(LOG_NOTICE, &format!("reloaded {} (sha256 {})", live.path.display(), live.sha256));
+                if layer1_changed {
+                    log(LOG_WARNING, "layer1 changed; it applies only after a php-fpm restart");
+                }
+            }
+            Poll::Rejected(problem) => {
+                log(LOG_WARNING, &format!("{problem}; keeping the last valid config"));
+            }
+        }
+    }
+    ZEND_RESULT_CODE_SUCCESS
+}
+
+/// What the extension is enforcing: which layers are enabled, layer 2's mode, the config
+/// file and its sha256, and the reload state.
+#[php_function]
+pub fn securecore_status() -> PhpResult<ZBox<ZendHashTable>> {
+    let guard = state();
+    let reloader = guard.as_ref().ok_or("securecore: no config loaded")?;
+    let live = reloader.live();
+    let c = &live.config;
+    let mut layers = ZendHashTable::new();
+    layers.insert("layer1", c.layer1.enabled)?;
+    layers.insert("layer2", c.layer2.enabled)?;
+    layers.insert("layer3", c.layer3.enabled)?;
+    let mut out = ZendHashTable::new();
+    out.insert("version", env!("CARGO_PKG_VERSION"))?;
+    out.insert("config", live.path.display().to_string())?;
+    out.insert("sha256", live.sha256.as_str())?;
+    out.insert("off", c.is_off())?;
+    out.insert("layers", layers)?;
+    out.insert("layer2_mode", c.layer2.mode.as_str())?;
+    out.insert("layer2_app", c.layer2.app.map(App::as_str))?;
+    out.insert("reloads", i64::try_from(reloader.reloads()).unwrap_or(i64::MAX))?;
+    out.insert("restart_needed", reloader.restart_needed())?;
+    out.insert("reload_error", reloader.error().map(str::to_owned))?;
+    Ok(out)
+}
+
+extern "C" fn module_info(_module: *mut ModuleEntry) {
+    let guard = state();
+    info_table_start!();
+    info_table_row!("securecore", "enabled");
+    if let Some(live) = guard.as_ref().map(Reloader::live) {
+        info_table_row!("config", live.path.display().to_string());
+        info_table_row!("sha256", live.sha256.as_str());
+    }
+    info_table_end!();
+}
+
+#[php_module]
+pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
+    module
+        .name("securecore")
+        .startup_function(module_startup)
+        .request_startup_function(request_startup)
+        .info_function(module_info)
+        .function(wrap_function!(securecore_status))
+}

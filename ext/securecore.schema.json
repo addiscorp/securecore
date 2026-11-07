@@ -1,0 +1,376 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "securecore.json",
+  "description": "SecureCore configuration. Three layers, each enabled independently; all three disabled\nmeans SecureCore is off. An invalid file means nothing starts.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "description": "Optional pointer to this schema, for editors. Not read by SecureCore.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "layer1": {
+      "$ref": "#/$defs/Layer1"
+    },
+    "layer2": {
+      "$ref": "#/$defs/Layer2"
+    },
+    "layer3": {
+      "$ref": "#/$defs/Layer3"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "layer1",
+    "layer2",
+    "layer3"
+  ],
+  "$defs": {
+    "App": {
+      "description": "An app adapter for layer 2.",
+      "type": "string",
+      "enum": [
+        "wordpress"
+      ]
+    },
+    "Core": {
+      "type": "object",
+      "properties": {
+        "hosts": {
+          "description": "Hostnames core may reach over HTTP.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Layer1": {
+      "description": "Layer 1, the outer layer: the `securecore-fpm` launcher starts php-fpm inside gelada\n(Landlock + seccomp). Knows only paths and ports, so it works for any PHP app. Read once by\nthe launcher: a change needs a php-fpm restart.",
+      "type": "object",
+      "properties": {
+        "deny": {
+          "description": "Paths php-fpm may not read at all, on top of the common secrets SecureCore always denies.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "network": {
+          "$ref": "#/$defs/Network",
+          "default": {
+            "bind": [],
+            "connect": [],
+            "unixSockets": []
+          }
+        },
+        "write": {
+          "description": "Folders php-fpm may write, relative to the app root. Everything else is read-only.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "enabled"
+      ]
+    },
+    "Layer2": {
+      "description": "Layer 2, the extension: engine-level policy inside php-fpm, per component (plugin or\ntheme). Reloaded when the file changes.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "description": "The app adapter: where the secrets live, what a component is and what it owns.\nRequired when layer 2 is enabled.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/App"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "components": {
+          "description": "Per-component rules, keyed by the component's slug (plugin or theme folder name).",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Rules"
+          },
+          "default": {}
+        },
+        "core": {
+          "description": "Rules for the app's own code (WordPress core).",
+          "$ref": "#/$defs/Core",
+          "default": {
+            "hosts": []
+          }
+        },
+        "default": {
+          "description": "Rules for every component without an entry of its own, and the base each entry in\n`components` overrides field by field.",
+          "$ref": "#/$defs/Rules",
+          "default": {}
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode",
+          "default": "enforce"
+        },
+        "vault": {
+          "description": "Secrets that never exist as PHP-visible values (E3).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Vault"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "if": {
+        "properties": {
+          "enabled": {
+            "const": true
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      },
+      "required": [
+        "enabled"
+      ],
+      "then": {
+        "required": [
+          "app"
+        ]
+      }
+    },
+    "Layer3": {
+      "description": "Layer 3, the clean child: calls into an isolated component run in a forked child under\ngelada. Lives inside the extension. Reloaded when the file changes.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "isolate": {
+          "description": "Components (slugs) whose calls run in an isolated child.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "limits": {
+          "$ref": "#/$defs/Limits",
+          "default": {
+            "memoryMb": 256,
+            "timeoutMs": 5000
+          }
+        },
+        "write": {
+          "description": "Extra folders an isolated component's child may write, relative to the app root.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "enabled"
+      ]
+    },
+    "Limits": {
+      "type": "object",
+      "properties": {
+        "memoryMb": {
+          "description": "Memory limit for one isolated child.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 256,
+          "minimum": 1
+        },
+        "timeoutMs": {
+          "description": "Wall-clock limit for one isolated call.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 5000,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "Mode": {
+      "description": "`enforce` blocks; `log` reports what would be blocked and blocks nothing; `off` does\nneither.",
+      "type": "string",
+      "enum": [
+        "enforce",
+        "log",
+        "off"
+      ]
+    },
+    "Network": {
+      "description": "The sockets php-fpm may use. Anything not listed is refused by the kernel.",
+      "type": "object",
+      "properties": {
+        "bind": {
+          "description": "TCP ports php-fpm may listen on.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Port"
+          }
+        },
+        "connect": {
+          "description": "TCP ports php-fpm may connect to (by port: the kernel can't see hostnames).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Port"
+          }
+        },
+        "unixSockets": {
+          "description": "Unix sockets php-fpm may connect to.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Port": {
+      "type": "object",
+      "properties": {
+        "port": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "port"
+      ]
+    },
+    "Rules": {
+      "description": "What a component may touch. A field left out inherits from `default`.",
+      "type": "object",
+      "properties": {
+        "files": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Scope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "grants": {
+          "description": "Extra access to what core owns, as `<area>:<access>` (e.g. `users:read`).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "hosts": {
+          "description": "Hostnames the component may reach over HTTP.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "options": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Scope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tables": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Scope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Scope": {
+      "description": "`\"own\"` (what the app adapter says the component owns) or an explicit list of patterns.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScopeKeyword"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "ScopeKeyword": {
+      "type": "string",
+      "enum": [
+        "own"
+      ]
+    },
+    "Vault": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "The file the secrets are defined in, relative to the app root.",
+          "type": "string"
+        },
+        "secrets": {
+          "description": "The constants SecureCore supplies natively instead of PHP.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "secrets"
+      ]
+    }
+  }
+}

@@ -2,3 +2,5 @@ node_modules/
 dist/
 sandbox/php2.wasm
 .tmp/
+.target/
+ext/target/
