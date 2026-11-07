@@ -6,3 +6,5 @@
 !bench/worker-breakdown.php
 !test/plugin/
 !docker/
+!ext/
+ext/target/

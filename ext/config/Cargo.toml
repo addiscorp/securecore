@@ -1,0 +1,18 @@
+[package]
+name = "securecore-config"
+description = "The securecore.json types, loader and JSON Schema (addiscorp/securecore#53)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+# Writes securecore.schema.json from the types: cargo run -p securecore-config --bin securecore-schema
+[[bin]]
+name = "securecore-schema"
+path = "src/bin/securecore-schema.rs"

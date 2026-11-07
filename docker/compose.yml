@@ -84,7 +84,8 @@ services:
     build: { context: .., dockerfile: docker/web.Dockerfile }
     depends_on: [php]
     ports:
-      - "127.0.0.1:8088:80"
+      # SECURECORE_PORT: run a second stack beside this one (test/ext-config.sh uses 8089).
+      - "127.0.0.1:${SECURECORE_PORT:-8088}:80"
     volumes:
       - wp:/var/www/html:ro
 

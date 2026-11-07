@@ -1,0 +1,20 @@
+[package]
+name = "securecore-php"
+description = "The SecureCore PHP extension (addiscorp/securecore#53)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# PHP loads lib<name>.so; the Dockerfile installs it as securecore.so.
+name = "securecore"
+crate-type = ["cdylib"]
+# A test binary can't link: the PHP symbols resolve only when php loads the .so. The extension
+# is tested by loading it (test/ext-config.sh).
+test = false
+doctest = false
+
+[dependencies]
+ext-php-rs.workspace = true
+securecore-config = { path = "../config" }

@@ -1,0 +1,30 @@
+{
+  "layer1": {
+    "enabled": true,
+    "write": ["wp-content/uploads", "wp-content/cache"],
+    "deny": ["/srv/backups"],
+    "network": {
+      "bind":        [{ "port": 9000 }],
+      "connect":     [{ "port": 3306 }, { "port": 443 }],
+      "unixSockets": ["/run/mysqld/mysqld.sock"]
+    }
+  },
+  "layer2": {
+    "enabled": true,
+    "app": "wordpress",
+    "mode": "enforce",
+    "vault": { "from": "wp-config.php", "secrets": ["DB_PASSWORD", "AUTH_KEY", "SECURE_AUTH_KEY", "LOGGED_IN_KEY", "NONCE_KEY", "AUTH_SALT", "SECURE_AUTH_SALT", "LOGGED_IN_SALT", "NONCE_SALT"] },
+    "core": { "hosts": ["api.wordpress.org", "downloads.wordpress.org"] },
+    "default": { "hosts": [], "files": "own", "tables": "own", "options": "own" },
+    "components": {
+      "contact-form-7": { "hosts": [] },
+      "woocommerce": { "hosts": ["api.stripe.com"], "tables": ["wc_*", "woocommerce_*"], "grants": ["users:read"] }
+    }
+  },
+  "layer3": {
+    "enabled": true,
+    "isolate": ["contact-form-7"],
+    "limits": { "timeoutMs": 5000, "memoryMb": 256 },
+    "write": { "contact-form-7": ["wp-content/uploads/wpcf7_uploads"] }
+  }
+}

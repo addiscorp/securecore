@@ -1,0 +1,6 @@
+{
+  "$schema": "../securecore.schema.json",
+  "layer1": { "enabled": false },
+  "layer2": { "enabled": false },
+  "layer3": { "enabled": false }
+}
