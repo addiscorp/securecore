@@ -21,7 +21,8 @@ cp "$root/plugin/securecore.php" "$root/plugin/SecureCore.php" "$pkg/"
 # The loader lives one level down so WordPress does not list it as a second plugin.
 mkdir -p "$pkg/mu-plugin"
 cp "$root/plugin/securecore-loader.php" "$pkg/mu-plugin/"
-cp "$root/sandbox/worker.php" "$root/sandbox/setup.php" "$root/sandbox/scan.php" "$root/sandbox/gen-manifest.php" "$pkg/sandbox/"
+cp "$root/sandbox/worker.php" "$root/sandbox/setup.php" "$root/sandbox/scan.php" "$root/sandbox/gen-manifest.php" \
+  "$root/sandbox/bootstrap.php" "$root/sandbox/realwp.php" "$root/sandbox/marshal.php" "$pkg/sandbox/"
 cp "$root/bin/securecore-worker" "$pkg/bin/"
 cp "$root/templates/securecore.service" "$root/templates/compose.yml" "$pkg/templates/"
 cp "$root/INSTALL.md" "$pkg/"

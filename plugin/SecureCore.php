@@ -27,6 +27,15 @@ namespace SecureCore;
 if (defined('SECURECORE_DISABLED') && SECURECORE_DISABLED) return;
 // wp-cli runs as the site owner, not as a web request; plugins load normally there.
 if (defined('WP_CLI') && WP_CLI) return;
+// Inside the sandbox's own WordPress (the "real WordPress" model, #42): this file is loaded
+// by the mu-plugin loader there too. Load no plugins — core's active plugins must not
+// auto-load, and the one sandboxed plugin is required directly by sandbox/realwp.php — and
+// do nothing else, so the sandbox never tries to open a worker socket of its own.
+if (defined('SECURECORE_SANDBOX') && SECURECORE_SANDBOX) {
+    add_filter('option_active_plugins', '__return_empty_array', PHP_INT_MAX);
+    add_filter('site_option_active_sitewide_plugins', '__return_empty_array', PHP_INT_MAX);
+    return;
+}
 
 function audit(string $plugin, string $event, array $detail = []): void
 {
@@ -182,6 +191,306 @@ final class Sandbox
         }
         return is_array($value) ? array_map($this->import(...), $value) : $value;
     }
+}
+
+/** The "real WordPress" model (addiscorp/securecore#42, part 1): define SECURECORE_REALWP. */
+function realwp_enabled(): bool
+{
+    return defined('SECURECORE_REALWP') && SECURECORE_REALWP;
+}
+
+/**
+ * Core side of the "real WordPress" sandbox. The plugin runs inside its own WordPress in the
+ * worker (sandbox/realwp.php); this class is the other end of that request's socket. It
+ *   - answers the sandbox's database calls against core's real $wpdb (the gateway);
+ *   - answers the salted pluggable calls (nonces, hashes, auth, wp_mail) with core's own;
+ *   - mirrors the registrations the plugin made in the sandbox into this, the serving
+ *     WordPress — hooks, shortcodes, REST routes, scripts, styles and admin menus — as stubs
+ *     that call back into the sandbox when core fires them;
+ *   - replays the request state (main query, current user) into the sandbox so a callback
+ *     sees the same post/query/user core does.
+ *
+ * Part 1 has no SQL policy yet (a later part of #42): the gateway runs whatever query the
+ * sandbox sends. See the PR for what that leaves open.
+ */
+require_once __DIR__ . '/sandbox/marshal.php';
+
+final class RealWpSandbox
+{
+    /** @var resource */
+    private $sock;
+    private bool $alive = true;
+    /** Page-render callbacks for mirrored admin menus, by page hook suffix. */
+    private array $pageHooks = [];
+
+    public function __construct(public readonly string $plugin, private readonly array $manifest)
+    {
+        $socket = socket_path();
+        $stream = @stream_socket_client("unix://$socket", $errno, $errstr, 15);
+        if (!$stream) {
+            $this->alive = false;
+            audit($plugin, 'sandbox.fail', ['reason' => "no worker on $socket: $errstr"]);
+            return;
+        }
+        $this->sock = $stream;
+        stream_set_timeout($stream, 30);
+    }
+
+    public function alive(): bool
+    {
+        return $this->alive;
+    }
+
+    public function boot(): void
+    {
+        if (!$this->alive) return;
+        $this->send(['boot', [
+            'plugin' => $this->plugin,
+            'main' => WP_PLUGIN_DIR . '/' . $this->plugin,
+            'prefix' => $GLOBALS['wpdb']->prefix,
+            'get' => $_GET,
+            'post' => $_POST,
+            'server' => array_intersect_key($_SERVER, array_flip(['REQUEST_METHOD', 'REQUEST_URI', 'QUERY_STRING', 'HTTP_HOST', 'HTTPS', 'SERVER_NAME', 'SERVER_PORT', 'HTTP_USER_AGENT', 'PATH_INFO'])),
+            'constants' => $this->request_constants(),
+        ]]);
+        $this->pump('ready');
+    }
+
+    /** The request-shape constants the sandbox needs defined before it boots WordPress. */
+    private function request_constants(): array
+    {
+        $out = [];
+        foreach (['WP_ADMIN', 'DOING_AJAX', 'REST_REQUEST', 'DOING_CRON', 'WP_CLI', 'DOING_AUTOSAVE'] as $c) {
+            if (defined($c)) $out[$c] = constant($c);
+        }
+        return $out;
+    }
+
+    /** Replay the request state into the sandbox (main query, current user). One-way. */
+    public function setup_state(): void
+    {
+        if (!$this->alive) return;
+        global $wp_query, $wp;
+        $state = ['user_id' => get_current_user_id()];
+        if (isset($wp_query) && $wp_query instanceof \WP_Query) {
+            $state['query_vars'] = $wp_query->query_vars;
+            $state['query_flags'] = [
+                'is_single' => $wp_query->is_single, 'is_page' => $wp_query->is_page,
+                'is_singular' => $wp_query->is_singular, 'is_home' => $wp_query->is_home,
+                'is_front_page' => $wp_query->is_front_page, 'is_archive' => $wp_query->is_archive,
+                'is_search' => $wp_query->is_search, 'is_404' => $wp_query->is_404,
+                'is_admin' => is_admin(),
+            ];
+        }
+        $this->send(['setup', $state]);
+    }
+
+    /** Run the sandbox callback $id with $args; return what it returned. */
+    public function call(int $id, array $args, string $tag = ''): mixed
+    {
+        if (!$this->alive) return $args[0] ?? null;
+        $this->send(['call', $id, $this->marshal_out($args), $tag]);
+        $reply = $this->pump('return');
+        if ($reply === null) return $args[0] ?? null;
+        if ($reply[0] === 'throw') return $args[0] ?? null;
+        return $this->marshal_in($reply[1]);
+    }
+
+    public function end(): void
+    {
+        if (!$this->alive) return;
+        $this->send(['end']);
+        fclose($this->sock);
+        $this->alive = false;
+    }
+
+    // --- the loop -----------------------------------------------------------------------
+
+    /**
+     * Serve the sandbox's messages until it sends the one we are waiting for ($until is
+     * 'ready' or 'return'). Returns that message, or null if the sandbox went away.
+     */
+    private function pump(string $until): ?array
+    {
+        while ($this->alive) {
+            $line = fgets($this->sock);
+            if ($line === false) {
+                $timeout = stream_get_meta_data($this->sock)['timed_out'];
+                audit($this->plugin, $timeout ? 'sandbox.timeout' : 'sandbox.exit');
+                $this->alive = false;
+                return null;
+            }
+            if ($line === "\n" || $line === "\r\n") continue;
+            if ($line[0] === '#') {
+                audit($this->plugin, 'sandbox.audit', json_decode(substr($line, 1), true) ?: []);
+                continue;
+            }
+            $message = unserialize(base64_decode(trim($line)), ['allowed_classes' => false]);
+            if (!is_array($message)) continue;
+            switch ($message[0]) {
+                case 'db':
+                    $this->send(['return', db_answer($message[1], $message[2])]);
+                    break;
+                case 'pluggable':
+                    $this->pluggable($message[1], $message[2]);
+                    break;
+                case 'log':
+                    audit($this->plugin, 'sandbox.log', ['message' => $message[1]]);
+                    break;
+                case 'ready':
+                    echo $message[1];
+                    $this->apply_regs($message[2] ?? []);
+                    if ($until === 'ready') return $message;
+                    break;
+                case 'return':
+                case 'throw':
+                    // Buffered plugin output is at index 2 for both; index 1 of 'throw' is the
+                    // error message (audited, never echoed into the page).
+                    echo $message[2] ?? '';
+                    $this->apply_regs($message[3] ?? []);
+                    if ($message[0] === 'throw') audit($this->plugin, 'sandbox.throw', ['message' => $message[1]]);
+                    return $message;
+            }
+        }
+        return null;
+    }
+
+    private function pluggable(string $function, array $args): void
+    {
+        if (!function_exists($function)) {
+            $this->send(['return', null]);
+            return;
+        }
+        try {
+            $this->send(['return', $function(...$this->import($args))]);
+        } catch (\Throwable $error) {
+            $this->send(['return', null]);
+            audit($this->plugin, 'pluggable.fail', ['name' => $function, 'message' => $error->getMessage()]);
+        }
+    }
+
+    // --- mirroring the sandbox's registrations into this WordPress ----------------------
+
+    private function apply_regs(array $ops): void
+    {
+        foreach ($ops as $op) {
+            try {
+                $this->apply_reg($op);
+            } catch (\Throwable $error) {
+                audit($this->plugin, 'mirror.fail', ['op' => $op[0] ?? '?', 'message' => $error->getMessage()]);
+            }
+        }
+    }
+
+    private function apply_reg(array $op): void
+    {
+        $kind = $op[0];
+        switch ($kind) {
+            case 'hook': {
+                [, $tag, $id, $priority, $accepted] = $op;
+                add_filter($tag, fn (...$args) => $this->call($id, $args, $tag), $priority, max(1, $accepted));
+                break;
+            }
+            case 'shortcode': {
+                [, $tag, $id] = $op;
+                add_shortcode($tag, fn ($atts, $content, $t) => (string) $this->call($id, [$atts, $content, $t]));
+                break;
+            }
+            case 'rest': {
+                [, $namespace, $route, $handlers] = $op;
+                $route = '/' . ltrim(substr($route, strlen('/' . $namespace)), '/');
+                register_rest_route($namespace, $route, array_map($this->import(...), $handlers), true);
+                break;
+            }
+            case 'script_register':
+            case 'style_register': {
+                [, $handle, $src, $deps, $ver, $args, $extra] = $op;
+                $deps = is_array($deps) ? $deps : [];
+                $deps = array_values(array_filter($deps, 'is_string'));
+                $reg = $kind === 'script_register' ? wp_scripts() : wp_styles();
+                $reg->add($handle, $src, $deps, $ver, $kind === 'script_register' ? $args : ($args ?: 'all'));
+                if (is_array($extra)) {
+                    foreach ($extra as $k => $v) $reg->add_data($handle, $k, $v);
+                }
+                break;
+            }
+            case 'script_enqueue':
+                wp_enqueue_script($op[1]);
+                break;
+            case 'style_enqueue':
+                wp_enqueue_style($op[1]);
+                break;
+            case 'menu':
+                $GLOBALS['menu'][] = $op[1];
+                break;
+            case 'submenu':
+                $GLOBALS['submenu'][$op[1]][] = $op[2];
+                break;
+            case 'registered_page':
+                $GLOBALS['_registered_pages'][$op[1]] = true;
+                break;
+            case 'admin_page_hook':
+                $GLOBALS['admin_page_hooks'][$op[1]] = $op[2];
+                break;
+        }
+    }
+
+    // --- values crossing the socket -----------------------------------------------------
+
+    /** Callback references the plugin passed come back to the sandbox when core calls them. */
+    private function import(mixed $value): mixed
+    {
+        if (is_array($value) && count($value) === 1 && isset($value['__securecore_callback'])) {
+            $id = (int) $value['__securecore_callback'];
+            return fn (...$args) => $this->call($id, $args);
+        }
+        return is_array($value) ? array_map($this->import(...), $value) : $value;
+    }
+
+    // core → sandbox (marshal_out) and sandbox → core (marshal_in). WordPress objects cannot
+    // cross the socket as themselves (unserialize forbids classes). Each side encodes them as
+    // small markers and the other rebuilds them from its own WordPress — the post by id, the
+    // main query and the $wp object from its own globals — so a callback works on the same
+    // post/query/user core has. Unknown objects cross as null (reported, not fatal); this is
+    // the request-state limit the spike reports on.
+    private function marshal_out(mixed $value): mixed
+    {
+        return marshal_encode($value);
+    }
+
+    private function marshal_in(mixed $value): mixed
+    {
+        return marshal_decode($value, fn (int $id) => fn (...$args) => $this->call($id, $args));
+    }
+
+    private function send(array $message): void
+    {
+        try {
+            $line = base64_encode(serialize($message));
+        } catch (\Throwable $error) {
+            $line = base64_encode(serialize(['return', null]));
+        }
+        if ($this->alive) fwrite($this->sock, $line . "\n");
+    }
+}
+
+/** The gateway: run $wpdb->$method(...$args) in core and return the answer for GatewayWpdb. */
+function db_answer(string $method, array $args): mixed
+{
+    global $wpdb;
+    if ($method === 'query') {
+        $return = $wpdb->query($args[0] ?? '');
+        return [
+            'return' => $return,
+            'last_result' => array_map(static fn ($r) => (array) $r, $wpdb->last_result ?: []),
+            'last_error' => $wpdb->last_error,
+            'insert_id' => $wpdb->insert_id,
+            'rows_affected' => $wpdb->rows_affected ?? 0,
+            'num_rows' => $wpdb->num_rows,
+        ];
+    }
+    if (method_exists($wpdb, $method)) return $wpdb->$method(...$args);
+    return null;
 }
 
 /**
@@ -405,9 +714,31 @@ if (!worker_running()) {
 
 // Start the sandboxes where core would have included the plugins.
 add_action('muplugins_loaded', function () use ($sandboxed, $manifests) {
+    $realwp = realwp_enabled();
     $sandboxes = [];
-    foreach ($sandboxed as $plugin) $sandboxes[] = new Sandbox($plugin, $manifests[$plugin]);
+    foreach ($sandboxed as $plugin) {
+        $sandboxes[] = $realwp
+            ? new RealWpSandbox($plugin, $manifests[$plugin])
+            : new Sandbox($plugin, $manifests[$plugin]);
+    }
     foreach ($sandboxes as $sandbox) $sandbox->boot();
+
+    // Real-WordPress model: once the request is resolved, replay its state (main query,
+    // current user) into each sandbox so a callback sees the same post/query/user as core.
+    if ($realwp) {
+        $sent = false;
+        $send_state = function () use ($sandboxes, &$sent) {
+            if ($sent) return;
+            $sent = true;
+            foreach ($sandboxes as $sandbox) {
+                if ($sandbox instanceof RealWpSandbox && $sandbox->alive()) $sandbox->setup_state();
+            }
+        };
+        add_action('wp', $send_state, PHP_INT_MIN);                 // front end: after the main query
+        add_action('current_screen', $send_state, PHP_INT_MIN);    // admin: after the screen is known
+        add_action('rest_api_init', $send_state, PHP_INT_MIN);     // REST: before routes dispatch
+    }
+
     add_action('shutdown', function () use ($sandboxes) {
         foreach ($sandboxes as $sandbox) $sandbox->end();
     }, PHP_INT_MAX);

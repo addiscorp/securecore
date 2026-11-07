@@ -30,7 +30,11 @@ services:
     build: { context: .., dockerfile: docker/worker.Dockerfile }
     network_mode: none
     restart: unless-stopped
-    environment: {}
+    # SECURECORE_REALWP: the "real WordPress" model (#42, part 1) — the child boots the site's
+    # own WordPress and runs its plugin inside it. Core must agree (define SECURECORE_REALWP in
+    # wp-config). Unset here = the forward-stub worker (#11), kept for the benchmark.
+    environment:
+      SECURECORE_REALWP: ${SECURECORE_REALWP:-}
     # The default launcher, hardening the worker through PHP settings (bin/securecore-worker,
     # installed under wp-content/securecore). The no-network container is the extra layer.
     # It waits for install-securecore to have written the launcher.

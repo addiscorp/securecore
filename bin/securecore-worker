@@ -51,15 +51,24 @@ if [ -S "$sock" ] && "$php" -r 'exit(@stream_socket_client("unix://" . $argv[1])
   exit 1
 fi
 
-# open_basedir: only the worker's code, the plugins (its input), the manifests and the
-# socket dir. wp-config.php and the rest of the site are outside it, so a sandboxed plugin
-# cannot read them. disable_functions: process execution, and every outbound-network call,
-# so a plugin cannot shell out or open a connection. allow_url_fopen/include off for the
-# same reason. env -i: a clean environment, so no host secrets leak in through getenv().
+# open_basedir: the worker's code, the plugins (its input), the manifests and the socket dir.
+# wp-config.php and the rest of the site are outside it, so a sandboxed plugin cannot read
+# them. In the "real WordPress" model (SECURECORE_REALWP, #42) the worker must also read the
+# site's WordPress core, so the WordPress root is added — reading wp-config.php is then left
+# to gelada to deny (a later part of #42; on this Docker spike the worker mounts it blocked).
+# disable_functions: process execution, and every outbound-network call, so a plugin cannot
+# shell out or open a connection. allow_url_fopen/include off for the same reason. env -i: a
+# clean environment, so no host secrets leak in through getenv().
+basedir="$code:$plugins:$manifests:$sockdir"
+if [ -n "${SECURECORE_REALWP:-}" ]; then
+  wproot=$(CDPATH='' cd "$content/.." && pwd)
+  basedir="$basedir:$wproot"
+fi
 exec env -i PATH=/usr/bin:/bin:/usr/local/bin \
   ${SECURECORE_NOFORK:+SECURECORE_NOFORK="$SECURECORE_NOFORK"} \
+  ${SECURECORE_REALWP:+SECURECORE_REALWP="$SECURECORE_REALWP"} \
   "$php" \
-  -d open_basedir="$code:$plugins:$manifests:$sockdir" \
+  -d open_basedir="$basedir" \
   -d disable_functions="exec,passthru,shell_exec,system,proc_open,proc_close,proc_get_status,proc_terminate,popen,pcntl_exec,fsockopen,pfsockopen,stream_socket_client,socket_create,socket_connect,socket_bind,curl_init,curl_exec,curl_multi_exec,mail" \
   -d allow_url_fopen=0 -d allow_url_include=0 \
   -d opcache.enable=1 -d opcache.enable_cli=1 -d opcache.validate_timestamps=0 \
