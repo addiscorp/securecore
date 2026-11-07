@@ -17,7 +17,11 @@ mkdir -p "$pkg/sandbox" "$pkg/bin" "$pkg/templates" "$pkg/setup"
 # install.sh's site setup (WordPress, database, wp-config.php), run before the plugin is in place.
 cp "$root/setup/site.php" "$pkg/setup/"
 
-cp "$root/plugin/securecore.php" "$root/plugin/SecureCore.php" "$pkg/"
+cp "$root/plugin/securecore.php" "$root/plugin/SecureCore.php" "$root/plugin/sql-policy.php" "$pkg/"
+# The vendored SQL parser (phpmyadmin/sql-parser, pinned in plugin/composer.json — APS 10). The
+# gateway's query policy needs it in core; ship it, with the composer files for provenance.
+cp -R "$root/plugin/vendor" "$pkg/vendor"
+cp "$root/plugin/composer.json" "$root/plugin/composer.lock" "$pkg/"
 # The loader lives one level down so WordPress does not list it as a second plugin.
 mkdir -p "$pkg/mu-plugin"
 cp "$root/plugin/securecore-loader.php" "$pkg/mu-plugin/"

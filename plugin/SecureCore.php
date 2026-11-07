@@ -214,6 +214,24 @@ function realwp_enabled(): bool
  * sandbox sends. See the PR for what that leaves open.
  */
 require_once __DIR__ . '/sandbox/marshal.php';
+require_once __DIR__ . '/sql-policy.php';
+
+/**
+ * Register the vendored SQL parser's autoloader (phpmyadmin/sql-parser, in the plugin zip). Done
+ * once, and only when a real-WordPress sandbox actually needs to check a query, so a normal
+ * request never pays for it. Without the parser the gateway falls back to allowing queries (the
+ * policy decides so), which is the part-1 behaviour — logged once so a broken install is visible.
+ */
+function require_sql_parser(): bool
+{
+    static $ok = null;
+    if ($ok !== null) return $ok;
+    $autoload = __DIR__ . '/vendor/autoload.php';
+    $ok = is_file($autoload);
+    if ($ok) require_once $autoload;
+    else audit('(securecore)', 'db.parser-missing', ['path' => $autoload]);
+    return $ok;
+}
 
 final class RealWpSandbox
 {
@@ -222,6 +240,8 @@ final class RealWpSandbox
     private bool $alive = true;
     /** Page-render callbacks for mirrored admin menus, by page hook suffix. */
     private array $pageHooks = [];
+    /** The SQL policy for this plugin, built at boot once $wpdb and the parser are available. */
+    private ?SqlPolicy $policy = null;
 
     public function __construct(public readonly string $plugin, private readonly array $manifest)
     {
@@ -244,6 +264,12 @@ final class RealWpSandbox
     public function boot(): void
     {
         if (!$this->alive) return;
+        // Build this plugin's SQL policy from core's real $wpdb (live table names + prefix) and
+        // the plugin's manifest (its own options and any grants). The gateway checks every query
+        // the sandbox forwards against it (addiscorp/securecore#42, part 2).
+        if (require_sql_parser()) {
+            $this->policy = new SqlPolicy($GLOBALS['wpdb'], $this->manifest);
+        }
         $this->send(['boot', [
             'plugin' => $this->plugin,
             'main' => WP_PLUGIN_DIR . '/' . $this->plugin,
@@ -329,7 +355,7 @@ final class RealWpSandbox
             if (!is_array($message)) continue;
             switch ($message[0]) {
                 case 'db':
-                    $this->send(['return', db_answer($message[1], $message[2], $this->plugin)]);
+                    $this->send(['return', $this->db_answer($message[1], $message[2])]);
                     break;
                 case 'pluggable':
                     $this->pluggable($message[1], $message[2]);
@@ -472,44 +498,105 @@ final class RealWpSandbox
         }
         if ($this->alive) fwrite($this->sock, $line . "\n");
     }
-}
 
-/**
- * The gateway: run one of the sandbox $wpdb's calls against core's real $wpdb and return the
- * answer for the connectionless GatewayWpdb. The method is allowlisted (addiscorp/securecore#42,
- * review note 1): the sandbox's $wpdb only ever needs these four, so core never calls an
- * arbitrary $wpdb method by name — a refused method is audited and returns null, ahead of the
- * per-row SQL policy that is a later part of #42.
- */
-function db_answer(string $method, array $args, string $plugin = '(sandbox)'): mixed
-{
-    global $wpdb;
-    switch ($method) {
-        case 'query':
-            // The sandbox's $wpdb::query() always sends a string; guard anyway so a malformed
-            // call can never reach mysqli_query() with a non-string and take down the core
-            // request. Audited, returns an empty result.
-            if (!is_string($args[0] ?? '')) {
-                audit($plugin, 'db.refused', ['method' => 'query', 'reason' => 'non-string: ' . gettype($args[0] ?? null)]);
-                return ['return' => false, 'last_result' => [], 'last_error' => '', 'insert_id' => 0, 'rows_affected' => 0, 'num_rows' => 0];
-            }
-            $return = $wpdb->query($args[0] ?? '');
-            return [
-                'return' => $return,
-                'last_result' => array_map(static fn ($r) => (array) $r, $wpdb->last_result ?: []),
-                'last_error' => $wpdb->last_error,
-                'insert_id' => $wpdb->insert_id,
-                'rows_affected' => $wpdb->rows_affected ?? 0,
-                'num_rows' => $wpdb->num_rows,
-            ];
-        case 'db_version':
-        case 'db_server_info':
-            return $wpdb->$method();
-        case 'get_col_info':
-            return $wpdb->get_col_info($args[0] ?? 'name', $args[1] ?? -1);
+    // --- the database gateway -------------------------------------------------------------------
+
+    /**
+     * Run one of the sandbox $wpdb's calls against core's real $wpdb and return the answer for the
+     * connectionless GatewayWpdb. The method is allowlisted: the sandbox's $wpdb only ever needs
+     * these four, so core never calls an arbitrary $wpdb method by name. 'query' goes through the
+     * SQL policy (addiscorp/securecore#42, part 2); the other three carry no row data.
+     */
+    private function db_answer(string $method, array $args): mixed
+    {
+        global $wpdb;
+        switch ($method) {
+            case 'query':
+                return $this->gateway_query($args[0] ?? '');
+            case 'db_version':
+            case 'db_server_info':
+                return $wpdb->$method();
+            case 'get_col_info':
+                return $wpdb->get_col_info($args[0] ?? 'name', $args[1] ?? -1);
+        }
+        audit($this->plugin, 'db.refused', ['method' => $method]);
+        return null;
     }
-    audit($plugin, 'db.refused', ['method' => $method]);
-    return null;
+
+    /**
+     * The policy-checked query path. A refused statement never reaches the database: it returns
+     * what a failed $wpdb query returns (false/empty, last_error "securecore: denied <reason>"),
+     * so the plugin degrades rather than crashes. An allowed statement runs, and its rows are
+     * filtered (users secrets stripped, usermeta capability/session rows and foreign/sensitive
+     * options removed) before they cross back.
+     */
+    private function gateway_query(mixed $query): array
+    {
+        global $wpdb;
+        // The sandbox's $wpdb::query() always sends a string; guard anyway so a malformed call can
+        // never reach mysqli_query() with a non-string and take down the core request.
+        if (!is_string($query)) {
+            audit($this->plugin, 'db.refused', ['method' => 'query', 'reason' => 'non-string: ' . gettype($query)]);
+            return $this->db_failed('bad query type');
+        }
+        $decision = $this->policy?->decide($query) ?? ['run' => true, 'filters' => []];
+        if (!($decision['run'] ?? true)) {
+            audit($this->plugin, 'db.deny', ['reason' => $decision['reason'] ?? '', 'sql' => self::sql_excerpt($query)]);
+            return $this->db_failed($decision['reason'] ?? 'denied');
+        }
+        $return = $wpdb->query($query);
+        $rows = array_map(static fn ($r) => (array) $r, $wpdb->last_result ?: []);
+        $rows = $this->filter_rows($rows, $decision['filters'] ?? []);
+        return [
+            'return' => $return,
+            'last_result' => array_values($rows),
+            'last_error' => $wpdb->last_error,
+            'insert_id' => $wpdb->insert_id,
+            'rows_affected' => $wpdb->rows_affected ?? 0,
+            'num_rows' => count($rows),
+        ];
+    }
+
+    /** Apply a decision's result filters to the rows core's $wpdb returned. */
+    private function filter_rows(array $rows, array $filters): array
+    {
+        if ($rows === [] || $filters === [] || $this->policy === null) return $rows;
+        $stripUsers = !empty($filters['strip_user_secrets']);
+        $usermeta = !empty($filters['usermeta']);
+        $keepCaps = !empty($filters['keep_caps']);
+        $options = $filters['options'] ?? null;        // 'allowlist' | 'denied' | null
+        $out = [];
+        foreach ($rows as $row) {
+            if ($stripUsers) {
+                unset($row['user_pass'], $row['user_activation_key']);
+            }
+            if ($usermeta && isset($row['meta_key']) && $this->policy->usermetaRowDenied((string) $row['meta_key'], $keepCaps)) {
+                continue;
+            }
+            if ($options !== null && array_key_exists('option_name', $row)) {
+                $name = (string) $row['option_name'];
+                if ($options === 'allowlist' ? !$this->policy->bulkOptionAllowed($name) : $this->policy->optionReadDenied($name)) {
+                    continue;
+                }
+            }
+            $out[] = $row;
+        }
+        return $out;
+    }
+
+    /** The shape core's $wpdb returns for a query that failed: nothing, with a last_error. */
+    private function db_failed(string $reason): array
+    {
+        return ['return' => false, 'last_result' => [], 'last_error' => 'securecore: denied ' . $reason,
+                'insert_id' => 0, 'rows_affected' => 0, 'num_rows' => 0];
+    }
+
+    /** A one-line, length-capped excerpt of a query for the audit log. */
+    private static function sql_excerpt(string $sql): string
+    {
+        $sql = preg_replace('/\s+/', ' ', trim($sql)) ?? $sql;
+        return strlen($sql) > 300 ? substr($sql, 0, 300) . '…' : $sql;
+    }
 }
 
 /**
@@ -621,8 +708,23 @@ function generate_manifest(string $pluginFile): array
     $functions = array_values(array_filter($scan['called'], fn ($n) => !isset($internal[$n])));
     sort($functions);
     sort($scan['hooks']);
+    // The database-policy section (addiscorp/securecore#42, part 2): the plugin's own options and
+    // tables, scanned from its code, and the grants it is allowed. Grants are a human decision —
+    // generated empty, so a sandboxed plugin reaches none of core's sensitive data until someone
+    // adds one. "options" is what the gateway keeps for this plugin in a bulk options read.
+    // A plugin's "own" options are the ones it writes — but it cannot claim one of core's
+    // protected options as its own just by writing it (that would launder admin_email et al. past
+    // the gateway), so drop those here as well as in the policy.
+    $protected = array_flip(['active_plugins', 'active_sitewide_plugins', 'admin_email',
+        'users_can_register', 'default_role', 'cron', 'mailserver_login', 'mailserver_pass',
+        'siteurl', 'home', $GLOBALS['wpdb']->prefix . 'user_roles']);
+    $dbOptions = array_values(array_filter($scan['db_options'] ?? [], fn ($o) => !isset($protected[$o])));
+    $dbTables = $scan['db_tables'] ?? [];
+    sort($dbOptions);
+    sort($dbTables);
     $manifest = ['plugin' => $pluginFile, 'hooks' => $scan['hooks'], 'functions' => $functions]
-        + ($scan['dynamic'] ? ['dynamic_hooks' => true] : []);
+        + ($scan['dynamic'] ? ['dynamic_hooks' => true] : [])
+        + ['db' => ['options' => $dbOptions, 'tables' => $dbTables, 'grants' => []]];
     @mkdir(data_dir() . '/manifests', 0755, true);
     file_put_contents(data_dir() . '/manifests/' . manifest_name($pluginFile), json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
     return $manifest;
@@ -701,18 +803,44 @@ function core_option_names(): array
     return $names;
 }
 
+/**
+ * The options a sandboxed plugin may be handed in bulk: WordPress's own options, minus the ones
+ * #42 denies. The ONE source of truth shared by the pre-boot snapshot (write_options_snapshot())
+ * and the gateway's bulk-read filter (SqlPolicy::bulkOptionAllowed()), so the snapshot the parent
+ * boots from and the options a child re-reads over the gateway can never disagree.
+ *
+ * It is core_option_names() plus {prefix}user_roles (core's role→capability map, which the
+ * sandbox's WP_Roles needs but which populate_roles(), not populate_options(), seeds), minus the
+ * options #42, part 2 step 4 keeps out: the active-plugin lists (forced empty in the sandbox) and
+ * the read-denied secrets/config (admin_email, users_can_register, default_role, cron,
+ * mailserver_login, mailserver_pass). siteurl and home stay: the parent and the children need
+ * them to build URLs, they are public, and dropping them regresses rendering (see sql-policy.php).
+ *
+ * @return array<string,true> option name => true
+ */
+function snapshot_option_allowlist(): array
+{
+    static $names = null;
+    if ($names !== null) return $names;
+    $names = core_option_names();
+    $prefix = isset($GLOBALS['wpdb']) ? $GLOBALS['wpdb']->prefix : 'wp_';
+    $names[$prefix . 'user_roles'] = true;
+    foreach (['active_plugins', 'active_sitewide_plugins', 'admin_email', 'users_can_register',
+              'default_role', 'cron', 'mailserver_login', 'mailserver_pass'] as $denied) {
+        unset($names[$denied]);
+    }
+    return $names;
+}
+
 function write_options_snapshot(): void
 {
     global $wpdb;
-    // Snapshot ONLY WordPress's own options (addiscorp/securecore#47): the allowlist from
-    // populate_options() plus the theme mods. A plugin's autoloaded options — license keys,
-    // SMTP/API credentials — must never reach the pre-booted parent (and so every sandbox
-    // child); the parent boots with no plugins and needs none of them. (#42: "no plugin options
-    // and no secrets" in the parent.)
-    $options = array_intersect_key(wp_load_alloptions(), core_option_names());
-    // The sandbox forces the active-plugin lists empty (the SECURECORE_SANDBOX guard at the top
-    // of this file), so never carry their values even if the allowlist names them.
-    unset($options['active_plugins'], $options['active_sitewide_plugins']);
+    // Snapshot ONLY WordPress's own non-sensitive options (addiscorp/securecore#47, #42 part 2):
+    // the shared allowlist above. A plugin's autoloaded options — license keys, SMTP/API
+    // credentials — and core's own secrets/config (admin_email, mailserver_*, …) must never reach
+    // the pre-booted parent (and so every sandbox child); the parent boots with no plugins and
+    // needs none of them.
+    $options = array_intersect_key(wp_load_alloptions(), snapshot_option_allowlist());
     $payload = ['prefix' => $wpdb->prefix, 'options' => $options];
     $php = '<?php return ' . var_export($payload, true) . ";\n";
     $hash = sha1($php);
