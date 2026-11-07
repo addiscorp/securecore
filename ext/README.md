@@ -202,30 +202,34 @@ a warning for `include`, a fatal for `require`); `log` writes one line and lets 
 `off` does neither. A refusal line is
 
 ```
-securecore: layer2 enforce plugin:acme file_put_contents write /var/www/html/wp-includes/x.php
-securecore: layer2 log     plugin:acme exec               exec  /usr/bin/convert input.png
+securecore: layer2 enforce plugin:acme open   write /var/www/html/wp-includes/x.php
+securecore: layer2 log     plugin:acme exec   exec  /usr/bin/convert input.png
 ```
 
-**Where the checks sit.** Every file open PHP code makes is a call to a file function or an
-include. A stream wrapper would see only `file://` and user schemes: a bare path — nearly all
-real paths — is served by the built-in plain-files wrapper, a `const` the engine returns
-directly without consulting any registry, so it cannot be wrapped without rewriting read-only
-memory. The one place every bare-path open passes through is the function it was called from, so
-on the first request of a worker (once layer 2 is active) the extension replaces the handlers of
-the watched file functions and the process functions with one checking handler, and the
-`zend_compile_file` wrapper (shared with E2a) covers include and require. opcache does not touch
-function handlers, and php-fpm forks after this, so one install per worker holds for every
-request.
+**Where the checks sit.** Every open of a plain path goes through a stream wrapper for its
+scheme, and a bare path (nearly all real paths) resolves `"file"`. `php_stream_locate_url_wrapper`
+looks `"file"` up in the per-request table `FG(stream_wrappers)` when it is set — which is how
+userland `stream_wrapper_unregister('file')` replaces it. So at each request (once layer 2 is
+active) the extension registers a volatile C `file` wrapper whose ops check the policy and
+delegate to the built-in plain-files wrapper's ops. That is the single checkpoint for every open
+through PHP streams — `fopen`, `file_get_contents`, `SplFileObject`, GD by filename, `error_log`
+type 3, libxml, metadata (`touch`/`chmod`/`chown` via `stream_metadata`), and more. Opcache-cached
+includes skip the open, so the `zend_compile_file` wrapper (shared with E2a) still covers include
+and require. Paths are resolved through PHP's realpath cache before the decision, so a symlink
+under the root cannot smuggle an open past the prefix tests, and the protected files are matched
+by (device, inode), so a hard link to one is caught too.
 
-**Covered** (each fails as PHP would on a permission error): `fopen` (read and write modes),
-`file_get_contents`, `file`, `readfile`, `parse_ini_file`, `md5_file`, `sha1_file`, `hash_file`,
-`opendir`, `scandir`, `dir`, `glob`, `file_put_contents`, `unlink`, `mkdir`, `rmdir`, `touch`,
-`chmod`, `tempnam`, `rename`, `copy`, `move_uploaded_file`; `include`/`require`(`_once`); and the
-process functions above. **Not covered** (documented gaps, not silently missed): opens made
-inside another extension's C code (GD, Zip), metadata-only calls (`file_exists`, `stat`,
-`is_dir` — not opens), and the OO file classes (`SplFileObject`, `DirectoryIterator`), whose
-construct-time open neither returns `false` nor passes through a function handler; these are
-follow-ups, and layer 1 (the kernel) backstops a component that reaches a file another way.
+Function handlers cover only what does **not** go through a stream wrapper: the process functions;
+`symlink`/`link` (handled in `ext/standard/link.c`, with `link` refused when its target is a
+protected file); and `stream_wrapper_register`/`unregister`/`restore` of `"file"`, which a
+component could otherwise use to undo the override.
+
+**Covered** (each fails as PHP would on a permission error): everything that opens through PHP
+streams, listed above, plus `include`/`require`(`_once`) and the process functions, plus `symlink`
+and `link`. **Not covered** (documented gaps, not silently missed): opens made inside another
+extension's C code that call `open(2)` directly rather than through PHP streams (libzip's archive
+I/O), and read-only metadata (`file_exists`, `stat`, `is_dir` — not opens). Layer 1 (the kernel)
+backstops a component that reaches a file by a path the engine's streams never see.
 
 `research/enforce/compat.sh` runs Classic Editor, Yoast SEO and Contact Form 7 in enforce mode
 and lists every refusal; `bench/enforce.sh` is the front-page benchmark.

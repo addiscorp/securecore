@@ -27,6 +27,7 @@ content=$html/wp-content
 plugin=$content/plugins/securecore-enforce
 victim=$content/sc-enf-victim.txt
 renamef=$content/sc-enf-rename.txt
+hardlink=$content/sc-enf-hardlink.txt
 fails=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
@@ -56,7 +57,7 @@ wp plugin activate securecore-enforce >/dev/null
 
 cleanup() {
   wp plugin deactivate securecore-enforce >/dev/null 2>&1
-  in_php "rm -rf $plugin $victim $renamef $renamef.moved $content/sc-enf-newdir /opt/sc-enf-out.php /tmp/sc-enf.txt $content/uploads/sc-enf"
+  in_php "rm -rf $plugin $victim $renamef $renamef.moved $hardlink $content/sc-enf-newdir /opt/sc-enf-out.php /tmp/sc-enf.txt $content/uploads/sc-enf"
   compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
   compose restart php >/dev/null 2>&1
   wait_200 || echo "FAIL php-fpm did not come back after cleanup"
@@ -88,7 +89,7 @@ base_cfg enforce "$grant"  granted
 run() {
   put_live "$dir/$1.json"
   sleep 1.3 # > RELOAD_INTERVAL, so every worker has the new config
-  in_php "printf victim > $victim && printf rn > $renamef && chown www-data:www-data $victim $renamef"
+  in_php "printf victim > $victim && printf rn > $renamef && ln -f $html/wp-config.php $hardlink && chown www-data:www-data $victim $renamef"
   T=$(now); sleep 1
   curl -s "$base/?sc_enf=run" > "$dir/out.$1"
   sleep 1
@@ -106,44 +107,49 @@ echo "# enforce (ungranted)"
 run enforce
 for c in read-own write-uploads include-own; do want enforce "$c" OK; done
 for c in read-config read-etc fopen-read-etc scandir-etc write-own write-tmp fopen-write-own \
-         unlink-core mkdir-core rename-core shell_exec exec include-outside status; do
+         unlink-core mkdir-core rename-core shell_exec exec include-outside status \
+         symlink-read symlink-write link-protected hardlink-read; do
   want enforce "$c" BLOCKED
 done
-has "$T" "layer2 enforce plugin:securecore-enforce file_get_contents read-protected $html/wp-config.php" "enforce: reading wp-config is logged read-protected"
-has "$T" "layer2 enforce plugin:securecore-enforce file_get_contents read-outside-root /etc/hostname" "enforce: reading /etc is logged read-outside-root"
-has "$T" "layer2 enforce plugin:securecore-enforce file_put_contents write $plugin/w.txt" "enforce: writing the own folder is logged write"
-has "$T" "layer2 enforce plugin:securecore-enforce exec exec echo scok" "enforce: exec is logged"
-has "$T" "layer2 enforce plugin:securecore-enforce include read-outside-root /opt/sc-enf-out.php" "enforce: include outside the root is logged"
-has "$T" "layer2 enforce plugin:securecore-enforce securecore_status core-only" "enforce: securecore_status from a plugin is logged core-only"
+has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $html/wp-config.php" "enforce: reading wp-config resolves to read-protected"
+has "$T" "layer2 enforce plugin:securecore-enforce open read-outside-root /etc/hostname" "enforce: reading /etc is read-outside-root"
+has "$T" "layer2 enforce plugin:securecore-enforce open write $plugin/w.txt" "enforce: writing the own folder is a refused write"
+has "$T" "layer2 enforce plugin:securecore-enforce exec exec echo scok" "enforce: exec is refused"
+has "$T" "layer2 enforce plugin:securecore-enforce include read-outside-root /opt/sc-enf-out.php" "enforce: include outside the root is refused"
+has "$T" "layer2 enforce plugin:securecore-enforce securecore_status core-only" "enforce: securecore_status from a plugin is core-only"
+has "$T" "layer2 enforce plugin:securecore-enforce link-target read-protected $html/wp-config.php" "enforce: hard-linking a protected file is refused (1c)"
+has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $hardlink" "enforce: a hard link to a protected file is caught by inode (1b)"
 
 # --- 2. log mode: the revert proof — the same ops now all succeed ----------------------------
 echo "# log (nothing blocked)"
 run log
 for c in read-own read-config read-etc fopen-read-etc scandir-etc write-uploads write-own \
          write-tmp fopen-write-own unlink-core mkdir-core rename-core shell_exec exec \
-         include-own include-outside status; do
+         include-own include-outside status symlink-read symlink-write link-protected hardlink-read; do
   want log "$c" OK
 done
-has "$T" "layer2 log plugin:securecore-enforce file_get_contents read-protected $html/wp-config.php" "log: the would-be refusal is recorded, mode log"
+has "$T" "layer2 log plugin:securecore-enforce open read-protected $html/wp-config.php" "log: the would-be refusal is recorded, mode log"
+has "$T" "layer2 log plugin:securecore-enforce open read-protected $hardlink" "log: the hard-link read is recorded (1b), mode log"
 has "$T" "layer2 log plugin:securecore-enforce exec exec echo scok" "log: exec would-be refusal recorded"
 
 # --- 3. layer 2 off: everything works, nothing recorded --------------------------------------
 echo "# off"
 run off
-for c in read-config read-etc write-own exec include-outside status; do want off "$c" OK; done
+for c in read-config read-etc write-own exec include-outside status symlink-read hardlink-read; do want off "$c" OK; done
 if [ "$(audit "$T" | grep -c .)" = 0 ]; then pass "off: no layer2 lines"; else fail "off: no layer2 lines" "$(audit "$T" | head -1)"; fi
 
 # --- 4. enforce, granted ---------------------------------------------------------------------
 echo "# enforce (granted exec + /etc + /opt + own folder)"
 run granted
 for c in read-own read-etc fopen-read-etc scandir-etc write-uploads write-own fopen-write-own \
-         shell_exec exec include-own include-outside; do
+         shell_exec exec include-own include-outside symlink-write; do
   want granted "$c" OK
 done
-for c in read-config write-tmp unlink-core mkdir-core rename-core status; do
+for c in read-config write-tmp unlink-core mkdir-core rename-core status symlink-read link-protected hardlink-read; do
   want granted "$c" BLOCKED
 done
-has "$T" "layer2 enforce plugin:securecore-enforce file_get_contents read-protected $html/wp-config.php" "granted: the protected file is still refused"
+has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $html/wp-config.php" "granted: the protected file is still refused"
+has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $hardlink" "granted: the hard link to it is still refused (inode)"
 has "$T" "layer2 enforce plugin:securecore-enforce securecore_status core-only" "granted: securecore_status is still core-only"
 hasnt "$T" "read-outside-root /etc/hostname" "granted: /etc is no longer refused"
 

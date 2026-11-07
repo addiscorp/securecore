@@ -289,7 +289,7 @@ unsafe extern "C" fn compile_file(file_handle: *mut ext_php_rs::ffi::zend_file_h
     // `false` for include, a fatal for require. SAFETY: the file handle from the engine.
     if let Some(op) = op
         && let Some(path) = unsafe { file_handle.as_ref() }.and_then(|f| zstr(f.filename)).and_then(watch::plain_path)
-        && crate::enforce::include_blocked(op, &securecore_attribution::normalize(Path::new(path)), current)
+        && crate::enforce::include_blocked(op, path, current)
     {
         return std::ptr::null_mut();
     }
