@@ -27,6 +27,15 @@ require_once __DIR__ . '/marshal.php';
 /** Run $wpdb->$method(...$args) in core; return the answer payload (see GatewayWpdb). */
 function db_gateway(string $method, array $args): mixed
 {
+    if (Registry::$parentBoot) {
+        // The worker parent is pre-booting and has no request socket (part 1b). The snapshot
+        // $wpdb serves the options the boot needs; a query reaching here is unexpected — log
+        // it and answer empty so the parent can finish booting rather than block on wait().
+        fwrite(STDERR, gmdate('c') . " securecore-worker preboot: db_gateway($method) with no request; empty\n");
+        return $method === 'query'
+            ? ['return' => false, 'last_result' => [], 'last_error' => '', 'insert_id' => 0, 'rows_affected' => 0, 'num_rows' => 0]
+            : null;
+    }
     send(['db', $method, $args]);
     return wait();
 }
@@ -34,6 +43,10 @@ function db_gateway(string $method, array $args): mixed
 /** Run a salted pluggable function (nonce/hash/auth/mail) in core; return its result. */
 function pluggable_gateway(string $function, array $args): mixed
 {
+    if (Registry::$parentBoot) {
+        fwrite(STDERR, gmdate('c') . " securecore-worker preboot: pluggable_gateway($function) with no request; null\n");
+        return null;
+    }
     send(['pluggable', $function, export_value($args)]);
     return wait();
 }
@@ -48,6 +61,8 @@ final class Registry
 {
     /** The baseline right after boot, before the plugin loaded. */
     public static array $base = [];
+    /** True only while the worker parent pre-boots WordPress (no request socket; part 1b). */
+    public static bool $parentBoot = false;
 }
 
 /** A snapshot of every registration surface we mirror. */
@@ -167,10 +182,65 @@ function rest_handlers(array $endpoints): array
     return $out;
 }
 
+// --- pre-boot (addiscorp/securecore#42, part 1b) --------------------------------------------
+//
+// The worker parent boots WordPress once, before accepting connections, so each forked child
+// inherits the booted state (copy-on-write) instead of running wp-settings.php per request.
+// The parent has no database and no request socket, so it boots against the options snapshot
+// core wrote to disk (make_snapshot_wpdb). These helpers read that snapshot and its hash; the
+// worker re-boots (by exiting for its supervisor to restart it) when the hash changes.
+
+function snapshot_path(string $manifestsDir): string
+{
+    return dirname($manifestsDir) . '/options-snapshot.php';
+}
+
+function snapshot_hash_path(string $manifestsDir): string
+{
+    return dirname($manifestsDir) . '/options-snapshot.hash';
+}
+
+/** The snapshot core wrote: ['prefix' => ?, 'options' => [...]], or null if none/invalid. */
+function read_snapshot(string $manifestsDir): ?array
+{
+    $file = snapshot_path($manifestsDir);
+    if (!is_file($file)) return null;
+    $data = @include $file;
+    return is_array($data) && isset($data['options']) && is_array($data['options']) ? $data : null;
+}
+
+/** The snapshot's current hash on disk, or '' if there is none. */
+function snapshot_hash(string $manifestsDir): string
+{
+    $file = snapshot_hash_path($manifestsDir);
+    return is_file($file) ? trim((string) @file_get_contents($file)) : '';
+}
+
+/** Boot WordPress in the worker parent from the snapshot, front-end shape. Throws on failure. */
+function preboot_wordpress(string $wpRoot, array $snapshot): void
+{
+    $prefix = (string) ($snapshot['prefix'] ?? 'wp_');
+    require_once rtrim($wpRoot, '/') . '/wp-includes/class-wpdb.php';
+    Registry::$parentBoot = true;
+    try {
+        boot_wordpress($wpRoot, $prefix, make_snapshot_wpdb($prefix, $snapshot['options']));
+        // Warm the REST server (core routes) in the parent too, so children inherit it and a
+        // REST request does not rebuild it. The plugin's own routes are still registered and
+        // mirrored per request in the child.
+        if (function_exists('rest_get_server')) rest_get_server();
+    } finally {
+        Registry::$parentBoot = false;
+    }
+}
+
 // --- the child ------------------------------------------------------------------------------
 
-
-function serve_realwp_connection($conn, string $wpRoot): void
+/**
+ * Serve one request. $preBooted is true when the worker parent already booted WordPress and
+ * this child inherited it (part 1b); false when the child boots WordPress itself per request
+ * (part 1). Either way, from the plugin load onward the two paths are identical.
+ */
+function serve_realwp_connection($conn, string $wpRoot, bool $preBooted = false): void
 {
     Conn::$in = $conn;
     Conn::$out = $conn;
@@ -191,10 +261,32 @@ function serve_realwp_connection($conn, string $wpRoot): void
 
     ob_start();
     try {
-        boot_wordpress($wpRoot, $prefix);
+        if ($preBooted) {
+            // WordPress is already booted in this process (forked from the worker parent).
+            // Point the database at this request's socket gateway and drop the parent's option
+            // cache, so every option the plugin reads comes fresh through the gateway, not the
+            // parent's copy (addiscorp/securecore#42, part 1b).
+            $GLOBALS['wpdb'] = make_gateway_wpdb($prefix);
+            // wp-settings.php runs wp_set_wpdb_vars() on the $wpdb it booted with; our swapped
+            // one needs the same, or its table names ($wpdb->users, ->posts, …) and field
+            // types are unset and queries become "SELECT * FROM  WHERE …".
+            $GLOBALS['table_prefix'] = $prefix;
+            if (function_exists('wp_set_wpdb_vars')) wp_set_wpdb_vars();
+            else $GLOBALS['wpdb']->set_prefix($prefix);
+            // Drop the parent's option cache so every option a plugin reads this request comes
+            // fresh through the gateway, not the parent's copy.
+            if (function_exists('wp_cache_delete')) {
+                wp_cache_delete('alloptions', 'options');
+                wp_cache_delete('notoptions', 'options');
+            }
+        } else {
+            boot_wordpress($wpRoot, $prefix);
+        }
         // Admin requests: load WordPress's admin API, so a plugin that extends WP_List_Table
         // or calls add_settings_field()/add_menu_page() at load has them, as in a real
-        // wp-admin request (where wp-admin/admin.php loads these before plugins run).
+        // wp-admin request (where wp-admin/admin.php loads these before plugins run). Under
+        // pre-boot the parent booted the front-end shape, so this also brings the admin API
+        // into the child when the request turns out to be an admin one.
         if (defined('WP_ADMIN') && WP_ADMIN) {
             require_once ABSPATH . 'wp-admin/includes/admin.php';
             set_current_screen();

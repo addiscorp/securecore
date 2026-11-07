@@ -34,6 +34,12 @@ if (!$socketPath || !$pluginsDir || !$manifestsDir) {
 // against. The WordPress root is the parent of wp-content, derived from the plugins dir.
 $realwp = (bool) getenv('SECURECORE_REALWP');
 $wpRoot = $realwp ? dirname($pluginsDir, 2) : '';
+// Pre-boot (addiscorp/securecore#42, part 1b): with SECURECORE_PREBOOT the parent boots
+// WordPress once, from the options snapshot core wrote to disk, and every child forks from
+// that booted state instead of running wp-settings.php per request. Without it, the
+// real-WordPress worker behaves as part 1 (each child boots), which is the "booting per
+// request" row in the benchmark.
+$prebootRequested = $realwp && (bool) getenv('SECURECORE_PREBOOT');
 if ($realwp) require __DIR__ . '/realwp.php';
 
 function log_line(string $line): void
@@ -94,6 +100,27 @@ if (!$realwp) {
 }
 log_line(($realwp ? 'ready (real-WordPress model); ' : 'ready: ' . count($cache) . ' plugins (' . implode(', ', array_keys($cache)) . '); ') . 'manifests are read per request');
 
+// Pre-boot the parent now, before the server socket is up, so the first request already forks
+// from a booted WordPress. If the snapshot is not there yet (core writes it on its next
+// request), boot per request and restart once it appears (see the accept loop).
+$preBooted = false;
+$bootedHash = '';
+if ($prebootRequested) {
+    $bootedHash = snapshot_hash($manifestsDir);
+    $snapshot = read_snapshot($manifestsDir);
+    if ($snapshot === null) {
+        log_line('preboot: no options snapshot at ' . snapshot_path($manifestsDir) . ' yet; booting per request until core writes one');
+    } else {
+        try {
+            preboot_wordpress($wpRoot, $snapshot);
+            $preBooted = true;
+            log_line('preboot: booted WordPress from snapshot (' . count($snapshot['options']) . ' options, hash ' . substr($bootedHash, 0, 12) . ')');
+        } catch (\Throwable $e) {
+            log_line('preboot: boot failed, falling back to per-request boot: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+        }
+    }
+}
+
 // Serve one connection: one request for one plugin. Returns when the request ends. Only a
 // plugin that has a manifest on disk at this moment is served.
 function serve_connection($conn, array $cache, string $pluginsDir, string $manifestsDir): void
@@ -136,24 +163,43 @@ log_line("listening on $socketPath" . ($noFork ? ' (NO FORK: state leaks between
 if (!$noFork) pcntl_signal(\SIGCHLD, \SIG_IGN);
 
 if ($noFork) restore_error_handler();
+
+// When pre-booting, the parent re-boots on an options-snapshot change by exiting for its
+// supervisor (Docker `restart: unless-stopped`, or a systemd Restart=) to start it again — a
+// booted WordPress cannot be re-initialised in place. The check runs once per accepted
+// connection (driven by a request, not a timer), reading a tiny hash file; the just-served
+// request used the previous snapshot. It also fires the first time the snapshot appears when
+// preboot was asked for but none existed at startup, so the worker comes up pre-booted.
+$restart_if_snapshot_changed = function () use ($prebootRequested, $manifestsDir, &$bootedHash, $server): void {
+    if (!$prebootRequested) return;
+    $now = snapshot_hash($manifestsDir);
+    if ($now !== '' && $now !== $bootedHash) {
+        log_line('preboot: options snapshot changed (' . substr($bootedHash, 0, 12) . ' -> ' . substr($now, 0, 12) . '); restarting to re-boot');
+        @fclose($server);
+        exit(75);
+    }
+};
+
 for (;;) {
     $conn = @stream_socket_accept($server, -1);
     if (!$conn) continue;
     if ($noFork) {
         // One process reused for every request: statics and globals carry over. For the
         // isolation test, to show what forking prevents. Never use in production.
-        if ($realwp) serve_realwp_connection($conn, $wpRoot);
+        if ($realwp) serve_realwp_connection($conn, $wpRoot, $preBooted);
         else serve_connection($conn, $cache, $pluginsDir, $manifestsDir);
         fclose($conn);
+        $restart_if_snapshot_changed();
         continue;
     }
     $pid = pcntl_fork();
     if ($pid === 0) {
         restore_error_handler();
         fclose($server);
-        if ($realwp) serve_realwp_connection($conn, $wpRoot);
+        if ($realwp) serve_realwp_connection($conn, $wpRoot, $preBooted);
         else serve_connection($conn, $cache, $pluginsDir, $manifestsDir);
         exit(0);
     }
     fclose($conn);
+    $restart_if_snapshot_changed();
 }

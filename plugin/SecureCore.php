@@ -329,7 +329,7 @@ final class RealWpSandbox
             if (!is_array($message)) continue;
             switch ($message[0]) {
                 case 'db':
-                    $this->send(['return', db_answer($message[1], $message[2])]);
+                    $this->send(['return', db_answer($message[1], $message[2], $this->plugin)]);
                     break;
                 case 'pluggable':
                     $this->pluggable($message[1], $message[2]);
@@ -474,22 +474,41 @@ final class RealWpSandbox
     }
 }
 
-/** The gateway: run $wpdb->$method(...$args) in core and return the answer for GatewayWpdb. */
-function db_answer(string $method, array $args): mixed
+/**
+ * The gateway: run one of the sandbox $wpdb's calls against core's real $wpdb and return the
+ * answer for the connectionless GatewayWpdb. The method is allowlisted (addiscorp/securecore#42,
+ * review note 1): the sandbox's $wpdb only ever needs these four, so core never calls an
+ * arbitrary $wpdb method by name — a refused method is audited and returns null, ahead of the
+ * per-row SQL policy that is a later part of #42.
+ */
+function db_answer(string $method, array $args, string $plugin = '(sandbox)'): mixed
 {
     global $wpdb;
-    if ($method === 'query') {
-        $return = $wpdb->query($args[0] ?? '');
-        return [
-            'return' => $return,
-            'last_result' => array_map(static fn ($r) => (array) $r, $wpdb->last_result ?: []),
-            'last_error' => $wpdb->last_error,
-            'insert_id' => $wpdb->insert_id,
-            'rows_affected' => $wpdb->rows_affected ?? 0,
-            'num_rows' => $wpdb->num_rows,
-        ];
+    switch ($method) {
+        case 'query':
+            // The sandbox's $wpdb::query() always sends a string; guard anyway so a malformed
+            // call can never reach mysqli_query() with a non-string and take down the core
+            // request. Audited, returns an empty result.
+            if (!is_string($args[0] ?? '')) {
+                audit($plugin, 'db.refused', ['method' => 'query', 'reason' => 'non-string: ' . gettype($args[0] ?? null)]);
+                return ['return' => false, 'last_result' => [], 'last_error' => '', 'insert_id' => 0, 'rows_affected' => 0, 'num_rows' => 0];
+            }
+            $return = $wpdb->query($args[0] ?? '');
+            return [
+                'return' => $return,
+                'last_result' => array_map(static fn ($r) => (array) $r, $wpdb->last_result ?: []),
+                'last_error' => $wpdb->last_error,
+                'insert_id' => $wpdb->insert_id,
+                'rows_affected' => $wpdb->rows_affected ?? 0,
+                'num_rows' => $wpdb->num_rows,
+            ];
+        case 'db_version':
+        case 'db_server_info':
+            return $wpdb->$method();
+        case 'get_col_info':
+            return $wpdb->get_col_info($args[0] ?? 'name', $args[1] ?? -1);
     }
-    if (method_exists($wpdb, $method)) return $wpdb->$method(...$args);
+    audit($plugin, 'db.refused', ['method' => $method]);
     return null;
 }
 
@@ -624,6 +643,61 @@ function manifest_file(string $pluginFile): ?string
     return null;
 }
 
+/** The pre-boot options snapshot and its hash, in the data dir next to the manifests. */
+function options_snapshot_path(): string
+{
+    return data_dir() . '/options-snapshot.php';
+}
+
+function options_snapshot_hash_path(): string
+{
+    return data_dir() . '/options-snapshot.hash';
+}
+
+/**
+ * Write the pre-boot options snapshot (addiscorp/securecore#42, part 1b): the autoloaded
+ * options the worker parent boots WordPress from, since the parent has no database of its own.
+ * Values are the raw stored strings, exactly as wp_load_alloptions() holds them, so the parent
+ * re-unserializes them like any request. The sandbox child does NOT read this copy — after it
+ * forks it drops its options cache and reads every option fresh through the gateway; the
+ * snapshot only carries the parent through its no-plugin bootstrap. Written atomically (a temp
+ * file then rename) so the worker never includes a half-written file. The hash lets the worker
+ * notice a change and re-boot.
+ */
+function write_options_snapshot(): void
+{
+    global $wpdb;
+    $options = wp_load_alloptions();
+    // The sandbox's WordPress forces the active-plugin lists empty (the SECURECORE_SANDBOX
+    // guard at the top of this file), so their values never affect the pre-booted parent.
+    // Dropping them keeps the snapshot — and its hash — from changing every time a plugin is
+    // activated or deactivated, which would otherwise re-boot the worker for no gain.
+    unset($options['active_plugins'], $options['active_sitewide_plugins']);
+    // Transients are caches, not boot state: the parent recomputes a missing one, and the
+    // child reads fresh through the gateway. Dropping them keeps the hash from churning on
+    // every cache write (theme patterns, update checks), which would re-boot the worker.
+    foreach (array_keys($options) as $name) {
+        if (str_starts_with($name, '_transient_') || str_starts_with($name, '_site_transient_')) {
+            unset($options[$name]);
+        }
+    }
+    $payload = ['prefix' => $wpdb->prefix, 'options' => $options];
+    $php = '<?php return ' . var_export($payload, true) . ";\n";
+    $hash = sha1($php);
+    // Nothing that affects the parent's boot changed: leave the file (and its hash) alone, so
+    // the worker does not re-boot for a no-op write.
+    if (is_file(options_snapshot_hash_path()) && trim((string) @file_get_contents(options_snapshot_hash_path())) === $hash) return;
+    $dir = data_dir();
+    @mkdir($dir, 0755, true);
+    $tmp = $dir . '/.options-snapshot.' . getmypid() . '.tmp';
+    if (@file_put_contents($tmp, $php, LOCK_EX) === false) return;
+    if (@rename($tmp, options_snapshot_path())) {
+        @file_put_contents(options_snapshot_hash_path(), $hash . "\n", LOCK_EX);
+    } else {
+        @unlink($tmp);
+    }
+}
+
 // --- admin screen -----------------------------------------------------------------------
 // Settings → SecureCore: the worker's status, a Run-in-sandbox switch per installed plugin,
 // and each sandboxed plugin's generated manifest. Always registered, so you can turn the
@@ -694,6 +768,39 @@ $manifests = manifests();
 $active = (array) get_option('active_plugins', []);
 $sandboxed = array_values(array_intersect($active, array_keys($manifests)));
 if (!$sandboxed) return;
+
+// Pre-boot (addiscorp/securecore#42, part 1b): keep an on-disk snapshot of the autoloaded
+// options so the worker parent can boot WordPress once, before any request, with no database
+// of its own. Maintained whenever the real-WordPress model is on and something is sandboxed,
+// so it is ready when the worker (re)starts. Only autoloaded options affect that boot, so we
+// rewrite at most once per request — at shutdown, and only when one of them changed (or no
+// snapshot exists yet). An option write that is not autoloaded (most transients) is ignored.
+if (realwp_enabled()) {
+    // The parent boots WordPress with no plugins, so only WordPress's own structural options
+    // affect that boot; a plugin's options, WooCommerce's settings, transients and the cron
+    // array do not (the parent never reads them, and the child reads every option fresh
+    // through the gateway). So re-snapshot — and re-boot the worker — only when one of these
+    // changes, not on the churn of ordinary option writes, which would re-boot it constantly.
+    $boot_structural = array_flip([
+        'siteurl', 'home', 'blogname', 'blogdescription', 'blog_charset', 'WPLANG',
+        'timezone_string', 'gmt_offset', 'start_of_week', 'date_format', 'time_format',
+        'permalink_structure', 'rewrite_rules', 'category_base', 'tag_base',
+        'show_on_front', 'page_on_front', 'page_for_posts', 'posts_per_page',
+        'template', 'stylesheet', 'current_theme', 'theme_switched', 'blog_public',
+        'sidebars_widgets', 'default_role', 'db_version', 'secret',
+    ]);
+    $mark_dirty = function () { $GLOBALS['securecore_options_dirty'] = true; };
+    $mark_if_structural = function ($option) use ($mark_dirty, $boot_structural) {
+        if (is_string($option) && isset($boot_structural[$option])) $mark_dirty();
+    };
+    add_action('added_option', $mark_if_structural);
+    add_action('updated_option', $mark_if_structural);
+    add_action('deleted_option', $mark_if_structural);
+    if (!file_exists(options_snapshot_path())) $mark_dirty();
+    add_action('shutdown', function () {
+        if (!empty($GLOBALS['securecore_options_dirty'])) write_options_snapshot();
+    }, PHP_INT_MAX - 1);
+}
 
 // Core loads every active plugin with include_once. Hide the sandboxed ones from that loop
 // only; the Plugins screen still shows them as active.

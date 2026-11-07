@@ -35,6 +35,10 @@ services:
     # wp-config). Unset here = the forward-stub worker (#11), kept for the benchmark.
     environment:
       SECURECORE_REALWP: ${SECURECORE_REALWP:-}
+      # SECURECORE_PREBOOT (with SECURECORE_REALWP): the parent boots WordPress once and each
+      # child forks from it, instead of booting per request (#42, part 1b). Unset = boot per
+      # request, the part-1 behaviour kept for the benchmark.
+      SECURECORE_PREBOOT: ${SECURECORE_PREBOOT:-}
     # The default launcher, hardening the worker through PHP settings (bin/securecore-worker,
     # installed under wp-content/securecore). The no-network container is the extra layer.
     # It waits for install-securecore to have written the launcher.
