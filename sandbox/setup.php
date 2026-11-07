@@ -2,7 +2,7 @@
 // Runs inside the wasm sandbox before the plugin's main file.
 //
 // The plugin sees a WordPress API, but every WordPress function here is a stand-in that
-// sends the call to core (SecureCore.php) and waits for the answer. Core checks each call
+// sends the call to core (securecore-core.php) and waits for the answer. Core checks each call
 // against the plugin's manifest. The plugin's own callbacks stay here, numbered; core
 // holds a stub per callback and calls back in when the hook fires.
 //

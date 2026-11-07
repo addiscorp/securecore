@@ -84,8 +84,11 @@ that name. Its constants half is #33.
 | #36 | String callbacks naming core functions (`'__return_false'`) aren't registered | Classic Editor |
 | #37 | A plugin's own objects come back into the sandbox as `__PHP_Incomplete_Class` | WP Mail SMTP |
 
-Also found while setting up: #38, `scripts/package.sh` on macOS with the default TMPDIR
-builds a zip without `SecureCore.php` (case-insensitive volume).
+Also found while setting up: #38, `scripts/package.sh` on macOS with the default TMPDIR built a zip
+without the main class — `securecore.php` (the loader) and `SecureCore.php` (the class) differ only
+in case, so on the case-insensitive staging volume one overwrote the other. Fixed in #51: the class
+file is now `securecore-core.php`, and `package.sh` fails if any two packaged paths are equal
+case-insensitively.
 
 ## Icons (wordpress.org plugins API, `icons`)
 

@@ -1,5 +1,5 @@
 <?php
-// Marshalling WordPress objects across the socket, shared by both ends (SecureCore.php in
+// Marshalling WordPress objects across the socket, shared by both ends (securecore-core.php in
 // core and sandbox/realwp.php in the child). unserialize() on the wire forbids classes, so an
 // object cannot cross as itself. Instead each side encodes the common WordPress objects as
 // small markers and the other rebuilds them from its own WordPress: a post by id, the main

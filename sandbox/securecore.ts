@@ -2,7 +2,7 @@
 //
 //   securecore <plugin-dir-or-file> <main-file>   run the plugin behind sandbox/setup.php
 //
-// stdin and stdout are the line to SecureCore.php in core. The wasm sees only:
+// stdin and stdout are the line to securecore-core.php in core. The wasm sees only:
 //   /sandbox/setup.php   (embedded)
 //   /plugin/...          the plugin's own folder, read-only
 //   /tmp                 empty, in memory, gone when the process exits

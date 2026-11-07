@@ -6,10 +6,14 @@
  * Requires PHP: 8.1
  * License: GPL-2.0-or-later
  *
- * The work is done by SecureCore.php, which the mu-plugin loader includes early (before
+ * The work is done by securecore-core.php, which the mu-plugin loader includes early (before
  * other plugins load) while this plugin is active. Deactivating this plugin turns
  * SecureCore off: plugins load normally again.
+ *
+ * The main class lives in securecore-core.php, not SecureCore.php: a name that differs from this
+ * file only in case would collide with it when the release zip is staged on a case-insensitive
+ * filesystem (macOS default TMPDIR), where one silently overwrites the other (#51).
  */
 defined('ABSPATH') || exit;
 
-require_once __DIR__ . '/SecureCore.php';
+require_once __DIR__ . '/securecore-core.php';
