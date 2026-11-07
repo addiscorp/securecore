@@ -20,7 +20,8 @@ base=http://127.0.0.1:$port
 dir=.tmp/ext-config
 mkdir -p "$dir"
 find "$dir" -mindepth 1 -delete 2>/dev/null
-conf=/etc/securecore/securecore.json
+# At the site root, as in a real install: the root is the folder containing it.
+conf=/var/www/html/securecore.json
 fails=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
@@ -53,6 +54,14 @@ wait_reload() { sleep 1.2; }
 echo "building and starting the extension stack (project securecore-ext, $base)"
 compose build php > "$dir/build.log" 2>&1 || { echo "FAIL docker build (see $dir/build.log)"; exit 1; }
 compose up -d db php web > "$dir/up.log" 2>&1 || { echo "FAIL compose up (see $dir/up.log)"; exit 1; }
+# On a new site volume the image's entrypoint first copies WordPress (and off.json as
+# securecore.json) into it, then starts php-fpm: wait for php-fpm, so that copy can't overwrite
+# the config put below.
+i=0
+until [ "$(php_state | cut -d' ' -f1)" = running ] && compose exec -T php sh -c 'grep -q "^php-fpm" /proc/1/comm' >/dev/null 2>&1; do
+  i=$((i + 1)); [ "$i" -lt 120 ] || { echo "FAIL php-fpm did not start"; exit 1; }
+  sleep 1
+done
 put ext/examples/wordpress.json
 compose restart php >/dev/null 2>&1
 i=0
@@ -78,6 +87,20 @@ is "$(field config)" "$conf" "status names the config path"
 is "$(layers)" 111 "status: all three layers enabled"
 is "$(field layer2_mode)/$(field layer2_app)" enforce/wordpress "status: layer2 enforce, app wordpress"
 is "$(field off)/$(field reload_error)" 0/ "status: not off, no reload error"
+is "$(field root)" /var/www/html "status: the root is the folder containing securecore.json"
+
+# The file sits in the web root, so nginx must refuse it (and any copy an editor leaves).
+if compose exec -T php test -s "$conf"; then pass "securecore.json is in the web root"; else fail "securecore.json is in the web root"; fi
+compose exec -T php sh -c "cp $conf $conf.bak"
+for u in /securecore.json /SecureCore.JSON /securecore%2Ejson /./securecore.json //securecore.json /securecore.json.bak '/securecore.json?x=1'; do
+  c=$(code "$u")
+  case $c in 403|404) pass "nginx refuses $u ($c)" ;; *) fail "nginx refuses $u" "$c" ;; esac
+done
+compose exec -T php rm -f "$conf.bak"
+# The refusal is the rule, not a missing file: the same request for a sibling file works.
+compose exec -T php sh -c "cp /var/www/html/readme.html /var/www/html/securecore-probe.json"
+is "$(code /securecore-probe.json)" 200 "a sibling .json file in the web root is served (so the 404s above are the rule)"
+compose exec -T php rm -f /var/www/html/securecore-probe.json
 
 # --- 2. reload without a restart -------------------------------------------------------------
 before="$(php_state) $(master_pid)"

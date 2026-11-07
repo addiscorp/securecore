@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "securecore.json",
-  "description": "SecureCore configuration. Three layers, each enabled independently; all three disabled\nmeans SecureCore is off. An invalid file means nothing starts.",
+  "description": "SecureCore configuration. Three layers, each enabled independently; all three disabled\nmeans SecureCore is off. An invalid file means nothing starts. Relative paths are relative to\nthe folder containing this file (the app root, as with composer.json); absolute paths are\nused as they are.",
   "type": "object",
   "properties": {
     "$schema": {
@@ -54,7 +54,7 @@
       "type": "object",
       "properties": {
         "deny": {
-          "description": "Paths php-fpm may not read at all, on top of the common secrets SecureCore always denies.",
+          "description": "Paths php-fpm may not read at all, on top of the common secrets SecureCore always denies\n(relative to the folder containing securecore.json, or absolute).",
           "type": "array",
           "default": [],
           "items": {
@@ -73,7 +73,7 @@
           }
         },
         "write": {
-          "description": "Folders php-fpm may write, relative to the app root. Everything else is read-only.",
+          "description": "Folders php-fpm may write (relative to the folder containing securecore.json, or\nabsolute). Everything else is read-only.",
           "type": "array",
           "default": [],
           "items": {
@@ -183,7 +183,7 @@
           }
         },
         "write": {
-          "description": "Extra folders an isolated component's child may write, relative to the app root.",
+          "description": "Extra folders an isolated component's child may write (relative to the folder\ncontaining securecore.json, or absolute).",
           "type": "object",
           "additionalProperties": {
             "type": "array",
@@ -355,7 +355,7 @@
       "type": "object",
       "properties": {
         "from": {
-          "description": "The file the secrets are defined in, relative to the app root.",
+          "description": "The file the secrets are defined in (relative to the folder containing securecore.json,\nor absolute).",
           "type": "string"
         },
         "secrets": {

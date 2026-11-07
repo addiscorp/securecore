@@ -9,7 +9,7 @@ if (!function_exists('securecore_status')) {
 $s = securecore_status();
 echo "loaded=1\n";
 echo 'pid=', getmypid(), "\n";
-foreach (['config', 'sha256', 'layer2_mode', 'layer2_app', 'reload_error'] as $k) {
+foreach (['config', 'sha256', 'layer2_mode', 'layer2_app', 'reload_error', 'root', 'caller', 'attribution_rule', 'attribution_log'] as $k) {
     echo $k, '=', $s[$k] ?? '', "\n";
 }
 foreach (['off', 'restart_needed'] as $k) {

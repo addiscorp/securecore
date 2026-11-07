@@ -1,13 +1,15 @@
 # SecureCore as a PHP extension (addiscorp/securecore#53).
 #   config/  securecore-config: the securecore.json types, loader and JSON Schema. Plain Rust, no
 #            PHP, so the securecore-fpm launcher (E6) reads the file with the same code.
+#   attribution/  securecore-attribution: path → component (plugin, mu-plugin, theme, core) and
+#            the rules for who is responsible on a PHP stack. Plain Rust, no PHP.
 #   php/     securecore-php: the extension itself (ext-php-rs), built into securecore.so.
 # The php crate needs PHP's headers (php-config) to build; docker/ext.Dockerfile builds it
-# against PHP 8.3 NTS. On a machine without PHP, `cargo test -p securecore-config` still works.
+# against PHP 8.3 NTS. On a machine without PHP, `cargo test` (the default members) still works.
 [workspace]
 resolver = "3"
-members = ["config", "php"]
-default-members = ["config"]
+members = ["config", "attribution", "php"]
+default-members = ["config", "attribution"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,15 @@
+[package]
+name = "securecore-attribution"
+description = "Which component a file belongs to and who is running, for SecureCore layer 2 (addiscorp/securecore#53)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+# Turns the extension's attribution log lines into the per-component tables (E2a measurement):
+#   cargo run -p securecore-attribution --bin securecore-attribution-report -- --root /var/www/html log...
+[[bin]]
+name = "securecore-attribution-report"
+path = "src/bin/securecore-attribution-report.rs"
