@@ -7,7 +7,7 @@
 // not wp-config.php, not wp-load.php — after defining the few things wp-config normally
 // provides (ABSPATH, the table prefix, a couple of debug constants) and after pre-seating a
 // $wpdb that has no connection: every query it would run goes back to core over the request
-// socket (the gateway in SecureCore.php). See sandbox/setup.php for the line protocol.
+// socket (the gateway in securecore-core.php). See sandbox/setup.php for the line protocol.
 //
 // A handful of salted pluggable functions (nonces, hashes, auth cookies, and wp_mail) are
 // pre-defined here to forward to core, so they agree with core's secrets, which the sandbox

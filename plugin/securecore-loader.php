@@ -10,7 +10,7 @@ defined('ABSPATH') || exit;
 
 (function () {
     $main = 'securecore/securecore.php';
-    $file = WP_PLUGIN_DIR . '/securecore/SecureCore.php';
+    $file = WP_PLUGIN_DIR . '/securecore/securecore-core.php';
     if (!is_file($file)) return;
     $active = (array) get_option('active_plugins', []);
     if (is_multisite()) $active = array_merge($active, array_keys((array) get_site_option('active_sitewide_plugins', [])));

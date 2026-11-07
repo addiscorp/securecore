@@ -25,7 +25,7 @@ SECURECORE_REALWP=1 docker/setup.sh     # or set it on the worker service + wp c
   prefix and a couple of debug constants, pre-seats a connectionless `$wpdb` subclass, and
   includes `wp-settings.php`. The sandbox holds no database password and has no network; every
   query the `$wpdb` subclass would run goes back to core over the request socket — the
-  **database gateway** in `SecureCore.php` runs it against core's real `$wpdb`. (No SQL policy
+  **database gateway** in `securecore-core.php` runs it against core's real `$wpdb`. (No SQL policy
   yet: core runs whatever query the sandbox sends — see "Not closed yet".)
 - **Fork per request.** `sandbox/worker.php` forks a child per connection, as before; the
   child (`sandbox/realwp.php`) boots WordPress, reseeds `mt_rand`, loads its one plugin, and
@@ -44,7 +44,7 @@ SECURECORE_REALWP=1 docker/setup.sh     # or set it on the worker service + wp c
   WordPress (`sandbox/marshal.php`); an object neither side knows crosses as `null`.
 
 Files: `sandbox/bootstrap.php`, `sandbox/realwp.php`, `sandbox/marshal.php` (new); the
-`RealWpSandbox` class in `plugin/SecureCore.php`; `sandbox/worker.php` (realwp branch);
+`RealWpSandbox` class in `plugin/securecore-core.php`; `sandbox/worker.php` (realwp branch);
 `bin/securecore-worker` (widens open_basedir to the WordPress root under realwp);
 `docker/worker.Dockerfile` (adds the `mysqli` extension — present, never connected).
 
@@ -403,7 +403,7 @@ itself an administrator. Part 2 puts a policy in front of the gateway.
 
 ### How a query is checked
 
-`db_answer`'s `query` path (now `RealWpSandbox::gateway_query()` in `plugin/SecureCore.php`) runs
+`db_answer`'s `query` path (now `RealWpSandbox::gateway_query()` in `plugin/securecore-core.php`) runs
 every forwarded statement through `SqlPolicy` (`plugin/sql-policy.php`) first:
 
 1. **Parse** with [phpmyadmin/sql-parser], pinned to **6.0.1** in `plugin/composer.json` and

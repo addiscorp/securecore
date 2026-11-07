@@ -91,7 +91,7 @@ and activate SecureCore. Either way you get:
 wp-content/
   mu-plugins/securecore-loader.php   # loads SecureCore early while the plugin is active
   plugins/securecore/                # the plugin: replaced as a whole on upgrade
-    securecore.php  SecureCore.php
+    securecore.php  securecore-core.php  sql-policy.php
     sandbox/   worker.php setup.php scan.php gen-manifest.php
     bin/       securecore-worker     # the launcher
     templates/ securecore.service compose.yml

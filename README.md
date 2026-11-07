@@ -7,7 +7,7 @@ plugin's manifest.
 
 ```
 browser → nginx → php-fpm (WordPress core)
-                    │  SecureCore.php (mu-plugin): one unix-socket connection per request
+                    │  securecore-core.php (mu-plugin): one unix-socket connection per request
                     ▼
        SecureCore worker  —  its own container, NO NETWORK, only wp-content/plugins (ro)
          php worker.php, opcache on, booted once, listening on the socket
@@ -28,7 +28,7 @@ only the plugin folder mounted read-only and the socket dir, a clean environment
 
 ## How a request works
 
-1. `SecureCore.php` (in the SecureCore plugin) is loaded early by the mu-plugin loader while
+1. `securecore-core.php` (in the SecureCore plugin) is loaded early by the mu-plugin loader while
    the plugin is active. Plugins with a manifest in `wp-content/securecore/manifests/` are
    hidden from core's plugin loader.
 2. For each, it connects to the worker's unix socket. One connection = one `pcntl_fork()` in
@@ -65,7 +65,7 @@ Settings in `wp-config.php`: `SECURECORE_DISABLED` (load plugins normally),
 | `sandbox/worker.php` | the worker: boots setup.php, listens on the socket, forks per request |
 | `sandbox/setup.php` | the protocol and the per-request work: stand-ins, callbacks, the call loop |
 | `plugin/securecore.php` | the plugin's main file (header, version) |
-| `plugin/SecureCore.php` | core side: hides sandboxed plugins, connects per request, manifest checks, audit log, Settings → SecureCore |
+| `plugin/securecore-core.php` | core side: hides sandboxed plugins, connects per request, manifest checks, audit log, Settings → SecureCore |
 | `plugin/securecore-loader.php` | the mu-plugin loader (installed to `wp-content/mu-plugins/`) |
 | `bin/securecore-worker` | the launcher: starts the worker with its PHP isolation forced on |
 | `sandbox/scan.php`, `sandbox/gen-manifest.php` | the `token_get_all` scan behind generated manifests |

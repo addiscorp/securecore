@@ -4,7 +4,7 @@
 //   php -d opcache.enable_cli=1 worker.php <socket> <plugins-dir> <manifests-dir>
 //
 // Boots setup.php only (no plugin) and listens on one unix socket. Per connection
-// (SecureCore.php opens one per plugin per request), pcntl_fork(): the child includes that
+// (securecore-core.php opens one per plugin per request), pcntl_fork(): the child includes that
 // one plugin's main file fresh — like PHP re-running a plugin each request, made cheap by
 // opcache holding the compiled code in shared memory the children inherit — serves the
 // conversation over the socket (the protocol in setup.php), and exits. State is clean per

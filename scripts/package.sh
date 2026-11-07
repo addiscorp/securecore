@@ -17,7 +17,7 @@ mkdir -p "$pkg/sandbox" "$pkg/bin" "$pkg/templates" "$pkg/setup"
 # install.sh's site setup (WordPress, database, wp-config.php), run before the plugin is in place.
 cp "$root/setup/site.php" "$pkg/setup/"
 
-cp "$root/plugin/securecore.php" "$root/plugin/SecureCore.php" "$root/plugin/sql-policy.php" "$pkg/"
+cp "$root/plugin/securecore.php" "$root/plugin/securecore-core.php" "$root/plugin/sql-policy.php" "$pkg/"
 # The vendored SQL parser (phpmyadmin/sql-parser, pinned in plugin/composer.json — APS 10). The
 # gateway's query policy needs it in core; ship it, with the composer files for provenance.
 cp -R "$root/plugin/vendor" "$pkg/vendor"
@@ -34,6 +34,18 @@ printf '%s\n' "$version" > "$pkg/VERSION"
 chmod 755 "$pkg/bin/securecore-worker"
 # The plugin header carries the version WordPress shows.
 sed "s/^ \* Version: .*/ * Version: $version/" "$root/plugin/securecore.php" > "$pkg/securecore.php"
+
+# No two packaged paths may differ only in case. On a case-insensitive filesystem (macOS's default
+# TMPDIR) one silently overwrites the other while staging — that is how a release once shipped
+# without the 47 KB main class, leaving only the 632-byte loader (#51). CI stages on a
+# case-sensitive filesystem, so both survive there and this catches the clash before it ships.
+collisions=$(cd "$stage" && find securecore -print | tr '[:upper:]' '[:lower:]' | sort | uniq -d)
+if [ -n "$collisions" ]; then
+  echo "package.sh: packaged paths differ only in case (one clobbers the other on a" >&2
+  echo "case-insensitive filesystem); rename one so the names differ once lowercased:" >&2
+  echo "$collisions" | sed 's/^/  /' >&2
+  exit 1
+fi
 
 rm -f "$out/securecore.zip"
 (cd "$stage" && find securecore -exec touch -t 202601010000 {} + && zip -qrX "$out/securecore.zip" securecore)
