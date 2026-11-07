@@ -243,6 +243,7 @@ Dolly + the bench plugin for the 2-plugin rows.
   now refuses a non-string query defensively, but the malformed objects upstream are the real
   gap. **Pre-boot is not ready to be the default real-WordPress mode until this is fixed** — it
   stays opt-in behind `SECURECORE_PREBOOT`, and the per-request model (part 1) is unaffected.
+  **→ Fixed in Part 1c below.**
 - **The admin gaps from part 1 remain** (Yoast's admin screen, CF7's shortcode and REST submit),
   underneath the regression above.
 - **The parent still holds every autoloaded option in memory**, plugin options included, for
@@ -256,3 +257,84 @@ Dolly + the bench plugin for the 2-plugin rows.
   in the launcher's `disable_functions`).
 - **`site.sh` still fails under the real-WordPress model** by design (wp-config readable,
   no SQL policy) — gelada and the SQL policy are later parts of #42.
+
+## Part 1c: correct pre-boot state
+
+### The cause
+
+The child was **swapping `$GLOBALS['wpdb']`** after the fork: it threw away the `$wpdb` the
+parent had booted against and installed a fresh gateway `$wpdb` (then re-ran
+`wp_set_wpdb_vars()` on it). WordPress had already booted in the parent against the *original*
+`$wpdb`, and parts of that booted state reach for the object they were set up with rather than
+re-reading `$GLOBALS['wpdb']`. After the swap those reads hit the now-inert snapshot `$wpdb`
+(no gateway, no request socket) and came back empty — so user and term rows rebuilt into
+objects with no `ID` / `user_login` / `term_id`. A simple plugin only logged the notices; a
+plugin that then ran capability or meta logic over the bad object built a broken query and the
+request 500'd. This is why flushing the object cache in 1b did nothing (the stale thing was a
+`$wpdb` reference, not a cached value), and why the per-request model never saw it (it boots
+once, against one `$wpdb`, and never swaps).
+
+The diagnostic that found it: dumping `$GLOBALS` right after boot in a per-request child and a
+pre-booted child for the same front request showed them **nearly identical** (the only diffs
+were the worker's own file-scope vars leaking into `$GLOBALS` and a one-key `$_SERVER`
+difference), which ruled out the post-boot snapshot and pointed at something dynamic. The
+worker's parent-boot-miss log confirmed the snapshot `$wpdb` answered a few non-autoloaded
+options empty during the parent's boot (`WPLANG`, the image-crop sizes, `theme_switched`) —
+harmless, but the same "answered empty off the snapshot" shape that, through a retained
+reference, produced the malformed objects.
+
+### The fix
+
+The pre-boot `$wpdb` is now **one object for the life of the process** (`make_snapshot_wpdb` in
+`sandbox/bootstrap.php`): while `Registry::$parentBoot` is true it serves the options query from
+the snapshot and logs anything else; once a child clears that flag after the fork, the **same
+object** forwards every query to core over the request socket. The child no longer swaps `$wpdb`
+or re-runs `wp_set_wpdb_vars()` (the parent already ran it on this object and the child inherits
+the table names) — so any reference taken during the parent's boot keeps working.
+
+### Plugins under pre-boot (after 1c)
+
+`test/compat.sh`, pre-boot, against the per-request baseline (same build):
+
+| plugin | per request (part 1) | pre-boot (after 1c) |
+|---|---|---|
+| Classic Editor 1.7.0 | front/dash 200, feature passes, audit clean | **front/dash 200, feature passes, audit + debug.log clean** (no new notices) |
+| Yoast SEO 28.8 | front/dash 200, feature passes, admin 500 | **front/dash 200, feature passes**, admin 500 |
+| Contact Form 7 6.2.4.1 | front/dash 200, shortcode empty, admin 403 | **front/dash 200**, shortcode empty, admin 403 |
+
+Pre-boot now matches the per-request model for all three: Classic Editor is a clean pass with
+no new notices, and Yoast and CF7 reach exactly their per-request results. What remains (Yoast's
+admin screen 500, CF7's shortcode/REST and admin 403, `site.sh`'s wp-config/SQL checks) is
+identical under both models — the part-1 request-state gaps and the by-design `site.sh`
+failures, not a pre-boot regression.
+
+### Measurements (after 1c)
+
+`bun bench/preboot.ts 3` — the +3.5 ms-per-plugin result still holds after the fix (the child
+now does slightly *less* work per request — no `$wpdb` swap, no `wp_set_wpdb_vars()`):
+
+| config | front `/` p50 (ms) | `/wp-admin/` p50 (ms) | req/s c=8 | worker PSS (MiB) |
+|---|---|---|---|---|
+| SecureCore off | 104.9 [104.8, 105.3] | 125.7 [125.2, 126.3] | 25.0 [24.8, 25.1] | — |
+| #11 stub, 1 plugin | 109.2 [108.9, 109.8] | 130.8 [130.3, 131.1] | 22.0 [21.8, 22.3] | 29 [28, 30] |
+| #11 stub, 2 plugins | 111.0 [110.7, 111.7] | 133.2 [133.2, 133.2] | 21.2 [21.1, 21.3] | 31 [30, 32] |
+| real WP, per request, 1 plugin | 168.5 [168.2, 169.6] | 188.3 [188.2, 190.0] | 14.9 [12.6, 15.1] | 73 [73, 73] |
+| real WP, per request, 2 plugins | 232.0 [230.6, 232.8] | 251.6 [250.0, 253.9] | 10.8 [10.8, 11.1] | 104 [102, 104] |
+| **real WP, pre-boot, 1 plugin** | **110.3 [110.2, 110.9]** | **133.2 [132.4, 133.2]** | **21.4 [20.5, 21.5]** | **69 [69, 70]** |
+| **real WP, pre-boot, 2 plugins** | **115.4 [113.3, 116.5]** | **137.5 [136.9, 138.9]** | **19.8 [19.6, 19.8]** | **83 [83, 84]** |
+
+Per sandboxed plugin (front p50, 2-plugin row minus 1-plugin row): #11 stub **+1.8 ms**, real WP
+per request **+63.5 ms**, real WP pre-boot **+5.1 ms**. The per-plugin cost is still the fork, not
+a WordPress boot — a few ms like the stub (1b measured +3.5 ms; the ~5 ms here is run-to-run
+variance, same order), against +63.5 ms for the per-request boot. The 1c fix did not cost
+anything: the child does slightly less now (no `$wpdb` swap, no `wp_set_wpdb_vars()`). Throughput
+and PSS are unchanged from 1b — pre-boot keeps one resident booted WordPress (~69→83 MiB) where
+per request each child boots its own (73→104).
+
+### Dev-stack fix (#45)
+
+`scripts/package.sh` freezes installed-file mtimes for reproducible release zips, so php-fpm's
+`validate_timestamps` opcache did not notice when `install-securecore` overwrote core PHP —
+core-side changes silently kept running the old bytes until opcache was reset. Fixed:
+`docker/install-securecore.sh` now gives the files it writes a current mtime, and
+`docker/setup.sh` restarts php after installing so the change is live immediately.

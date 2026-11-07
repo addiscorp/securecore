@@ -262,19 +262,14 @@ function serve_realwp_connection($conn, string $wpRoot, bool $preBooted = false)
     ob_start();
     try {
         if ($preBooted) {
-            // WordPress is already booted in this process (forked from the worker parent).
-            // Point the database at this request's socket gateway and drop the parent's option
-            // cache, so every option the plugin reads comes fresh through the gateway, not the
-            // parent's copy (addiscorp/securecore#42, part 1b).
-            $GLOBALS['wpdb'] = make_gateway_wpdb($prefix);
-            // wp-settings.php runs wp_set_wpdb_vars() on the $wpdb it booted with; our swapped
-            // one needs the same, or its table names ($wpdb->users, ->posts, …) and field
-            // types are unset and queries become "SELECT * FROM  WHERE …".
-            $GLOBALS['table_prefix'] = $prefix;
-            if (function_exists('wp_set_wpdb_vars')) wp_set_wpdb_vars();
-            else $GLOBALS['wpdb']->set_prefix($prefix);
-            // Drop the parent's option cache so every option a plugin reads this request comes
-            // fresh through the gateway, not the parent's copy.
+            // WordPress is already booted in this process (forked from the worker parent). The
+            // $wpdb inherited from the parent now forwards to this request's socket gateway
+            // (Registry::$parentBoot is false in the child) — we do NOT swap it for a fresh one,
+            // because then any WordPress state that captured a reference to $wpdb during the
+            // parent's boot would keep querying the dead snapshot and hand back malformed
+            // user/term objects (addiscorp/securecore#42, part 1c). Its table names and field
+            // types were set by wp_set_wpdb_vars() during the parent's boot and inherited here.
+            // Drop the parent's option cache so options come fresh through the gateway.
             if (function_exists('wp_cache_delete')) {
                 wp_cache_delete('alloptions', 'options');
                 wp_cache_delete('notoptions', 'options');
