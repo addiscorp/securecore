@@ -434,10 +434,13 @@ gelada --deny /var/www/html/wp-config.php [--deny wp-config-*.php …] \
 
 The container is no longer `network_mode: none` and the site is mounted read-write: gelada is now
 the boundary, so the test can prove it is gelada doing the work (a real install may keep the
-no-network container and a read-only mount as extra layers). Docker's default seccomp gates the
-`seccomp()` syscall behind `CAP_SYS_ADMIN`, so the worker service runs `security_opt:
-[seccomp:unconfined]` to let gelada install its *own* filter — this hands the sandbox to gelada,
-it does not remove it. Colima's kernel is 6.8 (Landlock needs 5.13+).
+no-network container and a read-only mount as extra layers). The worker container keeps Docker's
+**default** seccomp profile — no `security_opt` override. That profile already allows the
+`seccomp()` syscall, Landlock and seccomp user-notification, and gelada sets `no_new_privs` itself,
+so it installs its *own* seccomp + Landlock filter on **top** of the default profile rather than
+replacing it; `seccomp:unconfined` would have dropped the whole default profile, which is less
+confinement, not more. (gelada 0.2.0's own test suite passes under the default profile on this
+colima, as root and as an unprivileged user.) Colima's kernel is 6.8 (Landlock needs 5.13+).
 
 ### Property tests (`test/gelada.sh`, `test/gelada-plugin/`)
 

@@ -40,11 +40,12 @@ services:
   # (part 4). The launcher's open_basedir / disable_functions stay as an inner layer.
   worker:
     build: { context: .., dockerfile: docker/worker.Dockerfile }
-    # seccomp:unconfined lets gelada install its OWN seccomp filter inside the container (Docker's
-    # default profile gates the seccomp() syscall behind CAP_SYS_ADMIN). gelada then closes the
-    # network and unix sockets itself — this does not loosen the sandbox, it hands it to gelada.
-    security_opt:
-      - seccomp:unconfined
+    # No seccomp override. Docker's default seccomp profile already allows the seccomp() syscall,
+    # Landlock and seccomp user-notification, and gelada sets no_new_privs itself, so it installs
+    # its OWN seccomp + Landlock filter on TOP of the container's default profile instead of
+    # replacing it — strictly more confinement than seccomp:unconfined, which would have dropped
+    # the whole default profile. (gelada 0.2.0's own suite passes under the default profile on this
+    # colima, as root and as an unprivileged user.)
     restart: unless-stopped
     # SECURECORE_REALWP: the "real WordPress" model (#42, part 1). SECURECORE_PREBOOT (with it):
     # the parent boots WordPress once and each child forks from it (#42, part 1b). Core must agree
