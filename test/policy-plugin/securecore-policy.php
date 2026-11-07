@@ -35,6 +35,16 @@ if (!defined('SECURECORE_SANDBOX') || !SECURECORE_SANDBOX) return;
     $log('read_session_tokens', $filled($wpdb->get_var("SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = 1 AND meta_key = 'session_tokens'")));
     $log('read_caps', $filled($wpdb->get_var("SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = 1 AND meta_key = '{$wpdb->prefix}capabilities'")));
 
+    // --- prepared-statement bypass: hide a forbidden SELECT in a user variable, then PREPARE and
+    // EXECUTE it (none of the three names wp_users as a table the policy would see). With the policy
+    // on, each statement is refused on its own; with it off, the chain reads user_pass. Each is a
+    // separate forwarded query on the same core connection, so @scp persists across them.
+    $sel = "SELECT user_pass FROM {$wpdb->users} WHERE ID = 1";
+    $wpdb->query('SET @scp = 0x' . bin2hex($sel));
+    $wpdb->query('PREPARE scp_stmt FROM @scp');
+    $log('bypass_user_pass', $filled($wpdb->get_var('EXECUTE scp_stmt')));
+    $wpdb->query('DEALLOCATE PREPARE scp_stmt');
+
     // --- gated write: changing a protected option (reversible; the test restores it) ------------
     // update_option first reads the current value (denied → it thinks it changed) then writes
     // (denied → no change). The test confirms admin_email is unchanged from outside the sandbox.

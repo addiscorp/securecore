@@ -410,15 +410,47 @@ every forwarded statement through `SqlPolicy` (`plugin/sql-policy.php`) first:
    vendored into the release zip (`plugin/vendor/`, copied by `scripts/package.sh`). Dependencies
    come from a registry by exact version, no git pins — APS 10. An **unparseable** or
    **multi-statement** query is refused.
-2. **Classify.** The parser gives the statement type (SELECT / INSERT / … / DDL); the tables it
-   touches are found by scanning the SQL for core's own table names, read live from `$wpdb`
-   (`$wpdb->users`, `tables('all')`, …), word-bounded so `wp_users` ≠ `wp_usermeta`. (`getTables()`
-   alone misses JOINed and `CREATE` targets, so the policy does not rely on it for that.)
-3. **Decide**, per the table and operation below. A statement touching no core table — the
-   plugin's own tables, another plugin's, or a session/metadata statement like `SET NAMES` — is
-   free.
+2. **Check the shape** (deny-by-default on statement *type*, before any table is considered). The
+   statement is classified by the parser's statement **class** — its text, which an alias or
+   comment could disguise, is not trusted — and only an allowlisted type ever runs; everything else
+   is refused whatever it names (see *Statement-shape allowlist* below). The tables it touches are
+   found by scanning the SQL for core's own table names, read live from `$wpdb` (`$wpdb->users`,
+   `tables('all')`, …), word-bounded so `wp_users` ≠ `wp_usermeta`. (`getTables()` alone misses
+   JOINed and `CREATE` targets, so the policy does not rely on it for that.)
+3. **Decide on the data**, per the table and operation below. A statement touching no core table —
+   the plugin's own tables, another plugin's, or a session/metadata statement like `SET NAMES` —
+   is free on data (its shape was already checked in step 2).
 
 [phpmyadmin/sql-parser]: https://packagist.org/packages/phpmyadmin/sql-parser
+
+### Statement-shape allowlist
+
+An earlier cut of this policy decided only on the tables a statement named, and let anything that
+named no core table through. That is bypassable: `SET @s = 0x<hex of "SELECT user_pass FROM
+wp_users">`, then `PREPARE x FROM @s`, then `EXECUTE x` — none of the three names `wp_users` as a
+table the scan can see, so the column checks never run and the `EXECUTE` reads the hashes. Reading
+a file off the DB server (`SELECT LOAD_FILE('/etc/passwd')`, `… INTO OUTFILE`), `CALL`-ing a stored
+procedure, `LOAD DATA INFILE` into a plugin table, and `CREATE FUNCTION` / `VIEW` were open the
+same way. The policy now allowlists statement **types** by the parser's statement class:
+
+- **run:** SELECT, INSERT, UPDATE, DELETE, REPLACE; SHOW, DESCRIBE / DESC, EXPLAIN; the session
+  `SET`s (SET NAMES, SET SESSION sql_mode, SET autocommit — never `SET @x` or `SET @@…`);
+  transaction control (START TRANSACTION, BEGIN, COMMIT, ROLLBACK [TO [SAVEPOINT]], SAVEPOINT,
+  RELEASE SAVEPOINT); CREATE / ALTER / DROP / TRUNCATE on a **non-core** table;
+- **refused, whatever it names:** PREPARE, EXECUTE, DEALLOCATE, HANDLER, DO, USE, CALL, LOAD DATA,
+  LOCK / UNLOCK, CREATE PROCEDURE / FUNCTION / TRIGGER / EVENT / VIEW, GRANT, CTEs (`WITH …`), the
+  table-maintenance statements, and anything the parser does not build a statement for (PREPARE,
+  EXECUTE, DEALLOCATE, HANDLER, DO and USE all parse to **zero** statements in 6.0.1, so the "no
+  statement" case is a refusal, not a pass).
+
+Inside an allowed statement, `LOAD_FILE(`, `INTO OUTFILE` and `INTO DUMPFILE` are refused too —
+string literals are stripped first, so a query that merely mentions them as data (searching
+`post_content` for `"into outfile"`) is not caught. Transaction-control statements are matched on
+the normalised text *before* the parser, because 6.0.1 reports several of them (COMMIT, ROLLBACK,
+SAVEPOINT, …) as parse errors; the match is anchored with no `.*`, so a second statement cannot be
+smuggled in after one. `test/policy-unit.php` asserts every refused shape and every allowed one;
+`test/policy.sh` runs the full SET → PREPARE → EXECUTE chain live — blocked with the policy on,
+and (proving the policy is what blocks it) reading `user_pass` with it off.
 
 ### The policy
 
@@ -499,6 +531,12 @@ and reused. The remaining cost is the per-query parse, measured below.
   or specifically-named options from another; a bulk options read is filtered, but an explicit
   `get_option('other_plugins_secret')` is still allowed. That is a separate concern from #42's
   scope.
+- **One install per database.** Core tables are recognised from *this* install's `$wpdb` (its
+  prefix and table names). A second WordPress sharing the same MySQL database under a different
+  prefix (`otherprefix_users`, `otherprefix_options`) is invisible to the policy — the table scan
+  does not match it — so a sandboxed plugin may read and write those tables as if they were its
+  own; `otherprefix_users.user_pass` counts as free. SecureCore assumes one install per database;
+  a shared database is out of scope for this part.
 
 ### Tests
 
@@ -515,9 +553,10 @@ ok   another plugin's secret kept out of a bulk options read (bulk_foreign_secre
 ok   wp_users.user_pass not readable (read_user_pass=empty)
 ok   usermeta session_tokens not readable (read_session_tokens=empty)
 ok   usermeta capabilities not readable without a grant (read_caps=empty)
+ok   prepared-statement bypass (SET/PREPARE/EXECUTE) blocked (bypass_user_pass=empty)
 ok   the plugin's own option is readable (read_own_option=own-ok)
 ok   siteurl is readable (needed to render) (read_siteurl=nonempty)
-ok   core content (posts) is readable (count=88)
+ok   core content (posts) is readable (count=97)
 ok   a write to the protected option admin_email was blocked
 == policy OFF (parser disabled: the same probe should now leak) ==
 ok   without the policy, admin_email leaks into the bulk read (bulk_admin_email=present)
@@ -525,21 +564,30 @@ ok   without the policy, the other plugin's secret leaks into the bulk read
 ok   without the policy, user_pass is readable
 ok   without the policy, session_tokens is readable
 ok   without the policy, capabilities are readable
+ok   without the policy, the prepared-statement bypass reads user_pass (bypass_user_pass=nonempty)
 ok   without the policy, the admin_email write landed
 == grant usermeta:capabilities ==
 ok   with the grant, capabilities are readable
 ```
 
 The destructive and structural refusals (DROP/ALTER/TRUNCATE on a core table, multi-statement,
-INSERT into users, capability escalation, …) cannot be run live without wrecking the stack, so
-`test/policy-unit.php` asserts them at the `decide()` level with a real `$wpdb` — 33 verdicts,
-including that a grant opens exactly its own door and nothing else:
+INSERT into users, capability escalation, the whole statement-shape allowlist, …) cannot all be
+run live without wrecking the stack, so `test/policy-unit.php` asserts them at the `decide()` level
+with a real `$wpdb` — 61 verdicts, including that a grant opens exactly its own door and nothing
+else:
 
 ```
 ok    DROP core table                    deny: DROP on a core table
 ok    escalate capabilities              deny: writes the protected usermeta key 'wp_capabilities'
 ok    write active_plugins               deny: writes the protected option 'active_plugins'
+ok    SET user variable                  deny: SET of a user or system variable
+ok    PREPARE                            deny: unsupported statement
+ok    SELECT LOAD_FILE                   deny: uses a server file function (load_file / outfile / dumpfile)
+ok    CALL                               deny: unsupported statement type
+ok    WITH (CTE)                         deny: unsupported statement type
 ok    select * users (secrets stripped)  allow
+ok    COMMIT                             allow
+ok    search posts (outfile literal)     allow
 ok    insert users (granted)             allow
 ok    still DROP-denied (granted)        deny: DROP on a core table
 policy-unit: PASS

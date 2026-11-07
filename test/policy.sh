@@ -94,6 +94,7 @@ check_on bulk_foreign_secret absent "another plugin's secret kept out of a bulk 
 check_on read_user_pass empty "wp_users.user_pass not readable"
 check_on read_session_tokens empty "usermeta session_tokens not readable"
 check_on read_caps empty "usermeta capabilities not readable without a grant"
+check_on bypass_user_pass empty "prepared-statement bypass (SET/PREPARE/EXECUTE) blocked"
 check_on read_own_option own-ok "the plugin's own option is readable"
 check_on read_siteurl nonempty "siteurl is readable (needed to render)"
 if [ "$(obs on read_posts_count)" != denied ] && [ -n "$(obs on read_posts_count)" ]; then pass "core content (posts) is readable (count=$(obs on read_posts_count))"; else fail "core content readable" "read_posts_count=$(obs on read_posts_count)"; fi
@@ -110,6 +111,7 @@ leak bulk_foreign_secret present "the other plugin's secret leaks into the bulk 
 leak read_user_pass nonempty "user_pass is readable"
 leak read_session_tokens nonempty "session_tokens is readable"
 leak read_caps nonempty "capabilities are readable"
+leak bypass_user_pass nonempty "the prepared-statement bypass reads user_pass"
 if [ "$(wp option get admin_email)" = "$EVIL" ]; then pass "without the policy, the admin_email write landed"; else fail "OFF: admin_email write should land" "now $(wp option get admin_email)"; fi
 # restore
 wp option update admin_email admin@example.com >/dev/null
