@@ -664,23 +664,55 @@ function options_snapshot_hash_path(): string
  * file then rename) so the worker never includes a half-written file. The hash lets the worker
  * notice a change and re-boot.
  */
+/**
+ * The names of WordPress's own options: the ones populate_options() in wp-admin/includes/schema.php
+ * seeds at install, plus the active theme's theme_mods_<stylesheet>. Parsed from the site's own
+ * schema.php so it tracks the WordPress version. This is the allowlist for the pre-boot snapshot
+ * (addiscorp/securecore#47) — a plugin's autoloaded options must never reach the parent. The regex
+ * is deliberately generous (it also catches capability/array keys inside default values); that is
+ * harmless because the snapshot intersects it with the autoloaded options, so only real options
+ * survive, and a stray non-option name matches nothing. A core option boot needs that is NOT named
+ * here (e.g. rewrite_rules, added after install) shows up as a parent-boot miss in the worker log.
+ *
+ * @return array<string,true> option name => true
+ */
+function core_option_names(): array
+{
+    static $names = null;
+    if ($names !== null) return $names;
+    $names = [];
+    $schema = ABSPATH . 'wp-admin/includes/schema.php';
+    $src = is_readable($schema) ? (string) file_get_contents($schema) : '';
+    // Capture the whole populate_options() body: from its name to the first closing brace in
+    // column 0 (its own; every brace inside the body is indented). Matching the signature's
+    // parens would trip on the default `array()` in `populate_options( $options = array() )`.
+    if ($src !== '' && preg_match('/function\s+populate_options\b(.*?)\n\}/s', $src, $m)) {
+        // The option names: array keys in the $options literal and the add_option() calls.
+        if (preg_match_all("/'([A-Za-z0-9_-]+)'\s*=>/", $m[1], $k)) {
+            foreach ($k[1] as $n) $names[$n] = true;
+        }
+        if (preg_match_all("/add_option\(\s*'([A-Za-z0-9_-]+)'/", $m[1], $k2)) {
+            foreach ($k2[1] as $n) $names[$n] = true;
+        }
+    }
+    // The active theme's mods are WordPress's, not a plugin's.
+    $stylesheet = get_option('stylesheet');
+    if (is_string($stylesheet) && $stylesheet !== '') $names['theme_mods_' . $stylesheet] = true;
+    return $names;
+}
+
 function write_options_snapshot(): void
 {
     global $wpdb;
-    $options = wp_load_alloptions();
-    // The sandbox's WordPress forces the active-plugin lists empty (the SECURECORE_SANDBOX
-    // guard at the top of this file), so their values never affect the pre-booted parent.
-    // Dropping them keeps the snapshot — and its hash — from changing every time a plugin is
-    // activated or deactivated, which would otherwise re-boot the worker for no gain.
+    // Snapshot ONLY WordPress's own options (addiscorp/securecore#47): the allowlist from
+    // populate_options() plus the theme mods. A plugin's autoloaded options — license keys,
+    // SMTP/API credentials — must never reach the pre-booted parent (and so every sandbox
+    // child); the parent boots with no plugins and needs none of them. (#42: "no plugin options
+    // and no secrets" in the parent.)
+    $options = array_intersect_key(wp_load_alloptions(), core_option_names());
+    // The sandbox forces the active-plugin lists empty (the SECURECORE_SANDBOX guard at the top
+    // of this file), so never carry their values even if the allowlist names them.
     unset($options['active_plugins'], $options['active_sitewide_plugins']);
-    // Transients are caches, not boot state: the parent recomputes a missing one, and the
-    // child reads fresh through the gateway. Dropping them keeps the hash from churning on
-    // every cache write (theme patterns, update checks), which would re-boot the worker.
-    foreach (array_keys($options) as $name) {
-        if (str_starts_with($name, '_transient_') || str_starts_with($name, '_site_transient_')) {
-            unset($options[$name]);
-        }
-    }
     $payload = ['prefix' => $wpdb->prefix, 'options' => $options];
     $php = '<?php return ' . var_export($payload, true) . ";\n";
     $hash = sha1($php);
