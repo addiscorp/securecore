@@ -393,3 +393,142 @@ Nothing else regressed: under pre-boot `test/compat.sh` still gives the #46 resu
 clean, Yoast and CF7 at their per-request baselines, zero worker re-boots), and `bench/preboot.ts`
 still shows the per-plugin cost as the fork — front p50 pre-boot 110.3 → 113.2 ms for 1 → 2
 plugins (+2.9 ms/plugin) against 165.3 → 228.8 ms (+63.5 ms) for the per-request boot.
+
+## Part 3: the worker inside gelada (#42)
+
+Parts 1–2 isolated the sandbox with the launcher's `open_basedir`/`disable_functions` and, in the
+Docker spike, a `network_mode: none` container with the site mounted read-only. Under
+`SECURECORE_REALWP` the launcher has to widen `open_basedir` to the WordPress root so core can
+boot — which leaves `wp-config.php` readable (part 1d flagged this as "gelada's job later"). Part
+3 runs the worker inside [gelada](https://github.com/addiscorp/gelada), an OS sandbox applied at
+`exec` (Landlock + seccomp on Linux), so the worker and every child it forks get real filesystem
+and network confinement from the kernel.
+
+### How it is wired
+
+gelada comes from crates.io by exact version — `cargo install gelada --version 0.2.0 --locked` in
+a builder stage of `docker/worker.Dockerfile`, copied into the worker image (APS 10: a registry by
+version, no git pin; the worker image carries no Rust toolchain). The worker is launched as:
+
+```
+gelada --deny /var/www/html/wp-config.php [--deny wp-config-*.php …] \
+       --allow-write /run/securecore \
+       --allow-write /var/www/html/wp-content/uploads \
+       --allow-write /var/www/html/wp-content/cache \
+       -- securecore-worker <socket> <plugins> <manifests>
+```
+
+- **`--deny` wp-config.php** (and any `wp-config-*.php` backups the wrapper finds): unreadable even
+  though the WordPress root is readable, so the DB password never reaches the sandbox.
+- **network off, no `--allow-unix-socket`:** every outbound connect fails — MySQL, php-fpm's
+  FastCGI socket, any TCP host. The worker still binds and accepts on its *own* socket, because
+  gelada's seccomp blocks `connect`, not `socket`/`bind`/`listen`/`accept`, and the socket's folder
+  (`/run/securecore`) is `--allow-write`, so a writable path that is a socket is usable. Core,
+  which is not sandboxed, connects to it from outside.
+- **`--allow-write` only** the socket dir, uploads and cache; everything else — `wp-admin`,
+  `wp-includes`, `plugins`, `themes`, `mu-plugins` — is read-only. gelada's own `TMPDIR` is
+  writable and cleaned up.
+- The parent reads `options-snapshot.php` at boot; under the CLI it is sandboxed from the start, so
+  it is **not** denied in this layer. #47's deny of the snapshot *to a child* moves to the
+  per-child layer (part 4, below).
+
+The container is no longer `network_mode: none` and the site is mounted read-write: gelada is now
+the boundary, so the test can prove it is gelada doing the work (a real install may keep the
+no-network container and a read-only mount as extra layers). Docker's default seccomp gates the
+`seccomp()` syscall behind `CAP_SYS_ADMIN`, so the worker service runs `security_opt:
+[seccomp:unconfined]` to let gelada install its *own* filter — this hands the sandbox to gelada,
+it does not remove it. Colima's kernel is 6.8 (Landlock needs 5.13+).
+
+### Property tests (`test/gelada.sh`, `test/gelada-plugin/`)
+
+A sandboxed probe tries each attack with functions the launcher's `disable_functions` does **not**
+block (`file_get_contents`, `mysqli_connect`, `file_put_contents`), so what stops them is gelada.
+It runs with gelada on, then with gelada off (the `SECURECORE_NOGELADA` dev switch runs the
+launcher directly), then on again per-request:
+
+```
+== gelada ON, pre-boot ==
+ok   wp-config.php is unreadable (read_wp_config=failed)
+ok   DB_PASSWORD is not defined in the sandbox (db_password_const=undefined)
+ok   MySQL connect blocked (connect_mysql=blocked(2002))
+ok   php-fpm connect blocked (connect_php_fpm=blocked(2002))
+ok   arbitrary host connect blocked (connect_arbitrary=blocked(2002))
+ok   writes to uploads allowed (write_uploads=ok)
+ok   writes to the plugins folder blocked (write_plugins=failed)
+ok   writes to wp-includes blocked (write_wp_includes=failed)
+ok   writes to mu-plugins blocked (write_mu_plugins=failed)
+ok   the request still renders (200)
+== gelada OFF, pre-boot (same probe should now leak) ==
+ok   without gelada, wp-config.php is readable (read_wp_config=read 6113 bytes)
+ok   without gelada, MySQL is reachable (connect_mysql=reached(1045))
+ok   without gelada, php-fpm is reachable (connect_php_fpm=reached(2006))
+ok   without gelada, the plugins folder is writable (write_plugins=ok)
+== gelada ON, per-request ==
+ok   per-request: wp-config.php unreadable / MySQL blocked / plugins writes blocked / renders 200
+```
+
+`reached(1045)` for MySQL without gelada is the TCP connection succeeding and MySQL then refusing
+the bad credentials — it got there; with gelada the socket never opens (`2002`).
+
+### No regression
+
+`test/canary.sh` (#47) still passes under gelada. `test/compat.sh` in **both** modes (pre-boot and
+per-request) gives the #48 per-plugin results unchanged: classic-editor all green; wordpress-seo
+front/dash/feature green, admin 500 (the part-1c `admin_bar_menu` throw); contact-form-7 front/dash
+green, admin 403 + feature incomplete. No plugin hits a gelada filesystem or network denial while
+rendering — `--allow-write` on uploads/cache plus read-everything-else is enough. `test/site.sh`
+still fails (its overall verdict stays `no`), as it has since part 1b: it is a part-1/#11 test, and
+two of its checks no longer apply under realwp+gelada — `wp_remote_post` returns a `WP_Error`
+instead of throwing (so its probe reports "sent"), and this part drops the container's
+`network_mode: none` on purpose so the network block is gelada's to prove, which trips site.sh's
+"worker has no network" check. A deployment that keeps `network_mode: none` as an extra layer makes
+that check pass again.
+
+`bench/preboot.ts 3` (front-page p50, median of 3 runs), worker wrapped in gelada:
+
+| config | front p50 (ms) | /wp-admin/ p50 (ms) | req/s c=8 | worker PSS (MiB) |
+|---|---|---|---|---|
+| off | 103.8 | 123.4 | 25.7 | — |
+| stub 1p / 2p | 106.4 / 107 | 126.8 / 128 | 22.4 / 22.1 | ~29 |
+| realwp 1p / 2p | 166.6 / 166.5 | 186.4 / 186.3 | 15.1 / 15.1 | ~75 |
+| preboot 1p / 2p | 110.2 / 109.4 | 131.8 / 131.4 | 21.3 / 21.2 | ~73 |
+
+gelada costs **about nothing per request**: pre-boot front p50 is 110.2 / 109.4 ms with the worker
+inside gelada, against 110.3 / 113.2 ms for the same pre-boot worker without it in part 1d — within
+run-to-run noise. That is expected: gelada applies the Landlock ruleset and seccomp filter once,
+when the worker starts, and every forked child inherits them with no per-request syscall. Worker
+PSS is unchanged (~73 MiB). So the sandbox is real isolation at no measurable runtime cost.
+
+### A real-server install
+
+gelada is a single binary. Building it on the server would need a Rust toolchain there, which the
+rest of SecureCore avoids. **Recommendation:** ship prebuilt per-platform gelada binaries in the
+SecureCore release (the same canary→promote model as the worker PHP), each verified by sha256
+against the release manifest before use, and have `install.sh` / the launcher pick the one for the
+host's OS and arch. gelada supports Linux (Landlock + seccomp) and macOS (Seatbelt); on a host
+with neither (an old kernel, Windows) gelada refuses to run rather than falling back unsandboxed,
+so SecureCore must treat "no gelada" as "do not start the worker", not "start it unsandboxed".
+
+### The per-child layer (open design question for part 4)
+
+Today one gelada sandbox wraps the whole worker, so every child shares one profile. #42 wants each
+child narrowed to *its* plugin — deny the options snapshot (#47), allow only that plugin's own
+upload subfolder, and so on. gelada has `restrict_self()` for exactly this ("a worker that forks a
+child per request can narrow each child"), applied from the forked child before it loads the
+plugin, and it only ever restricts further. The snag is that `restrict_self()` is a Rust function
+and the child is PHP. The options:
+
+1. **A tiny PHP extension** exposing `restrict_self()` (and the builder for its profile). The child
+   calls it right after the fork, before `require`-ing the plugin. `restrict_self()` is designed
+   for this fork-per-request shape and refuses a process that has other threads (PHP-CLI has none),
+   and it can narrow — turn unix sockets fully off, deny more paths — but not add a unix-socket
+   allowlist (its supervisor would be a thread). It ships as one more per-platform binary.
+2. **Re-exec gelada per request** (`gelada <per-plugin opts> -- php child.php`). Simple and needs
+   no extension, but it throws away the pre-boot fork (parts 1b–1d): each request pays the full
+   WordPress boot again. A non-starter for the numbers below.
+3. **PHP FFI** into gelada's C ABI. No extension to build, but FFI would have to stay enabled in
+   the sandbox, which is itself an attack surface a hostile plugin could use.
+
+**Recommended: option 1, the extension.** It keeps the pre-boot fork (the whole point of parts
+1b–1d), uses `restrict_self()` as its author intended, and does not leave FFI enabled in the
+sandbox. Option 2 only if an extension cannot be shipped for a platform, and never with pre-boot.
