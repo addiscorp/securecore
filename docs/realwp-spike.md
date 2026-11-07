@@ -393,3 +393,198 @@ Nothing else regressed: under pre-boot `test/compat.sh` still gives the #46 resu
 clean, Yoast and CF7 at their per-request baselines, zero worker re-boots), and `bench/preboot.ts`
 still shows the per-plugin cost as the fork — front p50 pre-boot 110.3 → 113.2 ms for 1 → 2
 plugins (+2.9 ms/plugin) against 165.3 → 228.8 ms (+63.5 ms) for the per-request boot.
+
+## Part 2: the database gateway policy (#42)
+
+Through part 1 the gateway ran **whatever** query the sandbox forwarded against core's real
+`$wpdb`. A sandboxed plugin could therefore read any row core could — every user's password hash,
+every other plugin's secret option, the mail credentials — and write anything, including making
+itself an administrator. Part 2 puts a policy in front of the gateway.
+
+### How a query is checked
+
+`db_answer`'s `query` path (now `RealWpSandbox::gateway_query()` in `plugin/SecureCore.php`) runs
+every forwarded statement through `SqlPolicy` (`plugin/sql-policy.php`) first:
+
+1. **Parse** with [phpmyadmin/sql-parser], pinned to **6.0.1** in `plugin/composer.json` and
+   vendored into the release zip (`plugin/vendor/`, copied by `scripts/package.sh`). Dependencies
+   come from a registry by exact version, no git pins — APS 10. An **unparseable** or
+   **multi-statement** query is refused.
+2. **Classify.** The parser gives the statement type (SELECT / INSERT / … / DDL); the tables it
+   touches are found by scanning the SQL for core's own table names, read live from `$wpdb`
+   (`$wpdb->users`, `tables('all')`, …), word-bounded so `wp_users` ≠ `wp_usermeta`. (`getTables()`
+   alone misses JOINed and `CREATE` targets, so the policy does not rely on it for that.)
+3. **Decide**, per the table and operation below. A statement touching no core table — the
+   plugin's own tables, another plugin's, or a session/metadata statement like `SET NAMES` — is
+   free.
+
+[phpmyadmin/sql-parser]: https://packagist.org/packages/phpmyadmin/sql-parser
+
+### The policy
+
+| data | read | write |
+|---|---|---|
+| `wp_users.user_pass`, `.user_activation_key` | never (a query naming them is refused; `SELECT *` returns the row with them stripped) | via `users` grant |
+| `wp_usermeta` `session_tokens` | never | via `usermeta:capabilities` grant |
+| `wp_usermeta` `{prefix}capabilities`, `{prefix}user_level` | via `usermeta:capabilities` grant | via that grant |
+| `wp_users` rows (other columns) | allowed, secrets stripped | via `users` grant |
+| options `active_plugins`, `admin_email`, `users_can_register`, `default_role`, `cron`, `mailserver_login`, `mailserver_pass` | via `option:<name>` grant | via that grant |
+| options `siteurl`, `home`, `{prefix}user_roles` | **allowed** (see below) | via `option:<name>` grant |
+| the plugin's own tables / options / meta | free | free |
+| core content: `posts`, `postmeta`, `terms`, `comments`, … | free | free (see open questions) |
+
+A refused statement never reaches the database; the gateway returns what a failed `$wpdb` query
+returns (`false` / empty, `last_error` = `securecore: denied <reason>`), so the plugin degrades
+instead of crashing, and the refusal is audited as `db.deny` with the plugin and a SQL excerpt.
+Reads that are allowed-but-filtered run and then have their result rows trimmed: `user_pass` /
+`user_activation_key` columns dropped; `session_tokens` and (ungranted) capability rows dropped; a
+**bulk** options read (`wp_load_alloptions`' autoload `SELECT`) cut to the core allowlist plus the
+plugin's own options, so it cannot hand the sandbox every plugin's settings. A read that *names* a
+protected option or meta_key is refused rather than filtered, because such reads usually project
+only `option_value` / `meta_value` and leave no key column to strip.
+
+"The plugin's own options" are the ones its code writes (`update_option`/`register_setting`/…,
+scanned into the manifest's new `db.options` by `sandbox/scan.php`). A plugin cannot launder a
+protected option into "its own" by writing it — the deny beats the own-claim, in both the manifest
+generator and the policy.
+
+### siteurl / home / {prefix}user_roles — a deliberate divergence
+
+#42 lists `siteurl`, `home` and `{prefix}user_roles` among the options a sandbox may not read
+without a grant. The policy **allows reading them** (writes still need a grant) and keeps them in
+the pre-boot snapshot, because:
+
+- the sandbox's *own* WordPress needs them — `siteurl`/`home` for every URL it builds,
+  `user_roles` for `WP_Roles` (without it `current_user_can()` is empty) — so read-denying them
+  regresses the front page and dashboard below part 1d's results, which #42 requires we hold;
+- they are **public, non-secret** config (anyone can see a site's URL; roles are definitions, not
+  data).
+
+So the real protection on these three is "a plugin cannot *change* them". Flagging it for review:
+if you want them read-denied too, the child needs another way to source them (e.g. keeping the
+core-only snapshot in its cache rather than re-reading over the gateway), which is a bootstrap
+change, not a gateway one.
+
+### Snapshot and the shared allowlist (step 4)
+
+`write_options_snapshot()` and the gateway's bulk filter now share one source of truth —
+`snapshot_option_allowlist()` — so the options the parent boots from and the options a child may
+re-read can never disagree. It is `core_option_names()` **plus** `{prefix}user_roles`, **minus**
+the read-denied options (`admin_email`, `users_can_register`, `default_role`, `cron`,
+`mailserver_login`, `mailserver_pass`, and the active-plugin lists). The live snapshot dropped from
+549 options to **91** core options; `admin_email`, `mailserver_pass` and `active_plugins` are gone,
+`siteurl`/`home`/`{prefix}user_roles` remain.
+
+### The manifest's `db` section and grants
+
+`generate_manifest()` now writes `"db": { "options": [...], "tables": [...], "grants": [] }`.
+`options`/`tables` are scanned from the plugin's code (its own options and `$wpdb->prefix . '…'`
+tables). `grants` is **empty by default** — a sandboxed plugin reaches none of core's sensitive
+data until a human adds `users`, `usermeta:capabilities` or `option:<name>`. (No admin UI for
+grants yet; they are a manifest edit.)
+
+### Caching (AGENTS.md §7c)
+
+The policy is per-query, but its inputs are memoized: the schema parse (`core_option_names()`), the
+shared allowlist and the per-request `SqlPolicy` (built once at sandbox boot) are all computed once
+and reused. The remaining cost is the per-query parse, measured below.
+
+### Open questions / out of scope
+
+- **Core-content writes.** The policy frees reads *and* writes of `posts`/`terms`/`comments`
+  (many plugins create posts); #42 names only "reads of core content" as free and is silent on
+  writes. Left free to avoid regressing compat; flagging whether post/comment writes should be
+  gated in a later part.
+- **Cross-plugin isolation.** The policy protects *core's* sensitive data, not one plugin's tables
+  or specifically-named options from another; a bulk options read is filtered, but an explicit
+  `get_option('other_plugins_secret')` is still allowed. That is a separate concern from #42's
+  scope.
+
+### Tests
+
+`test/policy.sh` is a live canary on the pre-boot stack: a sandboxed probe
+(`test/policy-plugin/`) tries the blocked and allowed operations and reports each to the worker
+log; the script checks them, and checks from outside the sandbox that blocked writes did not land.
+It runs the probe **with the policy on, then with it off** (the vendored parser moved aside, so the
+gateway falls back to allowing everything), proving the block is the policy's doing:
+
+```
+== policy ON ==
+ok   core secret admin_email kept out of a bulk options read (bulk_admin_email=absent)
+ok   another plugin's secret kept out of a bulk options read (bulk_foreign_secret=absent)
+ok   wp_users.user_pass not readable (read_user_pass=empty)
+ok   usermeta session_tokens not readable (read_session_tokens=empty)
+ok   usermeta capabilities not readable without a grant (read_caps=empty)
+ok   the plugin's own option is readable (read_own_option=own-ok)
+ok   siteurl is readable (needed to render) (read_siteurl=nonempty)
+ok   core content (posts) is readable (count=88)
+ok   a write to the protected option admin_email was blocked
+== policy OFF (parser disabled: the same probe should now leak) ==
+ok   without the policy, admin_email leaks into the bulk read (bulk_admin_email=present)
+ok   without the policy, the other plugin's secret leaks into the bulk read
+ok   without the policy, user_pass is readable
+ok   without the policy, session_tokens is readable
+ok   without the policy, capabilities are readable
+ok   without the policy, the admin_email write landed
+== grant usermeta:capabilities ==
+ok   with the grant, capabilities are readable
+```
+
+The destructive and structural refusals (DROP/ALTER/TRUNCATE on a core table, multi-statement,
+INSERT into users, capability escalation, …) cannot be run live without wrecking the stack, so
+`test/policy-unit.php` asserts them at the `decide()` level with a real `$wpdb` — 33 verdicts,
+including that a grant opens exactly its own door and nothing else:
+
+```
+ok    DROP core table                    deny: DROP on a core table
+ok    escalate capabilities              deny: writes the protected usermeta key 'wp_capabilities'
+ok    write active_plugins               deny: writes the protected option 'active_plugins'
+ok    select * users (secrets stripped)  allow
+ok    insert users (granted)             allow
+ok    still DROP-denied (granted)        deny: DROP on a core table
+policy-unit: PASS
+```
+
+**No regression.** `test/canary.sh` (#47) still passes. Under `SECURECORE_PREBOOT`,
+`test/compat.sh` gives the part-1d / #48 results for each plugin's own checks:
+
+| plugin | front / dashboard / plugins | its admin screen | its feature | `db.deny` it hits |
+|---|---|---|---|---|
+| classic-editor 1.7.0 | 200, sandboxed | — | passes | **none** |
+| wordpress-seo 28.8 | 200, sandboxed | 500 (the part-1c `admin_bar_menu` `WP_Admin_Bar`-null throw, as #48) | passes (SEO meta on a post) | active_plugins (read), cron (read+write) |
+| contact-form-7 6.2.4.1 | 200, sandboxed | 403 (as #48) | incomplete (shortcode/REST, as #48) | **none** |
+
+`test/site.sh` fails under pre-boot for all three, as it does from part 1b on and as it did at #48:
+it is a part-1/#11 test (it asserts the probe cannot read `wp-config.php`), but under
+`SECURECORE_REALWP` the worker's `open_basedir` includes the WordPress root so core can boot, and
+closing `wp-config.php` to a child is gelada's job in a later part of #42. So `test/compat.sh`'s
+overall verdict stays `no` for the same reason as #48; every check that is the plugin's own is
+unchanged.
+
+The only plugin the new policy denies anything is Yoast: it reads `active_plugins` (to spot
+conflicting plugins) and reads/writes `cron` (to schedule its background indexing) — both on #42's
+denied list, both refused as `db.deny`, and both degrade gracefully (its front page, dashboard and
+SEO-meta feature are unaffected, exactly as #48; only the background work it cannot schedule is
+lost). **Neither the policy nor the plugin is wrong**: a sandboxed plugin should not be able to
+rewrite the site's WP-Cron array (whose entries name hooks core later fires) or read the active-
+plugin list; a deployment that wants Yoast's indexing grants it `option:cron`. Classic Editor and
+CF7 hit zero denials.
+
+`bench/preboot.ts 3` (front-page p50, median [min, max] of 3 runs):
+
+| config | front p50 (ms) | /wp-admin/ p50 (ms) | req/s c=8 | worker PSS (MiB) |
+|---|---|---|---|---|
+| off | 113.8 | 132 | 22.5 | — |
+| stub 1p / 2p | 111.3 / 115.3 | 134.1 / 140.2 | 21.5 / 20.1 | ~28 |
+| realwp 1p / 2p | 266 / 215.9 | 279.8 / 232.2 | 7.4 / 12.2 | ~70 |
+| preboot 1p / 2p | 125.4 / 112.7 | 149.1 / 135.1 | 18.5 / 19.4 | ~73 |
+
+Pre-boot stays an order of magnitude ahead of the per-request real-WordPress boot (≈113–125 ms
+vs ≈216–266 ms) — the policy did not change that. The policy's own cost is the per-query parse:
+`SqlPolicy::decide()` measured standalone (stub `$wpdb`, opcache on, mix of seven real query
+shapes) is **≈0.22 ms/query**. A page makes a few dozen gateway queries, so the aggregate is a few
+milliseconds (visible as the preboot 1p figure sitting ~12 ms over part 1d's 110.3 ms; the 2p
+figure, 112.7 ms, is within run-to-run noise of it). If that ever matters, `decide()` is a pure
+function of the query string and could be memoised per distinct statement — most of a request's
+queries repeat. (AGENTS.md §7c: its inputs — the schema parse, the allowlist, the per-request
+policy object — are already computed once and reused.)
