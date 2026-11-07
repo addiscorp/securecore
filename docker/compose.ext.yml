@@ -3,9 +3,10 @@
 #
 #   docker compose -f docker/compose.yml -f docker/compose.ext.yml -p securecore-ext up -d db php web
 #
-# The config lives at /etc/securecore/securecore.json in the php container (the image ships
-# ext/examples/off.json there); copy another in with `docker compose cp` and restart php, or
-# edit it in place: layers 2 and 3 reload without a restart. test/ext-config.sh does all of this.
+# The config lives at the site root, /var/www/html/securecore.json (a new site volume starts
+# with ext/examples/off.json there; nginx refuses to serve it); copy another in with
+# `docker compose cp` and restart php, or edit it in place: layers 2 and 3 reload without a
+# restart. test/ext-config.sh does all of this.
 services:
   php:
     build: { context: .., dockerfile: docker/ext.Dockerfile, target: php }

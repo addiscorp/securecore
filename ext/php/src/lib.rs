@@ -10,6 +10,12 @@
 //! `stat`s it at most once per [`RELOAD_INTERVAL`], at request start, and reads + hashes +
 //! parses it only when the stat changed. An edit that doesn't load keeps the last valid
 //! config live (never "off") and is logged; a `layer1` change is logged as needing a restart.
+//!
+//! E2a adds attribution ([`attribution`]): which component (plugin, mu-plugin, theme or core)
+//! is responsible for the running code, and a debug log of the component each rule would
+//! charge for every file open. Observation only.
+
+mod attribution;
 
 use std::ffi::{CString, c_char, c_int};
 use std::path::Path;
@@ -24,7 +30,7 @@ use ext_php_rs::types::ZendHashTable;
 use ext_php_rs::boxed::ZBox;
 use ext_php_rs::zend::{ExecutorGlobals, IniEntryDef, IniEntryDefs, ModuleEntry};
 use ext_php_rs::{info_table_end, info_table_row, info_table_start};
-use securecore_config::{App, Poll, Reloader};
+use securecore_config::{App, Loaded, Poll, Reloader};
 
 /// The ini setting naming the config file. PHP_INI_SYSTEM: php.ini or conf.d only, read once
 /// at startup.
@@ -33,8 +39,14 @@ const INI_CONFIG: &str = "securecore.config";
 /// How often a worker process checks the file for changes.
 pub const RELOAD_INTERVAL: Duration = Duration::from_millis(1000);
 
-static INI: IniEntryDefs<2> = IniEntryDefs::new([
+/// `securecore.config`, and two debug settings for attribution (E2a), all PHP_INI_SYSTEM:
+/// `securecore.debug_attribution_rule` (`frame` | `component`, the rule
+/// `securecore_status()['caller']` and later phases use) and `securecore.debug_attribution_log`
+/// (`off` | `frame` | `component` | `both`: a log line per file open, per rule).
+static INI: IniEntryDefs<4> = IniEntryDefs::new([
     IniEntryDef::new(c"securecore.config", c"", IniEntryPermission::System),
+    IniEntryDef::new(c"securecore.debug_attribution_rule", c"component", IniEntryPermission::System),
+    IniEntryDef::new(c"securecore.debug_attribution_log", c"off", IniEntryPermission::System),
     IniEntryDef::end(),
 ]);
 
@@ -46,6 +58,11 @@ fn state() -> MutexGuard<'static, Option<Reloader>> {
     // A panic while holding the lock can't leave a Reloader half-updated in a way that
     // matters: every field is replaced whole. Keep serving the last state.
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `f` on the live config, holding the lock only for the call.
+fn with_live<R>(f: impl FnOnce(&Loaded) -> R) -> Option<R> {
+    state().as_ref().map(|r| f(r.live()))
 }
 
 unsafe extern "C" {
@@ -70,18 +87,22 @@ fn refuse(message: &str) -> i32 {
     ZEND_RESULT_CODE_FAILURE
 }
 
-fn ini_config_path() -> Option<String> {
-    ExecutorGlobals::get().ini_values().remove(INI_CONFIG).flatten().filter(|p| !p.trim().is_empty())
-}
-
 extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
     IniEntryDef::register(INI.as_slice(), module_number);
-    let Some(path) = ini_config_path() else {
+    let mut ini = ExecutorGlobals::get().ini_values();
+    let mut value = |key: &str| ini.remove(key).flatten().unwrap_or_default();
+    let (path, rule, log) = (value(INI_CONFIG), value(attribution::INI_RULE), value(attribution::INI_LOG));
+    if path.trim().is_empty() {
         return refuse(&format!("{INI_CONFIG} is not set; point it at securecore.json"));
+    }
+    let settings = match attribution::Settings::parse(&rule, &log) {
+        Ok(s) => s,
+        Err(e) => return refuse(&e),
     };
     match Reloader::start(Path::new(&path), RELOAD_INTERVAL, Instant::now()) {
         Ok(reloader) => {
             *state() = Some(reloader);
+            attribution::startup(settings);
             ZEND_RESULT_CODE_SUCCESS
         }
         Err(e) => refuse(&e.to_string()),
@@ -89,6 +110,7 @@ extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
 }
 
 extern "C" fn request_startup(_ty: i32, _module_number: i32) -> i32 {
+    attribution::request_startup();
     let mut guard = state();
     if let Some(reloader) = guard.as_mut() {
         match reloader.poll(Instant::now()) {
@@ -112,6 +134,10 @@ extern "C" fn request_startup(_ty: i32, _module_number: i32) -> i32 {
 /// file and its sha256, and the reload state.
 #[php_function]
 pub fn securecore_status() -> PhpResult<ZBox<ZendHashTable>> {
+    // Who called, before taking the state lock (attribution reads the live config itself).
+    let root = with_live(|l| l.root.clone()).ok_or("securecore: no config loaded")?;
+    let caller = attribution::who_is_running(&root).to_string();
+    let settings = attribution::settings();
     let guard = state();
     let reloader = guard.as_ref().ok_or("securecore: no config loaded")?;
     let live = reloader.live();
@@ -131,6 +157,11 @@ pub fn securecore_status() -> PhpResult<ZBox<ZendHashTable>> {
     out.insert("reloads", i64::try_from(reloader.reloads()).unwrap_or(i64::MAX))?;
     out.insert("restart_needed", reloader.restart_needed())?;
     out.insert("reload_error", reloader.error().map(str::to_owned))?;
+    out.insert("root", root.display().to_string())?;
+    // The component responsible for this call, by the configured rule (E2a).
+    out.insert("caller", caller)?;
+    out.insert("attribution_rule", settings.as_ref().map(|s| s.rule.as_str()))?;
+    out.insert("attribution_log", settings.as_ref().map(attribution::Settings::log_str))?;
     Ok(out)
 }
 

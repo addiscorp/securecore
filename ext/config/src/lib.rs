@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 /// SecureCore configuration. Three layers, each enabled independently; all three disabled
-/// means SecureCore is off. An invalid file means nothing starts.
+/// means SecureCore is off. An invalid file means nothing starts. Relative paths are relative to
+/// the folder containing this file (the app root, as with composer.json); absolute paths are
+/// used as they are.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "securecore.json")]
@@ -42,10 +44,12 @@ pub struct Config {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Layer1 {
     pub enabled: bool,
-    /// Folders php-fpm may write, relative to the app root. Everything else is read-only.
+    /// Folders php-fpm may write (relative to the folder containing securecore.json, or
+    /// absolute). Everything else is read-only.
     #[serde(default)]
     pub write: Vec<String>,
-    /// Paths php-fpm may not read at all, on top of the common secrets SecureCore always denies.
+    /// Paths php-fpm may not read at all, on top of the common secrets SecureCore always denies
+    /// (relative to the folder containing securecore.json, or absolute).
     #[serde(default)]
     pub deny: Vec<String>,
     #[serde(default)]
@@ -143,7 +147,8 @@ impl Mode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Vault {
-    /// The file the secrets are defined in, relative to the app root.
+    /// The file the secrets are defined in (relative to the folder containing securecore.json,
+    /// or absolute).
     pub from: String,
     /// The constants SecureCore supplies natively instead of PHP.
     pub secrets: Vec<String>,
@@ -200,7 +205,8 @@ pub struct Layer3 {
     pub isolate: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
-    /// Extra folders an isolated component's child may write, relative to the app root.
+    /// Extra folders an isolated component's child may write (relative to the folder
+    /// containing securecore.json, or absolute).
     #[serde(default)]
     pub write: BTreeMap<String, Vec<String>>,
 }
@@ -234,6 +240,12 @@ impl Config {
     /// Parses and validates a file's bytes.
     pub fn from_slice(bytes: &[u8]) -> Result<Config, Problem> {
         let config: Config = serde_json::from_slice(bytes).map_err(Problem::Parse)?;
+        // serde's derived structs also accept a JSON array (fields by position); the schema
+        // says object. Compare the input with the typed value's own serialization, where every
+        // struct is an object: the parser then accepts exactly what the schema accepts.
+        let input: serde_json::Value = serde_json::from_slice(bytes).map_err(Problem::Parse)?;
+        let typed = serde_json::to_value(&config).map_err(Problem::Parse)?;
+        objects_are_objects(&typed, &input, &mut String::new())?;
         config.validate()?;
         Ok(config)
     }
@@ -250,6 +262,42 @@ impl Config {
     /// All three layers disabled: SecureCore is off. A valid configuration.
     pub fn is_off(&self) -> bool {
         !self.layer1.enabled && !self.layer2.enabled && !self.layer3.enabled
+    }
+}
+
+/// Fails where `typed` (the parsed config, serialized) has an object and `input` (the file) has
+/// an array: a struct written in serde's positional array form. `at` is the JSON path so far.
+fn objects_are_objects(typed: &serde_json::Value, input: &serde_json::Value, at: &mut String) -> Result<(), Problem> {
+    use serde_json::Value;
+    match (typed, input) {
+        (Value::Object(_), Value::Array(_)) => {
+            let place = if at.is_empty() { "the top level" } else { at.as_str() };
+            Err(Problem::Invalid(format!("{place} is an array; it must be an object")))
+        }
+        (Value::Object(t), Value::Object(i)) => {
+            for (key, tv) in t {
+                if let Some(iv) = i.get(key) {
+                    let len = at.len();
+                    if !at.is_empty() {
+                        at.push('.');
+                    }
+                    at.push_str(key);
+                    objects_are_objects(tv, iv, at)?;
+                    at.truncate(len);
+                }
+            }
+            Ok(())
+        }
+        (Value::Array(t), Value::Array(i)) => {
+            for (n, (tv, iv)) in t.iter().zip(i).enumerate() {
+                let len = at.len();
+                let _ = write!(at, "[{n}]");
+                objects_are_objects(tv, iv, at)?;
+                at.truncate(len);
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -293,6 +341,34 @@ pub struct Loaded {
     pub config: Config,
     /// Lowercase hex sha256 of the file's bytes.
     pub sha256: String,
+    /// The app root: the folder containing the file, with symlinks resolved. The file itself
+    /// may be a symlink; the root is where it sits, not where it points.
+    pub root: PathBuf,
+}
+
+impl Loaded {
+    /// A path from the config: relative paths are relative to [`Loaded::root`], absolute ones
+    /// are used as they are.
+    pub fn resolve(&self, path: &str) -> PathBuf {
+        resolve_against(&self.root, path)
+    }
+}
+
+/// `path` relative to `root` (or as is, if absolute).
+pub fn resolve_against(root: &Path, path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() { p.to_owned() } else { root.join(p) }
+}
+
+/// The folder containing `path`, absolute and with symlinks resolved where it exists.
+fn root_of(path: &Path) -> PathBuf {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_owned(),
+        _ => PathBuf::from("."),
+    };
+    fs::canonicalize(&parent)
+        .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(&parent)))
+        .unwrap_or(parent)
 }
 
 /// Reads, parses and validates the file at `path`.
@@ -300,7 +376,7 @@ pub fn load(path: &Path) -> Result<Loaded, LoadError> {
     let err = |problem| LoadError { path: path.to_owned(), problem };
     let bytes = fs::read(path).map_err(|e| err(Problem::Read(e)))?;
     let config = Config::from_slice(&bytes).map_err(err)?;
-    Ok(Loaded { path: path.to_owned(), config, sha256: sha256_hex(&bytes) })
+    Ok(Loaded { path: path.to_owned(), config, sha256: sha256_hex(&bytes), root: root_of(path) })
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {

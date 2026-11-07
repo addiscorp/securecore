@@ -16,5 +16,8 @@ test = false
 doctest = false
 
 [dependencies]
-ext-php-rs.workspace = true
+# `observer`: the Zend observer API bindings (zend_observer_fcall_register), for the attribution
+# recorder. We register our own observer; ext-php-rs's own observer wrappers stay unused.
+ext-php-rs = { workspace = true, features = ["observer"] }
 securecore-config = { path = "../config" }
+securecore-attribution = { path = "../attribution" }

@@ -97,6 +97,65 @@ fn every_layer_and_enabled_is_required() {
     rejected("[]");
 }
 
+/// serde reads a struct from a JSON array by position; the schema says object. Each of these
+/// is a valid config in serde's array form, and each must be rejected, naming where.
+#[test]
+fn the_array_form_is_rejected_at_every_level() {
+    // Proof that serde alone accepts them: they deserialize as the plain type.
+    // Positional: `$schema` first.
+    let top = r#"[null,{"enabled":false},{"enabled":false},{"enabled":false}]"#;
+    assert!(serde_json::from_str::<Config>(top).is_ok(), "serde accepts the array form");
+    let e = rejected(top);
+    assert!(e.contains("the top level is an array; it must be an object"), "{e}");
+
+    let l1 = r#"{"layer1":[false],"layer2":{"enabled":false},"layer3":{"enabled":false}}"#;
+    assert!(serde_json::from_str::<Config>(l1).is_ok());
+    assert!(rejected(l1).contains("layer1 is an array"), "{}", rejected(l1));
+
+    let port = r#"{"layer1":{"enabled":true,"network":{"connect":[{"port":443},[3306]]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#;
+    assert!(serde_json::from_str::<Config>(port).is_ok());
+    assert!(rejected(port).contains("layer1.network.connect[1] is an array"), "{}", rejected(port));
+
+    let limits = r#"{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":true,"limits":[100,64]}}"#;
+    assert!(rejected(limits).contains("layer3.limits is an array"), "{}", rejected(limits));
+
+    // A component's rules: `hosts` first, by position.
+    let rules = with_layer2(r#","components":{"cf7":[["example.com"]]}"#);
+    assert!(serde_json::from_str::<Config>(&rules).is_ok());
+    assert!(rejected(&rules).contains("layer2.components.cf7 is an array"), "{}", rejected(&rules));
+
+    // Arrays where the schema has arrays stay valid.
+    assert!(parse(&with_layer2(r#","default":{"files":["wp-content/uploads/*"]}"#)).is_ok());
+    assert!(parse(WORDPRESS).is_ok());
+}
+
+#[test]
+fn paths_resolve_against_the_folder_holding_the_file() {
+    let dir = scratch("root");
+    let site = dir.join("site");
+    fs::create_dir_all(&site).expect("mkdir");
+    let path = site.join("securecore.json");
+    fs::write(&path, WORDPRESS).expect("write");
+    let loaded = load(&path).expect("load");
+    let root = fs::canonicalize(&site).expect("canonical");
+    assert_eq!(loaded.root, root);
+    assert_eq!(loaded.resolve("wp-content/uploads"), root.join("wp-content/uploads"));
+    assert_eq!(loaded.resolve("/srv/backups"), Path::new("/srv/backups"), "absolute paths as they are");
+    assert_eq!(loaded.resolve(&loaded.config.layer2.vault.as_ref().expect("vault").from), root.join("wp-config.php"));
+
+    // A symlinked file: the root is where the link sits, not where it points.
+    let elsewhere = dir.join("etc");
+    fs::create_dir_all(&elsewhere).expect("mkdir");
+    let real = elsewhere.join("securecore.json");
+    fs::write(&real, WORDPRESS).expect("write");
+    let link_site = dir.join("linked-site");
+    fs::create_dir_all(&link_site).expect("mkdir");
+    std::os::unix::fs::symlink(&real, link_site.join("securecore.json")).expect("symlink");
+    let linked = load(&link_site.join("securecore.json")).expect("load via symlink");
+    assert_eq!(linked.root, fs::canonicalize(&link_site).expect("canonical"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn port_zero_and_bad_scope_are_rejected() {
     let e = rejected(r#"{"layer1":{"enabled":true,"network":{"connect":[{"port":0}]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#);

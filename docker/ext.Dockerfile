@@ -38,8 +38,10 @@ FROM scratch AS so
 COPY --from=build /out/securecore.so /securecore.so
 
 # Stock WordPress php-fpm (Debian trixie, PHP 8.3 NTS: same extension API as the build) with
-# the extension. One ini line points it at the config; docker/compose.ext.yml supplies the file.
+# the extension. One ini line points it at the config, /var/www/html/securecore.json: the site
+# root is the folder containing it. The image's entrypoint copies /usr/src/wordpress into a new
+# site volume, so a fresh stack starts with off.json there; test/ext-config.sh replaces it.
 FROM wordpress:php8.3-fpm AS php
 COPY --from=build /out/securecore.so /usr/local/lib/php/extensions/securecore.so
 COPY docker/securecore.ini /usr/local/etc/php/conf.d/securecore.ini
-COPY ext/examples/off.json /etc/securecore/securecore.json
+COPY ext/examples/off.json /usr/src/wordpress/securecore.json

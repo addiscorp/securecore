@@ -8,6 +8,7 @@ nothing yet; layer 2 policy (E2–E5), the layer 1 launcher (E6) and layer 3 (E7
 | crate | what |
 |---|---|
 | `config/` (`securecore-config`) | the config types (serde), the loader, the reloader and the JSON Schema. Plain Rust, no PHP: the `securecore-fpm` launcher (E6) reads the file with the same code. |
+| `attribution/` (`securecore-attribution`) | E2a: path → component (plugin, mu-plugin, theme, core), the two "who is running" rules, the watched file functions, and `securecore-attribution-report`. Plain Rust, no PHP. |
 | `php/` (`securecore-php`) | the extension, built as `securecore.so` |
 
 ## Build
@@ -30,8 +31,14 @@ Copy `securecore.so` into PHP's extension folder and add one ini file to `conf.d
 
 ```ini
 extension=securecore.so
-securecore.config=/etc/securecore/securecore.json
+securecore.config=/var/www/html/securecore.json
 ```
+
+**The app root is the folder containing `securecore.json`** (as with `composer.json`): every
+relative path in the file is relative to it, and absolute paths are used as they are. So the
+file usually sits at the web root, and **the web server must never serve it**: the docker nginx
+config answers 404 for any URI containing `securecore.json` (copies such as `.bak` included);
+an installer that writes the file must do the same for its server.
 
 `securecore.config` is `PHP_INI_SYSTEM`: set it in php.ini or `conf.d`, not in a php-fpm pool
 (`php_admin_value`), because the file is loaded once when PHP starts, before pools exist.
@@ -40,7 +47,7 @@ securecore.config=/etc/securecore/securecore.json
 invalid stops PHP from starting: module startup fails, PHP logs
 
 ```
-PHP Warning:  PHP Startup: securecore: /etc/securecore/securecore.json: invalid: unknown variant `block`, expected one of `enforce`, `log`, `off` at line 1 column 85; refusing to start in Unknown on line 0
+PHP Warning:  PHP Startup: securecore: /var/www/html/securecore.json: invalid: unknown variant `block`, expected one of `enforce`, `log`, `off` at line 1 column 85; refusing to start in Unknown on line 0
 PHP Fatal error:  Unable to start securecore module in Unknown on line 0
 ```
 
@@ -65,7 +72,9 @@ Examples: [`examples/wordpress.json`](examples/wordpress.json) (every field, the
 
 Beyond the schema's structure, one rule is checked in code and expressed in the schema as an
 `if`/`then`: `layer2.app` is required when layer 2 is enabled. `layer2.mode` defaults to
-`enforce`.
+`enforce`. The parser accepts exactly what the schema accepts: serde would also read any object
+from a JSON array (its fields by position), and that form is rejected
+(`layer1 is an array; it must be an object`).
 
 ## Reload
 
@@ -90,7 +99,7 @@ What this worker is enforcing:
 ```php
 [
   'version' => '0.1.0',
-  'config' => '/etc/securecore/securecore.json',
+  'config' => '/var/www/html/securecore.json',
   'sha256' => '6e5d42ec…',          // of the file's bytes
   'off' => false,                   // all three layers disabled
   'layers' => ['layer1' => true, 'layer2' => true, 'layer3' => true],
@@ -99,10 +108,65 @@ What this worker is enforcing:
   'reloads' => 0,                   // reloads in this worker since it forked
   'restart_needed' => false,        // layer1 differs from the one php-fpm started with
   'reload_error' => null,           // the problem with the file on disk, while it can't load
+  'root' => '/var/www/html',        // the folder containing securecore.json
+  'caller' => 'core',               // who called, by the attribution rule (below)
+  'attribution_rule' => 'component',
+  'attribution_log' => 'off',
 ]
 ```
 
 `phpinfo()` shows the config path and sha256 too.
+
+## Attribution (E2a)
+
+Layer 2 restricts each **component**. For `layer2.app = "wordpress"` (`attribution/`):
+
+- each folder in the plugins directory, or `.php` file directly in it, is `plugin:<slug>`;
+- each entry in mu-plugins is `mu-plugin:<name>`, except SecureCore's own loader
+  (`securecore-loader.php`), which is core;
+- each folder in the themes directory is `theme:<slug>`;
+- everything else under the root (and in `WP_CONTENT_DIR`) is `core`; anything else is
+  `outside`. `index.php` in those directories is core.
+
+`WP_CONTENT_DIR`, `WP_PLUGIN_DIR` and `WPMU_PLUGIN_DIR` move the directories when defined
+(read when asked, so they count once wp-config.php has set them). Symlinks are resolved: a plugin
+symlinked in from elsewhere is still itself when PHP reports its files by their real path. The
+map re-reads the component directories when their mtime changes (checked at most once a
+second).
+
+**Who is running** is computed only when asked, from the PHP stack (`execute_data`), by one of
+two rules:
+
+| rule | the component responsible is | a plugin calling a core API that opens a file |
+|---|---|---|
+| `frame` (a) | the innermost user-code frame's file | core |
+| `component` (b) | the innermost frame on the stack that belongs to a component; core only when none is | the plugin |
+
+Two debug settings, both PHP_INI_SYSTEM, choose and expose it:
+
+```ini
+securecore.debug_attribution_rule = component   ; frame | component (the default)
+securecore.debug_attribution_log  = off         ; off (default) | frame | component | both
+```
+
+With logging on and layer 2 in `log` or `enforce` mode, every file open writes one line per
+logged rule to PHP's error log:
+
+```
+securecore: attribution component plugin:contact-form-7 file_get_contents /var/www/html/wp-content/uploads/x.txt
+securecore: attribution frame core require_once /var/www/html/wp-includes/version.php
+```
+
+"Opens" are every include/require that loads a file (through a `zend_compile_file` wrapper, so
+opcache hits count), and the PHP functions that open a path through the plain-files wrapper
+(`attribution/src/watch.rs`: fopen with its mode, file_get_contents, file_put_contents, file,
+readfile, opendir/scandir/glob, unlink/rename/copy/mkdir/… and SplFileObject), through a Zend
+observer. Not seen: opens made inside other extensions' C code (GD, Zip, …) and metadata calls
+(`file_exists`, `stat`). With logging off neither hook exists, so the normal request path pays
+nothing. This is observation only: nothing is blocked.
+
+`research/attribution/measure.sh` runs the measurement on the docker stack and
+`securecore-attribution-report` turns the log into per-component tables.
 
 ## Tests
 
@@ -113,4 +177,10 @@ What this worker is enforcing:
   (`docker/compose.ext.yml`, project `securecore-ext`, port 8089): front page 200, the status
   reports the file's sha256 and layers, an edit is live in every worker without a restart, and
   an invalid, missing or unset config makes php-fpm refuse to start with the reason in its log.
+- `DOCKER_CONTEXT=colima test/ext-attribution.sh` (after ext-config.sh): fixture plugins open
+  files in known ways; checks the component each rule charges, the map (own includes, a
+  mu-plugin callback, a symlinked plugin, core including plugins and the theme), the rule
+  setting, that logging is off by default and that mode `off` records nothing.
 - `DOCKER_CONTEXT=colima bench/ext.sh`: front-page p50 with the extension loaded vs not.
+- `DOCKER_CONTEXT=colima bench/attribution.sh`: front-page p50 not loaded, loaded with
+  attribution logging off, and on.
