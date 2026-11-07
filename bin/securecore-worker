@@ -67,6 +67,7 @@ fi
 exec env -i PATH=/usr/bin:/bin:/usr/local/bin \
   ${SECURECORE_NOFORK:+SECURECORE_NOFORK="$SECURECORE_NOFORK"} \
   ${SECURECORE_REALWP:+SECURECORE_REALWP="$SECURECORE_REALWP"} \
+  ${SECURECORE_PREBOOT:+SECURECORE_PREBOOT="$SECURECORE_PREBOOT"} \
   "$php" \
   -d open_basedir="$basedir" \
   -d disable_functions="exec,passthru,shell_exec,system,proc_open,proc_close,proc_get_status,proc_terminate,popen,pcntl_exec,fsockopen,pfsockopen,stream_socket_client,socket_create,socket_connect,socket_bind,curl_init,curl_exec,curl_multi_exec,mail" \

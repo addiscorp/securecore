@@ -98,8 +98,13 @@ function make_gateway_wpdb(string $prefix): \wpdb
 /**
  * Boot WordPress. $root is the site's WordPress folder (ABSPATH); $prefix the table prefix.
  * Returns nothing — $GLOBALS are populated as in any WordPress request.
+ *
+ * $wpdb is the connectionless database to boot against. The per-request child passes none and
+ * boots against the socket gateway (every query goes to core). The worker parent pre-booting
+ * once (addiscorp/securecore#42, part 1b) passes a snapshot-backed $wpdb that serves the boot's
+ * one options query from the on-disk snapshot, because the parent has no request socket.
  */
-function boot_wordpress(string $root, string $prefix): void
+function boot_wordpress(string $root, string $prefix, ?\wpdb $wpdb = null): void
 {
     if (!defined('ABSPATH')) {
         define('ABSPATH', rtrim($root, '/') . '/');
@@ -122,9 +127,111 @@ function boot_wordpress(string $root, string $prefix): void
     // Pre-seat the connectionless $wpdb so require_wp_db() in wp-settings.php finds it set
     // and returns early instead of building one that connects.
     require_once ABSPATH . 'wp-includes/class-wpdb.php';
-    $GLOBALS['wpdb'] = make_gateway_wpdb($prefix);
+    $GLOBALS['wpdb'] = $wpdb ?? make_gateway_wpdb($prefix);
 
     require ABSPATH . 'wp-settings.php';
+}
+
+/**
+ * A $wpdb for the worker parent's one-time pre-boot (addiscorp/securecore#42, part 1b). The
+ * parent has no request socket, so there is no gateway to answer queries; instead this $wpdb
+ * serves the single query a no-plugin boot makes — wp_load_alloptions()'s autoloaded-options
+ * SELECT — from the snapshot core wrote to disk, and treats anything else as empty (logged to
+ * the worker log, so an unexpected boot query is visible). It never connects and never writes.
+ * Built as an anonymous class so \wpdb is resolved only after class-wpdb.php is loaded.
+ */
+function make_snapshot_wpdb(string $prefix, array $options): \wpdb
+{
+    return new class($prefix, $options) extends \wpdb {
+        /** @var array<string,string> option_name => raw option_value */
+        private array $snapshot;
+
+        public function __construct(string $prefix, array $options)
+        {
+            // No parent constructor (it would connect). wp-settings.php calls set_prefix()
+            // on us, which fills in the table names; we only need to be "ready".
+            $this->ready = true;
+            $this->prefix = $prefix;
+            $this->base_prefix = $prefix;
+            $this->field_types = [];
+            $this->snapshot = $options;
+        }
+
+        // wp_load_alloptions() runs "SELECT option_name, option_value ... WHERE autoload IN (...)";
+        // serve it from the snapshot regardless of the exact autoload values (they vary by
+        // WordPress version). Any other get_results during a no-plugin boot is unexpected.
+        public function get_results($query = null, $output = OBJECT)
+        {
+            if (is_string($query) && stripos($query, 'option_name') !== false && stripos($query, 'autoload') !== false) {
+                $rows = [];
+                foreach ($this->snapshot as $name => $value) {
+                    $rows[] = (object) ['option_name' => (string) $name, 'option_value' => $value];
+                }
+                return $rows;
+            }
+            $this->parent_boot_miss($query);
+            return [];
+        }
+
+        public function query($query)
+        {
+            $this->parent_boot_miss($query);
+            return false;
+        }
+
+        public function get_row($query = null, $output = OBJECT, $y = 0)
+        {
+            $this->parent_boot_miss($query);
+            return null;
+        }
+
+        public function get_var($query = null, $x = 0, $y = 0)
+        {
+            $this->parent_boot_miss($query);
+            return null;
+        }
+
+        public function get_col($query = null, $x = 0)
+        {
+            $this->parent_boot_miss($query);
+            return [];
+        }
+
+        public function _real_escape($data)
+        {
+            if (!is_scalar($data)) return '';
+            return $this->add_placeholder_escape(addslashes((string) $data));
+        }
+
+        public function db_version()
+        {
+            return '8.0.0';
+        }
+
+        public function db_server_info()
+        {
+            return '8.0.0';
+        }
+
+        public function check_connection($allow_bail = true)
+        {
+            return true;
+        }
+
+        public function close()
+        {
+            return true;
+        }
+
+        private function parent_boot_miss($query): void
+        {
+            // Truncated: a boot query may carry a large value (a theme's block-pattern cache),
+            // and this only needs to stay visible, not fill the log.
+            $sql = preg_replace('/\s+/', ' ', trim((string) $query));
+            if (strlen($sql) > 200) $sql = substr($sql, 0, 200) . '…';
+            fwrite(STDERR, gmdate('c') . ' securecore-worker preboot: query not served from snapshot (returned empty): ' . $sql . "\n");
+        }
+    };
 }
 
 /**
