@@ -25,33 +25,59 @@ services:
       - wp:/var/www/html
       - sock:/run/securecore
 
-  # The sandbox. No network at all; only the WordPress files (read-only) and the socket dir.
+  # The sandbox, run inside gelada (addiscorp/securecore#42, part 3). Unlike parts 1–2 this
+  # container is NOT network_mode:none and mounts the site read-write: gelada is now the sandbox
+  # boundary, so the isolation has to be gelada's doing (that is what the property tests check —
+  # with gelada removed, the worker can read wp-config.php, reach MySQL and write the plugins
+  # folder; with it on, none of that works). A real install can keep the no-network container and
+  # a read-only mount as extra layers; here they are off so the test proves gelada.
+  #
+  # gelada: --deny wp-config.php (+ backups); network off and no --allow-unix-socket, so every
+  # outbound connect fails while the worker still binds its own socket (its folder is writable,
+  # and a writable path that is a socket may be used); --allow-write only the socket dir, uploads
+  # and cache. The parent reads options-snapshot.php under the CLI, sandboxed from the start, so
+  # it is NOT denied here — #47's deny of the snapshot to a child belongs to the per-child layer
+  # (part 4). The launcher's open_basedir / disable_functions stay as an inner layer.
   worker:
     build: { context: .., dockerfile: docker/worker.Dockerfile }
-    network_mode: none
+    # No seccomp override. Docker's default seccomp profile already allows the seccomp() syscall,
+    # Landlock and seccomp user-notification, and gelada sets no_new_privs itself, so it installs
+    # its OWN seccomp + Landlock filter on TOP of the container's default profile instead of
+    # replacing it — strictly more confinement than seccomp:unconfined, which would have dropped
+    # the whole default profile. (gelada 0.2.0's own suite passes under the default profile on this
+    # colima, as root and as an unprivileged user.)
     restart: unless-stopped
-    # SECURECORE_REALWP: the "real WordPress" model (#42, part 1) — the child boots the site's
-    # own WordPress and runs its plugin inside it. Core must agree (define SECURECORE_REALWP in
-    # wp-config). Unset here = the forward-stub worker (#11), kept for the benchmark.
+    # SECURECORE_REALWP: the "real WordPress" model (#42, part 1). SECURECORE_PREBOOT (with it):
+    # the parent boots WordPress once and each child forks from it (#42, part 1b). Core must agree
+    # (define SECURECORE_REALWP in wp-config). Unset = the forward-stub worker (#11).
     environment:
       SECURECORE_REALWP: ${SECURECORE_REALWP:-}
-      # SECURECORE_PREBOOT (with SECURECORE_REALWP): the parent boots WordPress once and each
-      # child forks from it, instead of booting per request (#42, part 1b). Unset = boot per
-      # request, the part-1 behaviour kept for the benchmark.
       SECURECORE_PREBOOT: ${SECURECORE_PREBOOT:-}
-    # The default launcher, hardening the worker through PHP settings (bin/securecore-worker,
-    # installed under wp-content/securecore). The no-network container is the extra layer.
-    # It waits for install-securecore to have written the launcher.
+      # Test-only (test/gelada.sh): set it to run the launcher WITHOUT gelada, to show that the
+      # isolation is gelada's doing. Never set in a real deployment.
+      SECURECORE_NOGELADA: ${SECURECORE_NOGELADA:-}
+    # Wait for install-securecore to write the launcher, make the writable folders exist, then
+    # exec the launcher inside gelada. `$$` is a literal `$` (Compose would eat a single `$`).
     command:
       - sh
       - -c
-      - >
-        while [ ! -x /var/www/html/wp-content/plugins/securecore/bin/securecore-worker ]; do sleep 1; done;
-        exec /var/www/html/wp-content/plugins/securecore/bin/securecore-worker
-        /run/securecore/worker.sock /var/www/html/wp-content/plugins
-        /var/www/html/wp-content/securecore/manifests
+      - |
+        L=/var/www/html/wp-content/plugins/securecore/bin/securecore-worker
+        while [ ! -x "$$L" ]; do sleep 1; done
+        mkdir -p /run/securecore /var/www/html/wp-content/uploads /var/www/html/wp-content/cache
+        if [ -n "$$SECURECORE_NOGELADA" ]; then
+          exec "$$L" /run/securecore/worker.sock \
+            /var/www/html/wp-content/plugins /var/www/html/wp-content/securecore/manifests
+        fi
+        set -- --deny /var/www/html/wp-config.php
+        for f in /var/www/html/wp-config-*.php; do [ -e "$$f" ] && set -- "$$@" --deny "$$f"; done
+        set -- "$$@" --allow-write /run/securecore \
+          --allow-write /var/www/html/wp-content/uploads \
+          --allow-write /var/www/html/wp-content/cache
+        exec gelada "$$@" -- "$$L" /run/securecore/worker.sock \
+          /var/www/html/wp-content/plugins /var/www/html/wp-content/securecore/manifests
     volumes:
-      - wp:/var/www/html:ro
+      - wp:/var/www/html
       - sock:/run/securecore
 
   web:
