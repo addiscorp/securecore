@@ -156,7 +156,10 @@ the [database policy](#database-policy-e4)'s (E4). (`hosts` is for E5.)
 
 Layers 2 and 3 follow the file without a php-fpm restart. At request start (RINIT) each php-fpm
 worker `stat`s the file at most once per second (`RELOAD_INTERVAL`), and reads, hashes and
-parses it only when the stat (inode, size, mtime, ctime) changed. A new valid file goes live in
+parses it only when the stat (inode, size, mtime, ctime) changed, or while the stat is too recent
+to tell two writes apart: file times tick coarsely, so two same-size writes inside one tick leave
+the same stat, and for 2 s after the file changed the sha256 is compared too ("racily clean", as
+git calls it; #63). A new valid file goes live in
 that worker and is logged (`securecore: reloaded <path> (sha256 …)`). So an edit is live
 everywhere about a second after it is saved; the cost on a request with no change is one clock
 read, and one `stat` a second per worker.
