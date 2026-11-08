@@ -188,7 +188,7 @@ fn named_user_frames(mut ex: *const zend_execute_data) -> impl Iterator<Item = (
 pub fn who_is_running(root: &Path) -> Component {
     let rule = settings().map_or(Rule::Component, |s| s.rule);
     // SAFETY: EG(current_execute_data), read on the request's own thread.
-    let current = unsafe { (*std::ptr::addr_of!(ext_php_rs::ffi::executor_globals)).current_execute_data };
+    let current = unsafe { (*crate::executor_globals()).current_execute_data };
     responsible(rule, root, current)
 }
 
@@ -321,7 +321,7 @@ unsafe extern "C" fn compile_file(file_handle: *mut ext_php_rs::ffi::zend_file_h
     // main script (no caller) are neither recorded nor enforced.
     // SAFETY: EG(current_execute_data) and its opline, on the request's own thread.
     let (op, current) = unsafe {
-        let current = (*std::ptr::addr_of!(ext_php_rs::ffi::executor_globals)).current_execute_data;
+        let current = (*crate::executor_globals()).current_execute_data;
         let op = current
             .as_ref()
             .and_then(|c| c.opline.as_ref())

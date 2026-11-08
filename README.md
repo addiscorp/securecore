@@ -71,8 +71,10 @@ Settings in `wp-config.php`: `SECURECORE_DISABLED` (load plugins normally),
 | `sandbox/scan.php`, `sandbox/gen-manifest.php` | the `token_get_all` scan behind generated manifests |
 | `install.sh` | the one-line installer (POSIX sh) |
 | `templates/` | the systemd unit and Docker Compose service shipped in the zip |
-| `scripts/` | `version.sh`, `package.sh` (the zip), `release-layout.sh` (the bucket layout) |
-| `.github/workflows/` | tag-canary, release (canary → R2), promote (same bytes → stable) |
+| `scripts/` | `version.sh`, `package.sh` (the zip), `release-layout.sh` (the bucket layout and `release.json`, the manifest), `ext-cells.txt`/`ext-cells.sh` (the extension's matrix), `ext-build.sh` (one cell), `r2.sh` (one object over R2's S3 API) |
+| `ext/install.sh` | the extension installer, published as `install-ext.sh` (ext/README.md, Install) |
+| `test/release-check.sh` | the release check for one extension cell: WordPress on that PHP, installed by `install-ext.sh` |
+| `.github/workflows/` | tag-canary (nightly), release (16 extension cells built and release-checked, then canary → R2), promote (same bytes → stable) |
 | `probe/securecore-probe.php` | test plugin that behaves like a backdoored update |
 | `test/plugin/securecore-state.php` | test plugin for request isolation (a static that would leak without the fork) |
 | `manifests/` | one manifest per sandboxed plugin |
@@ -95,8 +97,9 @@ WordPress, the database and the site. Releases: `scripts/package.sh` builds the 
 what a site needs); `scripts/mirror-php.sh` mirrors the static-php-cli builds listed in
 `scripts/php-builds.txt` and writes `php.json`;
 `scripts/release-layout.sh` lays out a release as the `securecore-releases` bucket holds it;
-`.github/workflows/` tags a canary on every push to main, publishes it, and promotes a
-canary to stable with the same bytes (APS 9, APS 12).
+`.github/workflows/` tags a canary nightly when main changed, builds and release-checks the
+extension matrix, publishes it, and promotes a canary to stable with the same bytes (APS 9,
+APS 12; ext/README.md, Release).
 
 ## Run it (dev stack)
 

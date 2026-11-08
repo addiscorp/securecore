@@ -1,0 +1,47 @@
+# One cell of the extension's release matrix on pull requests (addiscorp/securecore#53, E8):
+# PHP 8.3 NTS on linux-x86_64, only for PRs that touch the extension, the Docker files or the
+# release scripts. The release (release.yml) runs all 16 cells; this catches a broken build or
+# release check before merge for the price of one. It also runs the Rust gate (clippy -D warnings
+# + cargo test, the whole workspace) in the same image.
+name: Extension (PR)
+
+on:
+  pull_request:
+    paths:
+      - 'ext/**'
+      - 'docker/**'
+      - 'scripts/ext-*'
+      - 'scripts/release-layout.sh'
+      - 'scripts/package.sh'
+      - 'test/release-check.sh'
+      - 'test/release/**'
+      - 'test/ext/securecore-status.php'
+      - '.github/workflows/ext-pr.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ext-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  cell:
+    name: ext php8.3-nts-linux-x86_64
+    # APS 11 puts CI on mirab VMs, but Docker inside jobs is not in mirab's phase 1 (mirab#59,
+    # row 12), and this job is Docker end to end (the build in PHP's official image, WordPress in
+    # containers for the release check). So it runs on a GitHub-hosted runner, as APS 11 allows
+    # for "jobs a mirab VM can't run yet"; it moves to mirab-linux-x64 when mirab#59 lands Docker.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Rust gate (clippy -D warnings + cargo test, PHP 8.3 NTS)
+        run: docker build -f docker/ext.Dockerfile --target check .
+      - name: Build the cell (scripts/ext-build.sh)
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          TMPDIR="$PWD/.tmp" scripts/ext-build.sh 8.3 nts dist
+      - name: Release check (test/release-check.sh)
+        run: TMPDIR="$PWD/.tmp" test/release-check.sh 8.3 nts dist

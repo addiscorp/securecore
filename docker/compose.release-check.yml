@@ -1,0 +1,64 @@
+# The release check (addiscorp/securecore#53, E8): WordPress on one release cell, SecureCore
+# installed by install-ext.sh from that cell's release files (docker/release-check.Dockerfile).
+# test/release-check.sh sets the variables and runs it, one compose project per cell:
+#   SC_PHP_IMAGE    the cell's image (scripts/ext-cells.sh image <php> <ts>)
+#   SC_TS           nts | zts
+#   SC_RELEASE_DIR  the laid-out release (absolute path)
+#   SC_COMMAND      sapi (plain) | sapi-layer1 (started by securecore-fpm)
+#   SC_USER         who runs it: root for php-fpm (its workers drop to www-data), www-data for php-cgi
+#   SC_PORT         the site's port on 127.0.0.1 (default 8095)
+services:
+  db:
+    image: mariadb:11.4@sha256:d1891ede5a559f1086f55053bb8cc1569b0298338c4d72d71725a7f74f6ba620
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress-db-password
+      MARIADB_ROOT_PASSWORD: root-db-password
+    volumes:
+      - db:/var/lib/mysql
+
+  php:
+    build:
+      context: ..
+      dockerfile: docker/release-check.Dockerfile
+      args:
+        PHP_IMAGE: ${SC_PHP_IMAGE:?}
+        TS: ${SC_TS:?}
+      additional_contexts:
+        release: ${SC_RELEASE_DIR:?}
+    command: ["${SC_COMMAND:-sapi}"]
+    user: ${SC_USER:-root}
+    depends_on: [db]
+    # Layer 1's port rules leave no UDP, so names resolve over TCP (layer1.network.connect has 53).
+    dns_opt: [use-vc]
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress-db-password
+      # The test site's keys and salts, which the vault maps and hides (never real ones).
+      WORDPRESS_AUTH_KEY: sc-test-auth-key
+      WORDPRESS_SECURE_AUTH_KEY: sc-test-secure-auth-key
+      WORDPRESS_LOGGED_IN_KEY: sc-test-logged-in-key
+      WORDPRESS_NONCE_KEY: sc-test-nonce-key
+      WORDPRESS_AUTH_SALT: sc-test-auth-salt
+      WORDPRESS_SECURE_AUTH_SALT: sc-test-secure-auth-salt
+      WORDPRESS_LOGGED_IN_SALT: sc-test-logged-in-salt
+      WORDPRESS_NONCE_SALT: sc-test-nonce-salt
+      # php-cgi (ZTS cells): FastCGI children forked from the parent that ran MINIT.
+      PHP_FCGI_CHILDREN: "4"
+    volumes:
+      - wp:/var/www/html
+
+  web:
+    build: { context: .., dockerfile: docker/web.Dockerfile }
+    depends_on: [php]
+    ports:
+      - "127.0.0.1:${SC_PORT:-8095}:80"
+    volumes:
+      - wp:/var/www/html:ro
+
+volumes:
+  db:
+  wp:
