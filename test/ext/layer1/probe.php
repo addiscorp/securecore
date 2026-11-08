@@ -32,7 +32,14 @@ function write(string $case, string $path): void {
     report($case, $ok, last_error());
 }
 
-// The database, over TCP 3306 (the name resolved over TCP 53).
+// The database, over TCP 3306 (the name resolved over TCP 53). Connect the way WordPress does:
+// mysqli errors as a return value (not an exception), and DB_HOST defined — the vault (E3) only
+// restores the DB password to the configured DB host, read from that constant, so a core script
+// that connects must define it, as wp-config.php does.
+mysqli_report(MYSQLI_REPORT_OFF);
+if (!defined('DB_HOST')) {
+    define('DB_HOST', getenv('WORDPRESS_DB_HOST'));
+}
 $db = mysqli_init();
 $ok = @$db->real_connect(getenv('WORDPRESS_DB_HOST'), getenv('WORDPRESS_DB_USER'), getenv('WORDPRESS_DB_PASSWORD'), getenv('WORDPRESS_DB_NAME'), 3306);
 report('db-3306', $ok && $db->query('select 1') !== false, mysqli_connect_error() ?? '');

@@ -11,6 +11,12 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# The vault's salt reconstruction and keyed hashing (E3), a pure function shared by the
+# extension so the engine and the tests can't disagree on the bytes.
+hmac.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+digest.workspace = true
 
 # Writes securecore.schema.json from the types: cargo run -p securecore-config --bin securecore-schema
 [[bin]]

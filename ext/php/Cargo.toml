@@ -21,3 +21,13 @@ doctest = false
 ext-php-rs = { workspace = true, features = ["observer"] }
 securecore-config = { path = "../config" }
 securecore-attribution = { path = "../attribution" }
+# The database policy (E4): parse + decide, plain Rust.
+securecore-db = { path = "../db" }
+# The vault (E3): HMAC over the real keys natively, so the key never reaches PHP; libc for the
+# C environ masking at MINIT.
+hmac = { workspace = true }
+md-5 = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+digest = { workspace = true }
+libc = { workspace = true }

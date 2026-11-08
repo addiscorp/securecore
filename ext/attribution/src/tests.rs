@@ -27,6 +27,9 @@ fn wordpress_default_layout() {
     assert_eq!(at(&m, "/srv/site/wp-content/mu-plugins/cache-tweaks.php"), Component::MuPlugin("cache-tweaks".into()));
     assert_eq!(at(&m, "/srv/site/wp-content/mu-plugins/agency/lib.php"), Component::MuPlugin("agency".into()));
     assert_eq!(at(&m, "/srv/site/wp-content/mu-plugins/securecore-loader.php"), Component::Core);
+    // SecureCore's vault mu-plugin (E3) is core too, so its native wp_salt/wp_hash are not a
+    // restricted component.
+    assert_eq!(at(&m, "/srv/site/wp-content/mu-plugins/securecore-vault.php"), Component::Core);
     // Themes: each folder; files directly in themes/ are core.
     assert_eq!(at(&m, "/srv/site/wp-content/themes/twentytwentyfive/functions.php"), Component::Theme("twentytwentyfive".into()));
     assert_eq!(at(&m, "/srv/site/wp-content/themes/index.php"), Component::Core);

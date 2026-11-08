@@ -16,8 +16,10 @@
 //! charge for every file open. Observation only.
 
 mod attribution;
+mod db;
 mod enforce;
 mod hosts;
+mod vault;
 
 use std::ffi::{CString, c_char, c_int};
 use std::path::Path;
@@ -45,10 +47,13 @@ pub const RELOAD_INTERVAL: Duration = Duration::from_millis(1000);
 /// `securecore.debug_attribution_rule` (`frame` | `component`, the rule
 /// `securecore_status()['caller']` and later phases use) and `securecore.debug_attribution_log`
 /// (`off` | `frame` | `component` | `both`: a log line per file open, per rule).
-static INI: IniEntryDefs<4> = IniEntryDefs::new([
+static INI: IniEntryDefs<5> = IniEntryDefs::new([
     IniEntryDef::new(c"securecore.config", c"", IniEntryPermission::System),
     IniEntryDef::new(c"securecore.debug_attribution_rule", c"component", IniEntryPermission::System),
     IniEntryDef::new(c"securecore.debug_attribution_log", c"off", IniEntryPermission::System),
+    // E4, research only: who a database query is charged to. `caller` is the rule; `component`
+    // reproduces the measurement that rejected it. See db::DbAttribution.
+    IniEntryDef::new(c"securecore.debug_db_attribution", c"caller", IniEntryPermission::System),
     IniEntryDef::end(),
 ]);
 
@@ -100,6 +105,9 @@ extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
     let mut ini = ExecutorGlobals::get().ini_values();
     let mut value = |key: &str| ini.remove(key).flatten().unwrap_or_default();
     let (path, rule, log) = (value(INI_CONFIG), value(attribution::INI_RULE), value(attribution::INI_LOG));
+    if let Err(e) = db::startup(&value(db::INI_ATTRIBUTION)) {
+        return refuse(&e);
+    }
     if path.trim().is_empty() {
         return refuse(&format!("{INI_CONFIG} is not set; point it at securecore.json"));
     }
@@ -109,6 +117,13 @@ extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
     };
     match Reloader::start(Path::new(&path), RELOAD_INTERVAL, Instant::now()) {
         Ok(reloader) => {
+            // The vault (E3): read the real secret values and mask the environment here, in the
+            // fpm master before it forks, so the workers inherit only placeholders. A missing or
+            // empty secret refuses MINIT, like a bad config.
+            let live = reloader.live();
+            if let Err(e) = vault::startup(&live.config, &live.root) {
+                return refuse(&e);
+            }
             *state() = Some(reloader);
             attribution::startup(settings);
             ZEND_RESULT_CODE_SUCCESS
@@ -121,15 +136,20 @@ extern "C" fn request_startup(_ty: i32, _module_number: i32) -> i32 {
     attribution::request_startup();
     enforce::request_startup();
     hosts::request_startup();
+    vault::request_startup();
+    db::request_startup();
     let mut guard = state();
     if let Some(reloader) = guard.as_mut() {
         match reloader.poll(Instant::now()) {
             Poll::Unchanged => {}
-            Poll::Reloaded { layer1_changed } => {
+            Poll::Reloaded { layer1_changed, vault_changed } => {
                 let live = reloader.live();
                 log(LOG_NOTICE, &format!("reloaded {} (sha256 {})", live.path.display(), live.sha256));
                 if layer1_changed {
                     log(LOG_WARNING, "layer1 changed; it applies only after a php-fpm restart");
+                }
+                if vault_changed {
+                    log(LOG_WARNING, "layer2.vault changed; it applies only after a php-fpm restart");
                 }
             }
             Poll::Rejected(problem) => {
@@ -171,6 +191,10 @@ pub fn securecore_status() -> PhpResult<ZBox<ZendHashTable>> {
     out.insert("layers", layers)?;
     out.insert("layer2_mode", c.layer2.mode.as_str())?;
     out.insert("layer2_app", c.layer2.app.map(App::as_str))?;
+    // The vault (E3): active in this process (loaded at MINIT), and how many secrets it holds.
+    // Never the values, and never the placeholders — only the count.
+    out.insert("vault", vault::active())?;
+    out.insert("vault_secrets", i64::try_from(vault::secret_count()).unwrap_or(i64::MAX))?;
     out.insert("reloads", i64::try_from(reloader.reloads()).unwrap_or(i64::MAX))?;
     out.insert("restart_needed", reloader.restart_needed())?;
     out.insert("reload_error", reloader.error().map(str::to_owned))?;
@@ -195,10 +219,14 @@ extern "C" fn module_info(_module: *mut ModuleEntry) {
 
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
-    module
+    let module = module
         .name("securecore")
         .startup_function(module_startup)
         .request_startup_function(request_startup)
         .info_function(module_info)
-        .function(wrap_function!(securecore_status))
+        .function(wrap_function!(securecore_status));
+    // The vault's native salted pluggables (E3); the mu-plugin defines wp_salt/wp_hash as thin
+    // wrappers over these so the HMAC key never reaches PHP. Registered from their own module so
+    // the macro finds the glue it generates there.
+    vault::register(module)
 }

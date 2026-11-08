@@ -69,8 +69,15 @@ impl fmt::Display for Component {
     }
 }
 
-/// SecureCore's own mu-plugin loader. It is part of SecureCore, so it counts as core.
+/// SecureCore's own mu-plugins. They are part of SecureCore, so they count as core: the loader
+/// (worker era) and the vault mu-plugin (E3), which defines the native `wp_salt`/`wp_hash`.
 pub const SECURECORE_LOADER: &str = "securecore-loader.php";
+pub const SECURECORE_VAULT_MU: &str = "securecore-vault.php";
+
+/// Whether a mu-plugin file is one of SecureCore's own (counted as core).
+fn is_securecore_mu(name: &str) -> bool {
+    name == SECURECORE_LOADER || name == SECURECORE_VAULT_MU
+}
 
 /// Where a WordPress site keeps its components.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,7 +268,7 @@ fn single_file_component(kind: Kind, name: &str) -> Option<Component> {
     }
     match kind {
         Kind::Plugins => Some(Component::Plugin(stem.to_owned())),
-        Kind::MuPlugins if name == SECURECORE_LOADER => None,
+        Kind::MuPlugins if is_securecore_mu(name) => None,
         Kind::MuPlugins => Some(Component::MuPlugin(stem.to_owned())),
         Kind::Themes => None,
     }

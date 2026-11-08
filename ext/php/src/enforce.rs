@@ -523,8 +523,8 @@ fn with_baseline<R>(f: impl FnOnce(&Baseline) -> R) -> Option<R> {
             Resolved::Pass | Resolved::Unresolvable(_) => normalize(p),
         };
         let mut protected = vec![resolve_cfg(&loaded.path)];
-        if let Some(vault) = &l2.vault {
-            protected.push(resolve_cfg(&loaded.resolve(&vault.from)));
+        if let Some(from) = l2.vault.as_ref().and_then(|v| v.from.as_ref()) {
+            protected.push(resolve_cfg(&loaded.resolve(from.path())));
         }
         let protected_ids = protected.iter().filter_map(|p| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))).collect();
         *guard = Some(Baseline {

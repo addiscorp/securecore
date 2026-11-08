@@ -12,7 +12,20 @@
     "enabled": true,
     "app": "wordpress",
     "mode": "enforce",
-    "vault": { "from": "wp-config.php", "secrets": ["DB_PASSWORD", "AUTH_KEY", "SECURE_AUTH_KEY", "LOGGED_IN_KEY", "NONCE_KEY", "AUTH_SALT", "SECURE_AUTH_SALT", "LOGGED_IN_SALT", "NONCE_SALT"] },
+    "vault": {
+      "from": { "wpConfig": "wp-config.php" },
+      "secrets": [
+        { "name": "DB_PASSWORD",      "env": "WORDPRESS_DB_PASSWORD" },
+        { "name": "AUTH_KEY",         "env": "WORDPRESS_AUTH_KEY" },
+        { "name": "SECURE_AUTH_KEY",  "env": "WORDPRESS_SECURE_AUTH_KEY" },
+        { "name": "LOGGED_IN_KEY",    "env": "WORDPRESS_LOGGED_IN_KEY" },
+        { "name": "NONCE_KEY",        "env": "WORDPRESS_NONCE_KEY" },
+        { "name": "AUTH_SALT",        "env": "WORDPRESS_AUTH_SALT" },
+        { "name": "SECURE_AUTH_SALT", "env": "WORDPRESS_SECURE_AUTH_SALT" },
+        { "name": "LOGGED_IN_SALT",   "env": "WORDPRESS_LOGGED_IN_SALT" },
+        { "name": "NONCE_SALT",       "env": "WORDPRESS_NONCE_SALT" }
+      ]
+    },
     "core": { "hosts": ["api.wordpress.org", "downloads.wordpress.org"] },
     "default": { "hosts": [], "tables": "own", "options": "own" },
     "components": {
