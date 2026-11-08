@@ -35,8 +35,10 @@ fn wordpress_example_parses_with_every_field() {
     assert_eq!(c.layer2.app, Some(App::Wordpress));
     assert_eq!(c.layer2.mode, Mode::Enforce);
     let vault = c.layer2.vault.as_ref().expect("vault");
-    assert_eq!(vault.from, "wp-config.php");
+    assert_eq!(vault.from, Some(Source::WpConfig("wp-config.php".into())));
     assert_eq!(vault.secrets.len(), 9);
+    assert_eq!(vault.secrets[0].name(), "DB_PASSWORD");
+    assert_eq!(vault.secrets[0].env(), Some("WORDPRESS_DB_PASSWORD"));
     assert_eq!(c.layer2.default.tables, Some(Scope::Keyword(ScopeKeyword::Own)));
     assert_eq!(c.layer2.default.files, None, "no extra file access by default");
     assert_eq!(c.layer2.default.exec, None);
@@ -179,7 +181,8 @@ fn paths_resolve_against_the_folder_holding_the_file() {
     assert_eq!(loaded.root, root);
     assert_eq!(loaded.resolve("wp-content/uploads"), root.join("wp-content/uploads"));
     assert_eq!(loaded.resolve("/srv/backups"), Path::new("/srv/backups"), "absolute paths as they are");
-    assert_eq!(loaded.resolve(&loaded.config.layer2.vault.as_ref().expect("vault").from), root.join("wp-config.php"));
+    let from = loaded.config.layer2.vault.as_ref().and_then(|v| v.from.as_ref()).expect("vault.from");
+    assert_eq!(loaded.resolve(from.path()), root.join("wp-config.php"));
 
     // A symlinked file: the root is where the link sits, not where it points.
     let elsewhere = dir.join("etc");
@@ -271,7 +274,7 @@ fn reloader_follows_the_file_and_never_drops_to_off() {
     fs::write(&path, &log_mode).expect("write");
     assert_eq!(r.poll(t0 + Duration::from_millis(999)), Poll::Unchanged, "throttled");
     assert_eq!(r.live().config.layer2.mode, Mode::Enforce);
-    assert_eq!(r.poll(t0 + interval), Poll::Reloaded { layer1_changed: false });
+    assert_eq!(r.poll(t0 + interval), Poll::Reloaded { layer1_changed: false, vault_changed: false });
     assert_eq!(r.live().config.layer2.mode, Mode::Log);
     assert_eq!(r.live().sha256, sha256_hex(log_mode.as_bytes()));
     assert_eq!(r.reloads(), 1);
@@ -294,10 +297,54 @@ fn reloader_follows_the_file_and_never_drops_to_off() {
     // Layer 1 changes reload (layers 2/3 see the file) and are flagged as needing a restart.
     let l1 = log_mode.replace(r#""port": 9000"#, r#""port": 9001"#);
     fs::write(&path, &l1).expect("write");
-    assert_eq!(r.poll(t0 + 6 * interval), Poll::Reloaded { layer1_changed: true });
+    assert_eq!(r.poll(t0 + 6 * interval), Poll::Reloaded { layer1_changed: true, vault_changed: false });
     assert!(r.restart_needed());
     assert_eq!(r.error(), None);
+
+    // A vault change reloads too, but the vault in force stays the one the process started
+    // with: its real values were read once, at startup.
+    let started = r.started_vault().cloned();
+    let v = l1.replace(r#""WORDPRESS_NONCE_SALT""#, r#""OTHER_NONCE_SALT""#);
+    assert_ne!(v, l1);
+    fs::write(&path, &v).expect("write");
+    assert_eq!(r.poll(t0 + 7 * interval), Poll::Reloaded { layer1_changed: true, vault_changed: true });
+    assert_eq!(r.started_vault().cloned(), started, "the started vault stays in force");
+    assert!(r.vault_changed() && r.restart_needed());
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn vault_secrets_name_their_source() {
+    // Bare names need `from`; env-mapped ones don't.
+    let e = rejected(&with_layer2(r#","vault":{"secrets":["AUTH_KEY"]}"#));
+    assert!(e.contains("AUTH_KEY has no env and layer2.vault.from is not set"), "{e}");
+    assert!(parse(&with_layer2(r#","vault":{"secrets":[{"name":"DB_PASSWORD","env":"WORDPRESS_DB_PASSWORD"}]}"#)).is_ok());
+    let both = r#","vault":{"from":{"vaultFile":"/etc/securecore/vault.json"},"secrets":["AUTH_KEY",{"name":"DB_PASSWORD","env":"X"}]}"#;
+    let c = parse(&with_layer2(both)).expect("mixed sources");
+    let v = c.layer2.vault.expect("vault");
+    assert_eq!(v.from, Some(Source::VaultFile("/etc/securecore/vault.json".into())));
+    assert_eq!((v.secrets[0].name(), v.secrets[0].env()), ("AUTH_KEY", None));
+    // The source is always explicit: the E1 string form is gone, and so is an unknown kind.
+    rejected(&with_layer2(r#","vault":{"from":"wp-config.php","secrets":["AUTH_KEY"]}"#));
+    rejected(&with_layer2(r#","vault":{"from":{"dotenv":".env"},"secrets":["AUTH_KEY"]}"#));
+    rejected(&with_layer2(r#","vault":{"from":{"wpConfig":"wp-config.php","vaultFile":"/v"},"secrets":["AUTH_KEY"]}"#));
+    // Names, duplicates, env names and unknown keys.
+    let e = rejected(&with_layer2(r#","vault":{"secrets":[{"name":"DB-PASSWORD","env":"X"}]}"#));
+    assert!(e.contains("not a constant name"), "{e}");
+    let e = rejected(&with_layer2(r#","vault":{"secrets":[{"name":"A","env":"X"},{"name":"A","env":"Y"}]}"#));
+    assert!(e.contains("listed twice"), "{e}");
+    let e = rejected(&with_layer2(r#","vault":{"secrets":[{"name":"A","env":""}]}"#));
+    assert!(e.contains("not an environment variable name"), "{e}");
+    rejected(&with_layer2(r#","vault":{"secrets":[{"name":"A","env":"X","default":"y"}]}"#));
+    rejected(&with_layer2(r#","vault":{"from":{"wpConfig":""},"secrets":["A"]}"#));
+}
+
+#[test]
+fn the_vault_in_force_needs_layer2_enabled() {
+    let mut c = parse(WORDPRESS).expect("example");
+    assert!(started_vault(&c).is_some());
+    c.layer2.enabled = false;
+    assert_eq!(started_vault(&c), None, "layer 2 off: no vault");
 }
 
 #[test]

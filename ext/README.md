@@ -3,13 +3,14 @@
 SecureCore as one PHP extension written in Rust ([ext-php-rs](https://crates.io/crates/ext-php-rs)),
 configured from one file, `securecore.json` (addiscorp/securecore#53). Phases so far: **E1** loads,
 validates and reloads the config and reports it; **E2a** works out which component is running;
-**E2b** enforces layer 2's file and process rules; **E6** is layer 1, the `securecore-fpm`
-launcher ([Layer 1](#layer-1-securecore-fpm-e6)). Still to come: the vault (E3), the database
-and hostname policy (E4–E5) and layer 3 (E7).
+**E2b** enforces layer 2's file and process rules; **E3** is the [vault](#vault-e3), which keeps
+the DB password and the WordPress keys and salts out of PHP's reach; **E6** is layer 1, the
+`securecore-fpm` launcher ([Layer 1](#layer-1-securecore-fpm-e6)). Still to come: the database and
+hostname policy (E4–E5) and layer 3 (E7).
 
 | crate | what |
 |---|---|
-| `config/` (`securecore-config`) | the config types (serde), the loader, the reloader and the JSON Schema. Plain Rust, no PHP: the `securecore-fpm` launcher (E6) reads the file with the same code. |
+| `config/` (`securecore-config`) | the config types (serde), the loader, the reloader and the JSON Schema; and the vault's pure logic (E3): reading a secret's source ([`source`](config/src/source.rs)) and the salt reconstruction + keyed hashing ([`salt`](config/src/salt.rs)). Plain Rust, no PHP: the `securecore-fpm` launcher (E6) reads the file with the same code, and the extension and the host tests share the vault's bytes. |
 | `attribution/` (`securecore-attribution`) | E2a: path → component (plugin, mu-plugin, theme, core), the two "who is running" rules, the watched file functions, `securecore-attribution-report`; and E2b: the file/process [`policy`](attribution/src/policy.rs). Plain Rust, no PHP. |
 | `php/` (`securecore-php`) | the extension, built as `securecore.so` |
 | `fpm/` (`securecore-fpm`) | E6: layer 1, the launcher that starts php-fpm inside [gelada](https://crates.io/crates/gelada) 0.3.0. Plain Rust, no PHP. |
@@ -102,6 +103,133 @@ read, and one `stat` a second per worker.
   start until the file is fixed.
 - `layer1` is read by the launcher at start. If it changes, the extension logs
   `layer1 changed; it applies only after a php-fpm restart` and reports `restart_needed`.
+- `layer2.vault` is read at MINIT too (the real secret values are taken once, before php-fpm
+  forks). A change to it logs `layer2.vault changed; it applies only after a php-fpm restart` and
+  reports `restart_needed`, like `layer1`. Everything else in layer 2 still reloads live.
+
+## Vault (E3)
+
+The DB password and the WordPress keys and salts never exist as a value PHP can read. The real
+values live only in the extension's own memory; everywhere PHP could look — the constant, the
+environment, `$_ENV`, `$_SERVER`, `getenv()`, `phpinfo()`, a `var_dump`/`serialize`/reflection of
+`$wpdb` — carries a **placeholder**, `securecore-vault:<NAME>` (unique per secret). The extension
+puts the real value back only at the two points where it is used: inside the database `connect`
+call, and inside the native `wp_salt`/`wp_hash` the mu-plugin installs.
+
+```json
+"vault": {
+  "from": { "vaultFile": "/etc/securecore/vault.json" },
+  "secrets": [
+    { "name": "DB_PASSWORD", "env": "WORDPRESS_DB_PASSWORD" },
+    "AUTH_KEY", "SECURE_AUTH_KEY", "LOGGED_IN_KEY", "NONCE_KEY",
+    "AUTH_SALT", "SECURE_AUTH_SALT", "LOGGED_IN_SALT", "NONCE_SALT"
+  ]
+}
+```
+
+Each entry in `secrets` is a **constant name** (`"AUTH_KEY"`) or an object
+`{ "name": "DB_PASSWORD", "env": "WORDPRESS_DB_PASSWORD" }`. With `env`, the real value is read
+from that environment variable of the php-fpm master. A bare name takes its value from `from`.
+Nothing implicit decides where a secret comes from: a bare name with no `from` is refused.
+
+`from` is one of:
+- `{ "vaultFile": "<path>" }` — **the recommended source.** A vault file is a JSON object of
+  `"NAME": "value"` strings, kept **outside the docroot**, owned by the user that starts php-fpm
+  (root) and readable by it alone (`chmod 400`). php-fpm's master reads it once at MINIT, before
+  it drops to `www-data`; the workers cannot open it at all, and the secret never appears in any
+  PHP file.
+  ```json
+  { "AUTH_KEY": "…", "AUTH_SALT": "…", "NONCE_SALT": "…" }
+  ```
+- `{ "wpConfig": "<path>" }` — read the `define()` values of a wp-config.php natively. Safe only
+  for the usual `define('NAME', getenv('NAME'))` form (an expression). **A secret written as a
+  bare string literal** in wp-config.php (`define('NAME', 'secret')`) **is not hidden** — see the
+  opcache note below. When `from` is set its file is also [protected](#enforcement-e2b): no PHP
+  code may read or write it.
+
+Setting `from` also protects that file; `env` secrets need no file.
+
+`dbHost` (optional): the database host the DB password may ever be sent to (see **Point of use**).
+Normally left unset — the extension reads WordPress's `DB_HOST` constant, the way WordPress does.
+Set it only where there is no such constant to read; a host is never guessed, so an unknown host
+means the swap is refused.
+
+### How it works
+
+- **At MINIT**, in the fpm master before it forks: read every real value (from its `env` variable
+  or from `from`) and keep it in extension memory. Then overwrite each mapped environment variable
+  in the C `environ` with the secret's placeholder, so the workers inherit a masked environment.
+- **Backstop sweep at MINIT:** also mask every `environ` entry whose value equals any secret's
+  value, whatever its name (so a copy under another name can't leak it). Only the names masked are
+  logged — `securecore: vault: masked N environment variable(s): …` — never a value.
+- **Fail closed:** a secret that is missing or empty, or a mapped variable that isn't set, refuses
+  MINIT, exactly as a bad config does. php-fpm never serves a request with a half-loaded vault.
+- **Per request / per call:** `getenv()` is overridden (through the E2b handler lever) to return
+  the placeholder for any value that matches a secret; `define()` of a secret name is forced to
+  the placeholder; and `$_ENV`/`$_SERVER` carry only placeholders because php-fpm builds them from
+  the masked `environ`.
+- **Point of use:** `mysqli_connect`, `mysqli_real_connect`, `mysqli::real_connect`, `new mysqli`
+  and `new PDO` restore the real DB password in the call frame, before the engine's own function
+  runs — so the real value reaches libmysql/PDO and never a PHP zval the caller keeps. The real
+  value is about to leave the process, so the swap happens **only when all three hold**, and is
+  refused (and recorded) otherwise — in `log` mode too, because leaking a secret is never "log and
+  allow":
+  - **the DB password only** — never a salt. The DB password is the single secret restored at a
+    connect boundary; a salt placeholder handed to a connect as the password is refused, not
+    swapped (otherwise a component could read `new mysqli('attacker.example', 'x',
+    SECURE_AUTH_KEY_placeholder)` and collect the salt).
+  - **the caller is core** — by E2a's `frame` attribution (the innermost user-code frame that
+    makes the call), so WordPress's `wpdb` counts and a plugin's own `new mysqli` does not.
+  - **the host is the configured DB host** — `layer2.vault.dbHost`, or the `DB_HOST` constant —
+    compared after normalising the `p:` prefix, a `:port` and a socket path
+    ([`config/src/dbhost.rs`](config/src/dbhost.rs)). A component pointing a connect at its own
+    server never matches, so the password is not sent there even over a cleartext or
+    RSA-under-attacker-key auth exchange.
+- **Salts:** the mu-plugin `securecore-vault.php` (installed in `wp-content/mu-plugins`, so it
+  loads before `pluggable.php`) defines `wp_salt()` and `wp_hash()` over the extension's native
+  `securecore_vault_salt`/`securecore_vault_hash`. `wp_hash()` computes `hash_hmac($algo, $data,
+  wp_salt($scheme))` over the **real** keys inside the extension — byte-identical to stock
+  WordPress for the standard key/salt constants — so the HMAC key never becomes a PHP value, while
+  login cookies, nonces and password-reset keys keep working. `wp_salt()` returns a scheme token,
+  never the key, so a probe that calls it cannot recover the key. The reconstruction and hashing
+  are one plain-Rust function ([`config/src/salt.rs`](config/src/salt.rs)), shared by the extension
+  and the host tests.
+
+The vault is **not a policy**: it works in `log` mode exactly as in `enforce` (it is where the
+value lives, not what is allowed), and with no `vault` in the config it does nothing.
+
+### The opcache finding
+
+opcache's optimizer rewrites `define('NAME', <scalar literal>)` into a compile-time
+`DECLARE_CONST` opcode, and keeps the literal string as an operand of the cached op_array in
+opcache's shared memory. Two consequences, both measured on the stack:
+
+- **PHP cannot read the cached literal directly:** `opcache_get_status()` and
+  `opcache_get_configuration()` expose only metadata, not op_array operands, and there is no
+  userland API that does.
+- **But a literal `define()` bypasses the extension's interception:** because the `define()` call
+  is gone, the `DECLARE_CONST` declares the constant to the **real literal**, which any PHP code
+  then reads as the constant. (Verified: with the optimizer on, a literal `define` yields the real
+  value; with it off, the extension's handler masks it.) The plaintext also sits in shared memory
+  for the life of the process.
+
+So a secret written as a bare literal in wp-config.php cannot be hidden by the engine. **This
+fails closed:** at MINIT, if `from` is `wpConfig` and any secret is a bare name (so it is read as
+a string literal) while opcache is loaded, the extension refuses to start, naming the secret:
+
+```
+PHP Warning:  PHP Startup: securecore: layer2.vault: DB_PASSWORD is a string literal in
+wp-config.php and opcache inlines it (DECLARE_CONST), so the vault cannot hide it; move it to a
+vault file (from.vaultFile) or an environment variable (secrets[].env); refusing to start
+```
+
+(opcache's own ini values are not yet applied when this module starts, so the optimizer level
+can't be read there; a standard build turns the optimizer on, so the check treats a literal as
+un-hideable whenever opcache is loaded. With no opcache at all, a literal `define()` stays a real
+call the extension masks.) The **vault file is the answer**: the secret lives in a root-only file
+outside the docroot, never enters a PHP file, and so never becomes a constant literal or an opcache
+operand. Expression defines (`define('NAME', getenv('NAME'))`, the Docker image's and the standard
+managed-WordPress form) are not literals, so env-mapped secrets and the vault file are unaffected.
 
 ## `securecore_status(): array`
 
@@ -116,8 +244,10 @@ What this worker is enforcing:
   'layers' => ['layer1' => true, 'layer2' => true, 'layer3' => true],
   'layer2_mode' => 'enforce',       // enforce | log | off
   'layer2_app' => 'wordpress',      // or null
+  'vault' => true,                  // the vault is loaded in this process (E3)
+  'vault_secrets' => 9,             // how many secrets it holds (never the values)
   'reloads' => 0,                   // reloads in this worker since it forked
-  'restart_needed' => false,        // layer1 differs from the one php-fpm started with
+  'restart_needed' => false,        // layer1 or the vault differs from the one php-fpm started with
   'reload_error' => null,           // the problem with the file on disk, while it can't load
   'root' => '/var/www/html',        // the folder containing securecore.json
   'caller' => 'core',               // who called, by the attribution rule (below)
@@ -378,6 +508,20 @@ gelada stacks its filters on top of it.
   refusals are logged), that log mode lets the same ones through (the revert proof), that layer 2
   off records nothing, and that a granted component gets its grants while the protected file and
   `securecore_status()` stay refused.
+- `DOCKER_CONTEXT=colima test/ext-vault.sh` (after ext-config.sh): a probe plugin and a core
+  probe try every route to the DB password and the salts (getenv, `$_ENV`, `$_SERVER`, phpinfo,
+  the constants, `$wpdb` dumped, `wp_salt`/`wp_hash`, the vault file and wp-config, reflection,
+  serialize, debug_backtrace and the error log) and must see only placeholders, in enforce and in
+  log mode; the DB connects and nonces, auth cookies and password reset round-trip; `wp_hash` is
+  byte-identical to a known-salt HMAC; the backstop masks the salt env vars (names only). It also
+  drives the connect boundary: a probe connects to a fake MySQL server that forces clear-text auth,
+  and the captured bytes must never carry the real password or a salt — the swap is refused for a
+  plugin, for a foreign host and for a salt placeholder (enforce and log), while core still
+  connects. And it checks the opcache fail-closed refusal (a literal `wpConfig` secret stops
+  php-fpm) and the revert proof — with the vault gone from the config, and with the extension
+  unloaded, the probe does see the secret — plus Classic Editor, Yoast and CF7 front/login 200.
+- `DOCKER_CONTEXT=colima bench/vault.sh` (after ext-config.sh): front-page p50 and a login round,
+  7 rounds, with the vault on vs a no-vault config.
 - `DOCKER_CONTEXT=colima bench/ext.sh`: front-page p50 with the extension loaded vs not.
 - `DOCKER_CONTEXT=colima bench/attribution.sh`: front-page p50 not loaded, loaded with
   attribution logging off, and on.

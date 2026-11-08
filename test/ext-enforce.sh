@@ -74,7 +74,7 @@ base_cfg() { # $1 = mode, $2 = components object body
   "layer1": { "enabled": false },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "$1",
-    "vault": { "from": "wp-config.php", "secrets": ["DB_PASSWORD"] },
+    "vault": { "from": { "wpConfig": "wp-config.php" }, "secrets": [{ "name": "DB_PASSWORD", "env": "WORDPRESS_DB_PASSWORD" }] },
     "default": {},
     "components": { $2 }
   },

@@ -8,6 +8,10 @@
 //! Plain Rust with no PHP dependency: the extension (layers 2 and 3) and the `securecore-fpm`
 //! launcher (layer 1, E6) both read the file through [`load`].
 
+pub mod dbhost;
+pub mod salt;
+pub mod source;
+
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::fs;
@@ -147,14 +151,125 @@ impl Mode {
     }
 }
 
+/// The vault (E3): secrets PHP never sees. The extension reads every real value once, at module
+/// startup in the php-fpm master before it forks, and keeps it in its own memory; PHP sees a
+/// placeholder (`securecore-vault:<NAME>`) in the constant, the environment, `$_ENV`,
+/// `$_SERVER` and `getenv()`. The extension puts the real value back only inside the database
+/// connect calls and the salted functions (`wp_salt`, `wp_hash`). Read at startup only: a change
+/// needs a php-fpm restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Vault {
-    /// The file the secrets are defined in (relative to the folder containing securecore.json,
-    /// or absolute).
-    pub from: String,
-    /// The constants SecureCore supplies natively instead of PHP.
-    pub secrets: Vec<String>,
+    /// Where a secret listed by name alone gets its real value. Required when any entry in
+    /// `secrets` is a bare name; a secret with `env` never reads it. When set, the file is also
+    /// protected: no PHP code may read or write it (wp-config.php may still be included).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Source>,
+    /// The constants SecureCore supplies natively instead of PHP. A bare name (`"AUTH_KEY"`)
+    /// takes its value from `from`; `{"name": …, "env": …}` takes it from that environment
+    /// variable of the php-fpm master.
+    pub secrets: Vec<Secret>,
+    /// The database host the DB password may be sent to. The real password is restored only on a
+    /// connection whose host matches this (so a component can't point a connect at its own server
+    /// and collect the password). Normally left unset: the extension reads it from WordPress's
+    /// `DB_HOST` constant, the way WordPress does. Set it only when there is no such constant to
+    /// read; no host is ever guessed, so an unknown host means the swap is refused.
+    #[serde(rename = "dbHost", default, skip_serializing_if = "Option::is_none")]
+    pub db_host: Option<String>,
+}
+
+/// Where bare-named secrets come from. Exactly one key, so the source is always stated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum Source {
+    /// Read the secret from this wp-config.php (relative to the folder containing securecore.json,
+    /// or absolute). Safe only for the usual `define('NAME', getenv('NAME'))` form, where the
+    /// value is an expression: opcache leaves the `define()` call intact, so the extension masks
+    /// it. A secret written as a bare string **literal** (`define('NAME', 'secret')`) is NOT
+    /// hidden — opcache's optimizer inlines it to a compile-time `DECLARE_CONST`, which the
+    /// extension cannot intercept, and the plaintext stays in opcache's shared memory. For a
+    /// hardcoded secret, use `vaultFile` instead.
+    WpConfig(String),
+    /// A vault file: a JSON object of `"NAME": "value"` strings, outside the app root, owned by
+    /// the user that starts php-fpm (root) and readable by it alone (mode 0400 or 0600). The
+    /// recommended source: php-fpm's workers can't open it at all.
+    VaultFile(String),
+}
+
+impl Source {
+    /// The file's path as written in the config.
+    pub fn path(&self) -> &str {
+        match self {
+            Source::WpConfig(p) | Source::VaultFile(p) => p,
+        }
+    }
+}
+
+/// One secret: a constant name, or a constant name and the environment variable holding it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum Secret {
+    /// A constant whose value comes from `vault.from`.
+    Name(String),
+    /// A constant whose value comes from an environment variable.
+    Env(EnvSecret),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnvSecret {
+    /// The constant (e.g. `DB_PASSWORD`).
+    pub name: String,
+    /// The environment variable holding the real value (e.g. `WORDPRESS_DB_PASSWORD`). It is
+    /// replaced by the placeholder before PHP runs.
+    pub env: String,
+}
+
+impl Secret {
+    pub fn name(&self) -> &str {
+        match self {
+            Secret::Name(n) => n,
+            Secret::Env(e) => &e.name,
+        }
+    }
+
+    pub fn env(&self) -> Option<&str> {
+        match self {
+            Secret::Name(_) => None,
+            Secret::Env(e) => Some(&e.env),
+        }
+    }
+}
+
+impl Vault {
+    /// The rules serde can't express: names are PHP constant names and unique, env names are
+    /// non-empty and free of `=`, and a bare name has a `from` to come from.
+    fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for s in &self.secrets {
+            let name = s.name();
+            let ok = name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            if !ok {
+                return Err(format!("layer2.vault.secrets: {name:?} is not a constant name"));
+            }
+            if !seen.insert(name) {
+                return Err(format!("layer2.vault.secrets: {name} is listed twice"));
+            }
+            if let Some(env) = s.env()
+                && (env.is_empty() || env.contains('=') || env.contains('\0'))
+            {
+                return Err(format!("layer2.vault.secrets: {name}: env {env:?} is not an environment variable name"));
+            }
+            if s.env().is_none() && self.from.is_none() {
+                return Err(format!("layer2.vault.secrets: {name} has no env and layer2.vault.from is not set; say where it comes from"));
+            }
+        }
+        if self.from.as_ref().is_some_and(|f| f.path().is_empty()) {
+            return Err("layer2.vault.from: the path is empty".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -255,6 +370,14 @@ impl Default for Limits {
     }
 }
 
+impl Layer2 {
+    /// The vault in force (E3): `vault`, when layer 2 is enabled. The vault isn't a policy, so
+    /// `mode` does not gate it; the real values are read once at startup regardless.
+    pub fn started_vault_ref(&self) -> Option<&Vault> {
+        self.enabled.then_some(self.vault.as_ref()).flatten()
+    }
+}
+
 fn default_timeout_ms() -> NonZeroU32 {
     NonZeroU32::new(5000).unwrap_or(NonZeroU32::MIN)
 }
@@ -282,6 +405,9 @@ impl Config {
     fn validate(&self) -> Result<(), Problem> {
         if self.layer2.enabled && self.layer2.app.is_none() {
             return Err(Problem::Invalid("layer2.enabled is true but layer2.app is missing".into()));
+        }
+        if let Some(vault) = &self.layer2.vault {
+            vault.validate().map_err(Problem::Invalid)?;
         }
         Ok(())
     }
@@ -444,14 +570,20 @@ fn stamp(path: &Path) -> std::io::Result<Stamp> {
     })
 }
 
+/// The vault a config puts in force at startup: `layer2.vault`, when layer 2 is enabled.
+pub fn started_vault(config: &Config) -> Option<Vault> {
+    config.layer2.enabled.then(|| config.layer2.vault.clone()).flatten()
+}
+
 /// What [`Reloader::poll`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Poll {
     /// Too soon since the last check, or the file is unchanged.
     Unchanged,
-    /// A new valid config is live. `layer1_changed`: its `layer1` differs from the one the
-    /// process started with, which only a php-fpm restart applies.
-    Reloaded { layer1_changed: bool },
+    /// A new valid config is live. `layer1_changed` / `vault_changed`: its `layer1` /
+    /// `layer2.vault` differs from the one the process started with, which only a php-fpm
+    /// restart applies.
+    Reloaded { layer1_changed: bool, vault_changed: bool },
     /// The file changed but can't be loaded. The last valid config stays live (never off);
     /// reported once per distinct problem.
     Rejected(String),
@@ -464,6 +596,9 @@ pub struct Reloader {
     live: Arc<Loaded>,
     /// The `layer1` the process started with.
     started_layer1: Layer1,
+    /// The vault the process started with (E3): `layer2.vault` when layer 2 was enabled. The
+    /// real values are read once at startup, so this, not the live file, is the vault in force.
+    started_vault: Option<Vault>,
     stamp: Option<Stamp>,
     interval: Duration,
     next_check: Instant,
@@ -479,6 +614,7 @@ impl Reloader {
         let live = load(path)?;
         Ok(Reloader {
             started_layer1: live.config.layer1.clone(),
+            started_vault: started_vault(&live.config),
             live: Arc::new(live),
             stamp,
             interval,
@@ -502,8 +638,23 @@ impl Reloader {
     }
 
     /// The file's `layer1` differs from the one the process started with.
-    pub fn restart_needed(&self) -> bool {
+    pub fn layer1_changed(&self) -> bool {
         self.live.config.layer1 != self.started_layer1
+    }
+
+    /// The file's vault differs from the one the process started with.
+    pub fn vault_changed(&self) -> bool {
+        started_vault(&self.live.config) != self.started_vault
+    }
+
+    /// Something in the file applies only after a php-fpm restart: `layer1` or the vault.
+    pub fn restart_needed(&self) -> bool {
+        self.layer1_changed() || self.vault_changed()
+    }
+
+    /// The vault in force: the one the process started with (see [`Vault`]).
+    pub fn started_vault(&self) -> Option<&Vault> {
+        self.started_vault.as_ref()
     }
 
     pub fn poll(&mut self, now: Instant) -> Poll {
@@ -527,7 +678,7 @@ impl Reloader {
                 self.error = None;
                 self.reloads += 1;
                 self.live = Arc::new(loaded);
-                Poll::Reloaded { layer1_changed: self.restart_needed() }
+                Poll::Reloaded { layer1_changed: self.layer1_changed(), vault_changed: self.vault_changed() }
             }
             Err(e) => {
                 // Keep the stamp unchanged so the file is retried until it is fixed, but
