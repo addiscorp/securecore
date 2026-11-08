@@ -28,6 +28,8 @@ plugin=$content/plugins/securecore-enforce
 victim=$content/sc-enf-victim.txt
 renamef=$content/sc-enf-rename.txt
 hardlink=$content/sc-enf-hardlink.txt
+escape=$content/sc-enf-escape.php
+escapedir=$content/sc-enf-escape-dir
 fails=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
@@ -57,7 +59,7 @@ wp plugin activate securecore-enforce >/dev/null
 
 cleanup() {
   wp plugin deactivate securecore-enforce >/dev/null 2>&1
-  in_php "rm -rf $plugin $victim $renamef $renamef.moved $hardlink $content/sc-enf-newdir /opt/sc-enf-out.php /tmp/sc-enf.txt $content/uploads/sc-enf"
+  in_php "rm -rf $plugin $victim $renamef $renamef.moved $hardlink $content/sc-enf-newdir /opt/sc-enf-out.php /tmp/sc-enf.txt $content/uploads/sc-enf $escape $escapedir"
   compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
   compose restart php >/dev/null 2>&1
   wait_200 || echo "FAIL php-fpm did not come back after cleanup"
@@ -90,6 +92,9 @@ run() {
   put_live "$dir/$1.json"
   sleep 1.3 # > RELOAD_INTERVAL, so every worker has the new config
   in_php "printf victim > $victim && printf rn > $renamef && ln -f $html/wp-config.php $hardlink && chown www-data:www-data $victim $renamef"
+  # Escape fixtures: a dangling symlink and a dir symlink under uploads, both pointing outside the
+  # writable area, so the write/mkdir probes have to resolve them (not trust the lexical path).
+  in_php "rm -rf $escape $escapedir $content/uploads/sc-enf/dangle $content/uploads/sc-enf/esc-dir-link; mkdir -p $content/uploads/sc-enf $escapedir; chown -R www-data:www-data $content/uploads/sc-enf $escapedir; ln -s $escape $content/uploads/sc-enf/dangle; ln -s $escapedir $content/uploads/sc-enf/esc-dir-link"
   T=$(now); sleep 1
   curl -s "$base/?sc_enf=run" > "$dir/out.$1"
   sleep 1
@@ -108,7 +113,8 @@ run enforce
 for c in read-own write-uploads include-own; do want enforce "$c" OK; done
 for c in read-config read-etc fopen-read-etc scandir-etc write-own write-tmp fopen-write-own \
          unlink-core mkdir-core rename-core shell_exec exec include-outside status \
-         symlink-read symlink-write link-protected hardlink-read; do
+         symlink-read symlink-write link-protected hardlink-read \
+         symlink-escape-create symlink-dangling-write mkdir-escape; do
   want enforce "$c" BLOCKED
 done
 has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $html/wp-config.php" "enforce: reading wp-config resolves to read-protected"
@@ -119,23 +125,30 @@ has "$T" "layer2 enforce plugin:securecore-enforce include read-outside-root /op
 has "$T" "layer2 enforce plugin:securecore-enforce securecore_status core-only" "enforce: securecore_status from a plugin is core-only"
 has "$T" "layer2 enforce plugin:securecore-enforce link-target read-protected $html/wp-config.php" "enforce: hard-linking a protected file is refused (1c)"
 has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $hardlink" "enforce: a hard link to a protected file is caught by inode (1b)"
+has "$T" "layer2 enforce plugin:securecore-enforce symlink-target write $escape" "enforce: a symlink target outside the writable area is refused (item 1, create)"
+has "$T" "layer2 enforce plugin:securecore-enforce open write $escape" "enforce: a write through a dangling symlink resolves to its target (item 1, write)"
+has "$T" "layer2 enforce plugin:securecore-enforce mkdir write $escapedir/a/b" "enforce: a recursive mkdir through a symlink resolves to the real folder (item 2)"
 
 # --- 2. log mode: the revert proof — the same ops now all succeed ----------------------------
 echo "# log (nothing blocked)"
 run log
 for c in read-own read-config read-etc fopen-read-etc scandir-etc write-uploads write-own \
          write-tmp fopen-write-own unlink-core mkdir-core rename-core shell_exec exec \
-         include-own include-outside status symlink-read symlink-write link-protected hardlink-read; do
+         include-own include-outside status symlink-read symlink-write link-protected hardlink-read \
+         symlink-escape-create symlink-dangling-write mkdir-escape; do
   want log "$c" OK
 done
 has "$T" "layer2 log plugin:securecore-enforce open read-protected $html/wp-config.php" "log: the would-be refusal is recorded, mode log"
 has "$T" "layer2 log plugin:securecore-enforce open read-protected $hardlink" "log: the hard-link read is recorded (1b), mode log"
+has "$T" "layer2 log plugin:securecore-enforce open write $escape" "log: the dangling-symlink write is recorded (item 1), mode log"
+has "$T" "layer2 log plugin:securecore-enforce mkdir write $escapedir/a/b" "log: the mkdir-through-symlink is recorded (item 2), mode log"
 has "$T" "layer2 log plugin:securecore-enforce exec exec echo scok" "log: exec would-be refusal recorded"
 
 # --- 3. layer 2 off: everything works, nothing recorded --------------------------------------
 echo "# off"
 run off
-for c in read-config read-etc write-own exec include-outside status symlink-read hardlink-read; do want off "$c" OK; done
+for c in read-config read-etc write-own exec include-outside status symlink-read hardlink-read \
+         symlink-escape-create symlink-dangling-write mkdir-escape; do want off "$c" OK; done
 if [ "$(audit "$T" | grep -c .)" = 0 ]; then pass "off: no layer2 lines"; else fail "off: no layer2 lines" "$(audit "$T" | head -1)"; fi
 
 # --- 4. enforce, granted ---------------------------------------------------------------------
@@ -145,7 +158,8 @@ for c in read-own read-etc fopen-read-etc scandir-etc write-uploads write-own fo
          shell_exec exec include-own include-outside symlink-write; do
   want granted "$c" OK
 done
-for c in read-config write-tmp unlink-core mkdir-core rename-core status symlink-read link-protected hardlink-read; do
+for c in read-config write-tmp unlink-core mkdir-core rename-core status symlink-read link-protected hardlink-read \
+         symlink-escape-create symlink-dangling-write mkdir-escape; do
   want granted "$c" BLOCKED
 done
 has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $html/wp-config.php" "granted: the protected file is still refused"

@@ -21,6 +21,7 @@ add_action('init', static function () {
     $victim = WP_CONTENT_DIR . '/sc-enf-victim.txt'; // core-owned; the harness recreates it per request
     $rename = WP_CONTENT_DIR . '/sc-enf-rename.txt'; // a second core-owned file, so unlink and rename don't collide
     $hardlink = WP_CONTENT_DIR . '/sc-enf-hardlink.txt'; // the harness makes this a hard link to wp-config.php
+    $escape = WP_CONTENT_DIR . '/sc-enf-escape.php';     // under the root but not writable (not uploads/cache)
     $outside_inc = '/opt/sc-enf-out.php';            // the harness places this; `return 'outok';`
 
     $ok = static fn(bool $did): string => $did ? 'OK' : 'BLOCKED';
@@ -77,6 +78,19 @@ add_action('init', static function () {
     $r['link-protected'] = $ok(@link($config, $uploads . '/hlink'));
     // Reading a pre-existing hard link to a protected file must be refused (matched by inode).
     $r['hardlink-read'] = $ok(is_string(@file_get_contents($hardlink)));
+
+    // --- dangling symlinks and recursive mkdir: a write must resolve to where it lands ---
+    // Creating a symlink whose target is not writable must be refused: a link may point only
+    // where the component could already write (item 1, the symlink() end).
+    @unlink($uploads . '/esc');
+    $r['symlink-escape-create'] = $ok(@symlink($escape, $uploads . '/esc'));
+    // The harness leaves a *dangling* symlink 'dangle' in uploads pointing at $escape (outside the
+    // writable area). A write through it must resolve to the target, not the link's own path, and
+    // be refused (item 1, the write end).
+    $r['symlink-dangling-write'] = $ok(@file_put_contents($uploads . '/dangle', '<?php // pwned') !== false);
+    // The harness leaves 'esc-dir-link' in uploads pointing at a folder outside uploads. A
+    // recursive mkdir through it must resolve to the real folder and be refused (item 2).
+    $r['mkdir-escape'] = $ok(@mkdir($uploads . '/esc-dir-link/a/b', 0777, true));
 
     // --- include: under the root is allowed; outside it is refused ---
     $r['include-own'] = $ok((@include $own . '/inc.php') === 'incok');

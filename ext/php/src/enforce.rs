@@ -25,7 +25,10 @@
 //!
 //! Paths are resolved (symlinks followed) through PHP's realpath cache before the decision, so a
 //! symlink under the root cannot smuggle a read or write past the prefix tests; protected files
-//! are matched by (device, inode) so a hard link to one is caught too.
+//! are matched by (device, inode) so a hard link to one is caught too. A file about to be created
+//! has no realpath, so [`resolve_new`] resolves its deepest existing ancestor and follows a
+//! dangling symlink at the first new component — the path a write or a recursive `mkdir` actually
+//! lands on, not the lexical path. `symlink()` itself is refused when its target is not writable.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int};
@@ -69,6 +72,10 @@ const WRAPPER_GUARDS: &[&str] = &["stream_wrapper_register", "stream_wrapper_unr
 
 /// A Zend internal-function handler.
 type Zif = unsafe extern "C" fn(*mut zend_execute_data, *mut zval);
+
+/// How deep a chain of not-yet-existing symlinks `resolve_new` follows before giving up and
+/// deciding on the lexical path. A write or mkdir rarely passes through even one.
+const SYMLINK_FOLLOW_MAX: u32 = 8;
 
 /// The handlers we replaced, by lowercase function name. Set once per process; read lock-free.
 static ORIGINALS: OnceLock<HashMap<String, Zif>> = OnceLock::new();
@@ -231,7 +238,12 @@ unsafe fn blocked(ex: *mut zend_execute_data, name: &str) -> bool {
         return refuse_decision(&ctx, Op::Exec, name, &cmd, ctx.policy.decide(&ctx.access, Op::Exec, Path::new(&cmd)));
     }
     if name == "symlink" {
-        return unsafe { guard_arg(ex, from, 2, Op::Write, "symlink") };
+        // The link path (arg 2) is a write of where the link sits, and a write *through* the link
+        // lands on its target (arg 1, taken relative to the link's own directory) — so the target
+        // must pass the write rule too: a link may point only where the component could write.
+        let link = unsafe { guard_arg(ex, from, 2, Op::Write, "symlink") };
+        let target = unsafe { guard_symlink_target(ex, from) };
+        return link || target;
     }
     if name == "link" {
         // write the new path (arg 2), and never hard-link a protected file (arg 1, a read).
@@ -255,7 +267,34 @@ unsafe fn blocked(ex: *mut zend_execute_data, name: &str) -> bool {
 /// `ex` is a live call frame.
 unsafe fn guard_arg(ex: *mut zend_execute_data, from: *const zend_execute_data, n: u32, op: Op, token: &str) -> bool {
     let Some(path) = (unsafe { arg_string(ex, n) }) else { return false };
-    guard(from, op, token, resolve_str(&path), true)
+    guard(from, op, token, resolve_str(&path), Inode::Stat)
+}
+
+/// Guard the effective target of `symlink(target, link)` as a write. A relative target is
+/// interpreted relative to the link's own directory (not the cwd), so a write through the link
+/// lands there — that is the path the write rule must clear.
+///
+/// # Safety
+/// `ex` is the live `symlink` call frame.
+unsafe fn guard_symlink_target(ex: *mut zend_execute_data, from: *const zend_execute_data) -> bool {
+    let (Some(target), Some(link)) = (unsafe { arg_string(ex, 1) }, unsafe { arg_string(ex, 2) }) else {
+        return false;
+    };
+    let target = Path::new(&target);
+    let effective = if target.is_absolute() {
+        target.to_owned()
+    } else {
+        let Some(dir) = abs_parent(&link) else { return false };
+        dir.join(target)
+    };
+    guard(from, Op::Write, "symlink-target", resolve_str(&effective.to_string_lossy()), Inode::Stat)
+}
+
+/// The absolute parent directory of a path given as a string (a relative path against the cwd).
+fn abs_parent(path: &str) -> Option<PathBuf> {
+    let p = Path::new(path);
+    let abs = if p.is_absolute() { p.to_owned() } else { std::env::current_dir().ok()?.join(p) };
+    abs.parent().map(Path::to_owned)
 }
 
 // --- the stream wrapper ops ---------------------------------------------------------------------
@@ -359,16 +398,28 @@ unsafe extern "C" fn sc_stream_closer(wrapper: *mut php_stream_wrapper, stream: 
 /// `cpath` is a valid NUL-terminated path from the engine.
 unsafe fn guard_c(cpath: *const c_char, op: Op, token: &str) -> bool {
     let from = current_execute_data();
-    guard(from, op, token, unsafe { resolve_c(cpath) }, true)
+    guard(from, op, token, unsafe { resolve_c(cpath) }, Inode::Stat)
+}
+
+/// Whether a protected file is also matched by inode (catching a hard link), and when.
+#[derive(Clone, Copy)]
+enum Inode {
+    /// Always stat — wrapper ops and `symlink`/`link`; not the hot path.
+    Stat,
+    /// Stat only for a path *outside* the code directories — includes. Keeps the include hot
+    /// path (a file under plugins/mu-plugins/themes) off the stat, while still catching a hard
+    /// link to a protected file included from elsewhere. A component can no longer make such a
+    /// link (`link()` is refused), so a residual link under a code directory is the only gap.
+    StatUnlessCode,
 }
 
 /// The decision for a resolved path. The fast path (an allowed read/include under the root, or a
 /// write to uploads/cache) never walks the stack; only a protected file or an op the baseline
 /// can't clear does. The baseline is the authority on "protected" (path *and* inode); the policy
 /// (plain Rust) only does path-based protection, so protection is settled here, not there.
-fn guard(from: *const zend_execute_data, op: Op, token: &str, resolved: Option<PathBuf>, inode_check: bool) -> bool {
+fn guard(from: *const zend_execute_data, op: Op, token: &str, resolved: Option<PathBuf>, inode: Inode) -> bool {
     let Some(resolved) = resolved else { return false }; // unresolvable: let the plain op report it
-    match classify(op, &resolved, inode_check) {
+    match classify(op, &resolved, inode) {
         None => false,            // layer 2 not active
         Some(Verdict::Allow) => false,
         Some(Verdict::Protected) => {
@@ -409,6 +460,9 @@ struct Baseline {
     root: PathBuf,
     uploads: PathBuf,
     cache: PathBuf,
+    /// The plugins, mu-plugins and themes directories — where almost every include lives. Used to
+    /// keep the include hot path off the inode stat (see [`include_blocked`]).
+    code_dirs: Vec<PathBuf>,
     protected: Vec<PathBuf>,
     protected_ids: Vec<(u64, u64)>,
 }
@@ -418,9 +472,10 @@ impl Baseline {
         if self.protected.iter().any(|p| p == resolved) {
             return true;
         }
-        // A hard link has its own path but the protected file's inode. This stat is skipped for
-        // includes (`inode_check` false): including a protected file only re-runs it, it does not
-        // disclose its bytes, and includes are the hot path.
+        // A hard link has its own path but the protected file's inode. The stat is skipped for an
+        // include under a code directory (the hot path; see `Inode::StatUnlessCode`): a component
+        // can no longer create such a link, and including a protected file re-runs it rather than
+        // disclosing its bytes.
         inode_check && std::fs::metadata(resolved).is_ok_and(|m| self.protected_ids.contains(&(m.dev(), m.ino())))
     }
 }
@@ -449,6 +504,7 @@ fn with_baseline<R>(f: impl FnOnce(&Baseline) -> R) -> Option<R> {
             root: resolve_cfg(&loaded.root),
             uploads: resolve_cfg(&layout.content.join("uploads")),
             cache: resolve_cfg(&layout.content.join("cache")),
+            code_dirs: [&layout.plugins, &layout.mu_plugins, &layout.themes].map(|d| resolve_cfg(d)).into(),
             protected,
             protected_ids,
         });
@@ -468,9 +524,13 @@ enum Verdict {
 
 /// `None` when layer 2 is not active. Protected is checked first, so a hard link or symlink to a
 /// protected file is caught before the under-root allow.
-fn classify(op: Op, resolved: &Path, inode_check: bool) -> Option<Verdict> {
+fn classify(op: Op, resolved: &Path, inode: Inode) -> Option<Verdict> {
     with_baseline(|b| {
-        if b.is_protected(resolved, inode_check) {
+        let stat = match inode {
+            Inode::Stat => true,
+            Inode::StatUnlessCode => !b.code_dirs.iter().any(|d| under_or_eq(resolved, d)),
+        };
+        if b.is_protected(resolved, stat) {
             return Verdict::Protected;
         }
         match op {
@@ -506,8 +566,14 @@ fn slow(from: *const zend_execute_data) -> Option<Slow> {
 
 /// The read-policy decision for an include/require of `path` by the code at `from`. Used by the
 /// `zend_compile_file` wrapper in [`crate::attribution`].
+///
+/// Includes are the hot path, so the inode stat (which catches a hard link to a protected file) is
+/// skipped for the common case — a file under plugins, mu-plugins or themes — and run only for an
+/// include whose resolved path lands elsewhere, which is rare. The protected *path* is always
+/// matched; a component can no longer create a hard link (`link()` is refused), so a residual hard
+/// link under a code directory is the only gap, noted in the README.
 pub(crate) fn include_blocked(op: &str, path: &str, from: *const zend_execute_data) -> bool {
-    guard(from, Op::Read, op, resolve_str(path), false)
+    guard(from, Op::Read, op, resolve_str(path), Inode::StatUnlessCode)
 }
 
 /// `securecore_status()` is for core. In `enforce` mode a component's call is refused; in `log`
@@ -564,17 +630,58 @@ fn resolve_existing(cpath: *const c_char) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
 }
 
-/// A path that does not exist: its parent resolved, plus the final name (so a file about to be
-/// created is still placed in the right, symlink-resolved, folder). Falls back to lexical.
+/// A path that does not exist as a whole (a file or folder about to be created): resolve its
+/// deepest existing ancestor through the realpath cache (so every symlink in it is followed), then
+/// append the rest. Two cases the plain parent-resolve missed:
+///   * the final component is itself a *dangling* symlink — it exists to `lstat` but not to
+///     realpath, and a write or `mkdir` follows it, so we read the link and decide on its target
+///     (`symlink('../other/x', uploads/link); fwrite(uploads/link)` writes `other/x`);
+///   * a recursive `mkdir` through a symlinked ancestor whose own parent doesn't exist
+///     (`mkdir(uploads/link/a/b)` with `uploads/link -> ../other` creates folders in `other`).
+///
+/// Bounded by [`SYMLINK_FOLLOW_MAX`]; falls back to the lexical path.
 fn resolve_new(abs: &Path) -> Option<PathBuf> {
     let abs = if abs.is_absolute() { abs.to_owned() } else { std::env::current_dir().ok()?.join(abs) };
-    if let (Some(parent), Some(name)) = (abs.parent(), abs.file_name())
-        && let Ok(c) = CString::new(parent.as_os_str().as_bytes())
-        && let Some(rp) = resolve_existing(c.as_ptr())
-    {
-        return Some(rp.join(name));
+    Some(resolve_tail(abs, 0))
+}
+
+/// Resolve `abs` by finding its deepest existing ancestor and appending the non-existing tail,
+/// following a dangling symlink at the first tail component (which is where a write lands).
+fn resolve_tail(abs: PathBuf, depth: u32) -> PathBuf {
+    if depth > SYMLINK_FOLLOW_MAX {
+        return normalize(&abs);
     }
-    Some(normalize(&abs))
+    // Walk up until a prefix resolves; `tail` collects the non-existing names, outermost last.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = abs.as_path();
+    loop {
+        if let Ok(c) = CString::new(cur.as_os_str().as_bytes())
+            && let Some(rp) = resolve_existing(c.as_ptr())
+        {
+            let Some(first) = tail.pop() else { return rp }; // the whole path resolved
+            let here = rp.join(&first);
+            // A dangling symlink at the first not-yet-existing component: a write follows it.
+            if let Ok(meta) = std::fs::symlink_metadata(&here)
+                && meta.file_type().is_symlink()
+                && let Ok(target) = std::fs::read_link(&here)
+            {
+                let base = if target.is_absolute() { target } else { rp.join(target) };
+                let next = tail.iter().rev().fold(base, |p, c| p.join(c));
+                return resolve_tail(next, depth + 1);
+            }
+            // Genuinely new: lexical from the resolved ancestor.
+            return tail.iter().rev().fold(here, |p, c| p.join(c));
+        }
+        match cur.parent() {
+            Some(p) if p != cur => {
+                if let Some(name) = cur.file_name() {
+                    tail.push(name.to_owned());
+                }
+                cur = p;
+            }
+            _ => return normalize(&abs),
+        }
+    }
 }
 
 // --- helpers ------------------------------------------------------------------------------------

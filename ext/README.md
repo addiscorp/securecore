@@ -217,19 +217,31 @@ type 3, libxml, metadata (`touch`/`chmod`/`chown` via `stream_metadata`), and mo
 includes skip the open, so the `zend_compile_file` wrapper (shared with E2a) still covers include
 and require. Paths are resolved through PHP's realpath cache before the decision, so a symlink
 under the root cannot smuggle an open past the prefix tests, and the protected files are matched
-by (device, inode), so a hard link to one is caught too.
+by (device, inode), so a hard link to one is caught too. A file or folder about to be *created*
+has no realpath, so the decision is made on its deepest existing ancestor (symlinks in it
+followed) with the rest appended, and a dangling symlink at the first new component is followed to
+its target — the path a write or a recursive `mkdir` actually lands on, not the lexical path (so
+`symlink('../other/x', uploads/link)` then writing `uploads/link`, and `mkdir(uploads/link/a/b)`
+through a symlinked ancestor, are both decided on `other/…`).
 
 Function handlers cover only what does **not** go through a stream wrapper: the process functions;
-`symlink`/`link` (handled in `ext/standard/link.c`, with `link` refused when its target is a
-protected file); and `stream_wrapper_register`/`unregister`/`restore` of `"file"`, which a
-component could otherwise use to undo the override.
+`symlink`/`link` (handled in `ext/standard/link.c`). `link` is refused when its target is a
+protected file; `symlink` is refused unless its target — resolved relative to the link's own
+directory — is itself writable, so a link may point only where the component could already write.
+And `stream_wrapper_register`/`unregister`/`restore` of `"file"`, which a component could otherwise
+use to undo the override.
 
 **Covered** (each fails as PHP would on a permission error): everything that opens through PHP
 streams, listed above, plus `include`/`require`(`_once`) and the process functions, plus `symlink`
 and `link`. **Not covered** (documented gaps, not silently missed): opens made inside another
 extension's C code that call `open(2)` directly rather than through PHP streams (libzip's archive
-I/O), and read-only metadata (`file_exists`, `stat`, `is_dir` — not opens). Layer 1 (the kernel)
-backstops a component that reaches a file by a path the engine's streams never see.
+I/O), and read-only metadata (`file_exists`, `stat`, `is_dir` — not opens). One residual, by
+design: an `include` of a path under the plugins/mu-plugins/themes directories skips the per-open
+inode stat (the include hot path), so a *pre-existing* hard link to a protected file placed inside
+a code directory and then included is not caught by inode — only by path. A component cannot make
+such a link (`link()` is refused), so this needs a link placed out-of-band; every other op, and an
+include resolving anywhere else, still gets the inode check. Layer 1 (the kernel) backstops a
+component that reaches a file by a path the engine's streams never see.
 
 `research/enforce/compat.sh` runs Classic Editor, Yoast SEO and Contact Form 7 in enforce mode
 and lists every refusal; `bench/enforce.sh` is the front-page benchmark.
