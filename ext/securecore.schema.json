@@ -75,7 +75,7 @@
       "type": "object",
       "properties": {
         "deny": {
-          "description": "Paths php-fpm may not read at all, on top of the common secrets SecureCore always denies\n(relative to the folder containing securecore.json, or absolute).",
+          "description": "Paths php-fpm may not read at all, on top of the common secrets gelada always denies\nunder the launcher's HOME (~/.ssh, ~/.aws, …) (relative to the folder containing\nsecurecore.json, or absolute).",
           "type": "array",
           "default": [],
           "items": {
@@ -270,7 +270,7 @@
           }
         },
         "unixSockets": {
-          "description": "Unix sockets php-fpm may connect to.",
+          "description": "Unix sockets php-fpm may connect to. Not enforceable by securecore-fpm yet: on Linux\ngelada can't combine them with TCP ports, nor allow them in place\n(addiscorp/securecore#57), so a layer 1 that lists any is refused at launch.",
           "type": "array",
           "default": [],
           "items": {

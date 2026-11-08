@@ -122,12 +122,14 @@ for variant in l2-off l2-enforce; do
     "$variant: Classic Editor, Yoast SEO and Contact Form 7 are active"
   is "$(curl -s "$base/" | grep -c 'yoast-schema-graph')" 1 "$variant: the front page carries Yoast's output"
   if [ "$variant" = l2-enforce ]; then
+    # shellcheck disable=SC2016 # PHP source: the $ are PHP's
     printf '<?php $s = securecore_status(); echo $s["layer2_mode"], "/", $s["layers"]["layer1"] ? 1 : 0;\n' > "$dir/l2.php"
     compose cp "$dir/l2.php" "php:$html/sc-l1-l2.php" >>"$dir/cp.log" 2>&1
     is "$(curl -s "$base/sc-l1-l2.php")" enforce/1 "$variant: the extension in php-fpm is enforcing layer 2"
     in_php "rm -f $html/sc-l1-l2.php"
   fi
   # Every php-fpm process: gelada's two seccomp filters on top of Docker's one, no_new_privs.
+  # shellcheck disable=SC2016 # expanded by the container's shell
   in_php 'for d in /proc/[0-9]*; do case "$(cat $d/comm 2>/dev/null)" in php-fpm*) echo "$(grep -E "^(Uid|NoNewPrivs|Seccomp_filters):" $d/status | awk "{print \$2}" | tr "\n" " ")";; esac; done' > "$dir/procs.$variant"
   is "$(grep -c . "$dir/procs.$variant" | grep -c '^[3-9]')" 1 "$variant: a master and workers ($(grep -c . "$dir/procs.$variant") php-fpm processes)"
   is "$(grep -vc '^[0-9]* 1 3 $' "$dir/procs.$variant")" 0 "$variant: every php-fpm process has no_new_privs and 3 seccomp filters (Docker's + gelada's 2)"

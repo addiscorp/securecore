@@ -3,14 +3,16 @@
 SecureCore as one PHP extension written in Rust ([ext-php-rs](https://crates.io/crates/ext-php-rs)),
 configured from one file, `securecore.json` (addiscorp/securecore#53). Phases so far: **E1** loads,
 validates and reloads the config and reports it; **E2a** works out which component is running;
-**E2b** enforces layer 2's file and process rules. Still to come: the vault (E3), the database
-and hostname policy (E4–E5), the layer 1 launcher (E6) and layer 3 (E7).
+**E2b** enforces layer 2's file and process rules; **E6** is layer 1, the `securecore-fpm`
+launcher ([Layer 1](#layer-1-securecore-fpm-e6)). Still to come: the vault (E3), the database
+and hostname policy (E4–E5) and layer 3 (E7).
 
 | crate | what |
 |---|---|
 | `config/` (`securecore-config`) | the config types (serde), the loader, the reloader and the JSON Schema. Plain Rust, no PHP: the `securecore-fpm` launcher (E6) reads the file with the same code. |
 | `attribution/` (`securecore-attribution`) | E2a: path → component (plugin, mu-plugin, theme, core), the two "who is running" rules, the watched file functions, `securecore-attribution-report`; and E2b: the file/process [`policy`](attribution/src/policy.rs). Plain Rust, no PHP. |
 | `php/` (`securecore-php`) | the extension, built as `securecore.so` |
+| `fpm/` (`securecore-fpm`) | E6: layer 1, the launcher that starts php-fpm inside [gelada](https://crates.io/crates/gelada) 0.3.0. Plain Rust, no PHP. |
 
 ## Build
 
@@ -20,6 +22,7 @@ repo root:
 ```sh
 docker build -f docker/ext.Dockerfile --target so -o .tmp/ext .   # → .tmp/ext/securecore.so
 docker build -f docker/ext.Dockerfile --target check .            # clippy -D warnings + cargo test, whole workspace
+docker build -f docker/ext.Dockerfile --target php-layer1 .       # WordPress php-fpm started by securecore-fpm
 ```
 
 The config crate alone needs no PHP: `cargo test` in `ext/` runs its tests (the workspace's
@@ -252,11 +255,116 @@ component that reaches a file by a path the engine's streams never see.
 `research/enforce/compat.sh` runs Classic Editor, Yoast SEO and Contact Form 7 in enforce mode
 and lists every refusal; `bench/enforce.sh` is the front-page benchmark.
 
+## Layer 1: `securecore-fpm` (E6)
+
+Layer 1 protects the server from the whole site, core included: php-fpm can write only the
+listed folders, can't read the denied paths, and has TCP on the listed ports and nothing else.
+It is the kernel's doing (Landlock + seccomp, through [gelada](https://crates.io/crates/gelada)
+0.3.0), so it holds for native code, for any PHP app, and for every program php-fpm starts.
+
+```sh
+securecore-fpm --config /var/www/html/securecore.json [--php-fpm <program>] [--] [php-fpm args...]
+```
+
+It reads the file with the same loader and types as the extension (`config/`), applies
+`layer1` to itself as a gelada sandbox (`restrict_self`) and then execs php-fpm (`php-fpm` on
+`PATH`, or `--php-fpm`) with the remaining arguments, so the master and every worker it forks
+run inside it. It logs one line to stderr first:
+
+```
+securecore-fpm: layer 1 on from /var/www/html/securecore.json (sha256 2ad59919…): write /var/www/html/wp-content/uploads /var/www/html/wp-content/cache /tmp; deny /srv/backups; tcp bind 9000; tcp connect 53 3306 443; starting php-fpm
+```
+
+With `layer1.enabled: false` it execs php-fpm as it is and says so (`layer 1 is off in …`).
+A change to `layer1` applies at the next php-fpm (launcher) restart; the extension flags it as
+`restart_needed`.
+
+**Fail closed.** The launcher exits **125** (gelada's convention for its own failures) with the
+reason on stderr, and php-fpm never starts, when the file is missing, unreadable or invalid,
+when `layer1` can't be enforced as written, or when the kernel won't apply the sandbox (no
+Landlock, or TCP port rules on a kernel without Landlock ABI 4, Linux 6.7):
+
+```
+securecore-fpm: /var/www/html/securecore.json: invalid: invalid value: integer `0`, expected a nonzero u16 at line 7 column 29; refusing to start php-fpm
+securecore-fpm: /var/www/html/securecore.json: layer1.network.unixSockets (/run/mysqld/mysqld.sock) can't be combined with TCP ports (layer1.network.bind/connect) yet: gelada 0.3.0 refuses a unix-socket allowlist together with port rules on Linux (addiscorp/securecore#57). Reach the service over its TCP port instead (MySQL: 3306) and remove unixSockets; refusing to start php-fpm
+```
+
+**`unixSockets` is refused for now**, never dropped: with TCP ports, gelada 0.3.0 can't also
+allow unix sockets on Linux (#57); without ports, the allowlist needs gelada's supervisor in a
+separate process, which `restrict_self` refuses. So layer 1 reaches MySQL over TCP 3306, and
+php-fpm must listen on TCP (`listen = 9000`): with port rules no unix socket can be made, so a
+`listen = /run/php/php-fpm.sock` pool (the Debian package's default) can't start.
+
+Linux only: on macOS gelada can sandbox a program only as it starts, so `restrict_self` fails
+and the launcher exits 125.
+
+### What php-fpm needs, and the example
+
+Everything php-fpm may do is in the file; the launcher adds nothing. `examples/wordpress.json`'s
+`layer1` is what a WordPress php-fpm needs (measured on the docker stack, `test/ext-layer1.sh`):
+
+| entry | why |
+|---|---|
+| `bind` 9000 | the pool's `listen = 9000`; the master binds it before it forks the workers |
+| `connect` 3306 | MySQL over TCP (not its socket, above) |
+| `connect` 443 | HTTPS out: WordPress.org updates, plugins' APIs. Port, not host: the hostnames are layer 2's (E5) |
+| `connect` 53 | DNS over TCP. Port rules leave no UDP, so the resolver must use TCP: `options use-vc` in `/etc/resolv.conf` (Docker: `dns_opt: [use-vc]`, as `docker/compose.ext-layer1.yml` does) or `RES_OPTIONS=use-vc`. Without it every name lookup (the `db` host too) fails |
+| `write` `wp-content/uploads` | media uploads |
+| `write` `wp-content/cache` | page caches |
+| `write` `/tmp` | PHP's temporary folder: file uploads (without it `$_FILES` gets `UPLOAD_ERR_NO_TMP_DIR`), file sessions (`session.save_path` is empty, so `/tmp`: `session_start()` fails), and `sys_get_temp_dir()` users such as WordPress's `download_url()` for updates. Point `upload_tmp_dir`, `session.save_path` and `sys_temp_dir` elsewhere to list that folder instead |
+| `deny` `/srv/backups` | an example of a path to hide: database dumps |
+
+What php-fpm needs **no** rule for, checked on the stack: its logs (the image's
+`error_log = /proc/self/fd/2` is a pipe, which Landlock doesn't restrict; a log *file* would
+need its folder in `write`), the master dropping to `www-data` (setuid works inside the
+sandbox, and the workers inherit it: every php-fpm process shows `NoNewPrivs: 1` and gelada's
+two seccomp filters), and opcache's shared memory (anonymous; no lock file). With a `pid` file
+or a log file configured in php-fpm, add their folders to `write`. WordPress's own loopback
+requests (wp-cron's spawn, Site Health) go to the site's own port: add it to `connect` (443 is
+already there; 80 for an HTTP site). Updating core or plugins in place needs their folders in
+`write`; layer 1 leaving them read-only is the point.
+
+Implicit, because gelada always does it and it is not SecureCore's to choose: gelada denies its
+common secrets under the launcher's `HOME` (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, …), lets the
+devices programs write by path be written (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/tty`,
+`/dev/ptmx`, `/dev/pts`, `/dev/shm`), and makes an empty temporary folder of its own writable
+(`$TMPDIR/gelada-<pid>-<n>`, left behind since the launcher execs). A `write` folder that doesn't
+exist is created by gelada as the launcher's user (root): create it beforehand, owned by the
+pool user, if php-fpm must write it. The environment is passed to php-fpm as it is (the Docker
+WordPress image's `wp-config.php` reads the database password from it).
+
+Known: a graceful stop (`SIGQUIT`, Docker's stop signal for this image) logs `WARNING: failed to
+create a new socket` once per worker. php-fpm's soft-quit handler opens a placeholder unix
+socket in place of the closed listening socket, and the port rules refuse it; the worker still
+finishes its request and exits.
+
+### Docker
+
+`docker/ext.Dockerfile`'s `php-layer1` target is the `php` target with `securecore-fpm` as the
+command (`securecore-fpm --config /var/www/html/securecore.json`) and `docker-ensure-installed.sh`
+as the entrypoint, so a new site volume still gets WordPress copied in.
+`docker/compose.ext-layer1.yml` runs it on top of `compose.ext.yml` and sets `dns_opt: [use-vc]`.
+No `--security-opt` is needed: Docker's default seccomp profile allows Landlock and seccomp, and
+gelada stacks its filters on top of it.
+
 ## Tests
 
 - `cargo test` (in Docker: the `check` target): the examples parse, unknown keys and bad
   values are rejected at every level, the schema is in sync, and the reloader follows the file,
-  keeps the last valid config on a bad edit and flags layer 1 changes.
+  keeps the last valid config on a bad edit and flags layer 1 changes. On Linux, `fpm/tests/`
+  runs the built launcher with bash standing in for php-fpm: an invalid file and unixSockets +
+  ports exit 125 without running it, layer 1 off runs it as it is, and layer 1 on refuses a
+  write outside the folders (from a child too), a denied read, another TCP port and UDP, with
+  the same script getting through each with layer 1 off.
+- `DOCKER_CONTEXT=colima test/ext-layer1.sh`: WordPress with php-fpm started by securecore-fpm
+  (`docker/compose.ext-layer1.yml`, project `securecore-layer1`, port 8090), the three plugins
+  active, layer 2 off and then in enforce mode: front page 200, every php-fpm process sandboxed,
+  the DB on 3306 and 443 work, ports 25 and 80, a bind of 8081, UDP and a unix socket are
+  refused (and the listeners outside the sandbox receive nothing), writes outside the folders
+  are refused from core and from a child program, the denied path is unreadable; unixSockets +
+  ports and an invalid file exit 125 at launch with php-fpm never starting.
+- All the `test/ext-*.sh` scripts take `SECURECORE_EXT_PROJECT` and `SECURECORE_EXT_PORT` to run
+  as another compose project on another port.
 - `DOCKER_CONTEXT=colima test/ext-config.sh`: WordPress on the docker stack with the extension
   (`docker/compose.ext.yml`, project `securecore-ext`, port 8089): front page 200, the status
   reports the file's sha256 and layers, an edit is live in every worker without a restart, and
@@ -275,3 +383,5 @@ and lists every refusal; `bench/enforce.sh` is the front-page benchmark.
   attribution logging off, and on.
 - `DOCKER_CONTEXT=colima bench/enforce.sh`: front-page p50 with the three plugins, not loaded vs
   loaded in enforce mode.
+- `DOCKER_CONTEXT=colima bench/layer1.sh` (after ext-layer1.sh): front-page p50 with the three
+  plugins and the extension unloaded, layer 1 off (stock php-fpm) vs on.
