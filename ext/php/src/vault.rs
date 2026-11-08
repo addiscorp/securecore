@@ -356,7 +356,7 @@ pub(crate) fn request_startup() {
 /// Called once, from RINIT, before userland code runs this request.
 unsafe fn install() {
     let mut originals = HashMap::new();
-    let ft = unsafe { (*std::ptr::addr_of_mut!(ext_php_rs::ffi::compiler_globals)).function_table };
+    let ft = unsafe { (*crate::compiler_globals()).function_table };
     if !ft.is_null() {
         for &(name, swap) in FUNCS {
             if let Some(original) = unsafe { hook_in(ft, name) } {
@@ -381,7 +381,7 @@ unsafe fn install() {
 /// # Safety
 /// Called on the request's own thread, before userland runs.
 pub(crate) unsafe fn method_table(class: &str) -> Option<*mut ext_php_rs::ffi::HashTable> {
-    let ct = unsafe { (*std::ptr::addr_of_mut!(ext_php_rs::ffi::compiler_globals)).class_table };
+    let ct = unsafe { (*crate::compiler_globals()).class_table };
     if ct.is_null() {
         return None;
     }

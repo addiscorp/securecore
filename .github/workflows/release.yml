@@ -7,10 +7,25 @@
 # release's full version with no "v":
 #   <version>/securecore.zip          the plugin (scripts/package.sh)
 #   <version>/securecore.zip.sha256
-#   <version>/release.json            version, tag, commit, channel, zip + sha256
+#   <version>/ext/securecore-php<v>-<ts>-linux-<arch>.so   the extension, one per matrix cell (E8)
+#   <version>/ext/securecore-fpm-linux-<arch>              the layer-1 launcher, one per architecture
+#   <version>/ext/securecore-vault.php                     the mu-plugin
+#   <version>/ext/securecore.schema.json                   the JSON Schema for securecore.json
+#   <version>/release.json            version, tag, commit, channel, zip + sha256, and "files": the
+#                                     sha256 and size of every other file in <version>/ (APS 12)
 #   canary.json                       the newest canary's release.json
 #   latest.json                       the newest stable's (promote.yml)
-#   install.sh                        the installer, from this repo
+#   install.sh                        the plugin installer, from this repo
+#   install-ext.sh                    the extension installer (ext/install.sh)
+#   staging/<tag>/<run id>/<cell>/    each matrix cell's checked files, until publish has
+#                                     assembled the release (then deleted). Nothing reaches
+#                                     <version>/ unless every cell built and passed its check.
+#
+# The extension matrix (addiscorp/securecore#53, E8): scripts/ext-cells.txt (PHP 8.1-8.4 x NTS/ZTS)
+# x linux-x86_64/linux-arm64 = 16 cells. Each cell builds in that PHP's official image
+# (scripts/ext-build.sh), then test/release-check.sh boots WordPress on that PHP with the built
+# files installed by install-ext.sh and runs the smoke subset of the ext-* suites. Publish takes
+# the checked bytes from staging, never a rebuild.
 #   php.json                          the mirrored PHP builds: sha256, upstream URL + sha256
 #   php/<build>/<version>/<platform>/php.tar.gz   static-php-cli builds, byte for byte
 name: Release (canary)
@@ -34,6 +49,7 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      cells: ${{ steps.resolve.outputs.cells }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: The ref is a canary of this commit and this version
@@ -63,12 +79,76 @@ jobs:
           {
             echo "tag=${TAG}"
             echo "version=${TAG#v}"
+            echo "cells=$(scripts/ext-cells.sh json)"
           } >> "$GITHUB_OUTPUT"
+
+  ext:
+    name: ext php${{ matrix.cell.php }}-${{ matrix.cell.ts }}-linux-${{ matrix.arch }}
+    needs: [resolve]
+    # APS 11 puts CI on mirab VMs, but Docker inside jobs is not in mirab's phase 1 (mirab#59,
+    # row 12), and this job is Docker end to end: the build runs in each PHP's official image and
+    # the release check boots WordPress (php, nginx, MariaDB) in containers. So it is one of the
+    # "jobs a mirab VM can't run yet" APS 11 lets run on GitHub-hosted runners, listed here with
+    # the reason; it moves to mirab-linux-x64 / mirab-linux-arm64 when mirab VMs run Docker. It
+    # is also part of the release (it stages the bytes publish ships), which stays hosted anyway.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJSON(needs.resolve.outputs.cells) }}
+        arch: [x86_64, arm64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      PHP: ${{ matrix.cell.php }}
+      TS: ${{ matrix.cell.ts }}
+      ARCH: ${{ matrix.arch }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build the cell in its PHP image (scripts/ext-build.sh)
+        run: |
+          set -euo pipefail
+          [ "$(scripts/ext-cells.sh arch)" = "$ARCH" ] || { echo "::error::this runner's Docker is $(scripts/ext-cells.sh arch), not $ARCH"; exit 1; }
+          mkdir -p .tmp
+          TMPDIR="$PWD/.tmp" scripts/ext-build.sh "$PHP" "$TS" dist
+          ls -l dist
+      - name: Release check (test/release-check.sh) — WordPress on this PHP with these bytes
+        run: TMPDIR="$PWD/.tmp" test/release-check.sh "$PHP" "$TS" dist
+      - name: Stage the checked files in R2
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${R2_ENDPOINT:-}" ] || [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::error::staging needs R2_ENDPOINT, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in the release environment."
+            exit 1
+          fi
+          cell="php${PHP}-${TS}-linux-${ARCH}"
+          prefix="staging/${TAG}/${GITHUB_RUN_ID}/${cell}"
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          cat dist/SHA256SUMS
+          for f in dist/*; do scripts/r2.sh put "${prefix}/${f#dist/}" "$f"; done
+          # Read back what was staged before it counts.
+          mkdir -p readback
+          for f in dist/*; do
+            scripts/r2.sh get "${prefix}/${f#dist/}" "readback/${f#dist/}"
+            cmp "$f" "readback/${f#dist/}" || { echo "::error::${prefix}/${f#dist/} does not read back as staged"; exit 1; }
+          done
+          echo "staged ${prefix}/"
 
   publish:
     name: Build and publish to R2
-    needs: [resolve]
-    # Publishing runs on GitHub-hosted runners (APS 11); the build is one zip, so it happens here.
+    needs: [resolve, ext]
+    # Publishing runs on GitHub-hosted runners (APS 11). The plugin zip is built here; the
+    # extension's files come from the ext cells' staging, checked against each cell's SHA256SUMS.
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -88,20 +168,56 @@ jobs:
           curl -fsSL https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz -o "$RUNNER_TEMP/shellcheck.tar.xz"
           echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum -c -
           tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" -s sh -S info install.sh bin/securecore-worker scripts/*.sh
-      - name: Lay out the release (scripts/release-layout.sh, the same script test/install.sh serves)
-        run: |
-          set -euo pipefail
-          mkdir -p .tmp
-          TMPDIR="$PWD/.tmp" scripts/release-layout.sh "$VERSION" "$TAG" "$GITHUB_SHA" canary release
-          unzip -l "release/${VERSION}/securecore.zip"
-          cat "release/${VERSION}/release.json"
+          "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" -s sh -S info install.sh bin/securecore-worker scripts/*.sh ext/install.sh test/release-check.sh
       - name: Release keys are present
         run: |
           if [ -z "${R2_ENDPOINT:-}" ] || [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
             echo "::error::publishing needs R2_ENDPOINT, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in the release environment."
             exit 1
           fi
+      # Every cell's staged files, checked against the SHA256SUMS that cell wrote after its release
+      # check passed: these are the bytes that were checked. Every cell must be there, and every
+      # cell of one architecture must have built the same launcher (it is plain Rust, no PHP), so
+      # the one shipped per architecture is the one every cell's layer-1 check ran.
+      - name: Take the extension's checked files from staging
+        env:
+          CELLS: ${{ needs.resolve.outputs.cells }}
+        run: |
+          set -euo pipefail
+          mkdir -p staged ext-dist
+          for arch in $(scripts/ext-cells.sh arches); do
+            launcher=""
+            for row in $(echo "$CELLS" | jq -r '.[] | "\(.php)-\(.ts)"'); do
+              cell="php${row}-linux-${arch}"
+              prefix="staging/${TAG}/${GITHUB_RUN_ID}/${cell}"
+              mkdir -p "staged/${cell}"
+              scripts/r2.sh get "${prefix}/SHA256SUMS" "staged/${cell}/SHA256SUMS" \
+                || { echo "::error::${cell} staged nothing: it did not pass"; exit 1; }
+              while read -r _ f; do
+                scripts/r2.sh get "${prefix}/${f}" "staged/${cell}/${f}"
+              done < "staged/${cell}/SHA256SUMS"
+              (cd "staged/${cell}" && sha256sum -c --strict SHA256SUMS) || { echo "::error::${cell}'s staged files do not match its SHA256SUMS"; exit 1; }
+              so="securecore-${cell}.so"
+              [ -f "staged/${cell}/${so}" ] || { echo "::error::${cell} staged no ${so}"; exit 1; }
+              cp "staged/${cell}/${so}" ext-dist/
+              sum=$(sha256sum "staged/${cell}/securecore-fpm-linux-${arch}" | cut -d' ' -f1)
+              if [ -z "$launcher" ]; then
+                launcher=$sum
+                cp "staged/${cell}/securecore-fpm-linux-${arch}" ext-dist/
+              elif [ "$sum" != "$launcher" ]; then
+                echo "::error::${cell} built a different securecore-fpm-linux-${arch} (${sum}, others ${launcher}): the launcher build is not reproducible across cells"
+                exit 1
+              fi
+            done
+          done
+          ls -l ext-dist
+      - name: Lay out the release (scripts/release-layout.sh, the same script the tests serve)
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          TMPDIR="$PWD/.tmp" scripts/release-layout.sh "$VERSION" "$TAG" "$GITHUB_SHA" canary release ext-dist
+          unzip -l "release/${VERSION}/securecore.zip"
+          cat "release/${VERSION}/release.json"
       # PHP for install.sh, mirrored before the installer that needs it is published:
       # static-php-cli's prebuilt builds (scripts/php-builds.txt), copied byte for byte into
       # php/<build>/<version>/<platform>/ with php.json recording our sha256, the upstream URL
@@ -133,8 +249,10 @@ jobs:
       - name: Publish the installer and point canary.json at this release
         run: |
           set -euo pipefail
-          aws s3 cp release/install.sh "s3://${R2_BUCKET_RELEASES}/install.sh" --endpoint-url="${R2_ENDPOINT}" \
-            --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
+          for f in install.sh install-ext.sh; do
+            aws s3 cp "release/$f" "s3://${R2_BUCKET_RELEASES}/$f" --endpoint-url="${R2_ENDPOINT}" \
+              --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
+          done
           aws s3 cp release/canary.json "s3://${R2_BUCKET_RELEASES}/canary.json" --endpoint-url="${R2_ENDPOINT}" \
             --content-type "application/json" --cache-control "no-cache"
       # Every uploaded file, read back over HTTPS from both hostnames and compared byte for
@@ -147,12 +265,15 @@ jobs:
           sum() { sha256sum "$1" | cut -d' ' -f1; }
           bust="?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           for host in securecore-releases.addis.gg; do
-            for f in "${VERSION}/securecore.zip" "${VERSION}/securecore.zip.sha256" "${VERSION}/release.json"; do
-              curl -fsSL "https://${host}/${f}" -o served
-              [ "$(sum served)" = "$(sum "release/${f}")" ] || { echo "::error::https://${host}/${f} does not match what was built"; exit 1; }
-              echo "ok https://${host}/${f} $(sum served)"
+            curl -fsSL "https://${host}/${VERSION}/release.json" -o served
+            [ "$(sum served)" = "$(sum "release/${VERSION}/release.json")" ] || { echo "::error::https://${host}/${VERSION}/release.json does not match"; exit 1; }
+            # Every file the manifest names, by the sha256 it promises installers.
+            jq -r '.files | to_entries[] | "\(.key) \(.value.sha256)"' "release/${VERSION}/release.json" | while read -r f want; do
+              curl -fsSL "https://${host}/${VERSION}/${f}" -o served
+              [ "$(sum served)" = "$want" ] || { echo "::error::https://${host}/${VERSION}/${f} does not match release.json"; exit 1; }
+              echo "ok https://${host}/${VERSION}/${f} ${want}"
             done
-            for f in install.sh canary.json; do
+            for f in install.sh install-ext.sh canary.json; do
               curl -fsSL "https://${host}/${f}${bust}" -o served
               [ "$(sum served)" = "$(sum "release/${f}")" ] || { echo "::error::https://${host}/${f} does not match what was uploaded"; exit 1; }
               echo "ok https://${host}/${f} $(sum served)"
@@ -174,13 +295,21 @@ jobs:
             # shellcheck disable=SC2086
             gh release create "$TAG" $files --repo "${{ github.repository }}" \
               --title "securecore ${VERSION} (canary)" --prerelease \
-              --notes "Canary build of ${GITHUB_SHA}. Install it: cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh -s -- --canary"
+              --notes "Canary build of ${GITHUB_SHA}. Install the plugin: cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh -s -- --canary. Install the extension: curl -fsSL https://securecore-releases.addis.gg/install-ext.sh | sudo sh -s -- --canary --wordpress /path/to/wordpress"
           fi
+      - name: Remove this run's staging
+        run: |
+          set -euo pipefail
+          for d in staged/*/; do
+            cell=$(basename "$d")
+            for f in "$d"*; do scripts/r2.sh delete "staging/${TAG}/${GITHUB_RUN_ID}/${cell}/$(basename "$f")"; done
+          done
       - name: Summary
         run: |
           {
             echo "### securecore ${VERSION} (canary)"
             echo "- https://securecore-releases.addis.gg/${VERSION}/release.json"
-            echo "- canary.json and install.sh now point here; latest.json was not touched (promote.yml)"
-            echo "- every file read back from both hostnames and matched by sha256"
+            echo "- the extension: $(jq -r '.files | keys[] | select(endswith(".so"))' "release/${VERSION}/release.json" | wc -l) cells, each release-checked on WordPress before staging"
+            echo "- canary.json, install.sh and install-ext.sh now point here; latest.json was not touched (promote.yml)"
+            echo "- every file in release.json read back from securecore-releases.addis.gg and matched by sha256"
           } >> "$GITHUB_STEP_SUMMARY"

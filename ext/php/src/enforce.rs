@@ -196,7 +196,7 @@ unsafe fn install() {
     // SAFETY: SC_WRAPPER is set once here before it is registered or read.
     unsafe { (*std::ptr::addr_of_mut!(SC_WRAPPER)).wops = std::ptr::addr_of!(SC_WOPS.0) };
 
-    let ft = unsafe { (*std::ptr::addr_of_mut!(ext_php_rs::ffi::compiler_globals)).function_table };
+    let ft = unsafe { (*crate::compiler_globals()).function_table };
     if ft.is_null() {
         return;
     }
@@ -759,7 +759,7 @@ unsafe fn mode_writes(mode: *const c_char) -> bool {
 
 fn current_execute_data() -> *const zend_execute_data {
     // SAFETY: EG(current_execute_data) on the request's own thread.
-    unsafe { (*std::ptr::addr_of!(ext_php_rs::ffi::executor_globals)).current_execute_data }
+    unsafe { (*crate::executor_globals()).current_execute_data }
 }
 
 fn audit(mode: Mode, component: &str, op: &str, path: &str, rule: &str) {

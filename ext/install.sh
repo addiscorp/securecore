@@ -1,0 +1,269 @@
+#!/bin/sh
+# Install the SecureCore PHP extension (addiscorp/securecore#53) on a Linux server, for the PHP
+# that runs the site:
+#
+#   curl -fsSL https://securecore-releases.addis.gg/install-ext.sh | sudo sh -s -- --wordpress /var/www/html
+#
+# 1. Finds the PHP (`php` on PATH, or --php): its version, thread safety (NTS/ZTS), extension
+#    folder and ini folder; and this machine's architecture (x86_64 or arm64).
+# 2. Downloads release.json (the newest stable, or --canary, or --version) and the files this
+#    PHP needs, and checks every file's sha256 against release.json before using it. Nothing
+#    downloaded is run or installed unless it matches.
+# 3. Checks the extension loads in this PHP (with every layer off), then installs:
+#      securecore.so         into PHP's extension folder
+#      securecore-fpm        the layer-1 launcher, into /usr/local/bin (--bin-dir)
+#      securecore.schema.json  into /usr/local/share/securecore (--share-dir)
+#      securecore-vault.php  the mu-plugin, into <wordpress>/wp-content/mu-plugins
+#      securecore.json       only if there is none: every layer off (an existing one is kept)
+#      securecore.ini        last: `extension=securecore.so` and `securecore.config=<file>`
+# 4. Says what it did, one line per step, and what to run next (restart php-fpm).
+#
+# Idempotent: a file already installed with the same bytes is left alone ("unchanged"), so
+# running it again changes nothing. It never restarts a service, never runs sudo itself, and
+# never edits a securecore.json that exists.
+set -eu
+
+BASE=https://securecore-releases.addis.gg
+CHANNEL=stable
+VERSION=
+PHP=php
+WP=
+CONFIG=
+INI_DIR=
+EXT_DIR=
+BIN_DIR=/usr/local/bin
+SHARE_DIR=/usr/local/share/securecore
+
+if [ -t 1 ]; then OK='✓' SAME='=' BAD='✗' NOTE='!' SKIP='·'; else OK=ok SAME=same BAD=error NOTE='!' SKIP=-; fi
+say() { printf '%s\n' "$*"; }
+step() { printf '%s %-14s %s\n' "$1" "$2" "$3"; }
+die() { printf '%s %s\n' "$BAD" "$*" >&2; exit 1; }
+usage() {
+  cat <<'EOF'
+Install the SecureCore PHP extension for the PHP that runs your site (Linux, x86_64 or arm64,
+PHP 8.1-8.4, NTS or ZTS).
+
+  curl -fsSL https://securecore-releases.addis.gg/install-ext.sh | sudo sh -s -- --wordpress /var/www/html
+
+Options:
+  --wordpress <dir>   the WordPress root: the mu-plugin goes into its wp-content/mu-plugins and
+                      the config defaults to <dir>/securecore.json (default: the current
+                      directory, if it is a WordPress root)
+  --config <file>     securecore.json (default: <wordpress>/securecore.json). Created with
+                      every layer off if it doesn't exist; never changed if it does
+  --php <program>     the PHP CLI of the same build as your php-fpm (default: php)
+  --ini-dir <dir>     where securecore.ini goes (default: PHP's scan folder; on Debian/Ubuntu
+                      packages, mods-available + phpenmod)
+  --extension-dir <dir>  where securecore.so goes (default: PHP's extension_dir)
+  --bin-dir <dir>     where securecore-fpm goes (default: /usr/local/bin)
+  --share-dir <dir>   where the JSON Schema goes (default: /usr/local/share/securecore)
+  --canary            install the newest canary instead of the newest stable release
+  --version <v>       install this release (e.g. 0.1.0 or 0.1.0-canary-a1b2c3d)
+  --from <url>        download from <url> instead of https://securecore-releases.addis.gg
+  -h, --help          this help
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --wordpress|--config|--php|--ini-dir|--extension-dir|--bin-dir|--share-dir|--version|--from)
+      [ $# -ge 2 ] || die "$1 needs a value (see --help)."; opt=$1 val=$2; shift 2 ;;
+    --*=*) opt=${1%%=*} val=${1#*=}; shift ;;
+    --canary) CHANNEL=canary; shift; continue ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option $1 (see --help)." ;;
+  esac
+  case $opt in
+    --wordpress) WP=$val ;;
+    --config) CONFIG=$val ;;
+    --php) PHP=$val ;;
+    --ini-dir) INI_DIR=$val ;;
+    --extension-dir) EXT_DIR=$val ;;
+    --bin-dir) BIN_DIR=$val ;;
+    --share-dir) SHARE_DIR=$val ;;
+    --version) VERSION=$val ;;
+    --from) BASE=$val ;;
+    *) die "Unknown option $opt (see --help)." ;;
+  esac
+done
+BASE=${BASE%/}
+
+command -v curl >/dev/null 2>&1 || die "This installer needs curl. Install it, then run the installer again."
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+  else die "This installer needs sha256sum (coreutils) to check its downloads."; fi
+}
+fetch() { curl -fsSL --retry 3 -o "$2" "$1"; }
+
+# --- this machine and its PHP ----------------------------------------------------------------
+[ "$(uname -s)" = Linux ] || die "SecureCore's extension is for Linux (this is $(uname -s))."
+case $(uname -m) in
+  x86_64|amd64) ARCH=x86_64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) die "There is no SecureCore build for $(uname -m); there are builds for x86_64 and arm64." ;;
+esac
+command -v "$PHP" >/dev/null 2>&1 || die "No PHP found ($PHP). Pass --php with the PHP CLI that matches your php-fpm."
+php_eval() { "$PHP" -n -r "$1"; }
+PHP_VER=$(php_eval 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;')
+if [ "$(php_eval 'echo PHP_ZTS;')" = 1 ]; then TS=zts; TS_LABEL=ZTS; else TS=nts; TS_LABEL=NTS; fi
+PHP_LABEL="PHP $(php_eval 'echo PHP_VERSION;') $TS_LABEL $ARCH"
+# Not -n here: extension_dir and the scan folder are the build's, and php.ini may move the
+# extension folder.
+[ -n "$EXT_DIR" ] || EXT_DIR=$("$PHP" -r 'echo ini_get("extension_dir");')
+case $EXT_DIR in /*) ;; *) die "PHP's extension_dir is '$EXT_DIR', not an absolute folder. Pass --extension-dir." ;; esac
+SO=securecore-php$PHP_VER-$TS-linux-$ARCH.so
+LAUNCHER=securecore-fpm-linux-$ARCH
+step "$OK" "PHP" "$PHP_LABEL ($("$PHP" -r 'echo PHP_BINARY;'))"
+
+# The ini goes where this PHP's SAPIs read it. Debian/Ubuntu packages keep one conf.d per SAPI
+# (cli, fpm, apache2) fed from mods-available by phpenmod; the official images and source
+# builds have one scan folder shared by the CLI and php-fpm.
+SCAN=$("$PHP" -r 'echo PHP_CONFIG_FILE_SCAN_DIR;')
+ENMOD=
+if [ -z "$INI_DIR" ]; then
+  mods=/etc/php/$PHP_VER/mods-available
+  case $SCAN in
+    /etc/php/"$PHP_VER"/*/conf.d) if [ -d "$mods" ] && command -v phpenmod >/dev/null 2>&1; then INI_DIR=$mods ENMOD=1; fi ;;
+  esac
+  [ -n "$INI_DIR" ] || INI_DIR=$SCAN
+fi
+[ -n "$INI_DIR" ] || die "This PHP has no folder for extra ini files. Pass --ini-dir."
+
+# --- WordPress and the config ------------------------------------------------------------------
+if [ -z "$WP" ] && [ -f ./wp-load.php ]; then WP=$(pwd); fi
+if [ -n "$WP" ]; then
+  [ -f "$WP/wp-load.php" ] || die "$WP is not a WordPress root (no wp-load.php). Pass --wordpress with the folder that has wp-config.php."
+  WP=$(CDPATH='' cd "$WP" && pwd)
+fi
+if [ -z "$CONFIG" ] && [ -n "$WP" ]; then CONFIG=$WP/securecore.json; fi
+[ -n "$CONFIG" ] || die "Say where securecore.json lives: --wordpress <root> (it goes at the root) or --config <file>."
+case $CONFIG in /*) ;; *) CONFIG=$(pwd)/$CONFIG ;; esac
+
+# Writable? Never sudo from here: say what to run.
+for d in "$EXT_DIR" "$INI_DIR" "$BIN_DIR"; do
+  if [ -d "$d" ] && [ ! -w "$d" ]; then die "Can't write to $d. Run the installer as root: curl -fsSL $BASE/install-ext.sh | sudo sh -s -- …"; fi
+done
+
+# --- the release -------------------------------------------------------------------------------
+WORK=$(mktemp -d)
+trap 'rm -f "$WORK"/*; rmdir "$WORK"' EXIT
+if [ -n "$VERSION" ]; then
+  fetch "$BASE/$VERSION/release.json" "$WORK/release.json" || die "There is no SecureCore release $VERSION at $BASE."
+elif [ "$CHANNEL" = canary ]; then
+  fetch "$BASE/canary.json" "$WORK/release.json" || die "Couldn't download $BASE/canary.json. Check the connection, then run the installer again."
+else
+  fetch "$BASE/latest.json" "$WORK/release.json" || die "There is no stable SecureCore release at $BASE yet. Run the installer with --canary for the newest canary."
+fi
+tr -d ' \t\r\n' < "$WORK/release.json" > "$WORK/release.flat"
+field() { sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$WORK/release.flat" | head -n 1; }
+REL=$(field version)
+[ -n "$REL" ] || die "$BASE did not describe a SecureCore release. Run the installer again later."
+# want <path>: the sha256 release.json gives for <path>, or nothing.
+want() {
+  key=$(printf '%s' "$1" | sed 's/[.]/[.]/g')
+  grep -o "\"$key\":{[^}]*}" "$WORK/release.flat" | sed -n 's/.*"sha256":"\([0-9a-f]\{64\}\)".*/\1/p' | head -n 1
+}
+[ -n "$(want "ext/$SO")" ] || die "SecureCore $REL has no build for PHP $PHP_VER $TS_LABEL on $ARCH (ext/$SO). Builds: $(grep -o '"ext/securecore-php[^"]*"' "$WORK/release.flat" | tr -d '"' | sed 's|ext/securecore-||' | tr '\n' ' ')"
+# get <path> <file>: download <path> of the release and check it against release.json.
+get() {
+  sha=$(want "$1")
+  [ -n "$sha" ] || die "release.json of SecureCore $REL lists no $1."
+  fetch "$BASE/$REL/$1" "$WORK/$2" || die "Couldn't download $BASE/$REL/$1. Run the installer again."
+  [ "$(sha256 "$WORK/$2")" = "$sha" ] || die "$1 failed its sha256 check against release.json, so nothing was installed. Run the installer again; if it keeps failing, the download is being corrupted or tampered with."
+}
+get "ext/$SO" securecore.so
+get "ext/$LAUNCHER" securecore-fpm
+get ext/securecore-vault.php securecore-vault.php
+get ext/securecore.schema.json securecore.schema.json
+step "$OK" "Download" "SecureCore $REL: 4 files, each matching its sha256 in release.json"
+
+# The verified extension must load in this PHP before anything is installed.
+printf '{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$WORK/off.json"
+if ! out=$("$PHP" -n -d "extension=$WORK/securecore.so" -d "securecore.config=$WORK/off.json" \
+    -r 'exit(extension_loaded("securecore") ? 0 : 1);' 2>&1); then
+  die "The SecureCore build for $PHP_LABEL does not load in this PHP, so nothing was installed: $out"
+fi
+step "$OK" "Check" "the extension loads in this PHP"
+
+# --- install -----------------------------------------------------------------------------------
+# put <file> <dest> <mode> <label>: install unless the same bytes are there; atomic (rename).
+put() {
+  if [ -f "$2" ] && [ "$(sha256 "$2")" = "$(sha256 "$WORK/$1")" ]; then
+    step "$SAME" "$4" "unchanged ($2)"
+    return
+  fi
+  mkdir -p "$(dirname "$2")"
+  cp "$WORK/$1" "$2.securecore-new"
+  chmod "$3" "$2.securecore-new"
+  mv -f "$2.securecore-new" "$2"
+  step "$OK" "$4" "installed $2"
+}
+put securecore.so "$EXT_DIR/securecore.so" 644 "Extension"
+put securecore-fpm "$BIN_DIR/securecore-fpm" 755 "Launcher"
+put securecore.schema.json "$SHARE_DIR/securecore.schema.json" 644 "JSON Schema"
+if [ -n "$WP" ]; then
+  mu=$WP/wp-content/mu-plugins
+  put securecore-vault.php "$mu/securecore-vault.php" 644 "mu-plugin"
+  # The site's files belong to the site's user, not root.
+  owner=$(stat -c '%u:%g' "$WP/wp-content")
+  chown "$owner" "$mu" "$mu/securecore-vault.php" 2>/dev/null || true
+else
+  put securecore-vault.php "$SHARE_DIR/securecore-vault.php" 644 "mu-plugin"
+  step "$SKIP" "WordPress" "none given (--wordpress): for the vault, copy $SHARE_DIR/securecore-vault.php into wp-content/mu-plugins"
+fi
+
+# The config: never overwrite one. A new one has every layer off, so loading the extension
+# changes nothing until a person turns layers on. Readable by the php-fpm workers, which reload it.
+if [ -f "$CONFIG" ]; then
+  step "$SAME" "Config" "kept $CONFIG"
+  NEW_CONFIG=
+else
+  mkdir -p "$(dirname "$CONFIG")"
+  cat > "$CONFIG.securecore-new" <<EOF
+{
+  "\$schema": "file://$SHARE_DIR/securecore.schema.json",
+  "layer1": { "enabled": false },
+  "layer2": { "enabled": false },
+  "layer3": { "enabled": false }
+}
+EOF
+  chmod 644 "$CONFIG.securecore-new"
+  if [ -n "$WP" ]; then chown "$(stat -c '%u:%g' "$WP")" "$CONFIG.securecore-new" 2>/dev/null || true; fi
+  mv -f "$CONFIG.securecore-new" "$CONFIG"
+  step "$OK" "Config" "created $CONFIG (every layer off)"
+  NEW_CONFIG=1
+fi
+
+# The ini last: from here on every new PHP process loads the extension, and refuses to start
+# without a valid config, which now exists.
+printf '; SecureCore %s (install-ext.sh). The config is read once at startup; layers 2 and 3 reload.\n; priority=20\nextension=securecore.so\nsecurecore.config=%s\n' "$REL" "$CONFIG" > "$WORK/securecore.ini"
+# The version line changes on every upgrade; compare what PHP reads.
+if [ -f "$INI_DIR/securecore.ini" ] && [ "$(grep -v '^;' "$INI_DIR/securecore.ini")" = "$(grep -v '^;' "$WORK/securecore.ini")" ]; then
+  step "$SAME" "ini" "unchanged ($INI_DIR/securecore.ini)"
+  INI_CHANGED=
+else
+  put securecore.ini "$INI_DIR/securecore.ini" 644 "ini"
+  INI_CHANGED=1
+fi
+if [ -n "$ENMOD" ]; then
+  # phpenmod is idempotent; run it every time so a SAPI added since is enabled too.
+  phpenmod -v "$PHP_VER" securecore
+  if [ -n "$INI_CHANGED" ]; then step "$OK" "phpenmod" "enabled for every PHP $PHP_VER SAPI"; else step "$SAME" "phpenmod" "enabled for every PHP $PHP_VER SAPI"; fi
+fi
+
+# What PHP sees now, with the site's ini.
+if out=$("$PHP" -r 'echo extension_loaded("securecore") ? "loaded" : "not loaded";' 2>&1) && [ "$out" = loaded ]; then
+  step "$OK" "Loaded" "php -m lists securecore, config $CONFIG"
+elif [ -n "$NEW_CONFIG" ]; then
+  die "PHP doesn't load SecureCore after the install: $out"
+else
+  step "$NOTE" "Loaded" "this PHP refuses $CONFIG here: $out"
+  say "  php-fpm refuses it the same way unless its environment differs (vault env variables). Fix the file before restarting php-fpm."
+fi
+
+say ""
+say "SecureCore $REL is installed for $PHP_LABEL. Next:"
+say "  restart php-fpm (e.g. systemctl restart php$PHP_VER-fpm) to load it;"
+say "  turn layers on in $CONFIG (schema: $SHARE_DIR/securecore.schema.json);"
+say "  for layer 1, start php-fpm through the launcher: $BIN_DIR/securecore-fpm --config $CONFIG -- <php-fpm args>"

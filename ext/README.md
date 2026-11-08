@@ -31,9 +31,71 @@ docker build -f docker/ext.Dockerfile --target php-layer1 .       # WordPress ph
 The config crate alone needs no PHP: `cargo test` in `ext/` runs its tests (the workspace's
 default member).
 
+`--build-arg PHP_IMAGE=<image>` builds against another PHP. The release builds every cell of
+[`scripts/ext-cells.txt`](../scripts/ext-cells.txt) that way (below).
+
+## Release (E8)
+
+Every release ships, in `securecore-releases/<version>/ext/` (APS 12):
+
+| file | what |
+|---|---|
+| `securecore-php<v>-<ts>-linux-<arch>.so` | the extension, for PHP 8.1, 8.2, 8.3, 8.4 × `nts`/`zts` × `x86_64`/`arm64`: 16 cells |
+| `securecore-fpm-linux-<arch>` | the layer-1 launcher, one per architecture (plain Rust: every cell builds the same bytes, and the release refuses to ship if they differ) |
+| `securecore-vault.php` | the mu-plugin |
+| `securecore.schema.json` | the JSON Schema for `securecore.json` |
+
+and `release.json` lists every file in the release with its sha256 and size.
+
+**The matrix.** [`scripts/ext-cells.txt`](../scripts/ext-cells.txt) pins one official php image
+per version and thread-safety build (`php:<v>-fpm-bookworm` for NTS, `php:<v>-zts-bookworm` for
+ZTS) by its multi-arch digest; each image's `php-config` and headers are that PHP exactly, so
+bindgen sees the ABI the extension is loaded into. `scripts/ext-build.sh <php> <ts> <out>` builds
+one cell on the Docker host's architecture. Built on bookworm (glibc 2.36), the binaries also run
+on trixie and Ubuntu 24.04. On ZTS the engine's globals are per thread, so the extension reads
+`EG`/`CG` through ext-php-rs's accessors (`executor_globals()`/`compiler_globals()` in
+`php/src/lib.rs`), never the NTS-only statics.
+
+**The release check.** `test/release-check.sh <php> <ts> <dir>` lays the cell's files out as a
+release (`scripts/release-layout.sh`, the script the bucket's release uses), builds that PHP's
+image with WordPress (`docker/release-check.Dockerfile`), installs SecureCore **with
+`install-ext.sh` from that release**, and runs the smoke subset of the ext-* suites: the install
+(right cell detected, the installed bytes are the built ones, a re-run changes nothing, a tampered
+file is refused), config load (fail closed on a missing file; status reports the file, the layers,
+enforce, `caller=core`), attribution (a mu-plugin's `securecore_status()` is charged to
+`mu-plugin:sc-smoke` and refused), one enforce refusal (and the same write passing in log mode),
+the vault (placeholders only, the real password with the vault removed), and layer 1 (started by
+`securecore-fpm`: sandboxed, serving, a core write outside `layer1.write` refused that worked
+without it). NTS runs WordPress on php-fpm; the ZTS images have no php-fpm, so ZTS runs it on
+`php-cgi -b` (FastCGI, forked children) behind the same nginx. That exercises the ZTS build's ABI
+and every hook, but in processes, not threads: a threaded ZTS server (FrankenPHP, Apache's worker
+MPM with mod_php) is not in the check. Under php-cgi a request's log lines go down FastCGI's
+stderr into the web server's error log.
+
+**Canary and stable (APS 9).** `tag-canary.yml` tags main nightly (09:00 UTC, only if it changed)
+and dispatches `release.yml`: 16 jobs build and release-check one cell each and stage the checked
+files with their `SHA256SUMS` in `staging/<tag>/<run>/`; publish verifies every cell against its
+sums, checks the launchers agree, lays out the release, uploads it, reads every file in
+`release.json` back from `https://securecore-releases.addis.gg` and only then points
+`canary.json` at it. `promote.yml` copies those bytes to `<X.Y.Z>/`, verifying every manifest
+file, never rebuilding.
+
 ## Install
 
-Copy `securecore.so` into PHP's extension folder and add one ini file to `conf.d`
+```sh
+curl -fsSL https://securecore-releases.addis.gg/install-ext.sh | sudo sh -s -- --wordpress /var/www/html
+```
+
+[`install.sh`](install.sh) (published as `install-ext.sh`) finds the PHP (`--php` for another
+one), its version, NTS/ZTS, extension and ini folders, and the machine's architecture; downloads
+`release.json` (stable, `--canary` or `--version`) and that cell's files; checks each against its
+sha256 and that the extension loads in this PHP; then installs the `.so`, the launcher
+(`/usr/local/bin`), the schema, the mu-plugin (`<wordpress>/wp-content/mu-plugins`), a
+`securecore.json` with every layer off **only if none exists**, and last the ini (on Debian/Ubuntu
+packages through `mods-available` + `phpenmod`, elsewhere in PHP's scan folder). It is
+idempotent, prints one line per step, never restarts a service and never runs sudo itself.
+
+By hand: copy `securecore.so` into PHP's extension folder and add one ini file to `conf.d`
 (`docker/securecore.ini`):
 
 ```ini

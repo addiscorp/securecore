@@ -1,8 +1,9 @@
 # Promote a published canary to stable (APS 9): the same bytes, no rebuild. Run by a person:
 # Actions → Promote → Run workflow, with the canary tag (vX.Y.Z-canary-<sha>).
 #
-# Checks the canary's release.json names the tagged commit and that its zip still matches
-# its sha256, copies <canary>/ to <X.Y.Z>/ in securecore-releases (APS 12), rewrites that
+# Checks the canary's release.json names the tagged commit and that its zip and every file in
+# its manifest ("files": the extension's cells, launchers, mu-plugin, schema) still match their
+# sha256, copies <canary>/ to <X.Y.Z>/ in securecore-releases (APS 12), rewrites that
 # release.json for the stable channel, points latest.json at it, reads everything back, tags
 # vX.Y.Z on the canary's commit and makes the GitHub release. A version is promoted once; the
 # next needs a VERSION bump.
@@ -77,9 +78,16 @@ jobs:
             echo "::error::${C}/release.json records ${RECORDED}, but the tag points at ${{ steps.validate.outputs.commit }}."
             exit 1
           fi
-          # The bytes must be the ones the canary recorded.
+          # The bytes must be the ones the canary recorded: the zip, and every file in its manifest
+          # (the extension's cells, launchers, mu-plugin and schema). A canary from before the
+          # manifest (no "files") has only the zip.
           [ "$(sha256sum "stable/${V}/securecore.zip" | cut -d' ' -f1)" = "$(jq -r .sha256 "stable/${V}/release.json")" ] \
             || { echo "::error::${C}/securecore.zip does not match its release.json"; exit 1; }
+          jq -r '(.files // {}) | to_entries[] | "\(.value.sha256)  \(.key)"' "stable/${V}/release.json" > stable.sums
+          (cd "stable/${V}" && sha256sum -c --strict ../../stable.sums) || { echo "::error::${C}/ does not match its release.json"; exit 1; }
+          # Nothing beyond the manifest is promoted.
+          extra=$(cd "stable/${V}" && find . -type f ! -name release.json | sed 's|^\./||' | sort | comm -23 - <(jq -r '(.files // {}) | keys[]' release.json | sort) | grep -vx 'securecore.zip\|securecore.zip.sha256' || true)
+          [ -z "$extra" ] || { echo "::error::${C}/ holds files its release.json doesn't list: ${extra}"; exit 1; }
           jq --arg v "$V" --arg canary "${{ steps.validate.outputs.canary }}" \
             '.version = $v | .tag = ("v" + $v) | .channel = "stable" | .promoted_from = $canary' \
             "stable/${V}/release.json" > release.tmp && mv release.tmp "stable/${V}/release.json"
@@ -92,7 +100,7 @@ jobs:
           V="${{ steps.validate.outputs.v }}"
           sum() { sha256sum "$1" | cut -d' ' -f1; }
           for host in securecore-releases.addis.gg; do
-            for f in securecore.zip securecore.zip.sha256 release.json; do
+            for f in securecore.zip securecore.zip.sha256 release.json $(jq -r '(.files // {}) | keys[]' "stable/${V}/release.json"); do
               curl -fsSL "https://${host}/${V}/${f}" -o served
               [ "$(sum served)" = "$(sum "stable/${V}/${f}")" ] || { echo "::error::https://${host}/${V}/${f} does not match"; exit 1; }
               echo "ok https://${host}/${V}/${f}"
