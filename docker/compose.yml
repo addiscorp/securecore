@@ -21,6 +21,17 @@ services:
       WORDPRESS_DB_NAME: wordpress
       WORDPRESS_DB_USER: wordpress
       WORDPRESS_DB_PASSWORD: wordpress-db-password
+      # The WordPress keys and salts in the environment, which the vault (E3) maps and hides.
+      # Fixed, known values so the tests can compute the expected HMACs; this is the test site's
+      # secret material, never a real one.
+      WORDPRESS_AUTH_KEY: sc-test-auth-key
+      WORDPRESS_SECURE_AUTH_KEY: sc-test-secure-auth-key
+      WORDPRESS_LOGGED_IN_KEY: sc-test-logged-in-key
+      WORDPRESS_NONCE_KEY: sc-test-nonce-key
+      WORDPRESS_AUTH_SALT: sc-test-auth-salt
+      WORDPRESS_SECURE_AUTH_SALT: sc-test-secure-auth-salt
+      WORDPRESS_LOGGED_IN_SALT: sc-test-logged-in-salt
+      WORDPRESS_NONCE_SALT: sc-test-nonce-salt
     volumes:
       - wp:/var/www/html
       - sock:/run/securecore

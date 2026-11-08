@@ -49,6 +49,24 @@
       },
       "additionalProperties": false
     },
+    "EnvSecret": {
+      "type": "object",
+      "properties": {
+        "env": {
+          "description": "The environment variable holding the real value (e.g. `WORDPRESS_DB_PASSWORD`). It is\nreplaced by the placeholder before PHP runs.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The constant (e.g. `DB_PASSWORD`).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "env"
+      ]
+    },
     "Files": {
       "description": "Extra file access for a component (E2b). A component may always read anywhere under the app\nroot except the protected files (the vault's `from` file and `securecore.json`), and write\nto the uploads and cache folders; these lists add to that. Each entry is a path (a file or a\nfolder) relative to the folder containing securecore.json, or absolute; a folder entry\ncovers everything under it.",
       "type": "object",
@@ -380,24 +398,75 @@
         "own"
       ]
     },
+    "Secret": {
+      "description": "One secret: a constant name, or a constant name and the environment variable holding it.",
+      "anyOf": [
+        {
+          "description": "A constant whose value comes from `vault.from`.",
+          "type": "string"
+        },
+        {
+          "description": "A constant whose value comes from an environment variable.",
+          "$ref": "#/$defs/EnvSecret"
+        }
+      ]
+    },
+    "Source": {
+      "description": "Where bare-named secrets come from. Exactly one key, so the source is always stated.",
+      "oneOf": [
+        {
+          "description": "Read the secret from this wp-config.php (relative to the folder containing securecore.json,\nor absolute). Safe only for the usual `define('NAME', getenv('NAME'))` form, where the\nvalue is an expression: opcache leaves the `define()` call intact, so the extension masks\nit. A secret written as a bare string **literal** (`define('NAME', 'secret')`) is NOT\nhidden — opcache's optimizer inlines it to a compile-time `DECLARE_CONST`, which the\nextension cannot intercept, and the plaintext stays in opcache's shared memory. For a\nhardcoded secret, use `vaultFile` instead.",
+          "type": "object",
+          "properties": {
+            "wpConfig": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "wpConfig"
+          ]
+        },
+        {
+          "description": "A vault file: a JSON object of `\"NAME\": \"value\"` strings, outside the app root, owned by\nthe user that starts php-fpm (root) and readable by it alone (mode 0400 or 0600). The\nrecommended source: php-fpm's workers can't open it at all.",
+          "type": "object",
+          "properties": {
+            "vaultFile": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "vaultFile"
+          ]
+        }
+      ]
+    },
     "Vault": {
+      "description": "The vault (E3): secrets PHP never sees. The extension reads every real value once, at module\nstartup in the php-fpm master before it forks, and keeps it in its own memory; PHP sees a\nplaceholder (`securecore-vault:<NAME>`) in the constant, the environment, `$_ENV`,\n`$_SERVER` and `getenv()`. The extension puts the real value back only inside the database\nconnect calls and the salted functions (`wp_salt`, `wp_hash`). Read at startup only: a change\nneeds a php-fpm restart.",
       "type": "object",
       "properties": {
         "from": {
-          "description": "The file the secrets are defined in (relative to the folder containing securecore.json,\nor absolute).",
-          "type": "string"
+          "description": "Where a secret listed by name alone gets its real value. Required when any entry in\n`secrets` is a bare name; a secret with `env` never reads it. When set, the file is also\nprotected: no PHP code may read or write it (wp-config.php may still be included).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Source"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "secrets": {
-          "description": "The constants SecureCore supplies natively instead of PHP.",
+          "description": "The constants SecureCore supplies natively instead of PHP. A bare name (`\"AUTH_KEY\"`)\ntakes its value from `from`; `{\"name\": …, \"env\": …}` takes it from that environment\nvariable of the php-fpm master.",
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/Secret"
           }
         }
       },
       "additionalProperties": false,
       "required": [
-        "from",
         "secrets"
       ]
     }
