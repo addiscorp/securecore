@@ -16,6 +16,7 @@
 //! charge for every file open. Observation only.
 
 mod attribution;
+mod db;
 mod enforce;
 mod vault;
 
@@ -45,10 +46,13 @@ pub const RELOAD_INTERVAL: Duration = Duration::from_millis(1000);
 /// `securecore.debug_attribution_rule` (`frame` | `component`, the rule
 /// `securecore_status()['caller']` and later phases use) and `securecore.debug_attribution_log`
 /// (`off` | `frame` | `component` | `both`: a log line per file open, per rule).
-static INI: IniEntryDefs<4> = IniEntryDefs::new([
+static INI: IniEntryDefs<5> = IniEntryDefs::new([
     IniEntryDef::new(c"securecore.config", c"", IniEntryPermission::System),
     IniEntryDef::new(c"securecore.debug_attribution_rule", c"component", IniEntryPermission::System),
     IniEntryDef::new(c"securecore.debug_attribution_log", c"off", IniEntryPermission::System),
+    // E4, research only: who a database query is charged to. `caller` is the rule; `component`
+    // reproduces the measurement that rejected it. See db::DbAttribution.
+    IniEntryDef::new(c"securecore.debug_db_attribution", c"caller", IniEntryPermission::System),
     IniEntryDef::end(),
 ]);
 
@@ -100,6 +104,9 @@ extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
     let mut ini = ExecutorGlobals::get().ini_values();
     let mut value = |key: &str| ini.remove(key).flatten().unwrap_or_default();
     let (path, rule, log) = (value(INI_CONFIG), value(attribution::INI_RULE), value(attribution::INI_LOG));
+    if let Err(e) = db::startup(&value(db::INI_ATTRIBUTION)) {
+        return refuse(&e);
+    }
     if path.trim().is_empty() {
         return refuse(&format!("{INI_CONFIG} is not set; point it at securecore.json"));
     }
@@ -128,6 +135,7 @@ extern "C" fn request_startup(_ty: i32, _module_number: i32) -> i32 {
     attribution::request_startup();
     enforce::request_startup();
     vault::request_startup();
+    db::request_startup();
     let mut guard = state();
     if let Some(reloader) = guard.as_mut() {
         match reloader.poll(Instant::now()) {

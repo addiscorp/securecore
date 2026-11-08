@@ -296,7 +296,7 @@ unsafe extern "C" {
 // --- the function handlers ----------------------------------------------------------------------
 
 /// A Zend internal-function handler.
-type Zif = unsafe extern "C" fn(*mut zend_execute_data, *mut zval);
+pub(crate) type Zif = unsafe extern "C" fn(*mut zend_execute_data, *mut zval);
 
 /// Where a connect function carries the host to compare against the configured DB host: a plain
 /// argument (mysqli), or inside the PDO DSN (`host=…`).
@@ -364,19 +364,32 @@ unsafe fn install() {
             }
         }
     }
-    let ct = unsafe { (*std::ptr::addr_of_mut!(ext_php_rs::ffi::compiler_globals)).class_table };
-    if !ct.is_null() {
-        for &(class, method, swap) in METHODS {
-            // SAFETY: the class table; the class entry (if present) owns its function table.
-            let ce = unsafe { zend_hash_str_find_ptr_lc(ct.cast_const(), class.as_ptr().cast(), class.len()) }.cast::<ext_php_rs::ffi::zend_class_entry>();
-            let Some(ce) = (unsafe { ce.as_ref() }) else { continue };
-            let mft: *const ext_php_rs::ffi::HashTable = std::ptr::addr_of!(ce.function_table);
-            if let Some(original) = unsafe { hook_in(mft.cast_mut(), method) } {
-                originals.insert(format!("{class}::{method}"), Override { original, swap: Some(swap) });
-            }
+    for &(class, method, swap) in METHODS {
+        // SAFETY: the class's own method table, on the request's own thread.
+        if let Some(mft) = unsafe { method_table(class) }
+            && let Some(original) = unsafe { hook_in(mft, method) }
+        {
+            originals.insert(format!("{class}::{method}"), Override { original, swap: Some(swap) });
         }
     }
     let _ = ORIGINALS.set(originals);
+}
+
+/// The method table of the internal class `class` (lowercase name), when it is loaded. Shared with
+/// the database policy's hooks ([`crate::db`]).
+///
+/// # Safety
+/// Called on the request's own thread, before userland runs.
+pub(crate) unsafe fn method_table(class: &str) -> Option<*mut ext_php_rs::ffi::HashTable> {
+    let ct = unsafe { (*std::ptr::addr_of_mut!(ext_php_rs::ffi::compiler_globals)).class_table };
+    if ct.is_null() {
+        return None;
+    }
+    // SAFETY: the class table; the class entry (if present) owns its function table.
+    let ce = unsafe { zend_hash_str_find_ptr_lc(ct.cast_const(), class.as_ptr().cast(), class.len()) }.cast::<ext_php_rs::ffi::zend_class_entry>();
+    let ce = unsafe { ce.as_ref() }?;
+    let mft: *const ext_php_rs::ffi::HashTable = std::ptr::addr_of!(ce.function_table);
+    Some(mft.cast_mut())
 }
 
 /// Replace the handler of the internal function `name` in table `ft` with [`dispatch`], returning
@@ -385,13 +398,22 @@ unsafe fn install() {
 /// # Safety
 /// `ft` is a live function table on the request's own thread.
 unsafe fn hook_in(ft: *mut ext_php_rs::ffi::HashTable, name: &str) -> Option<Zif> {
+    unsafe { hook_with(ft, name, dispatch) }
+}
+
+/// Replace the handler of the internal function `name` in table `ft` with `handler`, returning the
+/// handler it replaced (the vault's hooks and the database policy's, [`crate::db`], share this).
+///
+/// # Safety
+/// `ft` is a live function table on the request's own thread.
+pub(crate) unsafe fn hook_with(ft: *mut ext_php_rs::ffi::HashTable, name: &str, handler: Zif) -> Option<Zif> {
     let lc = name.to_ascii_lowercase();
     // SAFETY: a live function table and a byte string; the lookup is read-only.
     let ptr = unsafe { zend_hash_str_find_ptr_lc(ft.cast_const(), lc.as_ptr().cast(), lc.len()) };
     let func = unsafe { ptr.cast::<zend_function>().as_mut() }?;
     // SAFETY: an internal function; reading the union.
     let previous = unsafe { func.internal_function.handler }?;
-    func.internal_function.handler = Some(dispatch);
+    func.internal_function.handler = Some(handler);
     Some(previous)
 }
 
@@ -427,7 +449,7 @@ unsafe extern "C" fn dispatch(execute_data: *mut zend_execute_data, return_value
 ///
 /// # Safety
 /// `ex` is a live call frame.
-unsafe fn dispatch_key(ex: *mut zend_execute_data) -> Option<String> {
+pub(crate) unsafe fn dispatch_key(ex: *mut zend_execute_data) -> Option<String> {
     let func = unsafe { ex.as_ref()?.func.as_ref()? };
     let common = unsafe { &func.common };
     let name = crate::attribution::zstr(common.function_name)?;
@@ -635,7 +657,7 @@ pub(crate) fn register(module: ModuleBuilder) -> ModuleBuilder {
 ///
 /// # Safety
 /// `ex` is a live call frame with at least `n` arguments.
-unsafe fn arg<'a>(ex: *mut zend_execute_data, n: u32) -> Option<&'a Zval> {
+pub(crate) unsafe fn arg<'a>(ex: *mut zend_execute_data, n: u32) -> Option<&'a Zval> {
     if n == 0 || n > unsafe { num_args(ex) } {
         return None;
     }
@@ -646,7 +668,7 @@ unsafe fn arg<'a>(ex: *mut zend_execute_data, n: u32) -> Option<&'a Zval> {
 ///
 /// # Safety
 /// `ex` is a live call frame with at least `n` arguments.
-unsafe fn arg_mut<'a>(ex: *mut zend_execute_data, n: u32) -> Option<&'a mut Zval> {
+pub(crate) unsafe fn arg_mut<'a>(ex: *mut zend_execute_data, n: u32) -> Option<&'a mut Zval> {
     if n == 0 || n > unsafe { num_args(ex) } {
         return None;
     }

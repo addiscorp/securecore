@@ -1,0 +1,23 @@
+[package]
+name = "securecore-db"
+description = "The layer-2 database policy for SecureCore (addiscorp/securecore#53, phase E4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The component rules (tables, options, grants) a decision is built from.
+securecore-config = { path = "../config" }
+# Component: who a query is charged to (caller.rs).
+securecore-attribution = { path = "../attribution" }
+# A real MySQL-dialect parser (Apache DataFusion's sqlparser-rs). Exact version (APS 10).
+sqlparser = { workspace = true }
+# securecore-db-suggest writes the suggested entries as JSON.
+serde_json = { workspace = true }
+
+# Suggests component entries from log-mode audit lines:
+#   cargo run -p securecore-db --bin securecore-db-suggest -- --prefix wp_ php-fpm.log
+[[bin]]
+name = "securecore-db-suggest"
+path = "src/bin/securecore-db-suggest.rs"
