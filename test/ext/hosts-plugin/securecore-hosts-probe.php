@@ -192,13 +192,68 @@ add_action('init', function () {
         curl_close($h);
         return is_string($body) && $body !== '' ? 'OK' : 'BLOCKED';
     };
-    // curl following a redirect internally (the documented gap: libcurl resolves and connects the
-    // Location host itself, with no PHP frame for us to check).
-    $cases['curl-redirect-GAP'] = static function () use ($curl) {
+    // curl following a redirect: an allowed host 302s to a disallowed one. The extension follows
+    // in-process (FOLLOWLOCATION off, re-exec per hop) and checks each hop, so this is refused at
+    // the hop in enforce, logged+followed in log, allowed with the layer off.
+    $cases['curl-redirect'] = static function () use ($curl) {
         return $curl(static function ($h) {
             curl_setopt($h, CURLOPT_URL, 'http://redirector.test/');
             curl_setopt($h, CURLOPT_FOLLOWLOCATION, true);
         });
+    };
+    // curl reading a local file bypasses E2b's file policy — refused by the scheme restriction.
+    $cases['curl-file'] = static function () use ($curl) {
+        return $curl(static function ($h) {
+            curl_setopt($h, CURLOPT_URL, 'file:///var/www/html/wp-config.php');
+        });
+    };
+    // a non-web scheme (gopher) to an allowed host — refused by the scheme restriction.
+    $cases['curl-gopher'] = static function () use ($curl) {
+        return $curl(static function ($h) {
+            curl_setopt($h, CURLOPT_URL, 'gopher://allowed.test/');
+        });
+    };
+    // curl_copy_handle carries the recorded options to the copy: a copy of a handle aimed at a
+    // disallowed host is still refused (and an allowed one still allowed).
+    $cases['curl-copy-disallowed'] = static function () {
+        if (!function_exists('curl_copy_handle')) {
+            return 'SKIP';
+        }
+        $a = curl_init();
+        curl_setopt($a, CURLOPT_URL, 'http://disallowed.test/');
+        curl_setopt($a, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($a, CURLOPT_TIMEOUT, 3);
+        $b = curl_copy_handle($a);
+        $r = curl_exec($b);
+        curl_close($b);
+        curl_close($a);
+        return is_string($r) && $r !== '' ? 'OK' : 'BLOCKED';
+    };
+    $cases['curl-copy-allowed'] = static function () {
+        if (!function_exists('curl_copy_handle')) {
+            return 'SKIP';
+        }
+        $a = curl_init();
+        curl_setopt($a, CURLOPT_URL, 'http://allowed.test/');
+        curl_setopt($a, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($a, CURLOPT_TIMEOUT, 3);
+        $b = curl_copy_handle($a);
+        $r = curl_exec($b);
+        curl_close($b);
+        curl_close($a);
+        return is_string($r) && $r !== '' ? 'OK' : 'BLOCKED';
+    };
+    // a handle whose URL the extension never saw being set fails closed at exec for a component.
+    $cases['curl-nostate'] = static function () {
+        if (!function_exists('curl_init')) {
+            return 'SKIP';
+        }
+        $h = curl_init();
+        curl_setopt($h, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($h, CURLOPT_TIMEOUT, 3);
+        $r = @curl_exec($h);
+        curl_close($h);
+        return is_string($r) && $r !== '' ? 'OK' : 'BLOCKED';
     };
 
     // --- SoapClient (uses the http wrapper) ----------------------------------------------

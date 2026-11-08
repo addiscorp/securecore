@@ -65,11 +65,13 @@ until compose exec -T db mariadb -uwordpress -pwordpress-db-password -e 'select 
   i=$((i + 1)); [ "$i" -lt 60 ] || { echo "FAIL database did not start"; exit 1; }
   sleep 1
 done
+# Install, and retry until the front page actually serves 200 (is-installed can report a
+# half-initialised fresh volume as installed, so gate on the real page, not on its exit code).
 i=0
-until wp core is-installed >/dev/null 2>&1; do
+until [ "$(code /)" = 200 ]; do
   wp core install --url="$base" --title=SecureCore --admin_user=admin \
-    --admin_password=securecore-demo --admin_email=admin@example.com --skip-email >>"$dir/wp.err" 2>&1
-  i=$((i + 1)); [ "$i" -lt 10 ] || { echo "FAIL WordPress did not install (see $dir/wp.err)"; exit 1; }
+    --admin_password=securecore-demo --admin_email=admin@example.com --skip-email >>"$dir/wp.err" 2>&1 || true
+  i=$((i + 1)); [ "$i" -lt 12 ] || { echo "FAIL WordPress did not install (see $dir/wp.err)"; exit 1; }
   sleep 2
 done
 
@@ -160,24 +162,29 @@ want() { # $1 config $2 case $3 expected
 # Group A: a disallowed target — BLOCKED in enforce, OK in log and off (reachable both times).
 GROUP_A="stream-disallowed fopen-disallowed get_headers-disallowed userinfo-evil ip-literal \
 stream-redirect fsockopen-disallowed pfsockopen-disallowed ssc-disallowed socket-connect-disallowed \
-curl-disallowed curl-array-disallowed curlmulti-disallowed curl-resolve-evil curl-connectto-evil"
+curl-disallowed curl-array-disallowed curlmulti-disallowed curl-resolve-evil curl-connectto-evil \
+curl-redirect curl-copy-disallowed"
 # Group B: an allowed host — OK in every mode.
-GROUP_B="stream-allowed wildcard-allowed fsockopen-allowed ssc-allowed curl-allowed"
+GROUP_B="stream-allowed wildcard-allowed fsockopen-allowed ssc-allowed curl-allowed curl-copy-allowed"
+# Enforce-only: refused in enforce; in log/off the call behaves in an extension-specific way we
+# don't pin (a file:// read succeeds in log; gopher/no-url fail in libcurl regardless).
+ENFORCE_ONLY="curl-file curl-gopher curl-nostate soap-disallowed"
 
 echo "# enforce"
 run enforce
 for c in $GROUP_A; do want enforce "$c" BLOCKED; done
 for c in $GROUP_B; do want enforce "$c" OK; done
+for c in $ENFORCE_ONLY; do want enforce "$c" BLOCKED; done
 want enforce core-allowed OK
 want enforce core-disallowed BLOCKED
-# the http-wrapper redirect is refused at the second hop; curl's internal redirect is the gap
-printf 'note curl-redirect-GAP in enforce = %s (documented gap: libcurl follows internally; backstop = layer 1 ports + the stream path above, which IS blocked)\n' "$(verdict enforce curl-redirect-GAP)"
-want enforce soap-disallowed BLOCKED
 # audit lines
 has "$T" "layer2 enforce plugin:securecore-hosts-probe net open host disallowed.test" "enforce: stream to disallowed is a net refusal"
 has "$T" "layer2 enforce plugin:securecore-hosts-probe net open host disallowed.test http://allowed.test@disallowed.test/" "enforce: the userinfo URL is attributed to its real host"
 has "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_exec host disallowed.test" "enforce: curl to disallowed is a net refusal"
 has "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_exec host $ip" "enforce: the CURLOPT_RESOLVE override to a disallowed IP is refused"
+has "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_redirect host disallowed.test" "enforce: a curl FOLLOWLOCATION redirect is refused at the hop"
+has "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_exec scheme file" "enforce: a curl file:// URL is refused by the scheme restriction"
+has "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_exec no-url" "enforce: a handle with no recorded URL fails closed"
 has "$T" "layer2 enforce core net open host allowed.test" "enforce: core is restricted to core.hosts"
 
 echo "# log (the revert proof: every refusal above now reaches and is OK, and is logged)"
@@ -187,6 +194,7 @@ for c in $GROUP_B; do want log "$c" OK; done
 want log core-allowed OK
 want log core-disallowed OK
 has "$T" "layer2 log plugin:securecore-hosts-probe net open host disallowed.test" "log: the refusal is recorded"
+has "$T" "layer2 log plugin:securecore-hosts-probe net curl_redirect host disallowed.test" "log: the curl redirect hop is recorded and then followed"
 has "$T" "layer2 log core net open host allowed.test" "log: core's refusal is recorded"
 
 echo "# off (nothing checked, nothing logged)"

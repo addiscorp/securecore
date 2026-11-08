@@ -45,6 +45,8 @@ COPY --from=build /out/securecore.so /securecore.so
 # root is the folder containing it. The image's entrypoint copies /usr/src/wordpress into a new
 # site volume, so a fresh stack starts with off.json there; test/ext-config.sh replaces it.
 FROM wordpress:php8.3-fpm AS php
+# ext/sockets so the E5 host tests can exercise socket_connect (no external libs; cheap).
+RUN docker-php-ext-install -j"$(nproc)" sockets
 COPY --from=build /out/securecore.so /usr/local/lib/php/extensions/securecore.so
 COPY docker/securecore.ini /usr/local/etc/php/conf.d/securecore.ini
 COPY ext/examples/off.json /usr/src/wordpress/securecore.json

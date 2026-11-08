@@ -48,7 +48,7 @@ use ext_php_rs::ffi::{
     zend_hash_str_find_ptr_lc, zend_string, zval,
 };
 use ext_php_rs::flags::ErrorType;
-use ext_php_rs::types::{ArrayKey, ZendStr, Zval};
+use ext_php_rs::types::{ArrayKey, ZendCallable, ZendStr, Zval};
 use securecore_attribution::hosts;
 use securecore_attribution::{Component, Rule};
 use securecore_config::Mode;
@@ -104,7 +104,7 @@ type Zif = unsafe extern "C" fn(*mut zend_execute_data, *mut zval);
 /// recording functions are installed too, but never refuse.
 const CHECK: &[&str] = &["fsockopen", "pfsockopen", "stream_socket_client", "socket_connect", "curl_exec", "curl_multi_add_handle"];
 /// Functions that only record a curl handle's options, so the check at `curl_exec` has them.
-const RECORD: &[&str] = &["curl_init", "curl_setopt", "curl_setopt_array", "curl_reset", "curl_close"];
+const RECORD: &[&str] = &["curl_init", "curl_setopt", "curl_setopt_array", "curl_reset", "curl_close", "curl_copy_handle"];
 
 /// The handlers we replaced. Set once per process; read lock-free.
 static ORIGINALS: OnceLock<HashMap<String, Zif>> = OnceLock::new();
@@ -435,14 +435,21 @@ unsafe extern "C" fn dispatch(execute_data: *mut zend_execute_data, return_value
         unsafe { record_curl(name, execute_data, return_value) };
         return;
     }
-    // Checking functions: a refused connection fails without calling the original.
+    // curl gets full handling: scheme restriction, the pre-connect host checks, and manual
+    // redirect following (libcurl follows internally, below PHP, so FOLLOWLOCATION would otherwise
+    // let an open redirect on an allowed host reach anywhere).
+    if name == "curl_exec" {
+        unsafe { exec_curl(execute_data, return_value) };
+        return;
+    }
+    if name == "curl_multi_add_handle" {
+        unsafe { multi_add_curl(execute_data, return_value) };
+        return;
+    }
+    // The socket functions: a refused connection fails without calling the original.
     if unsafe { blocked_call(execute_data, name) } {
         if let Some(rv) = unsafe { return_value.cast::<Zval>().as_mut() } {
-            if name == "curl_multi_add_handle" {
-                rv.set_long(1); // a non-zero CURLM code: the easy handle is not added to the multi
-            } else {
-                rv.set_bool(false); // fsockopen/stream_socket_client/socket_connect/curl_exec fail
-            }
+            rv.set_bool(false); // fsockopen/pfsockopen/stream_socket_client/socket_connect fail
         }
         return;
     }
@@ -465,11 +472,19 @@ unsafe fn blocked_call(ex: *mut zend_execute_data, name: &str) -> bool {
         "stream_socket_client" => unsafe { guard_authority(ex, from, 1, name) },
         // socket_connect($socket, $address, …): arg 2 is the address (usually an IP literal).
         "socket_connect" => unsafe { guard_authority(ex, from, 2, name) },
-        // curl_exec($handle): check the handle's recorded targets.
-        "curl_exec" => unsafe { guard_curl(ex, from, 1, name) },
-        // curl_multi_add_handle($multi, $easy): check the easy handle's targets before it runs.
-        "curl_multi_add_handle" => unsafe { guard_curl(ex, from, 2, name) },
         _ => false,
+    }
+}
+
+/// `curl_exec`/`curl_multi_add_handle` is called `original` with `original(ex, rv)`. This runs the
+/// real libcurl `curl_exec` without re-entering our dispatch (we call the saved handler directly).
+///
+/// # Safety
+/// `ex`/`rv` are the live frame and return value.
+unsafe fn call_original(name: &str, ex: *mut zend_execute_data, rv: *mut zval) {
+    if let Some(original) = ORIGINALS.get().and_then(|m| m.get(name).copied()) {
+        // SAFETY: the engine handler we replaced for this function.
+        unsafe { original(ex, rv) };
     }
 }
 
@@ -485,16 +500,21 @@ unsafe fn guard_authority(ex: *mut zend_execute_data, from: *const zend_execute_
 
 // --- curl state ---------------------------------------------------------------------------------
 
-/// What a curl handle has been told to connect to, recorded from its options. Checked at
-/// `curl_exec` / `curl_multi_add_handle`, so an override (`CURLOPT_RESOLVE`, `CURLOPT_CONNECT_TO`)
-/// that points an allowed name at a disallowed address is caught.
-#[derive(Default)]
+/// What a curl handle has been told to do, recorded from its options so the check at
+/// `curl_exec` / `curl_multi_add_handle` has them. A handle with no recorded URL fails closed for
+/// a restricted component (we never saw it being built).
+#[derive(Clone, Default)]
 struct CurlState {
     url: Option<String>,
     proxy: Option<String>,
     /// CURLOPT_RESOLVE entries ("host:port:addr[,addr]") and CURLOPT_CONNECT_TO entries
     /// ("host:port:connect-host:connect-port"): the *effective* connect hosts they introduce.
     overrides: Vec<String>,
+    follow: bool,
+    maxredirs: Option<i64>,
+    returntransfer: bool,
+    post: bool,
+    postredir: i64,
 }
 
 static CURL: LazyLock<Mutex<HashMap<u32, CurlState>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -503,11 +523,31 @@ fn curl() -> MutexGuard<'static, HashMap<u32, CurlState>> {
     CURL.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// CURLOPT_* numeric constants (stable libcurl values).
+/// CURLOPT_* / CURLPROTO_* / CURLINFO numeric constants (stable libcurl values).
 const CURLOPT_URL: i64 = 10002;
 const CURLOPT_PROXY: i64 = 10004;
 const CURLOPT_RESOLVE: i64 = 10203;
 const CURLOPT_CONNECT_TO: i64 = 10243;
+const CURLOPT_FOLLOWLOCATION: i64 = 52;
+const CURLOPT_MAXREDIRS: i64 = 68;
+// CURLOPT_RETURNTRANSFER is a PHP-specific option (not a libcurl CURLOPT_*), value 19913.
+const CURLOPT_RETURNTRANSFER: i64 = 19913;
+const CURLOPT_POST: i64 = 47;
+const CURLOPT_POSTFIELDS: i64 = 10015;
+const CURLOPT_POSTREDIR: i64 = 161;
+const CURLOPT_HTTPGET: i64 = 80;
+const CURLOPT_PROTOCOLS: i64 = 181;
+const CURLOPT_REDIR_PROTOCOLS: i64 = 182;
+/// CURLPROTO_* bits: HTTP|HTTPS|FTP|FTPS — the only schemes a component may reach, so curl can't
+/// read `file://` or speak gopher/dict/telnet/smb/… (E2b's file policy and layer 1 would be
+/// bypassed otherwise). Redirects are confined to http/https.
+const CURLPROTO_HTTP_FTP: i64 = 1 | 2 | 4 | 16;
+const CURLPROTO_HTTP_HTTPS: i64 = 1 | 2;
+/// The default redirect cap when `CURLOPT_MAXREDIRS` is unset (libcurl's own default is unlimited;
+/// we cap at a sane 20, matching common practice).
+const DEFAULT_MAXREDIRS: i64 = 20;
+/// The schemes a component may use through curl.
+const ALLOWED_CURL_SCHEMES: &[&str] = &["http", "https", "ftp", "ftps"];
 
 /// Record a curl handle's relevant options.
 ///
@@ -554,6 +594,18 @@ unsafe fn record_curl(name: &str, ex: *mut zend_execute_data, rv: *mut zval) {
                 curl().remove(&id);
             }
         }
+        "curl_copy_handle" => {
+            // The copy must carry the source's recorded options, or it would have none and fail
+            // closed at exec. The new handle is the return value; the source is arg 1.
+            let src = (unsafe { crate::attribution::arg(ex, 1) }).and_then(handle_id);
+            let dst = (unsafe { rv.cast::<Zval>().as_ref() }).and_then(handle_id);
+            if let (Some(src), Some(dst)) = (src, dst) {
+                let mut map = curl();
+                if let Some(state) = map.get(&src).cloned() {
+                    map.insert(dst, state);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -589,8 +641,23 @@ fn apply_curl_opt(state: &mut CurlState, opt: i64, value: Option<&Zval>) {
                 }
             }
         }
+        CURLOPT_FOLLOWLOCATION => state.follow = value.map(truthy).unwrap_or(false),
+        CURLOPT_MAXREDIRS => state.maxredirs = value.and_then(Zval::long),
+        CURLOPT_RETURNTRANSFER => state.returntransfer = value.map(truthy).unwrap_or(false),
+        CURLOPT_POST => state.post = value.map(truthy).unwrap_or(false),
+        CURLOPT_POSTFIELDS => {
+            if value.map(truthy).unwrap_or(false) {
+                state.post = true;
+            }
+        }
+        CURLOPT_POSTREDIR => state.postredir = value.and_then(Zval::long).unwrap_or(0),
         _ => {}
     }
+}
+
+/// A curl option value read as a boolean (libcurl takes an int; PHP passes bool/int).
+fn truthy(v: &Zval) -> bool {
+    v.long().map(|n| n != 0).unwrap_or_else(|| v.bool().unwrap_or(false))
 }
 
 /// The string values of a curl option that is a PHP array (CURLOPT_RESOLVE/CONNECT_TO), or empty.
@@ -601,33 +668,264 @@ fn string_list(value: Option<&Zval>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Guard a curl handle's recorded connect targets. Every one — the URL host, the proxy host, and
-/// the host each RESOLVE/CONNECT_TO override points at — must be allowed; the first disallowed one
-/// refuses (and is the audit line). An override naming a disallowed address is thus caught.
-///
-/// # Safety
-/// `ex` is a live call frame; `arg` is the handle argument position.
-unsafe fn guard_curl(ex: *mut zend_execute_data, from: *const zend_execute_data, arg: u32, token: &str) -> bool {
-    let Some(id) = (unsafe { crate::attribution::arg(ex, arg) }).and_then(handle_id) else { return false };
-    let map = curl();
-    let Some(state) = map.get(&id) else { return false }; // no URL set yet: nothing to connect to
-    let mut hosts: Vec<String> = Vec::new();
-    if let Some(url) = &state.url
-        && let Some(host) = host_from_url(url)
-    {
-        hosts.push(host);
-    }
-    if let Some(proxy) = &state.proxy
-        && let Some(host) = host_from_url(proxy).or_else(|| host_from_authority(proxy))
-    {
-        hosts.push(host);
-    }
-    for o in &state.overrides {
-        if let Some(host) = host_from_authority(o) {
-            hosts.push(host);
+/// The attribution context for a curl call: who is responsible, the mode, and the host patterns
+/// that apply. Built once in [`precheck_curl`] and reused for every redirect hop.
+struct CurlCtx {
+    component: Component,
+    mode: Mode,
+    patterns: Vec<String>,
+}
+
+impl CurlCtx {
+    /// Audit `op`/`rule` on `host` (with `detail`) and say whether to block it (enforce only).
+    fn refuse(&self, op: &str, rule: &str, host: &str, detail: &str) -> bool {
+        audit(self.mode, &self.component.to_string(), op, host, detail, rule);
+        if self.mode == Mode::Enforce {
+            warn(&self.component.to_string(), host);
+            true
+        } else {
+            false
         }
     }
-    hosts.iter().any(|host| check_host(from, host, token, host))
+
+    fn host_allowed(&self, host: &str) -> bool {
+        hosts::host_allowed(&self.patterns, host).is_allowed()
+    }
+}
+
+/// What a curl pre-check decided.
+enum PreVerdict {
+    /// The caller is not a restricted component (code outside the app root): leave it alone.
+    NotOurs,
+    /// Refuse the whole call (enforce + a disallowed scheme/host, or a handle we never saw built).
+    Refuse,
+    /// Allowed to proceed (or `log` mode): the recorded state and the context for following.
+    Ok(Box<CurlState>, CurlCtx),
+}
+
+/// The pre-connect checks for a curl handle: fail closed when we never saw the handle built,
+/// restrict the scheme to http/https/ftp/ftps, and check the URL host, the proxy host and every
+/// RESOLVE/CONNECT_TO override host. Shared by `curl_exec` and `curl_multi_add_handle`.
+fn precheck_curl(id: u32, from: *const zend_execute_data) -> PreVerdict {
+    let Some(loaded) = crate::live_arc() else { return PreVerdict::NotOurs };
+    let l2 = &loaded.config.layer2;
+    if !l2.enabled || l2.app.is_none() || l2.mode == Mode::Off {
+        return PreVerdict::NotOurs;
+    }
+    let rule = attribution::settings().map_or(Rule::Component, |s| s.rule);
+    let component = attribution::responsible(rule, &loaded.root, from);
+    let Some(patterns) = hosts::hosts_for(l2, &component) else { return PreVerdict::NotOurs };
+    let ctx = CurlCtx { component, mode: l2.mode, patterns: patterns.to_vec() };
+
+    // Fail closed: a handle with no recorded URL is one we never saw being built.
+    let state = curl().get(&id).cloned();
+    let Some(state) = state.filter(|s| s.url.is_some()) else {
+        return if ctx.refuse("curl_exec", "no-url", "", "") { PreVerdict::Refuse } else { PreVerdict::Ok(Box::default(), ctx) };
+    };
+    let url = state.url.clone().unwrap_or_default();
+
+    // Scheme: a component may only speak http/https/ftp/ftps through curl (so no file://, gopher,
+    // dict, telnet, smb …). REDIR_PROTOCOLS and PROTOCOLS are also clamped on the handle.
+    let scheme = url_scheme(&url);
+    if !ALLOWED_CURL_SCHEMES.contains(&scheme.as_str()) && ctx.refuse("curl_exec", "scheme", &scheme, &url) {
+        return PreVerdict::Refuse;
+    }
+
+    // The URL host, the proxy host, and every RESOLVE/CONNECT_TO override host must be allowed.
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(h) = host_from_url(&url) {
+        targets.push(h);
+    }
+    if let Some(p) = &state.proxy
+        && let Some(h) = host_from_url(p).or_else(|| host_from_authority(p))
+    {
+        targets.push(h);
+    }
+    for o in &state.overrides {
+        if let Some(h) = host_from_authority(o) {
+            targets.push(h);
+        }
+    }
+    for h in &targets {
+        if !ctx.host_allowed(h) && ctx.refuse("curl_exec", "host", h, &url) {
+            return PreVerdict::Refuse;
+        }
+    }
+    PreVerdict::Ok(Box::new(state), ctx)
+}
+
+/// `curl_exec($handle)`: pre-check, clamp the protocols, and either follow redirects in the
+/// extension (when FOLLOWLOCATION is on and RETURNTRANSFER is set) or run the call once.
+///
+/// # Safety
+/// `ex`/`rv` are the live frame and return value of `curl_exec`.
+unsafe fn exec_curl(ex: *mut zend_execute_data, rv: *mut zval) {
+    let from = unsafe { ex.as_ref() }.map_or(std::ptr::null(), |f| f.prev_execute_data);
+    let Some(id) = (unsafe { crate::attribution::arg(ex, 1) }).and_then(handle_id) else {
+        return unsafe { call_original("curl_exec", ex, rv) };
+    };
+    let (state, ctx) = match precheck_curl(id, from) {
+        PreVerdict::NotOurs => return unsafe { call_original("curl_exec", ex, rv) },
+        PreVerdict::Refuse => {
+            if let Some(r) = unsafe { rv.cast::<Zval>().as_mut() } {
+                r.set_bool(false);
+            }
+            return;
+        }
+        PreVerdict::Ok(state, ctx) => (state, ctx),
+    };
+    // Clamp the schemes on the handle (defence in depth, and it stops a redirect target scheme we
+    // would not otherwise see): http/https/ftp/ftps for the request, http/https for any redirect.
+    // Only in enforce — `log` mode blocks nothing, so it must not clamp.
+    let handle = unsafe { crate::attribution::arg(ex, 1) }.map(Zval::shallow_clone);
+    if ctx.mode == Mode::Enforce
+        && let Some(handle) = &handle
+    {
+        curl_setopt_int(handle, CURLOPT_PROTOCOLS, CURLPROTO_HTTP_FTP);
+        curl_setopt_int(handle, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP_HTTPS);
+    }
+    match (state.follow, state.returntransfer, handle) {
+        // Follow in the extension, checking each hop (only clean when the body is captured).
+        (true, true, Some(handle)) => unsafe { follow_curl(ex, rv, &handle, &state, &ctx) },
+        // FOLLOWLOCATION on but the body is printed, not captured: we can't re-run hops cleanly, so
+        // degrade — turn following off and run once (a redirect returns the 3xx, it is not
+        // followed). Logged so we can see if anything relies on it.
+        (true, false, Some(handle)) => {
+            curl_setopt_int(&handle, CURLOPT_FOLLOWLOCATION, 0);
+            audit(ctx.mode, &ctx.component.to_string(), "curl_follow", "", "returntransfer-off", "degraded");
+            unsafe { call_original("curl_exec", ex, rv) };
+        }
+        _ => unsafe { call_original("curl_exec", ex, rv) },
+    }
+}
+
+/// Follow redirects ourselves: FOLLOWLOCATION off, then on each 3xx read the resolved next URL
+/// (`curl_getinfo`'s `redirect_url`, which libcurl resolves against the current URL), check its
+/// host with the same rules — an audit line per hop — and re-exec, honouring `CURLOPT_MAXREDIRS`
+/// and POSTREDIR. A refused hop fails the call (`false`); `log` mode records and follows.
+///
+/// # Safety
+/// `ex`/`rv` are the live `curl_exec` frame and return value; `handle` is its curl handle.
+unsafe fn follow_curl(ex: *mut zend_execute_data, rv: *mut zval, handle: &Zval, state: &CurlState, ctx: &CurlCtx) {
+    curl_setopt_int(handle, CURLOPT_FOLLOWLOCATION, 0);
+    let max = state.maxredirs.filter(|m| *m >= 0).unwrap_or(DEFAULT_MAXREDIRS);
+    let mut left = max;
+    // The first request (rv is the engine's own return slot — we never dtor it; libcurl writes it).
+    unsafe { call_original("curl_exec", ex, rv) };
+    while let Some((code, next)) = curl_getinfo(handle) {
+        if next.is_empty() || left <= 0 {
+            break;
+        }
+        let host = host_from_url(&next);
+        let allowed = host.as_deref().is_some_and(|h| ctx.host_allowed(h));
+        let shown = host.as_deref().unwrap_or("");
+        if !allowed {
+            // Refused (enforce) or logged-and-followed (log).
+            if ctx.refuse("curl_redirect", if host.is_none() { "unparseable-host" } else { "host" }, shown, &next) {
+                // Replace the 3xx body in rv with `false` (the assignment drops the old value).
+                if let Some(r) = unsafe { rv.cast::<Zval>().as_mut() } {
+                    *r = Zval::new();
+                    r.set_bool(false);
+                }
+                curl_setopt_int(handle, CURLOPT_FOLLOWLOCATION, 1);
+                return;
+            }
+        } else {
+            audit(ctx.mode, &ctx.component.to_string(), "curl_redirect", shown, &next, "follow");
+        }
+        // POSTREDIR: like libcurl's default, a POST becomes a GET on 301/302/303 unless the matching
+        // CURL_REDIR_POST_<code> bit is set; 307/308 keep the method.
+        if state.post && matches!(code, 301..=303) && (state.postredir & redir_post_bit(code)) == 0 {
+            curl_setopt_int(handle, CURLOPT_HTTPGET, 1);
+        }
+        curl_setopt_str(handle, CURLOPT_URL, &next);
+        left -= 1;
+        // Clear the previous hop's body (drop frees it) before the next request writes rv.
+        if let Some(r) = unsafe { rv.cast::<Zval>().as_mut() } {
+            *r = Zval::new();
+        }
+        unsafe { call_original("curl_exec", ex, rv) };
+    }
+    // Restore the user's FOLLOWLOCATION on the handle; rv holds the final body.
+    curl_setopt_int(handle, CURLOPT_FOLLOWLOCATION, 1);
+}
+
+/// `curl_multi_add_handle($multi, $easy)`: pre-check the easy handle, clamp its protocols, and turn
+/// FOLLOWLOCATION off (curl_multi follows internally with no hook — degrade, don't follow). A
+/// refused handle is not added (a non-zero CURLM code).
+///
+/// # Safety
+/// `ex`/`rv` are the live frame and return value of `curl_multi_add_handle`.
+unsafe fn multi_add_curl(ex: *mut zend_execute_data, rv: *mut zval) {
+    let from = unsafe { ex.as_ref() }.map_or(std::ptr::null(), |f| f.prev_execute_data);
+    let Some(id) = (unsafe { crate::attribution::arg(ex, 2) }).and_then(handle_id) else {
+        return unsafe { call_original("curl_multi_add_handle", ex, rv) };
+    };
+    match precheck_curl(id, from) {
+        PreVerdict::NotOurs => unsafe { call_original("curl_multi_add_handle", ex, rv) },
+        PreVerdict::Refuse => {
+            if let Some(r) = unsafe { rv.cast::<Zval>().as_mut() } {
+                r.set_long(1); // CURLM_BAD_HANDLE-ish: the easy handle is not added
+            }
+        }
+        PreVerdict::Ok(state, ctx) => {
+            // `log` blocks nothing, so clamp and degrade only in enforce.
+            if ctx.mode == Mode::Enforce
+                && let Some(handle) = unsafe { crate::attribution::arg(ex, 2) }.map(Zval::shallow_clone)
+            {
+                curl_setopt_int(&handle, CURLOPT_PROTOCOLS, CURLPROTO_HTTP_FTP);
+                curl_setopt_int(&handle, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP_HTTPS);
+                if state.follow {
+                    curl_setopt_int(&handle, CURLOPT_FOLLOWLOCATION, 0);
+                    audit(ctx.mode, &ctx.component.to_string(), "curl_follow", "", "curl_multi", "degraded");
+                }
+            }
+            unsafe { call_original("curl_multi_add_handle", ex, rv) };
+        }
+    }
+}
+
+/// The scheme of a URL, lowercased; an empty scheme (a bare host curl defaults to http) reads as
+/// `http`.
+fn url_scheme(url: &str) -> String {
+    match url.split_once("://") {
+        Some((s, _)) if !s.is_empty() => s.to_ascii_lowercase(),
+        _ => "http".to_owned(),
+    }
+}
+
+/// `CURL_REDIR_POST_301/302/303` bits.
+fn redir_post_bit(code: i64) -> i64 {
+    match code {
+        301 => 1,
+        302 => 2,
+        303 => 4,
+        _ => 0,
+    }
+}
+
+/// `curl_setopt($handle, $opt, <int>)` via a nested PHP call (so ext/curl sets it on the real
+/// libcurl handle). Best-effort: a failure leaves the option unchanged.
+fn curl_setopt_int(handle: &Zval, opt: i64, val: i64) {
+    if let Ok(f) = ZendCallable::try_from_name("curl_setopt") {
+        let _ = f.try_call(vec![handle, &opt, &val]);
+    }
+}
+
+fn curl_setopt_str(handle: &Zval, opt: i64, val: &str) {
+    if let Ok(f) = ZendCallable::try_from_name("curl_setopt") {
+        let _ = f.try_call(vec![handle, &opt, &val]);
+    }
+}
+
+/// `curl_getinfo($handle)` → (http_code, resolved redirect_url). `None` if the call fails.
+fn curl_getinfo(handle: &Zval) -> Option<(i64, String)> {
+    let f = ZendCallable::try_from_name("curl_getinfo").ok()?;
+    let z = f.try_call(vec![handle]).ok()?;
+    let arr = z.array()?;
+    let code = arr.get("http_code").and_then(Zval::long).unwrap_or(0);
+    let next = arr.get("redirect_url").and_then(Zval::str).unwrap_or("").to_owned();
+    Some((code, next))
 }
 
 /// A curl handle's object id (its state key).
