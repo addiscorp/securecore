@@ -50,9 +50,9 @@ static INI: IniEntryDefs<5> = IniEntryDefs::new([
     IniEntryDef::new(c"securecore.config", c"", IniEntryPermission::System),
     IniEntryDef::new(c"securecore.debug_attribution_rule", c"component", IniEntryPermission::System),
     IniEntryDef::new(c"securecore.debug_attribution_log", c"off", IniEntryPermission::System),
-    // E4: who a query is charged to (`component`: the attribution rule above; `caller`: the code
-    // that called into the database layer). See db::DbAttribution.
-    IniEntryDef::new(c"securecore.debug_db_attribution", c"component", IniEntryPermission::System),
+    // E4, research only: who a database query is charged to. `caller` is the rule; `component`
+    // reproduces the measurement that rejected it. See db::DbAttribution.
+    IniEntryDef::new(c"securecore.debug_db_attribution", c"caller", IniEntryPermission::System),
     IniEntryDef::end(),
 ]);
 

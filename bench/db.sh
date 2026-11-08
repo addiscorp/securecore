@@ -2,18 +2,17 @@
 # E4 database-policy benchmark (addiscorp/securecore#53): front-page and dashboard p50 with
 # Classic Editor, Yoast SEO and Contact Form 7 active, layer 2 in enforce mode, main's extension
 # against this branch's. Both sides run the same securecore.json (default: research/db/compat.sh's
-# .tmp/db-compat-component/enforce.json, the example with the generated entries), so the difference is the
+# .tmp/db-compat-caller/enforce.json, the example with the generated entries), so the difference is the
 # database policy. Sides alternate, php-fpm recreated for each; each measurement is 20 warm-up +
 # 100 sequential requests by oha on the stack's network. Writes .tmp/bench/db.json.
-#   DOCKER_CONTEXT=colima bench/db.sh [rounds] [config]     (default 7, .tmp/db-compat-component/enforce.json)
-#   SECURECORE_DB_ATTRIBUTION=caller sets securecore.debug_db_attribution on both sides (main
-#   ignores the key). Under `component` the dashboard is 403 with Yoast (see the README), so the
-#   dashboard is measured with `caller` and its config.
+#   DOCKER_CONTEXT=colima bench/db.sh [rounds] [config]     (default 7, .tmp/db-compat-caller/enforce.json)
+#   SECURECORE_DB_ATTRIBUTION=component sets the research setting securecore.debug_db_attribution
+#   on both sides (main ignores the key); the rule is `caller`.
 #   SECURECORE_EXT_PROJECT / SECURECORE_EXT_PORT pick another project / port.
 set -eu
 cd "$(dirname "$0")/.."
 rounds=${1:-7}
-config=${2:-.tmp/db-compat-component/enforce.json}
+config=${2:-.tmp/db-compat-caller/enforce.json}
 project=${SECURECORE_EXT_PROJECT:-securecore-ext}
 port=${SECURECORE_EXT_PORT:-8089}
 OHA=ghcr.io/hatoo/oha@sha256:3ec3dbf549ea197793482d47a6324797411406bbf438c2fe8b91f244ec641a2f # oha 1.16.0

@@ -139,6 +139,20 @@ expect() {
 line() { grep -F "$2" "$dir/out.$1" | head -1 | sed 's/.*=//'; }
 # coreline <config> <case>: the core probe's verdict.
 coreline() { grep -F "core|$2=" "$dir/core.$1" | head -1 | sed 's/.*=//'; }
+helpers="dbdelta-protected-opt dbdelta-user-pass maybe-create-table update-option-protected"
+# passthrough <config> <BLOCKED|RAN>: the core-helper probes (dbDelta, maybe_create_table,
+# update_option) and the cron pair: scheduling through core always runs, the direct write
+# follows <want>.
+passthrough() {
+  for h in $helpers; do
+    v=$(line "$1" "helper|$h=")
+    case "$2:$v" in BLOCKED:BLOCKED|RAN:RAN:*) pass "$1: $h through a core helper is $2" ;; *) fail "$1: $h through a core helper is $2" "got '$v'" ;; esac
+  done
+  v=$(line "$1" 'cron|schedule=')
+  case $v in RAN:*) pass "$1: a plugin's wp_schedule_single_event works (core's cron write)" ;; *) fail "$1: a plugin's wp_schedule_single_event works" "got '$v'" ;; esac
+  v=$(line "$1" 'cron|update-direct=')
+  case "$2:$v" in BLOCKED:BLOCKED|RAN:RAN:*) pass "$1: the plugin's own UPDATE of cron is $2" ;; *) fail "$1: the plugin's own UPDATE of cron is $2" "got '$v'" ;; esac
+}
 completed() { if grep -qx DONE "$dir/out.$1"; then pass "$1: the probe ran to the end (no fatal)"; else fail "$1: the probe ran to the end (no fatal)" "$(tail -3 "$dir/out.$1" | tr '\n' ' ')"; fi; }
 
 # --- 1. enforce, no grants ----------------------------------------------------------------------
@@ -165,6 +179,9 @@ has "$T" "layer2 enforce $p mysqli_query sql-mode set -" "enforce: ANSI_QUOTES"
 has "$T" "layer2 enforce $p mysqli_prepare protected-column select wp_users" "enforce: the prepare route is checked at prepare"
 has "$T" "layer2 enforce $p pdo::exec protected-column select wp_users" "enforce: PDO::exec"
 has "$T" "layer2 enforce $p mysqli_stmt::__construct protected-column select wp_users" "enforce: new mysqli_stmt"
+passthrough enforce BLOCKED
+has "$T" "layer2 enforce $p mysqli_query protected-option update wp_options options=active_plugins" "enforce: dbDelta's write is charged to the plugin that called it"
+has "$T" "layer2 enforce $p mysqli_query protected-column insert wp_securecore_db_probe,wp_users" "enforce: dbDelta's user_pass copy is charged to the plugin"
 for c in user-pass siteurl unparseable; do is_ "$(coreline enforce "$c" | cut -c1-3)" RAN "core: $c RAN (core is unrestricted)"; done
 for c in prepare set-var; do is_ "$(coreline enforce "$c")" BLOCKED "core: $c BLOCKED (the allowlist applies to core)"; done
 has "$T" "layer2 enforce core mysqli_query unparseable" "core: the unparseable query is logged"
@@ -176,6 +193,7 @@ completed log
 for c in $own_cases $refused_cases; do expect log "$c" RAN; done
 is_ "$(line log 'strict|user-pass=' | cut -c1-3)" RAN "log: strict-mode mysqli reads user_pass"
 is_ "$(line log 'select_db|use=' | cut -c1-3)" RAN "log: select_db runs"
+passthrough log RAN
 has "$T" "layer2 log $p mysqli_query protected-column select wp_users" "log: the would-be refusal is recorded"
 for c in prepare set-var; do is_ "$(coreline log "$c" | cut -c1-3)" RAN "log: core $c RAN"; done
 
@@ -184,6 +202,7 @@ echo "# off"
 run off
 completed off
 for c in $own_cases $refused_cases; do expect off "$c" RAN; done
+passthrough off RAN
 if [ "$(audit "$T" | grep -cE ' (mysqli|pdo::)')" = 0 ]; then pass "off: no layer2 database lines"; else fail "off: no layer2 database lines" "$(audit "$T" | head -1)"; fi
 
 # --- 4. enforce with grants ----------------------------------------------------------------------
@@ -194,6 +213,7 @@ for c in $own_cases core-posts; do expect granted "$c" RAN; done
 for c in other-table user-pass users-star protected-opt prepare set-var load-file outfile multi comment-trick ansi-quotes; do
   expect granted "$c" BLOCKED
 done
+passthrough granted BLOCKED
 
 # --- 6. the extension unloaded: the check removed altogether --------------------------------------
 echo "# extension unloaded"
@@ -205,6 +225,7 @@ wait_200 || fail "unloaded: front page 200"
 curl -s "$base/?sc_db=run" > "$dir/out.unloaded"
 completed unloaded
 for c in $own_cases $refused_cases; do expect unloaded "$c" RAN; done
+passthrough unloaded RAN
 compose cp "$dir/securecore.ini" "php:$ini" >>"$dir/cp.log" 2>&1
 
 echo

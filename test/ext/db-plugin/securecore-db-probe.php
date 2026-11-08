@@ -137,6 +137,41 @@ add_action('init', static function (): void {
     catch (mysqli_sql_exception $e) { $out[] = 'strict|user-pass=' . ($blocked($e->getMessage()) && $e->getCode() === 1142 ? 'BLOCKED' : 'RAN:' . $e->getCode()); }
     mysqli_report(MYSQLI_REPORT_OFF);
 
+    // Core's passthrough helpers: SQL (or an option name) the plugin hands them is the plugin's,
+    // so none of these may launder a protected write or a user_pass read through core.
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    $wpdb->suppress_errors(true);
+    $via = static function (string $case, callable $run) use (&$out, $wpdb, $blocked): void {
+        $wpdb->last_error = '';
+        $run();
+        $out[] = "helper|$case=" . ($blocked($wpdb->last_error) ? 'BLOCKED' : 'RAN:0');
+    };
+    $via('dbdelta-protected-opt', static fn () => dbDelta("UPDATE {$p}options SET option_value = option_value WHERE option_name = 'active_plugins'"));
+    $via('dbdelta-user-pass', static fn () => dbDelta("INSERT INTO {$p}securecore_db_probe (note) SELECT user_pass FROM {$p}users LIMIT 1"));
+    // maybe_create_table runs another query after the DDL (SHOW TABLES), which clears last_error,
+    // so this one is judged by its effect: the DDL writes a marker into a write-protected option.
+    $login = get_option('mailserver_login');
+    $marker = 'sc-probe-' . mt_rand();
+    maybe_create_table("{$p}sc_db_probe_nope", "UPDATE {$p}options SET option_value = '$marker' WHERE option_name = 'mailserver_login'");
+    wp_cache_delete('alloptions', 'options');
+    wp_cache_delete('mailserver_login', 'options');
+    $out[] = 'helper|maybe-create-table=' . (get_option('mailserver_login') === $marker ? 'RAN:0' : 'BLOCKED');
+    update_option('mailserver_login', $login); // put it back where log/off let the DDL through
+    $mailpass = get_option('mailserver_pass');
+    $via('update-option-protected', static fn () => update_option('mailserver_pass', 'sc-probe-' . mt_rand()));
+    $wpdb->last_error = '';
+    update_option('mailserver_pass', $mailpass); // put it back where log/off let the probe change it
+
+    // cron: scheduling through core's API is core's write; the plugin writing the option is not.
+    wp_clear_scheduled_hook('sc_db_probe_event');
+    $scheduled = wp_schedule_single_event(time() + 3600, 'sc_db_probe_event') && wp_next_scheduled('sc_db_probe_event');
+    $out[] = 'cron|schedule=' . ($scheduled ? 'RAN:0' : 'BLOCKED');
+    wp_clear_scheduled_hook('sc_db_probe_event');
+    $wpdb->last_error = '';
+    $r = $wpdb->query("UPDATE {$p}options SET option_value = option_value WHERE option_name = 'cron'");
+    $out[] = 'cron|update-direct=' . ($r === false && $blocked($wpdb->last_error) ? 'BLOCKED' : 'RAN:0');
+    $wpdb->suppress_errors(false);
+
     // Not queries: USE and a re-login are refused for a component, and an unsafe charset for all.
     $out[] = 'select_db|use=' . (mysqli_select_db($own, DB_NAME) ? 'RAN:0' : 'BLOCKED');
     $out[] = 'set_charset|gbk=' . ($own->set_charset('gbk') ? 'RAN:0' : 'BLOCKED');

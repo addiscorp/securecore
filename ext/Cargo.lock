@@ -1174,6 +1174,7 @@ dependencies = [
 name = "securecore-db"
 version = "0.1.0"
 dependencies = [
+ "securecore-attribution",
  "securecore-config",
  "serde_json",
  "sqlparser",

@@ -138,22 +138,49 @@ pub fn responsible(rule: Rule, root: &Path, from: *const zend_execute_data) -> C
     securecore_attribution::responsible(rule, user_frames(from).map(|file| map.frame(&layout, now, file)))
 }
 
-/// The code that called into the database layer (E4's `caller` attribution): the innermost
-/// user-code frame that is not WordPress's own `wp-includes/class-wpdb.php`. A component's direct
-/// SQL (`$wpdb->query(...)` in its file, or its own mysqli/PDO) is the component's; SQL a core API
-/// composes (`WP_User::get_data_by`, `WP_Query`) is core's, whoever called the API.
+/// Who a database query is charged to (E4): the code that called the database layer, with core's
+/// passthrough helpers (`dbDelta`, `update_option`, …) handing the charge to their caller. The
+/// rule is [`securecore_db::caller::charged`] (plain Rust, unit-tested); this collects its frames.
 pub fn db_caller(root: &Path, from: *const zend_execute_data) -> Component {
     let layout = layout(root);
     let now = Instant::now();
     let mut map = lock(&MAP);
-    for file in user_frames(from) {
-        let c = map.frame(&layout, now, file);
-        if c == Component::Core && file.ends_with("/wp-includes/class-wpdb.php") {
-            continue;
+    // Lowercased function names, owned for the frames below (stacks are shallow).
+    let named: Vec<(&'static str, Option<String>)> = named_user_frames(from).collect();
+    let frames: Vec<securecore_db::caller::Frame<'_>> = named
+        .iter()
+        .map(|(file, function)| securecore_db::caller::Frame {
+            component: map.frame(&layout, now, file),
+            file,
+            function: function.as_deref(),
+        })
+        .collect();
+    securecore_db::caller::charged(&frames)
+}
+
+/// The user-code frames from `ex` outwards, innermost first: each one's file, and its function
+/// name lowercased when it is a plain function (`None` for top-level code, closures and methods).
+fn named_user_frames(mut ex: *const zend_execute_data) -> impl Iterator<Item = (&'static str, Option<String>)> {
+    std::iter::from_fn(move || {
+        // SAFETY: the engine's frame chain, valid while the code that asked is running.
+        unsafe {
+            while let Some(frame) = ex.as_ref() {
+                ex = frame.prev_execute_data;
+                let Some(func) = frame.func.as_ref() else { continue };
+                if u32::from(func.type_) == ZEND_INTERNAL_FUNCTION {
+                    continue;
+                }
+                let Some(file) = zstr(func.op_array.filename) else { continue };
+                let name = if func.common.scope.is_null() {
+                    zstr(func.common.function_name).map(str::to_ascii_lowercase)
+                } else {
+                    None
+                };
+                return Some((file, name));
+            }
+            None
         }
-        return c;
-    }
-    Component::Core
+    })
 }
 
 /// Who is running now, by the configured rule: the stack of the code calling into the

@@ -23,10 +23,16 @@ RUN rustup component add clippy
 WORKDIR /build/ext
 COPY ext/ /build/ext/
 
+# The target cache is shared by every build of this file on the Docker host (every checkout and
+# branch), and cargo decides by mtime whether a workspace crate is stale. A COPY keeps the files'
+# edit times, so a crate built later from another branch looks newer than this branch's sources and
+# gets linked in its place. Stamping the workspace's own sources first makes cargo rebuild the five
+# local crates (seconds) while the registry dependencies stay cached.
 FROM toolchain AS build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --locked --release -p securecore-php -p securecore-fpm \
+    find /build/ext -name '*.rs' -exec touch {} + \
+ && cargo build --locked --release -p securecore-php -p securecore-fpm \
  && mkdir -p /out && cp /build/target/release/libsecurecore.so /out/securecore.so \
  && cp /build/target/release/securecore-fpm /out/securecore-fpm
 
@@ -34,7 +40,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM toolchain AS check
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo clippy --locked --workspace --all-targets -- -D warnings \
+    find /build/ext -name '*.rs' -exec touch {} + \
+ && cargo clippy --locked --workspace --all-targets -- -D warnings \
  && cargo test --locked --workspace
 
 FROM scratch AS so

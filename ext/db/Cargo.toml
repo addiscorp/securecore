@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 # The component rules (tables, options, grants) a decision is built from.
 securecore-config = { path = "../config" }
+# Component: who a query is charged to (caller.rs).
+securecore-attribution = { path = "../attribution" }
 # A real MySQL-dialect parser (Apache DataFusion's sqlparser-rs). Exact version (APS 10).
 sqlparser = { workspace = true }
 # securecore-db-suggest writes the suggested entries as JSON.

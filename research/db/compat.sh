@@ -10,14 +10,15 @@
 # The vault's mu-plugin is installed, as the README recommends (its native wp_salt keeps core's
 # salt fallback from reading the salt options under a component's frame).
 #   DOCKER_CONTEXT=colima research/db/compat.sh
-#   SECURECORE_DB_ATTRIBUTION=caller ...   charge queries to the code that called the database
-#                                         layer (securecore.debug_db_attribution); default component
+#   SECURECORE_DB_ATTRIBUTION=component ...   research only: charge queries to the innermost
+#                                            component on the stack, the rule #60 measured and
+#                                            rejected (securecore.debug_db_attribution); default caller
 #   SECURECORE_EXT_PROJECT / SECURECORE_EXT_PORT pick another project / port.
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 project=${SECURECORE_EXT_PROJECT:-securecore-ext}
 port=${SECURECORE_EXT_PORT:-8089}
-attr=${SECURECORE_DB_ATTRIBUTION:-component}
+attr=${SECURECORE_DB_ATTRIBUTION:-caller}
 base=http://127.0.0.1:$port
 out=.tmp/db-compat-$attr
 mkdir -p "$out/pages"

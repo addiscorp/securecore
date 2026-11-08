@@ -14,7 +14,8 @@
 //! component (they are `USE` and a re-login), and `set_charset` to a charset the parser can't read
 //! the way MySQL does is refused for everyone.
 //!
-//! **Who.** E2a's configured rule (`component` by default: the innermost component on the stack).
+//! **Who.** The code that called the database layer, through core's passthrough helpers
+//! ([`securecore_db::caller`]). Files stay on E2a's `component` rule.
 //!
 //! **What a refusal does.** `log`: an audit line, and the query runs. `enforce`: the audit line,
 //! and the server is given a statement that fails in its place, so the failure is the native one
@@ -48,24 +49,26 @@ pub const CACHE_SIZE: usize = 2048;
 /// The ini setting choosing who a query is charged to (PHP_INI_SYSTEM).
 pub const INI_ATTRIBUTION: &str = "securecore.debug_db_attribution";
 
-/// Who a query is charged to.
+/// Who a query is charged to. The rule is `Caller`, fixed (#60); the ini setting exists only to
+/// reproduce the measurement that chose it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DbAttribution {
-    /// E2a's configured rule (`component` by default: the innermost component on the stack). A
-    /// plugin that calls a core API is charged for the SQL the API runs.
-    Component,
-    /// The code that called into the database layer: the innermost frame outside `$wpdb`'s own
-    /// file. A component's direct SQL is the component's; SQL a core API composes is core's.
+    /// The code that called the database layer ([`securecore_db::caller`]): a component's own SQL
+    /// is the component's, SQL a core API composes is core's, and core's passthrough helpers
+    /// (`dbDelta`, `update_option`, …) hand the charge to their caller.
     Caller,
+    /// Research only: E2a's configured rule (the innermost component on the stack), which charges
+    /// a plugin for the SQL a core API runs on its behalf (with Yoast active it logs the admin out).
+    Component,
 }
 
 static ATTRIBUTION: OnceLock<DbAttribution> = OnceLock::new();
 
-/// At MINIT: the attribution setting. An unknown value refuses to start (fail closed).
+/// At MINIT: the research setting. An unknown value refuses to start (fail closed).
 pub(crate) fn startup(value: &str) -> Result<(), String> {
     let a = match value.trim() {
-        "" | "component" => DbAttribution::Component,
-        "caller" => DbAttribution::Caller,
+        "" | "caller" => DbAttribution::Caller,
+        "component" => DbAttribution::Component,
         other => return Err(format!("{INI_ATTRIBUTION} = {other:?}: expected component or caller")),
     };
     let _ = ATTRIBUTION.set(a);
@@ -213,7 +216,7 @@ unsafe fn check(ex: *mut zend_execute_data, hook: &Hook) -> Then {
         return Then::Run;
     };
     let from = unsafe { ex.as_ref() }.map_or(std::ptr::null(), |f| f.prev_execute_data);
-    let who = match ATTRIBUTION.get().copied().unwrap_or(DbAttribution::Component) {
+    let who = match ATTRIBUTION.get().copied().unwrap_or(DbAttribution::Caller) {
         DbAttribution::Component => {
             let rule = crate::attribution::settings().map_or(Rule::Component, |s| s.rule);
             crate::attribution::responsible(rule, &loaded.root, from)

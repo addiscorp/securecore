@@ -9,6 +9,7 @@
 //! it for a caller.
 
 pub mod analyze;
+pub mod caller;
 pub mod policy;
 pub mod suggest;
 

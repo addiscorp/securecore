@@ -235,8 +235,8 @@ managed-WordPress form) are not literals, so env-mapped secrets and the vault fi
 
 ## Database policy (E4)
 
-Every query PHP sends is attributed (E2a's configured rule: by default the innermost component on
-the stack) and checked before it reaches the server. A port of the worker spike's PHP policy
+Every query PHP sends is charged to the code that called the database layer
+([below](#who-a-query-is-charged-to)) and checked before it reaches the server. A port of the worker spike's PHP policy
 (#49, `plugin/sql-policy.php`) to Rust ([`db/`](db/)), with per-component tables, options and
 grants. `log` writes an audit line and runs the query; `enforce` writes the line and the query
 fails as a MySQL permission error does; `off` does neither.
@@ -343,31 +343,60 @@ measures the page cost against main.
 
 ### Who a query is charged to
 
-```ini
-securecore.debug_db_attribution = component   ; component (default) | caller
-```
+**A database query is charged to whoever called the database layer, because core APIs run their
+own SQL on a plugin's behalf.** That is the innermost frame outside
+`wp-includes/class-wpdb.php` ([`db/src/caller.rs`](db/src/caller.rs), unit-tested):
 
-- `component`: E2a's rule (`securecore.debug_attribution_rule`, by default the innermost component
-  on the stack). A plugin that calls a core API is charged for the SQL that API runs.
-- `caller`: the code that called into the database layer, the innermost frame outside
-  `wp-includes/class-wpdb.php`. A component's own SQL (`$wpdb->query(...)` in its file, its own
-  mysqli or PDO) is still the component's; the SQL a core API composes (`WP_User::get_data_by`,
-  `WP_Query`) is core's, whoever called the API. The cost: a core helper that runs SQL it is given
-  (`dbDelta()`) runs it as core.
+- a component's own SQL is the component's: `$wpdb->query(...)` in its file, or its own mysqli
+  or PDO connection;
+- the SQL a core API composes is core's, whoever called the API: `get_user_by()` loading the
+  current user, `WP_Query`, `wp_schedule_event()`'s cron write.
 
-The choice is open (see the PR): under `component`, core's own login check is charged to any
-plugin that triggers the current-user load first (Yoast does), and its `SELECT * FROM wp_users` is
-then a protected-column refusal.
+Charging core's SQL to the plugin on the stack instead (E2a's `component` rule, the one files use)
+was measured and rejected (#60). Yoast triggers the current-user load, so core's login check,
+`SELECT * FROM wp_users`, was charged to Yoast and refused as a protected column, and every signed-in
+admin page was 403. Under the caller rule the three plugins have 0 refusals. Files stay on
+`component` (E2b measured 0 refusals with it).
+
+**Passthrough helpers.** A core function that runs SQL, or a table, column or option name, its
+caller hands it would otherwise launder that SQL into core's. So while the chain of core frames from
+the query outward runs through one, the query is charged to the helper's caller (the innermost
+helper decides):
+
+- `wp-admin/includes/upgrade.php`: `dbDelta`, `maybe_create_table`, `maybe_add_column`,
+  `maybe_convert_table_to_utf8mb4`, `drop_index`, `add_clean_index`, `__get_option`;
+- `install-helper.php`: `maybe_drop_column`, `check_column`;
+- `schema.php`: `populate_options`, `populate_network`, `populate_network_meta`,
+  `populate_site_meta`;
+- the option write API: `add_option`, `update_option`, `delete_option` and their `_site_` /
+  `_network_` forms.
+
+So `dbDelta("UPDATE wp_options … 'active_plugins'")` and `update_option('mailserver_pass', …)`
+from a plugin are the plugin's (refused). `wp_schedule_event()` is core's (its `update_option('cron')`
+is called by core's cron code), while a plugin's own `UPDATE` of `cron` is refused. A function is a
+helper only when core defines it.
+
+`securecore.debug_db_attribution` (`caller`, the default, | `component`) exists only to reproduce
+that measurement; it is not configuration.
+
+### Threat model
+
+E4 stops a component's **own SQL** from reaching what it doesn't own: other components' tables,
+core's tables without a grant, the protected options and columns, and the statements that bypass
+the checks. That includes SQL routed through core's passthrough helpers. It does **not** stop:
+
+- **Filters (known gap).** A component's `query`, `posts_where`, `posts_clauses` (and similar)
+  callback has returned by the time core runs the SQL it shaped, so that SQL runs as core. Closing
+  this needs the filter results checked.
+- **What core APIs hand back.** `get_userdata()` returns a `WP_User` with `user_pass`, and core
+  keeps the current user's hash in memory for every plugin; `update_user_meta()` and
+  `WP_User::set_role()` write capability rows as core. These are API surface, beyond any SQL policy.
+- **WordPress's caches.** An autoloaded option is served from memory, without SQL.
 
 ### Known limits
 
-- **Filters launder SQL under either rule.** A component's `query` or `posts_where` /
-  `posts_clauses` callback has returned by the time core runs the SQL it shaped, so that SQL runs
-  as core. Closing this needs the mu-plugin or the extension to check what a component's filter
-  callback returns.
-- **The database, not WordPress's caches.** Autoloaded options are read once by core and then
-  served from memory, so `get_option('admin_email')` from a component returns the cached value
-  without SQL. E4 guards what reaches the server.
+The filter gap and what core APIs return: see the [threat model](#threat-model).
+
 - **No result filtering.** #49 let a plugin run `SELECT * FROM wp_users` and stripped `user_pass`
   from the rows, and cut a bulk options read down to an allowlist. E4 decides on the query alone,
   so a `*` over `users` is refused, and an unpinned options read needs `options:read` (and then
@@ -685,7 +714,10 @@ gelada stacks its filters on top of it.
   `/*! */` comment trick and ANSI_QUOTES are refused on every route, with audit lines. In strict
   mode mysqli throws 1142; `select_db` and an unsafe charset are refused; nothing is fatal. With
   grants, the granted table runs and the rest stay refused. A core probe may read `user_pass` but
-  not PREPARE. The revert proof: in log mode, with layer 2 off, and with the extension unloaded,
+  not PREPARE. Through core's passthrough helpers the probe's `dbDelta` write of `active_plugins`
+  and `user_pass` copy, `maybe_create_table` with a protected write, and `update_option` of a
+  protected option are refused; its `wp_schedule_single_event` works, while its own `UPDATE` of
+  `cron` is refused. The revert proof: in log mode, with layer 2 off, and with the extension unloaded,
   every refused case runs.
 - `DOCKER_CONTEXT=colima research/db/compat.sh` (after ext-config.sh): Classic Editor, Yoast and
   CF7 in log mode, entries suggested from the log, then enforce mode with them, every refusal
