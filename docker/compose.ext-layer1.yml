@@ -1,0 +1,14 @@
+# Layer 1 (addiscorp/securecore#53, E6): the extension stack with php-fpm started by
+# securecore-fpm inside gelada. On top of compose.yml and compose.ext.yml:
+#
+#   docker compose -f docker/compose.yml -f docker/compose.ext.yml -f docker/compose.ext-layer1.yml \
+#     -p securecore-layer1 up -d db php web
+#
+# test/ext-layer1.sh does this (port 8090).
+services:
+  php:
+    build: { context: .., dockerfile: docker/ext.Dockerfile, target: php-layer1 }
+    # With TCP port rules there is no UDP, so names (db, api.wordpress.org) resolve over TCP:
+    # `options use-vc` in /etc/resolv.conf, and layer1 allows connect to port 53. Docker's
+    # embedded DNS (127.0.0.11) answers over TCP too.
+    dns_opt: [use-vc]

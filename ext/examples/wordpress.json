@@ -1,12 +1,11 @@
 {
   "layer1": {
     "enabled": true,
-    "write": ["wp-content/uploads", "wp-content/cache"],
+    "write": ["wp-content/uploads", "wp-content/cache", "/tmp"],
     "deny": ["/srv/backups"],
     "network": {
-      "bind":        [{ "port": 9000 }],
-      "connect":     [{ "port": 3306 }, { "port": 443 }],
-      "unixSockets": ["/run/mysqld/mysqld.sock"]
+      "bind":    [{ "port": 9000 }],
+      "connect": [{ "port": 53 }, { "port": 3306 }, { "port": 443 }]
     }
   },
   "layer2": {

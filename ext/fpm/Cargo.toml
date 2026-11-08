@@ -1,0 +1,16 @@
+[package]
+name = "securecore-fpm"
+description = "Starts php-fpm inside gelada from securecore.json's layer1 (addiscorp/securecore#53, E6)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The same types, loader and validation as the extension: one file, one parser.
+securecore-config = { path = "../config" }
+gelada.workspace = true
+
+[[bin]]
+name = "securecore-fpm"
+path = "src/main.rs"

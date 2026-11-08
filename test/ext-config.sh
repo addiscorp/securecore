@@ -13,9 +13,11 @@
 #      its log names the file and the problem; a fixed file starts it again.
 # Exits non-zero on any failure. Writes .tmp/ext-config/. Leaves the stack up on a valid config.
 #   DOCKER_CONTEXT=colima test/ext-config.sh
+#   SECURECORE_EXT_PROJECT / SECURECORE_EXT_PORT pick another project / port (all ext-* tests).
 set -u
 cd "$(dirname "$0")/.." || exit 1
-port=8089
+project=${SECURECORE_EXT_PROJECT:-securecore-ext}
+port=${SECURECORE_EXT_PORT:-8089}
 base=http://127.0.0.1:$port
 dir=.tmp/ext-config
 mkdir -p "$dir"
@@ -27,7 +29,7 @@ pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
 # is <actual> <expected> <label>
 is() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$3" "got '$1', want '$2'"; fi; }
-compose() { SECURECORE_PORT=$port docker compose -f docker/compose.yml -f docker/compose.ext.yml -p securecore-ext "$@"; }
+compose() { SECURECORE_PORT=$port docker compose -f docker/compose.yml -f docker/compose.ext.yml -p "$project" "$@"; }
 wp() { compose run --rm -T cli wp "$@" 2>>"$dir/wp.err"; }
 cp_in() { compose cp "$1" "php:$2" >>"$dir/cp.log" 2>&1; }
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }

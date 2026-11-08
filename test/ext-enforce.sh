@@ -16,7 +16,8 @@
 #   DOCKER_CONTEXT=colima test/ext-config.sh && DOCKER_CONTEXT=colima test/ext-enforce.sh
 set -u
 cd "$(dirname "$0")/.." || exit 1
-port=8089
+project=${SECURECORE_EXT_PROJECT:-securecore-ext}
+port=${SECURECORE_EXT_PORT:-8089}
 base=http://127.0.0.1:$port
 dir=.tmp/ext-enforce
 mkdir -p "$dir"
@@ -33,7 +34,7 @@ escapedir=$content/sc-enf-escape-dir
 fails=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
-compose() { SECURECORE_PORT=$port docker compose -f docker/compose.yml -f docker/compose.ext.yml -p securecore-ext "$@"; }
+compose() { SECURECORE_PORT=$port docker compose -f docker/compose.yml -f docker/compose.ext.yml -p "$project" "$@"; }
 wp() { compose run --rm -T cli wp "$@" 2>>"$dir/wp.err" | tr -d '\r'; }
 in_php() { compose exec -T php sh -c "$1"; }
 code() { curl -s -o /dev/null -w '%{http_code}' "$base$1"; }

@@ -4,12 +4,13 @@
 #   attribution/  securecore-attribution: path → component (plugin, mu-plugin, theme, core) and
 #            the rules for who is responsible on a PHP stack. Plain Rust, no PHP.
 #   php/     securecore-php: the extension itself (ext-php-rs), built into securecore.so.
+#   fpm/     securecore-fpm: layer 1, the launcher that starts php-fpm inside gelada. Plain Rust.
 # The php crate needs PHP's headers (php-config) to build; docker/ext.Dockerfile builds it
 # against PHP 8.3 NTS. On a machine without PHP, `cargo test` (the default members) still works.
 [workspace]
 resolver = "3"
-members = ["config", "attribution", "php"]
-default-members = ["config", "attribution"]
+members = ["config", "attribution", "php", "fpm"]
+default-members = ["config", "attribution", "fpm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +21,7 @@ publish = false
 # Exact versions from crates.io (APS 10).
 [workspace.dependencies]
 ext-php-rs = "=0.16.4"
+gelada = "=0.3.0"
 schemars = "=1.2.3"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"

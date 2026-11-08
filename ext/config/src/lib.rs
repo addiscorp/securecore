@@ -48,8 +48,9 @@ pub struct Layer1 {
     /// absolute). Everything else is read-only.
     #[serde(default)]
     pub write: Vec<String>,
-    /// Paths php-fpm may not read at all, on top of the common secrets SecureCore always denies
-    /// (relative to the folder containing securecore.json, or absolute).
+    /// Paths php-fpm may not read at all, on top of the common secrets gelada always denies
+    /// under the launcher's HOME (~/.ssh, ~/.aws, …) (relative to the folder containing
+    /// securecore.json, or absolute).
     #[serde(default)]
     pub deny: Vec<String>,
     #[serde(default)]
@@ -66,7 +67,9 @@ pub struct Network {
     /// TCP ports php-fpm may connect to (by port: the kernel can't see hostnames).
     #[serde(default)]
     pub connect: Vec<Port>,
-    /// Unix sockets php-fpm may connect to.
+    /// Unix sockets php-fpm may connect to. Not enforceable by securecore-fpm yet: on Linux
+    /// gelada can't combine them with TCP ports, nor allow them in place
+    /// (addiscorp/securecore#57), so a layer 1 that lists any is refused at launch.
     #[serde(default)]
     pub unix_sockets: Vec<String>,
 }
