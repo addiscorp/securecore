@@ -74,8 +74,9 @@ COPY --from=build /out/securecore-fpm /securecore-fpm
 # site volume, so a fresh stack starts with off.json there; test/ext-config.sh replaces it.
 FROM wordpress:php8.3-fpm AS php
 # PDO's MySQL driver (the image ships mysqli only): plugins that use PDO, and the database policy's
-# probe (test/ext-db.sh, E4), which drives the PDO routes against the real server.
-RUN docker-php-ext-install pdo_mysql
+# probe (test/ext-db.sh, E4). ext/sockets (E5): so the host tests exercise socket_connect. Both
+# are core extensions with no external libs.
+RUN docker-php-ext-install -j"$(nproc)" pdo_mysql sockets
 COPY --from=build /out/securecore.so /usr/local/lib/php/extensions/securecore.so
 COPY docker/securecore.ini /usr/local/etc/php/conf.d/securecore.ini
 COPY ext/examples/off.json /usr/src/wordpress/securecore.json

@@ -75,10 +75,15 @@ until compose exec -T db mariadb -uwordpress -pwordpress-db-password -e 'select 
   i=$((i + 1)); [ "$i" -lt 60 ] || { echo "FAIL database did not start"; exit 1; }
   sleep 1
 done
-if ! wp core is-installed >/dev/null 2>&1; then
+# Install, retrying until the front page actually serves 200: `wp core is-installed` can report a
+# half-initialised fresh volume as installed, so gate on the real page, not on its exit code.
+i=0
+until [ "$(code /)" = 200 ]; do
   wp core install --url="$base" --title=SecureCore --admin_user=admin \
-    --admin_password=securecore-demo --admin_email=admin@example.com --skip-email >/dev/null
-fi
+    --admin_password=securecore-demo --admin_email=admin@example.com --skip-email >/dev/null 2>&1 || true
+  i=$((i + 1)); [ "$i" -lt 12 ] || { echo "FAIL WordPress did not install"; exit 1; }
+  sleep 2
+done
 wp plugin install classic-editor wordpress-seo contact-form-7 --activate >/dev/null || { echo "FAIL plugin install"; exit 1; }
 
 # Fixtures: the probe at the web root (core), the listeners outside php-fpm, a denied backup
@@ -102,7 +107,13 @@ arrived() { in_php "cat $listen_log" | grep -c "^$1 "; }
 # layer2 enabled or not, on examples/wordpress.json's layer1.
 awk '/"layer2": \{/ { l2 = 1 } l2 && /"enabled": true/ { sub(/"enabled": true/, "\"enabled\": false"); l2 = 0 } { print }' \
   ext/examples/wordpress.json > "$dir/l2-off.json"
-cp ext/examples/wordpress.json "$dir/l2-enforce.json"
+# With layer 2 also in enforce, its hostname allowlist (E5) governs the probe's connections too, so
+# the layer-1 probe's local targets (127.0.0.1's 443 listener, the `web` host) must be in core.hosts
+# or layer 2 would refuse them before layer 1's port rules ever apply. Allowing them here keeps this
+# variant a test of layer 1: layer 2 permits the host, and layer 1 decides the port (443 reaches,
+# 25/80 give EACCES).
+sed 's#"hosts": \["api.wordpress.org", "downloads.wordpress.org"\]#"hosts": ["api.wordpress.org", "downloads.wordpress.org", "127.0.0.1", "web"]#' \
+  ext/examples/wordpress.json > "$dir/l2-enforce.json"
 grep -q '"mode": "enforce"' "$dir/l2-enforce.json" || fail "examples/wordpress.json has layer 2 in enforce mode"
 
 # --- 1-4. layer 1 alone, then layers 1+2 -----------------------------------------------------

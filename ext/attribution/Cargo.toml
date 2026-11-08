@@ -10,6 +10,8 @@ publish.workspace = true
 # The config types: the layer-2 file/exec rules a component's effective access is built from.
 # Plain Rust, no PHP, so the policy stays unit-testable without PHP.
 securecore-config = { path = "../config" }
+# IDNA/punycode normalisation for the hostname allowlist (E5).
+idna.workspace = true
 
 # Turns the extension's attribution log lines into the per-component tables (E2a measurement):
 #   cargo run -p securecore-attribution --bin securecore-attribution-report -- --root /var/www/html log...

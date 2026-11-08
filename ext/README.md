@@ -636,6 +636,94 @@ component that reaches a file by a path the engine's streams never see.
 `research/enforce/compat.sh` runs Classic Editor, Yoast SEO and Contact Form 7 in enforce mode
 and lists every refusal; `bench/enforce.sh` is the front-page benchmark.
 
+## Hostnames (E5)
+
+Layer 2 also restricts **where PHP may open a network connection**, per component and for core, so a
+compromised site cannot phone home. Every outbound connection is attributed to the innermost
+responsible component (the `component` rule) and checked against that component's `hosts` — its own
+entry's list, or `default.hosts` when it has none. A connection **core** makes is checked against
+`core.hosts`: core *is* restricted here (unlike the file policy). Code outside the app root is not a
+component and is not checked. The matching rules are in
+[`attribution/src/hosts.rs`](attribution/src/hosts.rs) (plain Rust, unit-tested).
+
+**Patterns.** An entry is an exact name (`api.stripe.com`), a leading `*.` wildcard matching one or
+more labels (`*.example.com` matches `a.example.com` and `a.b.example.com`, never `example.com`), or
+an IP literal (v4 or v6), which matches only that address. Matching is case-insensitive, after
+IDNA/punycode normalisation and with a trailing dot stripped; a name never matches an IP pattern and
+an IP never matches a name pattern. An empty list denies every host.
+
+**The host a connection actually goes to, not what a URL claims.** The checks sit where the real
+connect host is known:
+
+- **The socket transport** (`tcp`/`ssl`/`tls`). SecureCore overrides the transport factories, the one
+  point every PHP socket connection passes through *at connect time*, with the resolved host — so
+  `fsockopen`, `pfsockopen`, `stream_socket_client`, the http/https/ftp stream wrappers
+  (`file_get_contents`, `fopen`, `SoapClient`, `get_headers`), WordPress's Requests library, and
+  **each redirect hop** (the http wrapper follows a `Location` by opening a fresh transport to the new
+  host) are all checked on the host they connect to. A `user:pass@` prefix and the SNI/`Host` header
+  never reach this point, so they don't count.
+- **The http/https/ftp wrappers** are additionally wrapped so the **target** host is checked even when
+  a **proxy** is set in the stream context (the transport then connects to the proxy — which is
+  checked too — while the request names the target).
+- **curl** does its own DNS and connect, below PHP's socket layer, so it is checked from the options
+  recorded on the handle at `curl_exec` / `curl_multi_add_handle`: the URL host, `CURLOPT_PROXY`, and
+  the `CURLOPT_RESOLVE` / `CURLOPT_CONNECT_TO` overrides (so an override pointing an allowed name at a
+  disallowed IP or host is refused). A component may only speak **http/https/ftp/ftps** through curl —
+  `CURLOPT_PROTOCOLS`/`REDIR_PROTOCOLS` are clamped and the scheme is checked, so `file://`
+  (which would bypass E2b's file policy) and gopher/dict/telnet/smb are refused. `curl_copy_handle`
+  carries the recorded options to the copy; a handle whose URL SecureCore never saw being set fails
+  closed for a component at exec.
+  - **Redirects:** libcurl follows a redirect *internally*, below any PHP hook. So when a restricted
+    component has `CURLOPT_FOLLOWLOCATION` on, SecureCore turns it off and **follows in the
+    extension** — on each 3xx it reads the resolved next URL, checks its host with the same rules (an
+    audit line per hop), and re-runs, honouring `CURLOPT_MAXREDIRS` and POSTREDIR. A redirect to a
+    disallowed host is refused at the hop. `curl_multi` (which follows internally with no hook) and a
+    `FOLLOWLOCATION` request whose body is printed rather than captured are **degraded**: following
+    is turned off and the 3xx is returned, not followed.
+
+**DNS rebinding.** Layer 2 allowlists *names* and checks the exact name string the connect uses (the
+transport resolves the very name this code read), so there is no check-versus-connect *name*
+discrepancy. An allowed name whose DNS later resolves to an internal IP is an IP-level rebind a name
+allowlist cannot see; layer 1's port rules (no internal ports open) are its backstop.
+
+**The database host** is allowed implicitly for **core's** connection only: WordPress's `DB_HOST` need
+not appear in `core.hosts`, and a vaulted password still connects. The DB goes through the transport
+factory (mysqlnd), where a connection attributed to core and aimed at `DB_HOST` is passed through
+before the allowlist is consulted; a *component* reaching the DB host directly is still checked
+against its own `hosts`.
+
+`mode` decides the effect, as everywhere: `enforce` refuses the connection the way PHP fails a refused
+connection — the stream opener and the socket functions return `false` (and Requests turns that into a
+`WP_Error`), `curl_exec` returns `false`, never a fatal — `log` records one line and lets it through,
+`off` does neither. A refusal line is
+
+```
+securecore: layer2 enforce plugin:acme net connect host evil.example tcp://evil.example:443
+securecore: layer2 log     core        net curl_exec host api.example http://api.example/v1
+```
+
+**Covered:** the http/https/ftp wrappers, `fsockopen`/`pfsockopen`/`stream_socket_client`, `curl`
+(`curl_exec`, `curl_multi_*`, `CURLOPT_FOLLOWLOCATION` followed in-extension per hop,
+`RESOLVE`/`CONNECT_TO`/proxy, the scheme and protocol clamp, `curl_copy_handle`), `get_headers`
+and `SoapClient` (both use the http wrapper), `socket_connect` from ext/sockets (a function handler;
+the transport factory does not see ext/sockets, which uses a raw socket), and SMTP that a mail plugin
+opens with `fsockopen`/`stream_socket_client`. **Left to layer 1:** metadata-free local transports
+(`unix`/`udg`) are not hostnames; and a component that reaches the network by native code the engine's
+streams and curl never see is the kernel's job.
+
+**Recommended `hosts` for the bundled-WordPress compat set** (what SecureCore's generated manifests
+suggest; a person approves them as a git diff):
+
+| component | `hosts` | why |
+|---|---|---|
+| core | `api.wordpress.org`, `downloads.wordpress.org` | core updates, plugin/theme installs |
+| Classic Editor | *(none)* | makes no outbound calls |
+| Yoast SEO | *(none)* for normal operation | its indexing/SEO work is local; add `*.yoast.com` only if you use myYoast/premium |
+| Contact Form 7 | *(none)* | local; add `www.google.com` only if you enable reCAPTCHA |
+
+`test/ext-hosts.sh` is the property test (a no-internet nginx helper under several aliases), and
+`bench/hosts.sh` is the front-page and per-connection benchmark.
+
 ## Layer 1: `securecore-fpm` (E6)
 
 Layer 1 protects the server from the whole site, core included: php-fpm can write only the
