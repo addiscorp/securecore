@@ -81,18 +81,32 @@ in_php "mkdir -p $(dirname "$vaultfile")"
 compose cp "$dir/vault.json" "php:$vaultfile" >>"$dir/cp.log" 2>&1
 in_php "chown root:root $vaultfile && chmod 400 $vaultfile"
 
-# The vault mu-plugin (native wp_salt/wp_hash) and the two probes.
-in_php "mkdir -p $plugin $html/wp-content/mu-plugins"
+# The vault mu-plugin (native wp_salt/wp_hash), the two read probes, the connect probes and the
+# fake MySQL server.
+connect_plugin=$html/wp-content/plugins/securecore-vault-connect
+fakescript=/tmp/sc-fakemysql.php
+fakecap=/tmp/sc-fake.bin
+fakepid=/tmp/sc-fake.pid
+in_php "mkdir -p $plugin $connect_plugin $html/wp-content/mu-plugins"
 compose cp ext/mu-plugin/securecore-vault.php "php:$muplugin" >>"$dir/cp.log" 2>&1
 compose cp test/ext/vault/plugin.php "php:$plugin/securecore-vault-probe.php" >>"$dir/cp.log" 2>&1
 compose cp test/ext/vault/routine.php "php:$html/sc-vault-routine.php" >>"$dir/cp.log" 2>&1
 compose cp test/ext/vault/core.php "php:$html/sc-vault-core.php" >>"$dir/cp.log" 2>&1
-in_php "chown -R www-data:www-data $plugin $muplugin $html/sc-vault-routine.php $html/sc-vault-core.php"
-wp plugin activate securecore-vault-probe >/dev/null
+compose cp test/ext/vault/connect-plugin.php "php:$connect_plugin/securecore-vault-connect.php" >>"$dir/cp.log" 2>&1
+compose cp test/ext/vault/connect-core.php "php:$html/sc-vault-connect-core.php" >>"$dir/cp.log" 2>&1
+compose cp test/ext/vault/fakemysql.php "php:$fakescript" >>"$dir/cp.log" 2>&1
+in_php "chown -R www-data:www-data $plugin $connect_plugin $muplugin $html/sc-vault-routine.php $html/sc-vault-core.php $html/sc-vault-connect-core.php"
+wp plugin activate securecore-vault-probe securecore-vault-connect >/dev/null
+
+# fake_start / fake_stop: a fake MySQL server (cleartext-forcing) on $fakeport, by PID.
+fakeport=33070
+fake_start() { in_php "rm -f $fakecap; php $fakescript $fakeport $fakecap >/tmp/sc-fake.log 2>&1 & echo \$! > $fakepid"; sleep 1; }
+fake_stop() { in_php "[ -f $fakepid ] && kill \$(cat $fakepid) 2>/dev/null; rm -f $fakepid"; }
 
 cleanup() {
-  wp plugin deactivate securecore-vault-probe classic-editor wordpress-seo contact-form-7 >/dev/null 2>&1
-  in_php "rm -rf $plugin $muplugin $html/sc-vault-routine.php $html/sc-vault-core.php $vaultfile"
+  fake_stop
+  wp plugin deactivate securecore-vault-probe securecore-vault-connect classic-editor wordpress-seo contact-form-7 >/dev/null 2>&1
+  in_php "rm -rf $plugin $connect_plugin $muplugin $html/sc-vault-routine.php $html/sc-vault-core.php $html/sc-vault-connect-core.php $html/sc-lit-config.php $fakescript $fakecap $fakepid"
   compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
   # Restore the extension ini in case a revert step changed it, then restart.
   compose cp docker/securecore.ini "php:$ini" >/dev/null 2>&1
@@ -173,6 +187,43 @@ for mode in enforce log; do
   is "$(field "$dir/core.$mode" wp_hash_auth)" "$(hmac_md5 "$auth_secret")" "$mode: wp_hash('auth') is byte-identical to stock HMAC"
 done
 
+# --- 3b. the connect boundary: the real value never leaves to a foreign host or for a plugin ---
+# A fake MySQL server that forces clear-text auth captures whatever password a connecting client
+# sends. A probe connects to it (another host/port) with a vault placeholder; the captured bytes
+# must be the placeholder, never the real value. The swap is allowed only for core, to the real
+# DB host, with the DB password placeholder — so a plugin, a foreign host, or a salt placeholder
+# is refused in enforce AND in log mode (leaking is never "log and allow").
+for mode in enforce log; do
+  echo "# connect boundary ($mode)"
+  apply "$mode"
+  fake_start
+  t=$(now)
+  curl -s "$base/?sc_conn=run&fp=$fakeport" > "$dir/connect.plugin.$mode"
+  curl -s "$base/sc-vault-connect-core.php?fp=$fakeport" > "$dir/connect.core.$mode"
+  sleep 1
+  in_php "cat $fakecap 2>/dev/null" > "$dir/capture.$mode"
+  fake_stop
+
+  # No real secret in the bytes the foreign server received (plugin DB + salt, core DB).
+  cap_leak=''
+  for sec in $secrets; do if grep -qF "$sec" "$dir/capture.$mode"; then cap_leak="$cap_leak $sec"; fi; done
+  is "$cap_leak" "" "$mode: no real DB password or salt reached the fake server"
+  # The placeholders DID arrive — so the probe connected and the clean capture is the gate, not a
+  # failed connection.
+  if grep -qF 'securecore-vault:DB_PASSWORD' "$dir/capture.$mode"; then pass "$mode: the DB placeholder (not the value) reached the foreign server"; else fail "$mode: the DB placeholder reached the foreign server" "$(tr -d '\0' < "$dir/capture.$mode" | tr '\n' ' ')"; fi
+  if grep -qF 'securecore-vault:AUTH_KEY' "$dir/capture.$mode"; then pass "$mode: a salt placeholder (not the value) reached the foreign server"; else fail "$mode: a salt placeholder reached the foreign server"; fi
+  # A plugin is refused the swap even to the real DB host: the connection fails.
+  is "$(sed -n 's/^plugin_connects_real_db=//p' "$dir/connect.plugin.$mode")" failed "$mode: a plugin is refused the swap to the real DB (connection fails)"
+  # Core still connects to the real DB with the placeholder (the swap is allowed).
+  is "$(sed -n 's/^core_connects_real_db=//p' "$dir/connect.core.$mode")" CONNECTED "$mode: core still connects to the real DB"
+  # The refusals are recorded (both modes).
+  if phplog "$t" | grep -q 'vault: refused DB-password swap'; then pass "$mode: refused swaps are recorded in the log"; else fail "$mode: refused swaps are recorded"; fi
+  # And the log carries no real value.
+  leak=''
+  for sec in $secrets; do if phplog "$t" | grep -qF "$sec"; then leak="$leak $sec"; fi; done
+  is "$leak" "" "$mode: the refusal log carries no real value"
+done
+
 # 4. the backstop masked the salt env vars (names only), and no value is in the log.
 t=$(now)
 apply enforce
@@ -226,6 +277,38 @@ else
 fi
 # Restore the extension and the vault config.
 compose cp "$dir/securecore.ini" "php:$ini" >/dev/null 2>&1
+apply enforce
+
+# --- 5b. opcache: a wpConfig literal secret is refused at startup (fail closed) ---------------
+# A secret read as a bare string literal from wp-config.php can't be hidden (opcache inlines the
+# define to DECLARE_CONST). With the optimizer on (PHP's default), MINIT must refuse, naming the
+# secret — not run a vault that silently isn't one.
+echo "# opcache literal fail-closed"
+# opcache really is loaded in this php-fpm (checked while it is still up), so the refusal below is
+# the real fail-closed path, not a vacuous one.
+is "$(in_php 'php -v 2>/dev/null | grep -c "Zend OPcache"')" 1 "opcache: Zend OPcache is loaded, so the refusal is the fail-closed path"
+in_php "printf '<?php define(\"SC_LIT_SECRET\", \"literal-xyz-123\");\n' > $html/sc-lit-config.php"
+cat > "$dir/wpc-lit.json" <<JSON
+{ "layer1": { "enabled": false },
+  "layer2": { "enabled": true, "app": "wordpress", "mode": "enforce",
+    "vault": { "from": { "wpConfig": "sc-lit-config.php" }, "secrets": ["SC_LIT_SECRET"] },
+    "default": {}, "components": {} },
+  "layer3": { "enabled": false } }
+JSON
+compose cp "$dir/wpc-lit.json" "php:$conf" >/dev/null 2>&1
+since=$(now)
+compose restart php >/dev/null 2>&1
+# It must refuse to start (php-fpm exits), not serve.
+i=0; until compose ps -a --format '{{.State}}' php 2>/dev/null | grep -q exited; do i=$((i+1)); [ "$i" -lt 30 ] || break; sleep 1; done
+if compose ps -a --format '{{.State}}' php 2>/dev/null | grep -q exited; then pass "opcache: php-fpm refuses to start on a literal wpConfig secret"; else fail "opcache: php-fpm refuses to start" "$(compose ps -a --format '{{.State}}' php)"; fi
+refuse_log=$(phplog "$since" 2>&1)
+if echo "$refuse_log" | grep -q "SC_LIT_SECRET is a string literal" && echo "$refuse_log" | grep -q "DECLARE_CONST"; then
+  pass "opcache: the log names the secret and says to move it to a vault file or the env"
+else
+  fail "opcache: the log explains the refusal" "$(echo "$refuse_log" | grep -i securecore | tail -1)"
+fi
+# Restore and restart.
+in_php "rm -f $html/sc-lit-config.php"
 apply enforce
 
 # --- 6. compat -------------------------------------------------------------------------------

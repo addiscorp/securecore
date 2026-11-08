@@ -446,6 +446,13 @@
       "description": "The vault (E3): secrets PHP never sees. The extension reads every real value once, at module\nstartup in the php-fpm master before it forks, and keeps it in its own memory; PHP sees a\nplaceholder (`securecore-vault:<NAME>`) in the constant, the environment, `$_ENV`,\n`$_SERVER` and `getenv()`. The extension puts the real value back only inside the database\nconnect calls and the salted functions (`wp_salt`, `wp_hash`). Read at startup only: a change\nneeds a php-fpm restart.",
       "type": "object",
       "properties": {
+        "dbHost": {
+          "description": "The database host the DB password may be sent to. The real password is restored only on a\nconnection whose host matches this (so a component can't point a connect at its own server\nand collect the password). Normally left unset: the extension reads it from WordPress's\n`DB_HOST` constant, the way WordPress does. Set it only when there is no such constant to\nread; no host is ever guessed, so an unknown host means the swap is refused.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "from": {
           "description": "Where a secret listed by name alone gets its real value. Required when any entry in\n`secrets` is a bare name; a secret with `env` never reads it. When set, the file is also\nprotected: no PHP code may read or write it (wp-config.php may still be included).",
           "anyOf": [

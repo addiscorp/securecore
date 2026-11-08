@@ -8,6 +8,7 @@
 //! Plain Rust with no PHP dependency: the extension (layers 2 and 3) and the `securecore-fpm`
 //! launcher (layer 1, E6) both read the file through [`load`].
 
+pub mod dbhost;
 pub mod salt;
 pub mod source;
 
@@ -168,6 +169,13 @@ pub struct Vault {
     /// takes its value from `from`; `{"name": …, "env": …}` takes it from that environment
     /// variable of the php-fpm master.
     pub secrets: Vec<Secret>,
+    /// The database host the DB password may be sent to. The real password is restored only on a
+    /// connection whose host matches this (so a component can't point a connect at its own server
+    /// and collect the password). Normally left unset: the extension reads it from WordPress's
+    /// `DB_HOST` constant, the way WordPress does. Set it only when there is no such constant to
+    /// read; no host is ever guessed, so an unknown host means the swap is refused.
+    #[serde(rename = "dbHost", default, skip_serializing_if = "Option::is_none")]
+    pub db_host: Option<String>,
 }
 
 /// Where bare-named secrets come from. Exactly one key, so the source is always stated.

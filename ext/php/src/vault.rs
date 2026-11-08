@@ -43,14 +43,19 @@ use ext_php_rs::ffi::{
 };
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::Zval;
+use securecore_attribution::{Component, Rule};
 use securecore_config::salt::{self, Secrets};
-use securecore_config::{Config, Secret, Source};
+use securecore_config::{Config, Mode, Secret, Source};
 
 /// The placeholder a secret's real value is replaced by, everywhere PHP can see. Unique per
 /// secret (it carries the constant name), so the point of use knows which value to restore.
 fn placeholder(name: &str) -> String {
     format!("securecore-vault:{name}")
 }
+
+/// The WordPress constant that holds the database password: the one secret the vault ever
+/// restores at a connect boundary (never a salt).
+const DB_PASSWORD: &str = "DB_PASSWORD";
 
 /// What the vault holds after MINIT: the real values, kept out of PHP's reach, and the lookups
 /// the request path needs.
@@ -62,11 +67,28 @@ struct Vault {
     /// (real value, placeholder) pairs, longest value first, for masking `getenv()` and the
     /// `environ` backstop by value.
     by_value: Vec<(String, String)>,
+    /// The database host the DB password may be sent to, from `layer2.vault.dbHost`. When unset,
+    /// the extension reads WordPress's `DB_HOST` constant instead; a host is never guessed.
+    db_host: Option<String>,
 }
 
 impl Secrets for Vault {
     fn get(&self, name: &str) -> Option<&str> {
         self.by_name.get(name).map(String::as_str)
+    }
+}
+
+impl Vault {
+    /// The DB password's placeholder and real value, when the vault holds `DB_PASSWORD`. This is
+    /// the only secret ever restored at a connect boundary.
+    fn db_password(&self) -> Option<(String, &str)> {
+        self.by_name.get(DB_PASSWORD).map(|v| (placeholder(DB_PASSWORD), v.as_str()))
+    }
+
+    /// Whether `ph` is any secret's placeholder (used to spot a salt placeholder smuggled into a
+    /// password argument).
+    fn is_placeholder(&self, ph: &str) -> bool {
+        self.by_placeholder.contains_key(ph)
     }
 }
 
@@ -153,6 +175,25 @@ pub(crate) fn startup(config: &Config, root: &Path) -> Result<(), String> {
     }
     let values = read_values(config, root)?;
 
+    // Fail closed on the opcache leak: a secret read as a bare string literal from wp-config.php
+    // cannot be hidden, because opcache's optimizer inlines `define('NAME', 'literal')` into a
+    // compile-time DECLARE_CONST that the extension can't intercept (and keeps the plaintext in
+    // shared memory). Refuse at MINIT, naming the secret, rather than run a vault that silently
+    // isn't one. Expression defines (`getenv`) are not literals, so env-mapped secrets and the
+    // vault file are unaffected.
+    if let Some(vault) = config.layer2.started_vault_ref()
+        && matches!(vault.from, Some(Source::WpConfig(_)))
+        && opcache_inlines_defines()
+        && let Some(secret) = vault.secrets.iter().find(|s| matches!(s, Secret::Name(_)))
+    {
+        let file = vault.from.as_ref().map_or("wp-config.php", Source::path);
+        return Err(format!(
+            "layer2.vault: {} is a string literal in {file} and opcache inlines it (DECLARE_CONST), so the vault cannot hide it; \
+             move it to a vault file (from.vaultFile) or an environment variable (secrets[].env)",
+            secret.name()
+        ));
+    }
+
     // Mask every mapped environment variable with its secret's placeholder.
     if let Some(vault) = config.layer2.started_vault_ref() {
         for secret in &vault.secrets {
@@ -193,7 +234,8 @@ pub(crate) fn startup(config: &Config, root: &Path) -> Result<(), String> {
     // only compare whole values, but ordering keeps the sweep deterministic).
     by_value.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
     by_value.dedup();
-    let _ = VAULT.set(Vault { by_name: values, by_placeholder, by_value });
+    let db_host = config.layer2.started_vault_ref().and_then(|v| v.db_host.clone());
+    let _ = VAULT.set(Vault { by_name: values, by_placeholder, by_value, db_host });
     crate::log(
         crate::LOG_NOTICE,
         &format!("vault: {} secret(s) held in the extension; PHP sees placeholders", vault().map_or(0, |v| v.by_name.len())),
@@ -222,26 +264,78 @@ fn read_environ() -> Vec<(String, String)> {
     out
 }
 
+/// Whether opcache would inline a literal `define()` into a `DECLARE_CONST` in this process:
+/// opcache is enabled (for this SAPI) and its optimizer is on. Conservative (fail closed): any
+/// non-zero `opcache.optimization_level` with opcache enabled counts, since the standard
+/// optimizer includes the define-inlining pass. With opcache absent or its optimizer off, a
+/// literal define stays a real function call the extension can intercept.
+fn opcache_inlines_defines() -> bool {
+    // opcache is a zend_extension, reliably detectable at this module's MINIT. Its own ini values
+    // (`opcache.enable`, `opcache.optimization_level`) are not yet applied here — they read as 0 —
+    // so we cannot tell at MINIT whether the optimizer is off. A standard build turns the
+    // optimizer on, and it inlines `define('NAME', <literal>)` into a compile-time DECLARE_CONST
+    // the extension can't intercept (with the plaintext left in shared memory). So fail closed: if
+    // opcache is loaded, a literal secret is treated as un-hideable. With no opcache at all, a
+    // literal define stays a real `define()` call the extension masks. Env-mapped secrets and the
+    // vault file are literals in no PHP file, so they are unaffected either way.
+    zend_extension_loaded("Zend OPcache")
+}
+
+/// Whether a Zend extension (e.g. opcache) is loaded.
+fn zend_extension_loaded(name: &str) -> bool {
+    let Ok(c) = CString::new(name) else { return false };
+    // SAFETY: a NUL-terminated name; `zend_get_extension` returns a pointer or NULL.
+    !unsafe { zend_get_extension(c.as_ptr()) }.is_null()
+}
+
+unsafe extern "C" {
+    /// Zend/zend_extensions.h: the loaded zend_extension by name, or NULL.
+    fn zend_get_extension(extension_name: *const c_char) -> *const std::ffi::c_void;
+}
+
 // --- the function handlers ----------------------------------------------------------------------
 
 /// A Zend internal-function handler.
 type Zif = unsafe extern "C" fn(*mut zend_execute_data, *mut zval);
 
-/// Global functions we override, and the 1-based argument that carries the DB password (if any).
-/// `getenv`/`define` have no password arg; the mysqli/PDO constructors are handled as methods.
-const FUNCS: &[(&str, Option<u32>)] = &[
+/// Where a connect function carries the host to compare against the configured DB host: a plain
+/// argument (mysqli), or inside the PDO DSN (`host=…`).
+#[derive(Clone, Copy)]
+enum HostArg {
+    /// The host is argument `n` (1-based).
+    Arg(u32),
+    /// The host is `host=` inside the DSN at argument `n`.
+    Dsn(u32),
+}
+
+/// A connect boundary where the DB password placeholder may be restored: which argument is the
+/// password, and where its host is.
+#[derive(Clone, Copy)]
+struct Swap {
+    password_arg: u32,
+    host: HostArg,
+}
+
+/// Global functions we override. `getenv`/`define` have no connect swap; the mysqli/PDO
+/// constructors are handled as methods.
+const FUNCS: &[(&str, Option<Swap>)] = &[
     ("getenv", None),
     ("define", None),
-    ("mysqli_connect", Some(3)),
-    ("mysqli_real_connect", Some(4)),
+    ("mysqli_connect", Some(Swap { password_arg: 3, host: HostArg::Arg(1) })),
+    ("mysqli_real_connect", Some(Swap { password_arg: 4, host: HostArg::Arg(2) })),
 ];
-/// Methods we override: `(class, method, password arg)`.
-const METHODS: &[(&str, &str, u32)] = &[("mysqli", "__construct", 3), ("pdo", "__construct", 3)];
+/// Methods we override: `(class, method, swap)`. `mysqli::real_connect` has no link argument, so
+/// its host/password are one position earlier than the procedural `mysqli_real_connect`.
+const METHODS: &[(&str, &str, Swap)] = &[
+    ("mysqli", "__construct", Swap { password_arg: 3, host: HostArg::Arg(1) }),
+    ("mysqli", "real_connect", Swap { password_arg: 3, host: HostArg::Arg(1) }),
+    ("pdo", "__construct", Swap { password_arg: 3, host: HostArg::Dsn(1) }),
+];
 
-/// The handlers we replaced, by a key (`"func"` or `"class::method"`), with the password arg.
+/// The handlers we replaced, by a key (`"func"` or `"class::method"`), with the connect swap.
 struct Override {
     original: Zif,
-    password_arg: Option<u32>,
+    swap: Option<Swap>,
 }
 static ORIGINALS: OnceLock<HashMap<String, Override>> = OnceLock::new();
 static INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -264,21 +358,21 @@ unsafe fn install() {
     let mut originals = HashMap::new();
     let ft = unsafe { (*std::ptr::addr_of_mut!(ext_php_rs::ffi::compiler_globals)).function_table };
     if !ft.is_null() {
-        for &(name, pw) in FUNCS {
+        for &(name, swap) in FUNCS {
             if let Some(original) = unsafe { hook_in(ft, name) } {
-                originals.insert(name.to_string(), Override { original, password_arg: pw });
+                originals.insert(name.to_string(), Override { original, swap });
             }
         }
     }
     let ct = unsafe { (*std::ptr::addr_of_mut!(ext_php_rs::ffi::compiler_globals)).class_table };
     if !ct.is_null() {
-        for &(class, method, pw) in METHODS {
+        for &(class, method, swap) in METHODS {
             // SAFETY: the class table; the class entry (if present) owns its function table.
             let ce = unsafe { zend_hash_str_find_ptr_lc(ct.cast_const(), class.as_ptr().cast(), class.len()) }.cast::<ext_php_rs::ffi::zend_class_entry>();
             let Some(ce) = (unsafe { ce.as_ref() }) else { continue };
             let mft: *const ext_php_rs::ffi::HashTable = std::ptr::addr_of!(ce.function_table);
             if let Some(original) = unsafe { hook_in(mft.cast_mut(), method) } {
-                originals.insert(format!("{class}::{method}"), Override { original, password_arg: Some(pw) });
+                originals.insert(format!("{class}::{method}"), Override { original, swap: Some(swap) });
             }
         }
     }
@@ -309,11 +403,12 @@ unsafe extern "C" fn dispatch(execute_data: *mut zend_execute_data, return_value
     };
     let name = key.as_deref().unwrap_or("");
 
-    // Point of use: swap a placeholder password argument for the real value, in the frame, before
-    // the engine's own function runs. The caller's own `$password` zval is untouched (a by-value
-    // argument is a separate zval), so the real value reaches libmysql/PDO and no PHP variable.
-    if let Some(n) = ov.password_arg {
-        unsafe { swap_password(execute_data, n) };
+    // Point of use: restore the real DB password in the frame, before the engine's own function
+    // runs — but only when it is safe to (see [`connect_swap`]). The caller's own `$password`
+    // zval is untouched (a by-value argument is a separate zval), so the real value reaches
+    // libmysql/PDO and no PHP variable.
+    if let Some(swap) = ov.swap {
+        unsafe { connect_swap(execute_data, swap) };
     }
     if name == "define" {
         unsafe { force_define_placeholder(execute_data) };
@@ -344,18 +439,108 @@ unsafe fn dispatch_key(ex: *mut zend_execute_data) -> Option<String> {
     })
 }
 
-/// If argument `n` (1-based) of the frame is a known placeholder, replace it in place with the
-/// real value.
+/// Restore the real DB password at a connect boundary — but only when all three hold, because the
+/// real value is about to leave the process. One: the password argument is the **DB password's**
+/// placeholder, never a salt's (a salt placeholder handed to a connect as the password is refused,
+/// not swapped). Two: the **caller is core**, by E2a's `frame` attribution — the innermost
+/// user-code frame that calls connect, so WordPress's `wpdb` counts and a plugin's own `new
+/// mysqli` does not. Three: the **host is the configured DB host** (`layer2.vault.dbHost`, or
+/// WordPress's `DB_HOST` constant), compared after normalising the `p:` prefix, a `:port` and a
+/// socket path. Otherwise the placeholder is left in place (so the connection fails) and the
+/// refusal is recorded. This holds in `log` mode too: the vault is not a policy, and leaking a
+/// secret is never "log and allow".
+///
+/// # Safety
+/// `ex` is a live connect call frame.
+unsafe fn connect_swap(ex: *mut zend_execute_data, swap: Swap) {
+    // Read the password argument (immutable) and decide before taking the mutable borrow.
+    let Some(current) = (unsafe { arg(ex, swap.password_arg) }).and_then(Zval::str).map(str::to_owned) else { return };
+    let Some(v) = vault() else { return };
+    let Some((db_ph, db_val)) = v.db_password() else { return };
+
+    // 1. Only the DB password placeholder is ever restored.
+    if current != db_ph {
+        // A salt placeholder (or any other) handed to a connect as the password is an attempt to
+        // exfiltrate it: refuse, never swap. A real (non-placeholder) password is left alone.
+        if v.is_placeholder(&current) {
+            refuse("not-db-secret", unsafe { caller(ex) }, None);
+        }
+        return;
+    }
+
+    // 2. The caller must be core.
+    let who = unsafe { caller(ex) };
+    if who.as_ref() != Some(&Component::Core) {
+        refuse("noncore-connect", who, None);
+        return;
+    }
+
+    // 3. The host must be the configured DB host.
+    let host = unsafe { connect_host(ex, swap.host) };
+    let expected = expected_db_host(v);
+    match (host.as_deref(), expected.as_deref()) {
+        (Some(h), Some(e)) if securecore_config::dbhost::normalize_host(h) == securecore_config::dbhost::normalize_host(e) => {
+            let val = db_val.to_owned();
+            if let Some(zv) = unsafe { arg_mut(ex, swap.password_arg) } {
+                let _ = zv.set_string(&val, false);
+            }
+        }
+        (h, _) => refuse("wrong-host", who, h),
+    }
+}
+
+/// The component responsible for a connect call, by E2a's `frame` rule (the innermost user-code
+/// frame that made the call): WordPress's `wpdb` is core; a plugin's own connect is the plugin.
 ///
 /// # Safety
 /// `ex` is a live call frame.
-unsafe fn swap_password(ex: *mut zend_execute_data, n: u32) {
-    let Some(zv) = (unsafe { arg_mut(ex, n) }) else { return };
-    // Resolve the real value before taking the mutable borrow for set_string.
-    let real = zv.str().and_then(|current| vault().and_then(|v| v.by_placeholder.get(current)).cloned());
-    if let Some(real) = real {
-        let _ = zv.set_string(&real, false);
+unsafe fn caller(ex: *mut zend_execute_data) -> Option<Component> {
+    let from = unsafe { ex.as_ref() }?.prev_execute_data;
+    let loaded = crate::live_arc()?;
+    Some(crate::attribution::responsible(Rule::Frame, &loaded.root, from))
+}
+
+/// The host a connect call targets: a plain argument (mysqli), or `host=` from the PDO DSN.
+///
+/// # Safety
+/// `ex` is a live connect call frame.
+unsafe fn connect_host(ex: *mut zend_execute_data, host: HostArg) -> Option<String> {
+    match host {
+        HostArg::Arg(n) => unsafe { arg(ex, n) }.and_then(Zval::str).map(str::to_owned),
+        HostArg::Dsn(n) => {
+            let dsn = unsafe { arg(ex, n) }.and_then(Zval::str)?;
+            securecore_config::dbhost::dsn_host(dsn)
+        }
     }
+}
+
+/// The DB host the password may be sent to: `layer2.vault.dbHost`, or WordPress's `DB_HOST`
+/// constant (the way WordPress reads it). `None` when neither is known — the swap is then refused,
+/// never guessed.
+fn expected_db_host(v: &Vault) -> Option<String> {
+    v.db_host.clone().or_else(|| constant("DB_HOST"))
+}
+
+/// A PHP constant's string value, or `None` when it is not defined.
+fn constant(name: &str) -> Option<String> {
+    let c = CString::new(name).ok()?;
+    // SAFETY: a NUL-terminated name; the returned zval (if any) lives in the constants table.
+    let zv = unsafe { zend_get_constant_str(c.as_ptr(), name.len()).cast::<Zval>().as_ref() }?;
+    zv.str().map(str::to_owned)
+}
+
+unsafe extern "C" {
+    /// Zend/zend_constants.h: the constant's value, or NULL when it is not defined.
+    fn zend_get_constant_str(name: *const c_char, name_len: usize) -> *mut zval;
+}
+
+/// Record a refused password swap (both modes): the reason, the component (if known) and the host
+/// it tried to reach. Never the password or any placeholder's value.
+fn refuse(reason: &str, who: Option<Component>, host: Option<&str>) {
+    let mode = crate::live_arc().map_or(Mode::Enforce, |l| l.config.layer2.mode);
+    let who = who.map_or_else(|| "unknown".to_string(), |c| c.to_string());
+    let host = host.unwrap_or("");
+    crate::log(crate::LOG_WARNING, &format!("vault: refused DB-password swap ({reason}) for {who} connecting to {host:?} [{}]", mode.as_str()));
 }
 
 /// For `define(name, value)`: if `name` is a vault secret, force `value` (argument 2) to the

