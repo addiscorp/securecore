@@ -125,7 +125,6 @@ cfg() { # $1 = mode, $2 = file
   "layer1": { "enabled": false },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "$1",
-    "vault": { "from": "wp-config.php", "secrets": ["DB_PASSWORD"] },
     "core": { "hosts": ["core-allowed.test"] },
     "default": { "hosts": [] },
     "components": {

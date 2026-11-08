@@ -36,7 +36,6 @@ cat > "$out/hosts.json" <<JSON
   "layer1": { "enabled": false },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "enforce",
-    "vault": { "from": "wp-config.php", "secrets": ["DB_PASSWORD"] },
     "core": { "hosts": ["web", "api.wordpress.org", "downloads.wordpress.org"] },
     "default": { "hosts": [] },
     "components": {}

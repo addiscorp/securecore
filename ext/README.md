@@ -603,7 +603,18 @@ connect host is known:
 - **curl** does its own DNS and connect, below PHP's socket layer, so it is checked from the options
   recorded on the handle at `curl_exec` / `curl_multi_add_handle`: the URL host, `CURLOPT_PROXY`, and
   the `CURLOPT_RESOLVE` / `CURLOPT_CONNECT_TO` overrides (so an override pointing an allowed name at a
-  disallowed IP or host is refused).
+  disallowed IP or host is refused). A component may only speak **http/https/ftp/ftps** through curl —
+  `CURLOPT_PROTOCOLS`/`REDIR_PROTOCOLS` are clamped and the scheme is checked, so `file://`
+  (which would bypass E2b's file policy) and gopher/dict/telnet/smb are refused. `curl_copy_handle`
+  carries the recorded options to the copy; a handle whose URL SecureCore never saw being set fails
+  closed for a component at exec.
+  - **Redirects:** libcurl follows a redirect *internally*, below any PHP hook. So when a restricted
+    component has `CURLOPT_FOLLOWLOCATION` on, SecureCore turns it off and **follows in the
+    extension** — on each 3xx it reads the resolved next URL, checks its host with the same rules (an
+    audit line per hop), and re-runs, honouring `CURLOPT_MAXREDIRS` and POSTREDIR. A redirect to a
+    disallowed host is refused at the hop. `curl_multi` (which follows internally with no hook) and a
+    `FOLLOWLOCATION` request whose body is printed rather than captured are **degraded**: following
+    is turned off and the 3xx is returned, not followed.
 
 **DNS rebinding.** Layer 2 allowlists *names* and checks the exact name string the connect uses (the
 transport resolves the very name this code read), so there is no check-versus-connect *name*
@@ -627,16 +638,13 @@ securecore: layer2 log     core        net curl_exec host api.example http://api
 ```
 
 **Covered:** the http/https/ftp wrappers, `fsockopen`/`pfsockopen`/`stream_socket_client`, `curl`
-(`curl_exec`, `curl_multi_*`, and `CURLOPT_FOLLOWLOCATION`/`RESOLVE`/`CONNECT_TO`/proxy), `get_headers`
+(`curl_exec`, `curl_multi_*`, `CURLOPT_FOLLOWLOCATION` followed in-extension per hop,
+`RESOLVE`/`CONNECT_TO`/proxy, the scheme and protocol clamp, `curl_copy_handle`), `get_headers`
 and `SoapClient` (both use the http wrapper), `socket_connect` from ext/sockets (a function handler;
 the transport factory does not see ext/sockets, which uses a raw socket), and SMTP that a mail plugin
-opens with `fsockopen`/`stream_socket_client`. **Not fully covered (documented):** a redirect that
-**libcurl** follows *internally* (`CURLOPT_FOLLOWLOCATION`) — libcurl resolves and connects the new
-host itself, with no PHP frame or transport to check, so only the initial URL, proxy and
-RESOLVE/CONNECT_TO overrides are checked; the stream wrappers' redirects are checked per hop, and
-layer 1's ports backstop the curl case. `curl_copy_handle` does not carry the recorded options to the
-copy (a follow-up). Metadata-free local transports (`unix`/`udg`) are not hostnames and are left to
-layer 1.
+opens with `fsockopen`/`stream_socket_client`. **Left to layer 1:** metadata-free local transports
+(`unix`/`udg`) are not hostnames; and a component that reaches the network by native code the engine's
+streams and curl never see is the kernel's job.
 
 **Recommended `hosts` for the bundled-WordPress compat set** (what SecureCore's generated manifests
 suggest; a person approves them as a git diff):
