@@ -336,7 +336,7 @@
           ]
         },
         "grants": {
-          "description": "Extra access to what core owns, as `<area>:<access>` (e.g. `users:read`).",
+          "description": "Extra access to what core owns, as `<area>:read` or `<area>:write` (`write` includes\n`read`). Areas: `users`, `capabilities`, `posts`, `comments`, `terms`, `links`, `options`,\n`network`. E.g. `users:read`.",
           "type": [
             "array",
             "null"
@@ -356,6 +356,7 @@
           }
         },
         "options": {
+          "description": "The options (rows of core's `options` table) the component may read and write (E4).\nAlways its own: names equal to its slug or starting with `<slug>_` / `<slug>-` (transients\nincluded). A list adds glob patterns. The protected options (siteurl, home,\nactive_plugins, the role capabilities and the rest of the README's list) are never\nwritable; listing a read-protected one makes it readable only. Unset inherits `default`.",
           "anyOf": [
             {
               "$ref": "#/$defs/Scope"
@@ -366,6 +367,7 @@
           ]
         },
         "tables": {
+          "description": "The database tables the component may use (E4). Always its own: the tables named after\nits slug (`<prefix><slug>` and `<prefix><slug>_*`, `-` read as `_`), never one of core's.\nA list adds glob patterns (`*`, `?`) matched against the table name without the site's\ntable prefix, e.g. `[\"wc_*\", \"woocommerce_*\"]`. Core's tables are reached only through\n`grants`. Unset inherits `default`.",
           "anyOf": [
             {
               "$ref": "#/$defs/Scope"

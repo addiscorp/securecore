@@ -9,6 +9,7 @@
 //! launcher (layer 1, E6) both read the file through [`load`].
 
 pub mod dbhost;
+pub mod grant;
 pub mod salt;
 pub mod source;
 
@@ -296,11 +297,23 @@ pub struct Rules {
     /// `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec: Option<bool>,
+    /// The database tables the component may use (E4). Always its own: the tables named after
+    /// its slug (`<prefix><slug>` and `<prefix><slug>_*`, `-` read as `_`), never one of core's.
+    /// A list adds glob patterns (`*`, `?`) matched against the table name without the site's
+    /// table prefix, e.g. `["wc_*", "woocommerce_*"]`. Core's tables are reached only through
+    /// `grants`. Unset inherits `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tables: Option<Scope>,
+    /// The options (rows of core's `options` table) the component may read and write (E4).
+    /// Always its own: names equal to its slug or starting with `<slug>_` / `<slug>-` (transients
+    /// included). A list adds glob patterns. The protected options (siteurl, home,
+    /// active_plugins, the role capabilities and the rest of the README's list) are never
+    /// writable; listing a read-protected one makes it readable only. Unset inherits `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<Scope>,
-    /// Extra access to what core owns, as `<area>:<access>` (e.g. `users:read`).
+    /// Extra access to what core owns, as `<area>:read` or `<area>:write` (`write` includes
+    /// `read`). Areas: `users`, `capabilities`, `posts`, `comments`, `terms`, `links`, `options`,
+    /// `network`. E.g. `users:read`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<Vec<String>>,
 }
@@ -409,6 +422,7 @@ impl Config {
         if let Some(vault) = &self.layer2.vault {
             vault.validate().map_err(Problem::Invalid)?;
         }
+        grant::validate(&self.layer2).map_err(Problem::Invalid)?;
         Ok(())
     }
 

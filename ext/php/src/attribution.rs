@@ -138,6 +138,24 @@ pub fn responsible(rule: Rule, root: &Path, from: *const zend_execute_data) -> C
     securecore_attribution::responsible(rule, user_frames(from).map(|file| map.frame(&layout, now, file)))
 }
 
+/// The code that called into the database layer (E4's `caller` attribution): the innermost
+/// user-code frame that is not WordPress's own `wp-includes/class-wpdb.php`. A component's direct
+/// SQL (`$wpdb->query(...)` in its file, or its own mysqli/PDO) is the component's; SQL a core API
+/// composes (`WP_User::get_data_by`, `WP_Query`) is core's, whoever called the API.
+pub fn db_caller(root: &Path, from: *const zend_execute_data) -> Component {
+    let layout = layout(root);
+    let now = Instant::now();
+    let mut map = lock(&MAP);
+    for file in user_frames(from) {
+        let c = map.frame(&layout, now, file);
+        if c == Component::Core && file.ends_with("/wp-includes/class-wpdb.php") {
+            continue;
+        }
+        return c;
+    }
+    Component::Core
+}
+
 /// Who is running now, by the configured rule: the stack of the code calling into the
 /// extension. `root` is the app root (the folder containing securecore.json).
 pub fn who_is_running(root: &Path) -> Component {

@@ -4,14 +4,16 @@ SecureCore as one PHP extension written in Rust ([ext-php-rs](https://crates.io/
 configured from one file, `securecore.json` (addiscorp/securecore#53). Phases so far: **E1** loads,
 validates and reloads the config and reports it; **E2a** works out which component is running;
 **E2b** enforces layer 2's file and process rules; **E3** is the [vault](#vault-e3), which keeps
-the DB password and the WordPress keys and salts out of PHP's reach; **E6** is layer 1, the
-`securecore-fpm` launcher ([Layer 1](#layer-1-securecore-fpm-e6)). Still to come: the database and
-hostname policy (E4–E5) and layer 3 (E7).
+the DB password and the WordPress keys and salts out of PHP's reach; **E4** is the
+[database policy](#database-policy-e4), which checks every query PHP sends; **E6** is layer 1, the
+`securecore-fpm` launcher ([Layer 1](#layer-1-securecore-fpm-e6)). Still to come: the hostname
+policy (E5) and layer 3 (E7).
 
 | crate | what |
 |---|---|
 | `config/` (`securecore-config`) | the config types (serde), the loader, the reloader and the JSON Schema; and the vault's pure logic (E3): reading a secret's source ([`source`](config/src/source.rs)) and the salt reconstruction + keyed hashing ([`salt`](config/src/salt.rs)). Plain Rust, no PHP: the `securecore-fpm` launcher (E6) reads the file with the same code, and the extension and the host tests share the vault's bytes. |
 | `attribution/` (`securecore-attribution`) | E2a: path → component (plugin, mu-plugin, theme, core), the two "who is running" rules, the watched file functions, `securecore-attribution-report`; and E2b: the file/process [`policy`](attribution/src/policy.rs). Plain Rust, no PHP. |
+| `db/` (`securecore-db`) | E4: the [database policy](#database-policy-e4) — the SQL analysis ([`analyze`](db/src/analyze.rs), on sqlparser-rs's MySQL dialect), the per-component decision ([`policy`](db/src/policy.rs)), the per-worker query cache, and `securecore-db-suggest`. Plain Rust, no PHP. |
 | `php/` (`securecore-php`) | the extension, built as `securecore.so` |
 | `fpm/` (`securecore-fpm`) | E6: layer 1, the launcher that starts php-fpm inside [gelada](https://crates.io/crates/gelada) 0.3.0. Plain Rust, no PHP. |
 
@@ -85,8 +87,8 @@ Each entry in `layer2.default` and `layer2.components.<slug>` sets a component's
 left out of an entry inherits from `default`. For E2b those fields are `files` — an object with
 `read` (extra readable paths outside the root) and `write` (extra writable paths, on top of
 uploads and cache) — and `exec` (a bool: may the component run programs). See
-[Enforcement (E2b)](#enforcement-e2b) for what each means. (`hosts`, `tables`, `options` and
-`grants` are for later phases.)
+[Enforcement (E2b)](#enforcement-e2b) for what each means. `tables`, `options` and `grants` are
+the [database policy](#database-policy-e4)'s (E4). (`hosts` is for E5.)
 
 ## Reload
 
@@ -230,6 +232,161 @@ call the extension masks.) The **vault file is the answer**: the secret lives in
 outside the docroot, never enters a PHP file, and so never becomes a constant literal or an opcache
 operand. Expression defines (`define('NAME', getenv('NAME'))`, the Docker image's and the standard
 managed-WordPress form) are not literals, so env-mapped secrets and the vault file are unaffected.
+
+## Database policy (E4)
+
+Every query PHP sends is attributed (E2a's configured rule: by default the innermost component on
+the stack) and checked before it reaches the server. A port of the worker spike's PHP policy
+(#49, `plugin/sql-policy.php`) to Rust ([`db/`](db/)), with per-component tables, options and
+grants. `log` writes an audit line and runs the query; `enforce` writes the line and the query
+fails as a MySQL permission error does; `off` does neither.
+
+```
+securecore: layer2 enforce plugin:acme mysqli_query protected-column select wp_users
+securecore: layer2 log     plugin:acme mysqli_query option select wp_options options=blogname
+securecore: layer2 enforce core mysqli_query unparseable select -
+```
+
+(`layer2 <mode> <component> <route> <rule> <statement> <tables>`; an options refusal adds the
+option names it pinned.)
+
+### The rules
+
+**Everyone, core included**, gets only the allowlisted statement types: SELECT, INSERT, REPLACE,
+UPDATE, DELETE; SHOW, DESCRIBE, EXPLAIN; the session SETs (`SET NAMES`, `SET SESSION sql_mode`,
+`SET autocommit`, …); transaction control; and table DDL (CREATE / ALTER / DROP / TRUNCATE /
+RENAME TABLE, CREATE / DROP INDEX). Refused for everyone, whatever they name: PREPARE / EXECUTE /
+DEALLOCATE, `SET @var` and `SET @@…`, `LOAD_FILE(`, `INTO OUTFILE` / `DUMPFILE`, LOAD DATA, CALL,
+HANDLER, DO, USE, LOCK / UNLOCK, GRANT, CTEs (`WITH …`), `SELECT … INTO`, the table-maintenance
+statements, stored-object DDL (views, functions, procedures, triggers, events), a `/*! … */`
+executable comment, a `sql_mode` with `ANSI_QUOTES`, `ANSI` or `NO_BACKSLASH_ESCAPES`, and a
+charset other than utf8mb4 / utf8 / utf8mb3 / latin1 / ascii / binary (`SET NAMES`,
+`SET CHARACTER SET`, `mysqli_set_charset`). Those last three change how the server tokenizes the
+text, so after one of them the parser and MySQL would read the same query differently. The worker
+spike (#49) checked only the sandboxed plugins' queries; E4 holds core to the allowlist too.
+
+**Core** is otherwise unrestricted. An unparseable query from core runs and is logged
+(`unparseable`), except an unparseable `SET`, which is refused.
+
+**A component** (plugin, mu-plugin, theme):
+
+| | may | never |
+|---|---|---|
+| **tables** | its own: named after its slug (`<prefix><slug>` and `<prefix><slug>_*`, with `-` read as `_`), plus what its `tables` globs match (against the name without the prefix, e.g. `["wc_*"]`) | DDL on a core table, whatever it is granted; another component's tables; another schema (except reading `information_schema`) |
+| **core tables** | only through `grants`: `users`, `capabilities`, `posts`, `comments`, `terms`, `links`, `options`, `network`, each `:read` or `:write` (`write` includes `read`) | |
+| **options** | its own (names equal to its slug or starting with `<slug>_` / `<slug>-`, transients included), plus what its `options` globs match; any other one with `options:read` / `options:write` | write a protected option: `siteurl`, `home`, `active_plugins`, `<prefix>user_roles`, `admin_email`, `users_can_register`, `default_role`, `cron`, `mailserver_login`, `mailserver_pass` and the salt options. The read-protected ones (#49's list) are readable only when named in `options`; the salt options never |
+| **users** | with `users:read`, any column but the two below; with `users:write`, write rows (and set a password, as `wp_set_password` does) | read `user_pass` or `user_activation_key`: naming either anywhere (select list, WHERE, ORDER BY, JOIN … USING), a `*` / `users.*` over `users`, or a NATURAL JOIN with it |
+| **usermeta** | through `users`; capability rows (`<prefix>capabilities`, `<prefix>user_level`) need `capabilities:write` too, and so does a write not pinned to named keys | read `session_tokens` by name |
+| **statements** | one per query | an unparseable or multi-statement query (refused in enforce: fail closed) |
+
+**How "own" is decided: by name, from the slug.** Not "tables it created": that needs a
+persistent ledger shared by every worker, and it rewards squatting (a component creating another
+plugin's table first). Not a hand-written list alone: most plugins' tables and options already
+follow their slug. Where they don't (Yoast's slug is `wordpress-seo`, its options `wpseo*`), the
+entry lists globs, and `securecore-db-suggest` writes those entries.
+
+**Which options a statement touches** comes from the parsed WHERE: `option_name = '…'`,
+`IN (…)`, or `LIKE 'prefix%'`, only through top-level ANDs (an OR could widen it), and from the
+VALUES or SET of an INSERT / UPDATE (so a row can't be renamed into `siteurl`). A read not pinned
+to named options needs `options:read`; an unpinned write is refused (it could reach a protected
+option).
+
+### Where queries are seen
+
+As internal-function handlers, on the vault's hook mechanism (`vault::hook_with`): `mysqli_query`,
+`mysqli_real_query`, `mysqli_multi_query`, `mysqli_prepare`, `mysqli_stmt_prepare`,
+`mysqli_execute_query`, and the `mysqli::query`, `real_query`, `multi_query`, `prepare` and
+`execute_query`, `mysqli_stmt::prepare` and `new mysqli_stmt($link, $sql)` methods; `PDO::exec`,
+`PDO::query` and `PDO::prepare`. `$wpdb` uses `mysqli_query`. A prepared statement is checked at
+prepare: the execute calls carry no SQL. PHP 8.3 has no `mysqli_send_query`; an async query is sent
+by `mysqli_query`. `select_db` and `change_user` are refused for a component (`USE` and a
+re-login); `set_charset` to an unsafe charset is refused for everyone. Every connection is checked,
+not just `$wpdb`'s.
+
+### What a refusal does
+
+`enforce` hands the server a statement that fails in the query's place, so the failure is the
+native one in every error mode:
+
+- **a query** (`query`, `real_query`, `multi_query`, `exec`, the PDO routes) runs
+  `SIGNAL SQLSTATE '42000' SET MYSQL_ERRNO = 1142` (MySQL's "command denied") with the reason as its
+  message. mysqli returns `false` and sets `errno`/`error`, or throws `mysqli_sql_exception` 1142
+  in strict report mode; PDO follows its error mode; `$wpdb->query()` returns `false` with
+  `$wpdb->last_error` set. Plugins degrade, nothing is fatal;
+- **a mysqli prepare** gets a statement the server rejects *at prepare* (a syntax error naming the
+  rule, `securecore_denied_<rule>`): MariaDB prepares a SIGNAL successfully and would fail only at
+  execute, after `bind_param` had already thrown `ArgumentCountError` on the placeholder count. So
+  `prepare` returns `false` (or `new mysqli_stmt` leaves the statement unprepared, as PHP does for
+  any failed prepare);
+- **select_db / change_user / set_charset** return `false` without reaching the server (a failed
+  `change_user` would drop the connection, core's included).
+
+### Parser: sqlparser-rs
+
+[sqlparser](https://crates.io/crates/sqlparser) `=0.63.0` (Apache DataFusion's), with its MySQL
+dialect. It is the maintained Rust SQL parser with a MySQL grammar (the alternatives are
+unmaintained, Postgres- or SQLite-only), and it reads every shape WordPress and the three plugins
+send: `SQL_CALC_FOUND_ROWS`, `ON DUPLICATE KEY UPDATE`, `SHOW FULL COLUMNS`, `@@SESSION`,
+multi-table DELETE (unit-tested in `wordpress_query_shapes_parse`, and on the stack: no core
+`unparseable` line on the compat pages). Its gaps are handled before it runs. A few refused
+statements aren't in its grammar (`PREPARE … FROM`, `HANDLER`, `DO`, `INTO OUTFILE`), so they're
+refused by leading keyword or token rather than left to "unparseable", which core is allowed. Its
+tokenizer expands some `/*! … */` comments and not others, while MySQL runs them, so any executable
+comment is refused, found by scanning the raw text.
+
+### Cost
+
+Analyses are cached by query text, per worker (bounded LRU, 2048 texts; texts over 8 KiB aren't
+kept). On the host, a miss (parse + analysis) costs ~37 µs, a hit 0.06 µs, the decision 0.1 µs
+(`cargo test --release -p securecore-db -- --ignored --nocapture parse_cost`). `bench/db.sh`
+measures the page cost against main.
+
+### Who a query is charged to
+
+```ini
+securecore.debug_db_attribution = component   ; component (default) | caller
+```
+
+- `component`: E2a's rule (`securecore.debug_attribution_rule`, by default the innermost component
+  on the stack). A plugin that calls a core API is charged for the SQL that API runs.
+- `caller`: the code that called into the database layer, the innermost frame outside
+  `wp-includes/class-wpdb.php`. A component's own SQL (`$wpdb->query(...)` in its file, its own
+  mysqli or PDO) is still the component's; the SQL a core API composes (`WP_User::get_data_by`,
+  `WP_Query`) is core's, whoever called the API. The cost: a core helper that runs SQL it is given
+  (`dbDelta()`) runs it as core.
+
+The choice is open (see the PR): under `component`, core's own login check is charged to any
+plugin that triggers the current-user load first (Yoast does), and its `SELECT * FROM wp_users` is
+then a protected-column refusal.
+
+### Known limits
+
+- **Filters launder SQL under either rule.** A component's `query` or `posts_where` /
+  `posts_clauses` callback has returned by the time core runs the SQL it shaped, so that SQL runs
+  as core. Closing this needs the mu-plugin or the extension to check what a component's filter
+  callback returns.
+- **The database, not WordPress's caches.** Autoloaded options are read once by core and then
+  served from memory, so `get_option('admin_email')` from a component returns the cached value
+  without SQL. E4 guards what reaches the server.
+- **No result filtering.** #49 let a plugin run `SELECT * FROM wp_users` and stripped `user_pass`
+  from the rows, and cut a bulk options read down to an allowlist. E4 decides on the query alone,
+  so a `*` over `users` is refused, and an unpinned options read needs `options:read` (and then
+  returns every row, the read-protected ones included). Bulk `usermeta` reads with `users:read`
+  return `session_tokens` rows; those hold hashed token verifiers, not the cookies.
+- **Tables in a write statement are all writes.** `INSERT INTO mine SELECT … FROM wp_posts` needs
+  `posts:write`, not `posts:read` (fails closed).
+
+### Suggesting entries
+
+Run the site in `log` mode, use it, then
+
+```sh
+cargo run -p securecore-db --bin securecore-db-suggest -- --prefix wp_ php-fpm.log > suggested.json
+```
+
+prints the `components` entries (tables, options, grants) each component needed, for a person to
+approve, plus `refusedAlways`: what no entry can open (a protected option written, a protected
+column). `research/db/compat.sh` does this for Classic Editor, Yoast and CF7.
 
 ## `securecore_status(): array`
 
@@ -520,6 +677,21 @@ gelada stacks its filters on top of it.
   connects. And it checks the opcache fail-closed refusal (a literal `wpConfig` secret stops
   php-fpm) and the revert proof — with the vault gone from the config, and with the extension
   unloaded, the probe does see the secret — plus Classic Editor, Yoast and CF7 front/login 200.
+- `DOCKER_CONTEXT=colima test/ext-db.sh` (after ext-config.sh): a probe plugin sends 15 cases
+  through all 18 query routes (mysqli procedural and method, the prepare routes, PDO in exception
+  and silent mode, `$wpdb`), on core's connection and its own. In enforce mode its own table and
+  option run, and another plugin's table, a core table without a grant, `user_pass`, a `*` over
+  users, a protected option, PREPARE, `SET @`, LOAD_FILE, INTO OUTFILE, multi-statement, the
+  `/*! */` comment trick and ANSI_QUOTES are refused on every route, with audit lines. In strict
+  mode mysqli throws 1142; `select_db` and an unsafe charset are refused; nothing is fatal. With
+  grants, the granted table runs and the rest stay refused. A core probe may read `user_pass` but
+  not PREPARE. The revert proof: in log mode, with layer 2 off, and with the extension unloaded,
+  every refused case runs.
+- `DOCKER_CONTEXT=colima research/db/compat.sh` (after ext-config.sh): Classic Editor, Yoast and
+  CF7 in log mode, entries suggested from the log, then enforce mode with them, every refusal
+  listed.
+- `DOCKER_CONTEXT=colima bench/db.sh` (after research/db/compat.sh): front-page and dashboard p50,
+  main's extension against this branch's, same config, 7 rounds.
 - `DOCKER_CONTEXT=colima bench/vault.sh` (after ext-config.sh): front-page p50 and a login round,
   7 rounds, with the vault on vs a no-vault config.
 - `DOCKER_CONTEXT=colima bench/ext.sh`: front-page p50 with the extension loaded vs not.

@@ -9,8 +9,8 @@
 # against PHP 8.3 NTS. On a machine without PHP, `cargo test` (the default members) still works.
 [workspace]
 resolver = "3"
-members = ["config", "attribution", "php", "fpm"]
-default-members = ["config", "attribution", "fpm"]
+members = ["config", "attribution", "db", "php", "fpm"]
+default-members = ["config", "attribution", "db", "fpm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -32,3 +32,5 @@ md-5 = "=0.11.0"
 sha1 = "=0.11.0"
 digest = "=0.11.3"
 libc = "=0.2.191"
+# The database policy (E4): a maintained MySQL-dialect SQL parser, with the AST visitor.
+sqlparser = { version = "=0.63.0", features = ["visitor"] }
