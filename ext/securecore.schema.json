@@ -49,6 +49,27 @@
       },
       "additionalProperties": false
     },
+    "Files": {
+      "description": "Extra file access for a component (E2b). A component may always read anywhere under the app\nroot except the protected files (the vault's `from` file and `securecore.json`), and write\nto the uploads and cache folders; these lists add to that. Each entry is a path (a file or a\nfolder) relative to the folder containing securecore.json, or absolute; a folder entry\ncovers everything under it.",
+      "type": "object",
+      "properties": {
+        "read": {
+          "description": "Paths outside the app root the component may also read (reads under the root need no\nentry).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "write": {
+          "description": "Paths the component may also write, on top of uploads and cache.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "Layer1": {
       "description": "Layer 1, the outer layer: the `securecore-fpm` launcher starts php-fpm inside gelada\n(Landlock + seccomp). Knows only paths and ports, so it works for any PHP app. Read once by\nthe launcher: a change needs a php-fpm restart.",
       "type": "object",
@@ -278,10 +299,18 @@
       "description": "What a component may touch. A field left out inherits from `default`.",
       "type": "object",
       "properties": {
+        "exec": {
+          "description": "Whether the component may run external programs (exec, shell_exec, system, passthru,\npopen, proc_open, pcntl_exec, and mail when it shells out). Default: no. Unset inherits\n`default`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "files": {
+          "description": "Extra file access, on top of what a component always has (read anywhere under the app\nroot except the protected files; write to uploads and cache). Unset inherits `default`.",
           "anyOf": [
             {
-              "$ref": "#/$defs/Scope"
+              "$ref": "#/$defs/Files"
             },
             {
               "type": "null"

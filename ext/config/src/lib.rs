@@ -169,8 +169,15 @@ pub struct Rules {
     /// Hostnames the component may reach over HTTP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosts: Option<Vec<String>>,
+    /// Extra file access, on top of what a component always has (read anywhere under the app
+    /// root except the protected files; write to uploads and cache). Unset inherits `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub files: Option<Scope>,
+    pub files: Option<Files>,
+    /// Whether the component may run external programs (exec, shell_exec, system, passthru,
+    /// popen, proc_open, pcntl_exec, and mail when it shells out). Default: no. Unset inherits
+    /// `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tables: Option<Scope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,6 +185,23 @@ pub struct Rules {
     /// Extra access to what core owns, as `<area>:<access>` (e.g. `users:read`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<Vec<String>>,
+}
+
+/// Extra file access for a component (E2b). A component may always read anywhere under the app
+/// root except the protected files (the vault's `from` file and `securecore.json`), and write
+/// to the uploads and cache folders; these lists add to that. Each entry is a path (a file or a
+/// folder) relative to the folder containing securecore.json, or absolute; a folder entry
+/// covers everything under it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Files {
+    /// Paths outside the app root the component may also read (reads under the root need no
+    /// entry).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read: Vec<String>,
+    /// Paths the component may also write, on top of uploads and cache.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write: Vec<String>,
 }
 
 /// `"own"` (what the app adapter says the component owns) or an explicit list of patterns.

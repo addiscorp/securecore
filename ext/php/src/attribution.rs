@@ -94,7 +94,7 @@ fn constant(name: &CStr) -> Option<String> {
 
 /// WordPress's directories now: its defaults under the root, moved by `WP_CONTENT_DIR`,
 /// `WP_PLUGIN_DIR` and `WPMU_PLUGIN_DIR` once wp-config.php / wp-settings.php define them.
-fn layout(root: &Path) -> Layout {
+pub(crate) fn layout(root: &Path) -> Layout {
     Layout::wordpress(
         root,
         constant(c"WP_CONTENT_DIR").as_deref(),
@@ -103,7 +103,7 @@ fn layout(root: &Path) -> Layout {
     )
 }
 
-fn zstr(s: *const zend_string) -> Option<&'static str> {
+pub(crate) fn zstr(s: *const zend_string) -> Option<&'static str> {
     // SAFETY: a live zend_string from the engine (an op_array filename or function name),
     // which outlives the call that reads it.
     let s = unsafe { s.as_ref() }?;
@@ -193,7 +193,7 @@ fn watched_of(common: &ext_php_rs::ffi::_zend_function__bindgen_ty_1) -> Option<
 ///
 /// # Safety
 /// `ex` is a live call frame with at least `n` arguments.
-unsafe fn arg<'a>(ex: *const zend_execute_data, n: u32) -> Option<&'a Zval> {
+pub(crate) unsafe fn arg<'a>(ex: *const zend_execute_data, n: u32) -> Option<&'a Zval> {
     let slot = std::mem::size_of::<zend_execute_data>().div_ceil(std::mem::size_of::<zval>());
     // SAFETY: the caller guarantees the frame and the argument count.
     unsafe { ex.cast::<zval>().add(slot + n as usize - 1).cast::<Zval>().as_ref() }
@@ -201,7 +201,7 @@ unsafe fn arg<'a>(ex: *const zend_execute_data, n: u32) -> Option<&'a Zval> {
 
 /// A path argument as the plain-files wrapper will open it: absolute (relative to PHP's
 /// working directory), normalized, symlinks resolved as far as it exists.
-fn opened_path(arg: &str) -> Option<PathBuf> {
+pub(crate) fn opened_path(arg: &str) -> Option<PathBuf> {
     let plain = watch::plain_path(arg)?;
     let p = Path::new(plain);
     let abs = if p.is_absolute() { p.to_owned() } else { std::env::current_dir().ok()?.join(p) };
@@ -248,9 +248,16 @@ unsafe extern "C" {
 static PREVIOUS_COMPILE_FILE: Mutex<Option<CompileFile>> = Mutex::new(None);
 static INCLUDES_HOOKED: AtomicBool = AtomicBool::new(false);
 
-/// At request start: installs the include recorder once, if logging is on.
+/// At request start: installs the `zend_compile_file` wrapper once per process, if attribution
+/// logging is on (to record includes, E2a) or layer 2 is active (to enforce them, E2b). It is
+/// the one wrapper that does both; with neither wanted it is never installed, so a request that
+/// needs nothing from it pays nothing.
 pub fn request_startup() {
-    if INCLUDES_HOOKED.load(Ordering::Relaxed) || settings().is_none_or(|s| s.log.is_empty()) {
+    if INCLUDES_HOOKED.load(Ordering::Relaxed) {
+        return;
+    }
+    let logging = !settings().is_none_or(|s| s.log.is_empty());
+    if !logging && !crate::enforce::layer2_active() {
         return;
     }
     INCLUDES_HOOKED.store(true, Ordering::Relaxed);
@@ -265,23 +272,38 @@ pub fn request_startup() {
 
 unsafe extern "C" fn compile_file(file_handle: *mut ext_php_rs::ffi::zend_file_handle, kind: c_int) -> *mut zend_op_array {
     let Some(previous) = *lock(&PREVIOUS_COMPILE_FILE) else { return std::ptr::null_mut() };
+    // The frame running the include and the include op (include/require, not eval). eval and the
+    // main script (no caller) are neither recorded nor enforced.
+    // SAFETY: EG(current_execute_data) and its opline, on the request's own thread.
+    let (op, current) = unsafe {
+        let current = (*std::ptr::addr_of!(ext_php_rs::ffi::executor_globals)).current_execute_data;
+        let op = current
+            .as_ref()
+            .and_then(|c| c.opline.as_ref())
+            .filter(|o| o.opcode == ZEND_INCLUDE_OR_EVAL)
+            .and_then(|o| watch::include_op(o.extended_value));
+        (op, current)
+    };
+    // E2b: enforce the read policy on the file before compiling it. Blocking here (return null,
+    // never compiling) makes a denied include fail exactly as a missing file does: a warning and
+    // `false` for include, a fatal for require. SAFETY: the file handle from the engine.
+    if let Some(op) = op
+        && let Some(path) = unsafe { file_handle.as_ref() }.and_then(|f| zstr(f.filename)).and_then(watch::plain_path)
+        && crate::enforce::include_blocked(op, path, current)
+    {
+        return std::ptr::null_mut();
+    }
     // SAFETY: the engine's own call, passed through unchanged.
     let op_array = unsafe { previous(file_handle, kind) };
-    // SAFETY: the op_array just compiled (or served from opcache), and the frame executing the
-    // include, whose opline is the ZEND_INCLUDE_OR_EVAL being run.
-    unsafe {
-        let current = (*std::ptr::addr_of!(ext_php_rs::ffi::executor_globals)).current_execute_data;
-        let Some(caller) = current.as_ref() else { return op_array }; // the main script
-        let Some(opline) = caller.opline.as_ref() else { return op_array };
-        if opline.opcode != ZEND_INCLUDE_OR_EVAL {
-            return op_array;
-        }
-        let Some(op) = watch::include_op(opline.extended_value) else { return op_array };
-        if let Some(file) = op_array.as_ref().and_then(|a| zstr(a.filename))
-            && let Some(path) = watch::plain_path(file)
-        {
-            record(op, &real_path(Path::new(path)), current);
-        }
+    // E2a logging (observation only): one line per logged rule, from the compiled op_array's
+    // resolved filename. Guarded by logging being on, so enforcement-only workers (the common
+    // case) never pay for the real_path here. SAFETY: the op_array just compiled or from opcache.
+    if settings().is_some_and(|s| !s.log.is_empty())
+        && let Some(op) = op
+        && let Some(file) = unsafe { op_array.as_ref() }.and_then(|a| zstr(a.filename))
+        && let Some(path) = watch::plain_path(file)
+    {
+        record(op, &real_path(Path::new(path)), current);
     }
     op_array
 }
