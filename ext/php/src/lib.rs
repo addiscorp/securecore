@@ -17,6 +17,7 @@
 
 mod attribution;
 mod enforce;
+mod hosts;
 
 use std::ffi::{CString, c_char, c_int};
 use std::path::Path;
@@ -119,6 +120,7 @@ extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
 extern "C" fn request_startup(_ty: i32, _module_number: i32) -> i32 {
     attribution::request_startup();
     enforce::request_startup();
+    hosts::request_startup();
     let mut guard = state();
     if let Some(reloader) = guard.as_mut() {
         match reloader.poll(Instant::now()) {
