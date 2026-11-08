@@ -91,6 +91,10 @@ add_action('init', static function () {
     // The harness leaves 'esc-dir-link' in uploads pointing at a folder outside uploads. A
     // recursive mkdir through it must resolve to the real folder and be refused (item 2).
     $r['mkdir-escape'] = $ok(@mkdir($uploads . '/esc-dir-link/a/b', 0777, true));
+    // The harness leaves a 9-deep symlink chain 'chain1 -> ... -> chain9 -> chaindst' in uploads,
+    // one past SYMLINK_FOLLOW_MAX (8). A write through it can't be pinned to a real path, so it is
+    // refused as unresolvable rather than decided on the lexical path (the hop-limit case).
+    $r['symlink-chain-write'] = $ok(@file_put_contents($uploads . '/chain1', 'x') !== false);
 
     // --- include: under the root is allowed; outside it is refused ---
     $r['include-own'] = $ok((@include $own . '/inc.php') === 'incok');

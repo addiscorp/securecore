@@ -217,12 +217,18 @@ type 3, libxml, metadata (`touch`/`chmod`/`chown` via `stream_metadata`), and mo
 includes skip the open, so the `zend_compile_file` wrapper (shared with E2a) still covers include
 and require. Paths are resolved through PHP's realpath cache before the decision, so a symlink
 under the root cannot smuggle an open past the prefix tests, and the protected files are matched
-by (device, inode), so a hard link to one is caught too. A file or folder about to be *created*
-has no realpath, so the decision is made on its deepest existing ancestor (symlinks in it
-followed) with the rest appended, and a dangling symlink at the first new component is followed to
-its target — the path a write or a recursive `mkdir` actually lands on, not the lexical path (so
-`symlink('../other/x', uploads/link)` then writing `uploads/link`, and `mkdir(uploads/link/a/b)`
-through a symlinked ancestor, are both decided on `other/…`).
+by (device, inode), so a hard link to one is caught too. That per-open inode stat is the one
+non-trivial cost on the open path, so it runs only while it can matter: each request stats the
+protected files once and skips it entirely unless one has more than one link (a hard link to a
+protected file cannot exist otherwise, and a component cannot create one — `link()` is refused). A
+file or folder about to be *created* has no realpath, so the decision is made on its deepest
+existing ancestor (symlinks in it followed) with the rest appended, and a dangling symlink at the
+first new component is followed to its target — the path a write or a recursive `mkdir` actually
+lands on, not the lexical path (so `symlink('../other/x', uploads/link)` then writing
+`uploads/link`, and `mkdir(uploads/link/a/b)` through a symlinked ancestor, are both decided on
+`other/…`). A chain of not-yet-existing symlinks is followed up to eight hops; a path that runs
+past that, or that has no existing ancestor at all, is refused as `unresolvable` rather than
+decided on its lexical form.
 
 Function handlers cover only what does **not** go through a stream wrapper: the process functions;
 `symlink`/`link` (handled in `ext/standard/link.c`). `link` is refused when its target is a

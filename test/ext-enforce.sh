@@ -92,9 +92,11 @@ run() {
   put_live "$dir/$1.json"
   sleep 1.3 # > RELOAD_INTERVAL, so every worker has the new config
   in_php "printf victim > $victim && printf rn > $renamef && ln -f $html/wp-config.php $hardlink && chown www-data:www-data $victim $renamef"
-  # Escape fixtures: a dangling symlink and a dir symlink under uploads, both pointing outside the
-  # writable area, so the write/mkdir probes have to resolve them (not trust the lexical path).
-  in_php "rm -rf $escape $escapedir $content/uploads/sc-enf/dangle $content/uploads/sc-enf/esc-dir-link; mkdir -p $content/uploads/sc-enf $escapedir; chown -R www-data:www-data $content/uploads/sc-enf $escapedir; ln -s $escape $content/uploads/sc-enf/dangle; ln -s $escapedir $content/uploads/sc-enf/esc-dir-link"
+  # Escape fixtures under uploads, each pointing where the lexical path does not: a dangling symlink,
+  # a dir symlink outside uploads, and a 9-deep symlink chain (one past SYMLINK_FOLLOW_MAX = 8). The
+  # write/mkdir probes must resolve the first two; the chain must be refused as unresolvable, not
+  # guessed from its lexical path.
+  in_php "d=$content/uploads/sc-enf; rm -rf \$d/dangle \$d/esc-dir-link \$d/chain* \$d/chaindst $escape $escapedir; mkdir -p \$d $escapedir; chown -R www-data:www-data \$d $escapedir; ln -s $escape \$d/dangle; ln -s $escapedir \$d/esc-dir-link; for i in 1 2 3 4 5 6 7 8; do ln -s chain\$((i+1)) \$d/chain\$i; done; ln -s chaindst \$d/chain9"
   T=$(now); sleep 1
   curl -s "$base/?sc_enf=run" > "$dir/out.$1"
   sleep 1
@@ -114,7 +116,7 @@ for c in read-own write-uploads include-own; do want enforce "$c" OK; done
 for c in read-config read-etc fopen-read-etc scandir-etc write-own write-tmp fopen-write-own \
          unlink-core mkdir-core rename-core shell_exec exec include-outside status \
          symlink-read symlink-write link-protected hardlink-read \
-         symlink-escape-create symlink-dangling-write mkdir-escape; do
+         symlink-escape-create symlink-dangling-write mkdir-escape symlink-chain-write; do
   want enforce "$c" BLOCKED
 done
 has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $html/wp-config.php" "enforce: reading wp-config resolves to read-protected"
@@ -128,6 +130,7 @@ has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $hardlink
 has "$T" "layer2 enforce plugin:securecore-enforce symlink-target write $escape" "enforce: a symlink target outside the writable area is refused (item 1, create)"
 has "$T" "layer2 enforce plugin:securecore-enforce open write $escape" "enforce: a write through a dangling symlink resolves to its target (item 1, write)"
 has "$T" "layer2 enforce plugin:securecore-enforce mkdir write $escapedir/a/b" "enforce: a recursive mkdir through a symlink resolves to the real folder (item 2)"
+has "$T" "layer2 enforce plugin:securecore-enforce open unresolvable $content/uploads/sc-enf/chain1" "enforce: a write past the symlink hop limit is refused as unresolvable (hop limit)"
 
 # --- 2. log mode: the revert proof — the same ops now all succeed ----------------------------
 echo "# log (nothing blocked)"
@@ -135,20 +138,21 @@ run log
 for c in read-own read-config read-etc fopen-read-etc scandir-etc write-uploads write-own \
          write-tmp fopen-write-own unlink-core mkdir-core rename-core shell_exec exec \
          include-own include-outside status symlink-read symlink-write link-protected hardlink-read \
-         symlink-escape-create symlink-dangling-write mkdir-escape; do
+         symlink-escape-create symlink-dangling-write mkdir-escape symlink-chain-write; do
   want log "$c" OK
 done
 has "$T" "layer2 log plugin:securecore-enforce open read-protected $html/wp-config.php" "log: the would-be refusal is recorded, mode log"
 has "$T" "layer2 log plugin:securecore-enforce open read-protected $hardlink" "log: the hard-link read is recorded (1b), mode log"
 has "$T" "layer2 log plugin:securecore-enforce open write $escape" "log: the dangling-symlink write is recorded (item 1), mode log"
 has "$T" "layer2 log plugin:securecore-enforce mkdir write $escapedir/a/b" "log: the mkdir-through-symlink is recorded (item 2), mode log"
+has "$T" "layer2 log plugin:securecore-enforce open unresolvable $content/uploads/sc-enf/chain1" "log: the over-limit symlink chain is recorded as unresolvable, mode log"
 has "$T" "layer2 log plugin:securecore-enforce exec exec echo scok" "log: exec would-be refusal recorded"
 
 # --- 3. layer 2 off: everything works, nothing recorded --------------------------------------
 echo "# off"
 run off
 for c in read-config read-etc write-own exec include-outside status symlink-read hardlink-read \
-         symlink-escape-create symlink-dangling-write mkdir-escape; do want off "$c" OK; done
+         symlink-escape-create symlink-dangling-write mkdir-escape symlink-chain-write; do want off "$c" OK; done
 if [ "$(audit "$T" | grep -c .)" = 0 ]; then pass "off: no layer2 lines"; else fail "off: no layer2 lines" "$(audit "$T" | head -1)"; fi
 
 # --- 4. enforce, granted ---------------------------------------------------------------------
@@ -159,7 +163,7 @@ for c in read-own read-etc fopen-read-etc scandir-etc write-uploads write-own fo
   want granted "$c" OK
 done
 for c in read-config write-tmp unlink-core mkdir-core rename-core status symlink-read link-protected hardlink-read \
-         symlink-escape-create symlink-dangling-write mkdir-escape; do
+         symlink-escape-create symlink-dangling-write mkdir-escape symlink-chain-write; do
   want granted "$c" BLOCKED
 done
 has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $html/wp-config.php" "granted: the protected file is still refused"

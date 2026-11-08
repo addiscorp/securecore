@@ -24,11 +24,15 @@
 //! lets it through; `off` does neither. Core is never restricted.
 //!
 //! Paths are resolved (symlinks followed) through PHP's realpath cache before the decision, so a
-//! symlink under the root cannot smuggle a read or write past the prefix tests; protected files
-//! are matched by (device, inode) so a hard link to one is caught too. A file about to be created
-//! has no realpath, so [`resolve_new`] resolves its deepest existing ancestor and follows a
-//! dangling symlink at the first new component — the path a write or a recursive `mkdir` actually
-//! lands on, not the lexical path. `symlink()` itself is refused when its target is not writable.
+//! symlink under the root cannot smuggle a read or write past the prefix tests. Protected files
+//! are matched by (device, inode) so a hard link to one is caught too, but that per-open stat runs
+//! only while a protected file actually has more than one link (checked once per request): on a
+//! normal request none does, so every open skips it. A file about to be created has no realpath, so
+//! [`resolve_new`] resolves its deepest existing ancestor and follows a dangling symlink at the
+//! first new component — the path a write or a recursive `mkdir` actually lands on, not the lexical
+//! path. A path whose symlink chain runs past [`SYMLINK_FOLLOW_MAX`], or that has no existing
+//! ancestor, is refused as unresolvable rather than guessed at. `symlink()` itself is refused when
+//! its target is not writable.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int};
@@ -73,13 +77,19 @@ const WRAPPER_GUARDS: &[&str] = &["stream_wrapper_register", "stream_wrapper_unr
 /// A Zend internal-function handler.
 type Zif = unsafe extern "C" fn(*mut zend_execute_data, *mut zval);
 
-/// How deep a chain of not-yet-existing symlinks `resolve_new` follows before giving up and
-/// deciding on the lexical path. A write or mkdir rarely passes through even one.
+/// How deep a chain of not-yet-existing symlinks `resolve_new` follows before giving up. Past this
+/// the path is treated as unresolvable and refused, never guessed from its lexical form. A write or
+/// mkdir rarely passes through even one.
 const SYMLINK_FOLLOW_MAX: u32 = 8;
 
 /// The handlers we replaced, by lowercase function name. Set once per process; read lock-free.
 static ORIGINALS: OnceLock<HashMap<String, Zif>> = OnceLock::new();
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+/// Whether, this request, any protected file has more than one hard link — decided once in
+/// [`request_startup`]. Only then does an open run the per-open (dev, inode) stat that catches a
+/// hard link to a protected file; a component cannot create such a link (`link()` is refused), so
+/// on a normal request this is false and every open skips the stat.
+static PROTECTED_LINKED: AtomicBool = AtomicBool::new(false);
 
 fn lock<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -172,6 +182,11 @@ pub(crate) fn request_startup() {
     }
     // SAFETY: registering our per-request wrapper before userland opens anything.
     unsafe { register_file_wrapper() };
+    // Stat the protected files once now: the per-open inode check is needed only while one has more
+    // than one link (see [`PROTECTED_LINKED`]). On a normal request none does and every open skips
+    // it; the stat here is two calls, not one per open.
+    let linked = with_baseline(|b| b.protected.iter().any(|p| std::fs::metadata(p).map(|m| m.nlink() > 1).unwrap_or(false))).unwrap_or(false);
+    PROTECTED_LINKED.store(linked, Ordering::Relaxed);
 }
 
 /// # Safety
@@ -417,8 +432,17 @@ enum Inode {
 /// write to uploads/cache) never walks the stack; only a protected file or an op the baseline
 /// can't clear does. The baseline is the authority on "protected" (path *and* inode); the policy
 /// (plain Rust) only does path-based protection, so protection is settled here, not there.
-fn guard(from: *const zend_execute_data, op: Op, token: &str, resolved: Option<PathBuf>, inode: Inode) -> bool {
-    let Some(resolved) = resolved else { return false }; // unresolvable: let the plain op report it
+fn guard(from: *const zend_execute_data, op: Op, token: &str, resolved: Resolved, inode: Inode) -> bool {
+    let resolved = match resolved {
+        Resolved::Pass => return false, // not a path we govern (non-file scheme): let the plain op report it
+        Resolved::Unresolvable(path) => {
+            // A path we govern whose symlink chain ran past the limit, or that has no existing
+            // ancestor: refuse rather than decide on a path we could not pin down. Core is exempt.
+            let Some(ctx) = slow(from) else { return false };
+            return refuse_decision(&ctx, op, token, &path.display().to_string(), policy::Decision::Refuse("unresolvable"));
+        }
+        Resolved::Path(resolved) => resolved,
+    };
     match classify(op, &resolved, inode) {
         None => false,            // layer 2 not active
         Some(Verdict::Allow) => false,
@@ -472,10 +496,11 @@ impl Baseline {
         if self.protected.iter().any(|p| p == resolved) {
             return true;
         }
-        // A hard link has its own path but the protected file's inode. The stat is skipped for an
-        // include under a code directory (the hot path; see `Inode::StatUnlessCode`): a component
-        // can no longer create such a link, and including a protected file re-runs it rather than
-        // disclosing its bytes.
+        // A hard link has its own path but the protected file's inode. `inode_check` is off unless
+        // a protected file has more than one link this request (so a hard link to one could exist),
+        // and additionally off for an include under a code directory (the hot path). A component
+        // can no longer create such a link (`link()` is refused), and including a protected file
+        // re-runs it rather than disclosing its bytes.
         inode_check && std::fs::metadata(resolved).is_ok_and(|m| self.protected_ids.contains(&(m.dev(), m.ino())))
     }
 }
@@ -493,7 +518,10 @@ fn with_baseline<R>(f: impl FnOnce(&Baseline) -> R) -> Option<R> {
     let mut guard = lock(&BASELINE);
     if guard.as_ref().map(|b| b.sha.as_str()) != Some(loaded.sha256.as_str()) {
         let layout = attribution::layout(&loaded.root);
-        let resolve_cfg = |p: &Path| resolve_str(&p.to_string_lossy()).unwrap_or_else(|| normalize(p));
+        let resolve_cfg = |p: &Path| match resolve_str(&p.to_string_lossy()) {
+            Resolved::Path(r) => r,
+            Resolved::Pass | Resolved::Unresolvable(_) => normalize(p),
+        };
         let mut protected = vec![resolve_cfg(&loaded.path)];
         if let Some(vault) = &l2.vault {
             protected.push(resolve_cfg(&loaded.resolve(&vault.from)));
@@ -526,10 +554,13 @@ enum Verdict {
 /// protected file is caught before the under-root allow.
 fn classify(op: Op, resolved: &Path, inode: Inode) -> Option<Verdict> {
     with_baseline(|b| {
-        let stat = match inode {
-            Inode::Stat => true,
-            Inode::StatUnlessCode => !b.code_dirs.iter().any(|d| under_or_eq(resolved, d)),
-        };
+        // The per-open inode stat runs only while a protected file has more than one link; without
+        // one, no path can be a hard link to a protected file, so path matching alone is exact.
+        let stat = PROTECTED_LINKED.load(Ordering::Relaxed)
+            && match inode {
+                Inode::Stat => true,
+                Inode::StatUnlessCode => !b.code_dirs.iter().any(|d| under_or_eq(resolved, d)),
+            };
         if b.is_protected(resolved, stat) {
             return Verdict::Protected;
         }
@@ -568,10 +599,10 @@ fn slow(from: *const zend_execute_data) -> Option<Slow> {
 /// `zend_compile_file` wrapper in [`crate::attribution`].
 ///
 /// Includes are the hot path, so the inode stat (which catches a hard link to a protected file) is
-/// skipped for the common case — a file under plugins, mu-plugins or themes — and run only for an
-/// include whose resolved path lands elsewhere, which is rare. The protected *path* is always
-/// matched; a component can no longer create a hard link (`link()` is refused), so a residual hard
-/// link under a code directory is the only gap, noted in the README.
+/// skipped for the common case — a file under plugins, mu-plugins or themes — and in any case runs
+/// only while a protected file has more than one link (see [`PROTECTED_LINKED`]). The protected
+/// *path* is always matched; a component can no longer create a hard link (`link()` is refused), so
+/// a residual hard link under a code directory is the only gap, noted in the README.
 pub(crate) fn include_blocked(op: &str, path: &str, from: *const zend_execute_data) -> bool {
     guard(from, Op::Read, op, resolve_str(path), Inode::StatUnlessCode)
 }
@@ -593,27 +624,39 @@ pub(crate) fn status_only_core(caller: &str) -> Option<String> {
 
 // --- path resolution ----------------------------------------------------------------------------
 
-/// Resolve a path from the wrapper (NUL-terminated) through the realpath cache, following
-/// symlinks. `None` only if it cannot be made into a path at all.
+/// The outcome of resolving a path for a decision.
+enum Resolved {
+    /// A concrete filesystem path to decide on.
+    Path(PathBuf),
+    /// Not a path we govern — a non-file scheme (`php://`, `https://`) or one we cannot form at
+    /// all. The plain op handles it; we do not refuse.
+    Pass,
+    /// A path we govern that could not be resolved: its symlink chain ran past
+    /// [`SYMLINK_FOLLOW_MAX`], or it has no existing ancestor. Refused as `unresolvable` (the
+    /// lexical form is kept only for the audit line).
+    Unresolvable(PathBuf),
+}
+
+/// Resolve a path from the wrapper (NUL-terminated) through the realpath cache, following symlinks.
 ///
 /// # Safety
 /// `cpath` is a valid NUL-terminated string.
-unsafe fn resolve_c(cpath: *const c_char) -> Option<PathBuf> {
+unsafe fn resolve_c(cpath: *const c_char) -> Resolved {
     // The whole path, via the realpath cache, with no allocation (already NUL-terminated).
     if let Some(r) = resolve_existing(cpath) {
-        return Some(r);
+        return Resolved::Path(r);
     }
-    // A path that does not exist yet (a new file being written): resolve via its parent.
-    let s = unsafe { CStr::from_ptr(cpath) }.to_str().ok()?;
+    // A path that does not exist yet (a new file being written): resolve via its deepest ancestor.
+    let Ok(s) = (unsafe { CStr::from_ptr(cpath) }).to_str() else { return Resolved::Pass };
     resolve_new(Path::new(s))
 }
 
 /// Resolve a path given as a Rust string (includes, symlink/link args).
-fn resolve_str(path: &str) -> Option<PathBuf> {
-    let plain = watch::plain_path(path)?; // skip php://, https:// …
-    let c = CString::new(plain).ok()?;
+fn resolve_str(path: &str) -> Resolved {
+    let Some(plain) = watch::plain_path(path) else { return Resolved::Pass }; // skip php://, https:// …
+    let Ok(c) = CString::new(plain) else { return Resolved::Pass };
     if let Some(r) = resolve_existing(c.as_ptr()) {
-        return Some(r);
+        return Resolved::Path(r);
     }
     resolve_new(Path::new(plain))
 }
@@ -639,26 +682,39 @@ fn resolve_existing(cpath: *const c_char) -> Option<PathBuf> {
 ///   * a recursive `mkdir` through a symlinked ancestor whose own parent doesn't exist
 ///     (`mkdir(uploads/link/a/b)` with `uploads/link -> ../other` creates folders in `other`).
 ///
-/// Bounded by [`SYMLINK_FOLLOW_MAX`]; falls back to the lexical path.
-fn resolve_new(abs: &Path) -> Option<PathBuf> {
-    let abs = if abs.is_absolute() { abs.to_owned() } else { std::env::current_dir().ok()?.join(abs) };
-    Some(resolve_tail(abs, 0))
+/// Bounded by [`SYMLINK_FOLLOW_MAX`]; past that, or with no existing ancestor, the path is
+/// unresolvable and refused, never guessed from its lexical form.
+fn resolve_new(abs: &Path) -> Resolved {
+    let abs = if abs.is_absolute() {
+        abs.to_owned()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(abs),
+            Err(_) => return Resolved::Unresolvable(normalize(abs)),
+        }
+    };
+    match resolve_tail(&abs, 0) {
+        Some(p) => Resolved::Path(p),
+        None => Resolved::Unresolvable(normalize(&abs)),
+    }
 }
 
 /// Resolve `abs` by finding its deepest existing ancestor and appending the non-existing tail,
-/// following a dangling symlink at the first tail component (which is where a write lands).
-fn resolve_tail(abs: PathBuf, depth: u32) -> PathBuf {
+/// following a dangling symlink at the first tail component (which is where a write lands). `None`
+/// when the chain runs past [`SYMLINK_FOLLOW_MAX`] or no ancestor exists — the path is then
+/// unresolvable, and the caller refuses it rather than guess from its lexical form.
+fn resolve_tail(abs: &Path, depth: u32) -> Option<PathBuf> {
     if depth > SYMLINK_FOLLOW_MAX {
-        return normalize(&abs);
+        return None; // too many symlink hops: unresolvable
     }
     // Walk up until a prefix resolves; `tail` collects the non-existing names, outermost last.
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = abs.as_path();
+    let mut cur = abs;
     loop {
         if let Ok(c) = CString::new(cur.as_os_str().as_bytes())
             && let Some(rp) = resolve_existing(c.as_ptr())
         {
-            let Some(first) = tail.pop() else { return rp }; // the whole path resolved
+            let Some(first) = tail.pop() else { return Some(rp) }; // the whole path resolved
             let here = rp.join(&first);
             // A dangling symlink at the first not-yet-existing component: a write follows it.
             if let Ok(meta) = std::fs::symlink_metadata(&here)
@@ -667,10 +723,10 @@ fn resolve_tail(abs: PathBuf, depth: u32) -> PathBuf {
             {
                 let base = if target.is_absolute() { target } else { rp.join(target) };
                 let next = tail.iter().rev().fold(base, |p, c| p.join(c));
-                return resolve_tail(next, depth + 1);
+                return resolve_tail(&next, depth + 1);
             }
             // Genuinely new: lexical from the resolved ancestor.
-            return tail.iter().rev().fold(here, |p, c| p.join(c));
+            return Some(tail.iter().rev().fold(here, |p, c| p.join(c)));
         }
         match cur.parent() {
             Some(p) if p != cur => {
@@ -679,7 +735,7 @@ fn resolve_tail(abs: PathBuf, depth: u32) -> PathBuf {
                 }
                 cur = p;
             }
-            _ => return normalize(&abs),
+            _ => return None, // no existing ancestor: unresolvable
         }
     }
 }
