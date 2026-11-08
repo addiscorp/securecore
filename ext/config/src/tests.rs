@@ -314,6 +314,38 @@ fn reloader_follows_the_file_and_never_drops_to_off() {
 }
 
 #[test]
+fn a_racy_stamp_is_checked_by_content() {
+    // The collision the flake hit (#63): a same-size rewrite inside one timestamp tick leaves
+    // (inode, size, mtime, ctime) as they were. Force exactly that: the reloader's stamp is the
+    // new file's own, taken just now.
+    let dir = scratch("racy");
+    let path = dir.join("securecore.json");
+    fs::write(&path, WORDPRESS).expect("write");
+    let t0 = Instant::now();
+    let interval = Duration::from_secs(1);
+    let mut r = Reloader::start(&path, interval, t0).expect("start");
+    let edited = WORDPRESS.replace(r#""port": 9000"#, r#""port": 9001"#);
+    assert_ne!(edited, WORDPRESS);
+    assert_eq!(edited.len(), WORDPRESS.len(), "same size, as in the flake");
+    fs::write(&path, &edited).expect("write");
+    r.stamp = stamp(&path).ok();
+    r.stamped_at = SystemTime::now();
+    assert!(racy(&r.stamp.expect("stamp"), r.stamped_at));
+    assert_eq!(r.poll(t0 + interval), Poll::Reloaded { layer1_changed: true, vault_changed: false }, "a racy stamp is not trusted");
+    assert_eq!(r.live().sha256, sha256_hex(edited.as_bytes()));
+
+    // Once the stamp is well past the file's ctime it vouches for the bytes: an unchanged stamp
+    // is trusted without reading (the write below is invisible, which is the stat-only path).
+    fs::write(&path, WORDPRESS).expect("write");
+    r.stamp = stamp(&path).ok();
+    r.stamped_at = SystemTime::now() + 2 * RACY;
+    assert!(!racy(&r.stamp.expect("stamp"), r.stamped_at));
+    assert_eq!(r.poll(t0 + 2 * interval), Poll::Unchanged, "a settled stamp is trusted");
+    assert_eq!(r.live().sha256, sha256_hex(edited.as_bytes()));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn vault_secrets_name_their_source() {
     // Bare names need `from`; env-mapped ones don't.
     let e = rejected(&with_layer2(r#","vault":{"secrets":["AUTH_KEY"]}"#));

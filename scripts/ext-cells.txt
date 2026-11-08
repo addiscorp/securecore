@@ -1,0 +1,19 @@
+# The extension's release matrix (addiscorp/securecore#53, E8): one line per PHP version and
+# thread-safety build. Each is built for every architecture in ext-cells.sh (linux-x86_64,
+# linux-arm64), so 4 versions x 2 builds x 2 architectures = 16 cells.
+#
+#   <php> <ts> <image>
+#
+# <image> is the official php image the cell is built in AND release-checked in: its php-config
+# and headers are that PHP exactly. NTS cells use the fpm image (php-fpm is how WordPress runs);
+# ZTS cells use the zts image, which has the CLI and php-cgi (FastCGI) but no php-fpm. Pinned by
+# the multi-arch index digest (amd64 + arm64 under one digest), so both architectures build
+# from the same pinned image. Bump a digest here and nowhere else.
+8.1 nts php:8.1-fpm-bookworm@sha256:e3893eeb8f6fb719b6efa7e011e76a65cb1322054226250cedac1138b406aba4
+8.1 zts php:8.1-zts-bookworm@sha256:4320d456d0baae344be7da46bffd783d5b25d0fbc241bd014ae53993f90cf2c3
+8.2 nts php:8.2-fpm-bookworm@sha256:f15b9649b74a4af4621c960b2d9861a998e6eaf652a28089ceb4b3f238b371d4
+8.2 zts php:8.2-zts-bookworm@sha256:025d4148dcdc12a5def5fa947066be9b802111d52ddb2eae323247b3c1d51313
+8.3 nts php:8.3-fpm-bookworm@sha256:d7677e2a3c1579fbe52848cc446bc24860187c876c383a43b7d4b8e06dce537e
+8.3 zts php:8.3-zts-bookworm@sha256:47d3c81c4f256ce9070e129648fb210d5ba2c968aa89d264024b70acdab569a1
+8.4 nts php:8.4-fpm-bookworm@sha256:b75642e8c89c321039f351466134df951576fb0f7017117b3931e9a19b908d6c
+8.4 zts php:8.4-zts-bookworm@sha256:dc0b99cf3abb6c9dfae4efa4cfe9a089449e43f1800b1e29b45746d47e8f9cbc

@@ -153,7 +153,7 @@ pub(crate) fn request_startup() {
 /// Called once, from RINIT, before userland code runs this request.
 unsafe fn install() {
     let mut hooks = HashMap::new();
-    let ft = unsafe { (*std::ptr::addr_of_mut!(ext_php_rs::ffi::compiler_globals)).function_table };
+    let ft = unsafe { (*crate::compiler_globals()).function_table };
     if !ft.is_null() {
         for &(name, sql_arg, kind) in FUNCS {
             if let Some(original) = unsafe { vault::hook_with(ft, name, dispatch) } {
@@ -333,7 +333,7 @@ fn global_string(name: &str) -> Option<String> {
     let c = CString::new(name).ok()?;
     // SAFETY: EG(symbol_table) on the request's own thread; a read-only lookup.
     let mut zv = unsafe {
-        let table = std::ptr::addr_of!((*std::ptr::addr_of!(ext_php_rs::ffi::executor_globals)).symbol_table);
+        let table = std::ptr::addr_of!((*crate::executor_globals()).symbol_table);
         zend_hash_str_find(table, c.as_ptr(), name.len())
     };
     // SAFETY: zv is a live zval from the table (or NULL); IS_INDIRECT points at the CV slot,

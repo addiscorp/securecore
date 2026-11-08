@@ -57,6 +57,20 @@ static INI: IniEntryDefs<5> = IniEntryDefs::new([
     IniEntryDef::end(),
 ]);
 
+/// The executor globals (`EG`) of the calling thread, without ext-php-rs's lock (the hot paths
+/// read one field). On an NTS build this is `&executor_globals`; on a ZTS build the static does
+/// not exist and the pointer is the thread's TSRM slot, so every read of `EG` goes through here.
+pub(crate) fn executor_globals() -> *mut ext_php_rs::ffi::zend_executor_globals {
+    // SAFETY: ext-php-rs's C helper; it only computes the address (TSRMG on ZTS).
+    unsafe { ext_php_rs::ffi::ext_php_rs_executor_globals() }
+}
+
+/// The compiler globals (`CG`) of the calling thread, as [`executor_globals`] does for `EG`.
+pub(crate) fn compiler_globals() -> *mut ext_php_rs::ffi::zend_compiler_globals {
+    // SAFETY: as above.
+    unsafe { ext_php_rs::ffi::ext_php_rs_compiler_globals() }
+}
+
 /// The live config. php-fpm loads it in the master at MINIT; each worker inherits it at fork
 /// and then reloads on its own.
 static STATE: Mutex<Option<Reloader>> = Mutex::new(None);

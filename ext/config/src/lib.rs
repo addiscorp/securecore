@@ -20,7 +20,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -573,6 +573,21 @@ struct Stamp {
     ctime: (i64, i64),
 }
 
+/// How close to the moment it was taken a stamp's ctime may be before the stamp stops telling two
+/// writes apart. File timestamps come from the kernel's coarse clock (a few ms), and some
+/// filesystems keep whole seconds or two, so two writes of the same size inside one tick leave
+/// the same (inode, size, mtime, ctime). Git calls such an entry "racily clean".
+const RACY: Duration = Duration::from_secs(2);
+
+/// A stamp taken at `at` can't vouch for the file's bytes when the file changed (ctime) within
+/// [`RACY`] of `at`: a later write in the same tick would leave the stamp unchanged.
+fn racy(stamp: &Stamp, at: SystemTime) -> bool {
+    let (secs, nsec) = stamp.ctime;
+    let (Ok(secs), Ok(nsec)) = (u64::try_from(secs), u32::try_from(nsec)) else { return true };
+    let ctime = UNIX_EPOCH + Duration::new(secs, nsec);
+    ctime + RACY > at
+}
+
 fn stamp(path: &Path) -> std::io::Result<Stamp> {
     let m = fs::metadata(path)?;
     Ok(Stamp {
@@ -614,6 +629,8 @@ pub struct Reloader {
     /// real values are read once at startup, so this, not the live file, is the vault in force.
     started_vault: Option<Vault>,
     stamp: Option<Stamp>,
+    /// When `stamp` was taken (wall clock, which file times use): see [`racy`].
+    stamped_at: SystemTime,
     interval: Duration,
     next_check: Instant,
     reloads: u64,
@@ -624,6 +641,7 @@ impl Reloader {
     /// Loads the file; fails if it can't be loaded (the caller fails closed).
     pub fn start(path: &Path, interval: Duration, now: Instant) -> Result<Reloader, LoadError> {
         // Stamp before reading: a write between the two is then seen by the next poll.
+        let stamped_at = SystemTime::now();
         let stamp = stamp(path).ok();
         let live = load(path)?;
         Ok(Reloader {
@@ -631,6 +649,7 @@ impl Reloader {
             started_vault: started_vault(&live.config),
             live: Arc::new(live),
             stamp,
+            stamped_at,
             interval,
             next_check: now + interval,
             reloads: 0,
@@ -677,18 +696,27 @@ impl Reloader {
         }
         self.next_check = now + self.interval;
         let path = self.live.path.clone();
+        let at = SystemTime::now();
         let current = stamp(&path).ok();
-        if current.is_some() && current == self.stamp {
+        // An unchanged stamp means an unchanged file, unless it is racy (the file changed within
+        // a timestamp tick or two of when the stamp was taken): then compare the bytes' sha256.
+        // That costs a read only in the seconds right after an edit.
+        if let Some(s) = current
+            && current == self.stamp
+            && !racy(&s, self.stamped_at)
+        {
             return Poll::Unchanged;
         }
         match load(&path) {
             Ok(loaded) if loaded.sha256 == self.live.sha256 => {
                 self.stamp = current;
+                self.stamped_at = at;
                 self.error = None;
                 Poll::Unchanged
             }
             Ok(loaded) => {
                 self.stamp = current;
+                self.stamped_at = at;
                 self.error = None;
                 self.reloads += 1;
                 self.live = Arc::new(loaded);

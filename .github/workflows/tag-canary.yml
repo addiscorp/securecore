@@ -1,5 +1,7 @@
-# Every push to main becomes a canary (APS 9): the same shape as mirab's tag-canary, but on
-# push rather than nightly — a release here is one small zip.
+# Main becomes a canary once a night (APS 9), at 09:00 UTC, if it changed since the last one;
+# "Run workflow" makes one now. The same shape as mirab's tag-canary. (It ran on every push
+# while a release was one small zip; since E8 a canary is the 16-cell extension matrix, each
+# cell built and release-checked on WordPress, so it follows APS 9's nightly rule.)
 #
 #   1. TAG = v<VERSION>-canary-<7-char sha> (scripts/version.sh).
 #   2. Push TAG as an annotated tag. A push made with GITHUB_TOKEN starts no workflow
@@ -12,8 +14,8 @@
 name: Tag canary
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: '0 9 * * *'
   workflow_dispatch:
 
 permissions:

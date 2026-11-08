@@ -1,25 +1,38 @@
-# The SecureCore PHP extension (ext/, addiscorp/securecore#53), built against PHP 8.3 NTS on
-# Debian bookworm. From the repo root (the repo is the build context; nothing is bind-mounted,
-# so this works on Docker hosts that can't see this folder, e.g. Colima):
+# The SecureCore PHP extension (ext/, addiscorp/securecore#53), built against the PHP in
+# PHP_IMAGE: an official php image on Debian bookworm (PHP 8.3 NTS unless told otherwise). From
+# the repo root (the repo is the build context; nothing is bind-mounted, so this works on Docker
+# hosts that can't see this folder, e.g. Colima):
 #
 #   docker build -f docker/ext.Dockerfile --target check .            clippy (-D warnings) + tests
 #   docker build -f docker/ext.Dockerfile --target so -o .tmp/ext .   writes .tmp/ext/securecore.so
+#   docker build -f docker/ext.Dockerfile --target dist -o <dir> .    securecore.so + securecore-fpm
 #   docker build -f docker/ext.Dockerfile --target php .              WordPress php-fpm + the extension
 #   docker build -f docker/ext.Dockerfile --target php-layer1 .       the same, started by securecore-fpm
 #
+# The release matrix (E8) builds `dist` once per cell of scripts/ext-cells.txt, with
+# --build-arg PHP_IMAGE=<that cell's image> (scripts/ext-build.sh). The NTS cells build in the
+# php:<v>-fpm-bookworm image and the ZTS cells in php:<v>-zts-bookworm: each image's php-config
+# and headers are that version and thread-safety build exactly, so bindgen sees the ABI the
+# extension will be loaded into. bookworm (glibc 2.36) is also the oldest glibc the binaries
+# need, so they run on bookworm, trixie and Ubuntu 24.04 alike.
+#
 # docker/compose.ext.yml runs the WordPress stack with the `php` target;
 # docker/compose.ext-layer1.yml on top of it runs the `php-layer1` target (layer 1, E6).
+ARG PHP_IMAGE=php:8.3-fpm-bookworm@sha256:d7677e2a3c1579fbe52848cc446bc24860187c876c383a43b7d4b8e06dce537e
 
 # php-config and the headers ext-php-rs's bindgen reads; clang/libclang for bindgen.
-FROM php:8.3-fpm-bookworm@sha256:d7677e2a3c1579fbe52848cc446bc24860187c876c383a43b7d4b8e06dce537e AS toolchain
+FROM ${PHP_IMAGE} AS toolchain
 RUN apt-get update \
  && apt-get install -y --no-install-recommends clang libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=rust:1.99-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c /usr/local/cargo /usr/local/cargo
 COPY --from=rust:1.99-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c /usr/local/rustup /usr/local/rustup
-ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:$PATH \
-    CARGO_TARGET_DIR=/build/target
+ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:$PATH
 RUN rustup component add clippy
+# One target folder per PHP flavour (e.g. 8.3-nts) inside the shared cache: ext-php-rs's build
+# script watches php-config's path, not which PHP it is, so a target folder shared between
+# flavours would keep the first flavour's bindings.
+RUN php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION, PHP_ZTS ? "-zts" : "-nts";' > /flavour
 WORKDIR /build/ext
 COPY ext/ /build/ext/
 
@@ -32,20 +45,28 @@ FROM toolchain AS build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     find /build/ext -name '*.rs' -exec touch {} + \
+ && export CARGO_TARGET_DIR="/build/target/$(cat /flavour)" \
  && cargo build --locked --release -p securecore-php -p securecore-fpm \
- && mkdir -p /out && cp /build/target/release/libsecurecore.so /out/securecore.so \
- && cp /build/target/release/securecore-fpm /out/securecore-fpm
+ && mkdir -p /out && cp "$CARGO_TARGET_DIR/release/libsecurecore.so" /out/securecore.so \
+ && cp "$CARGO_TARGET_DIR/release/securecore-fpm" /out/securecore-fpm
 
 # Every Rust gate for ext/: the whole workspace, the PHP crate included.
 FROM toolchain AS check
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     find /build/ext -name '*.rs' -exec touch {} + \
+ && export CARGO_TARGET_DIR="/build/target/$(cat /flavour)" \
  && cargo clippy --locked --workspace --all-targets -- -D warnings \
  && cargo test --locked --workspace
 
 FROM scratch AS so
 COPY --from=build /out/securecore.so /securecore.so
+
+# What a release cell ships: the extension for this PHP, and the launcher (plain Rust; the same
+# bytes in every cell of one architecture, which the release checks).
+FROM scratch AS dist
+COPY --from=build /out/securecore.so /securecore.so
+COPY --from=build /out/securecore-fpm /securecore-fpm
 
 # Stock WordPress php-fpm (Debian trixie, PHP 8.3 NTS: same extension API as the build) with
 # the extension. One ini line points it at the config, /var/www/html/securecore.json: the site
