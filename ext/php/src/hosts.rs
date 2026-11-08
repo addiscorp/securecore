@@ -407,7 +407,7 @@ fn db_host() -> Option<String> {
 /// # Safety
 /// Called once, from RINIT, before userland code runs this request.
 unsafe fn install() {
-    let ft = unsafe { (*std::ptr::addr_of_mut!(ext_php_rs::ffi::compiler_globals)).function_table };
+    let ft = unsafe { (*crate::compiler_globals()).function_table };
     if ft.is_null() {
         return;
     }
@@ -1024,7 +1024,7 @@ fn host_from_authority(authority: &str) -> Option<String> {
 
 fn current_execute_data() -> *const zend_execute_data {
     // SAFETY: EG(current_execute_data) on the request's own thread.
-    unsafe { (*std::ptr::addr_of!(ext_php_rs::ffi::executor_globals)).current_execute_data }
+    unsafe { (*crate::executor_globals()).current_execute_data }
 }
 
 /// `*const c_char` as a `&str`, or `""` when it is null or not UTF-8 (used only to pick the
