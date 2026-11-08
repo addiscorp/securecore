@@ -27,10 +27,11 @@ fn wordpress_example_parses_with_every_field() {
     let c = parse(WORDPRESS).expect("examples/wordpress.json");
     assert!(c.layer1.enabled && c.layer2.enabled && c.layer3.enabled);
     assert!(!c.is_off());
-    assert_eq!(c.layer1.write, ["wp-content/uploads", "wp-content/cache"]);
+    assert_eq!(c.layer1.write, ["wp-content/uploads", "wp-content/cache", "/tmp"]);
     assert_eq!(c.layer1.network.bind.iter().map(|p| p.port.get()).collect::<Vec<_>>(), [9000]);
-    assert_eq!(c.layer1.network.connect.iter().map(|p| p.port.get()).collect::<Vec<_>>(), [3306, 443]);
-    assert_eq!(c.layer1.network.unix_sockets, ["/run/mysqld/mysqld.sock"]);
+    // MySQL over TCP, not its unix socket: the launcher can't combine the two yet (#57).
+    assert_eq!(c.layer1.network.connect.iter().map(|p| p.port.get()).collect::<Vec<_>>(), [53, 3306, 443]);
+    assert!(c.layer1.network.unix_sockets.is_empty());
     assert_eq!(c.layer2.app, Some(App::Wordpress));
     assert_eq!(c.layer2.mode, Mode::Enforce);
     let vault = c.layer2.vault.as_ref().expect("vault");
