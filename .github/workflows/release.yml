@@ -295,7 +295,7 @@ jobs:
             # shellcheck disable=SC2086
             gh release create "$TAG" $files --repo "${{ github.repository }}" \
               --title "securecore ${VERSION} (canary)" --prerelease \
-              --notes "Canary build of ${GITHUB_SHA}. Install the plugin: cd /path/to/wordpress && curl -fsSL https://securecore.addis.gg/install.sh | sh -s -- --canary. Install the extension: curl -fsSL https://securecore-releases.addis.gg/install-ext.sh | sudo sh -s -- --canary --wordpress /path/to/wordpress"
+              --notes "Canary build of ${GITHUB_SHA}. Install the extension: curl -fsSL https://securecore.addis.gg/install.sh | sudo sh -s -- --canary (from the WordPress folder, or it uses /var/www/html)"
           fi
       - name: Remove this run's staging
         run: |

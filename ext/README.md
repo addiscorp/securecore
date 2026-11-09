@@ -83,12 +83,17 @@ file, never rebuilding.
 ## Install
 
 ```sh
-curl -fsSL https://securecore-releases.addis.gg/install-ext.sh | sudo sh -s -- --wordpress /var/www/html
+curl -fsSL https://securecore.addis.gg/install.sh | sudo sh
 ```
+
+(`securecore.addis.gg/install.sh` redirects to `securecore-releases.addis.gg/install-ext.sh`.)
+With no options it uses the WordPress in the current folder, or else `/var/www/html`
+(`--wordpress` for another), and the newest stable release, or the newest canary while there is
+none (`--canary` or `--version` to choose).
 
 [`install.sh`](install.sh) (published as `install-ext.sh`) finds the PHP (`--php` for another
 one), its version, NTS/ZTS, extension and ini folders, and the machine's architecture; downloads
-`release.json` (stable, `--canary` or `--version`) and that cell's files; checks each against its
+`release.json` and that cell's files; checks each against its
 sha256 and that the extension loads in this PHP; then installs the `.so`, the launcher
 (`/usr/local/bin`), the schema, the mu-plugin (`<wordpress>/wp-content/mu-plugins`), a
 `securecore.json` with every layer off **only if none exists**, and last the ini (on Debian/Ubuntu
