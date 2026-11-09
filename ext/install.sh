@@ -2,7 +2,11 @@
 # Install the SecureCore PHP extension (addiscorp/securecore#53) on a Linux server, for the PHP
 # that runs the site:
 #
-#   curl -fsSL https://securecore-releases.addis.gg/install-ext.sh | sudo sh -s -- --wordpress /var/www/html
+#   curl -fsSL https://securecore.addis.gg/install.sh | sudo sh
+#
+# (securecore.addis.gg/install.sh redirects to securecore-releases.addis.gg/install-ext.sh.) With
+# no options it installs the newest stable release, or the newest canary while there is none, for
+# the WordPress in the current folder, or else in /var/www/html.
 #
 # 1. Finds the PHP (`php` on PATH, or --php): its version, thread safety (NTS/ZTS), extension
 #    folder and ini folder; and this machine's architecture (x86_64 or arm64).
@@ -24,7 +28,7 @@
 set -eu
 
 BASE=https://securecore-releases.addis.gg
-CHANNEL=stable
+CHANNEL=auto
 VERSION=
 PHP=php
 WP=
@@ -43,12 +47,14 @@ usage() {
 Install the SecureCore PHP extension for the PHP that runs your site (Linux, x86_64 or arm64,
 PHP 8.1-8.4, NTS or ZTS).
 
-  curl -fsSL https://securecore-releases.addis.gg/install-ext.sh | sudo sh -s -- --wordpress /var/www/html
+  curl -fsSL https://securecore.addis.gg/install.sh | sudo sh
+
+Every option is optional; the defaults suit a usual server.
 
 Options:
   --wordpress <dir>   the WordPress root: the mu-plugin goes into its wp-content/mu-plugins and
                       the config defaults to <dir>/securecore.json (default: the current
-                      directory, if it is a WordPress root)
+                      directory if it is a WordPress root, else /var/www/html if that is one)
   --config <file>     securecore.json (default: <wordpress>/securecore.json). Created with
                       every layer off if it doesn't exist; never changed if it does
   --php <program>     the PHP CLI of the same build as your php-fpm (default: php)
@@ -57,7 +63,8 @@ Options:
   --extension-dir <dir>  where securecore.so goes (default: PHP's extension_dir)
   --bin-dir <dir>     where securecore-fpm goes (default: /usr/local/bin)
   --share-dir <dir>   where the JSON Schema goes (default: /usr/local/share/securecore)
-  --canary            install the newest canary instead of the newest stable release
+  --canary            install the newest canary (default: the newest stable release, or the
+                      newest canary while there is no stable one)
   --version <v>       install this release (e.g. 0.1.0 or 0.1.0-canary-a1b2c3d)
   --from <url>        download from <url> instead of https://securecore-releases.addis.gg
   -h, --help          this help
@@ -131,7 +138,12 @@ fi
 [ -n "$INI_DIR" ] || die "This PHP has no folder for extra ini files. Pass --ini-dir."
 
 # --- WordPress and the config ------------------------------------------------------------------
-if [ -z "$WP" ] && [ -f ./wp-load.php ]; then WP=$(pwd); fi
+if [ -z "$WP" ] && [ -z "$CONFIG" ]; then
+  if [ -f ./wp-load.php ]; then WP=$(pwd)
+  elif [ -f /var/www/html/wp-load.php ]; then WP=/var/www/html
+  else die "There's no WordPress here or in /var/www/html. Run the installer from your WordPress folder, or pass --wordpress <folder>."
+  fi
+fi
 if [ -n "$WP" ]; then
   [ -f "$WP/wp-load.php" ] || die "$WP is not a WordPress root (no wp-load.php). Pass --wordpress with the folder that has wp-config.php."
   WP=$(CDPATH='' cd "$WP" && pwd)
@@ -152,8 +164,9 @@ if [ -n "$VERSION" ]; then
   fetch "$BASE/$VERSION/release.json" "$WORK/release.json" || die "There is no SecureCore release $VERSION at $BASE."
 elif [ "$CHANNEL" = canary ]; then
   fetch "$BASE/canary.json" "$WORK/release.json" || die "Couldn't download $BASE/canary.json. Check the connection, then run the installer again."
-else
-  fetch "$BASE/latest.json" "$WORK/release.json" || die "There is no stable SecureCore release at $BASE yet. Run the installer with --canary for the newest canary."
+elif ! fetch "$BASE/latest.json" "$WORK/release.json" 2>/dev/null; then
+  fetch "$BASE/canary.json" "$WORK/release.json" || die "Couldn't download $BASE/latest.json or $BASE/canary.json. Check the connection, then run the installer again."
+  step "$NOTE" Release "no stable release yet, so the newest canary"
 fi
 tr -d ' \t\r\n' < "$WORK/release.json" > "$WORK/release.flat"
 field() { sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$WORK/release.flat" | head -n 1; }

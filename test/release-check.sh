@@ -99,12 +99,15 @@ is "$(in_php 'test -f /var/www/html/wp-content/mu-plugins/securecore-vault.php &
 is "$(in_php 'php -r "echo PHP_MAJOR_VERSION, \".\", PHP_MINOR_VERSION, PHP_ZTS ? \"-zts\" : \"-nts\";"')" "$php-$ts" "the site's PHP is $php $ts"
 is "$(in_php 'php -m' | grep -cx securecore)" 1 "php -m lists securecore"
 
-in_root 'sh /release/install-ext.sh --from file:///release --canary --wordpress /var/www/html' > "$dir/install-2.log" 2>&1; rc=$?
+# Again with the defaults the site shows (no --canary, no --wordpress), from outside the site:
+# with no latest.json it takes the newest canary, and it finds WordPress in /var/www/html.
+in_root 'cd / && sh /release/install-ext.sh --from file:///release' > "$dir/install-2.log" 2>&1; rc=$?
 if [ "$rc" = 0 ] && ! grep -qE '^ok +(Extension|Launcher|JSON Schema|mu-plugin|Config|ini) ' "$dir/install-2.log"; then
-  pass "install-ext.sh again: exit 0, nothing changed"
+  pass "install-ext.sh again, with the defaults: exit 0, nothing changed"
 else
-  fail "install-ext.sh again: exit 0, nothing changed" "rc=$rc: $(tr '\n' '|' < "$dir/install-2.log")"
+  fail "install-ext.sh again, with the defaults: exit 0, nothing changed" "rc=$rc: $(tr '\n' '|' < "$dir/install-2.log")"
 fi
+has "$dir/install-2.log" "no stable release yet, so the newest canary" "install-ext.sh with no stable release takes the newest canary"
 in_root "rm -rf /tmp/tampered && cp -a /release /tmp/tampered && printf x >> /tmp/tampered/$version/ext/$so"
 in_root 'sh /release/install-ext.sh --from file:///tmp/tampered --canary --wordpress /var/www/html' > "$dir/install-tampered.log" 2>&1; rc=$?
 if [ "$rc" != 0 ] && grep -q "ext/$so failed its sha256 check against release.json, so nothing was installed" "$dir/install-tampered.log"; then
