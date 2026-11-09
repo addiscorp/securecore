@@ -127,3 +127,11 @@ bun bench/summary.ts     # the split table; load prints its own (.tmp/bench/load
 
 Open http://127.0.0.1:8088/wp-admin/ (admin / securecore-demo). Stop with
 `docker compose -f docker/compose.yml down -v`.
+
+## License
+
+SecureCore's own code is [MIT](LICENSE). The plugin's release zip also ships
+the libraries in `plugin/vendor/`, which keep their own licences:
+phpMyAdmin's sql-parser is GPL-2.0-or-later and symfony/polyfill-mbstring is
+MIT. So the zip as a whole is distributed under the GPL-2.0-or-later, like
+the WordPress plugins it sits beside.

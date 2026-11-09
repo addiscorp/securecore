@@ -1,7 +1,7 @@
 {
     "name": "addiscorp/securecore-plugin",
     "description": "SecureCore WordPress plugin: vendored runtime dependencies shipped in the release zip.",
-    "license": "proprietary",
+    "license": "MIT",
     "require": {
         "php": ">=8.2",
         "phpmyadmin/sql-parser": "6.0.1"
