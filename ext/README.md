@@ -931,7 +931,13 @@ through filters, actions and shortcodes, on the front end and the dashboard (Hel
 
 `bench/layer3.sh`: time to first byte of a post that goes through the probe plugin's
 `the_content` filter and one shortcode, the probe isolated vs the same probe in the worker,
-alternating round by round (see the PR for the numbers and the machine).
+alternating round by round. On a 4-thread Linux box shared with CI runners (7 rounds × 50
+requests): median 74.6 ms in the worker [72.5–76.1] vs 84.4 ms isolated [82.8–87.5], **+9.8 ms**
+for one isolated plugin with two calls. That is the snapshot hash, the hand-off, the fork, the
+child's sandbox (gelada builds its Landlock rules per child), loading the plugin and two round
+trips; the spike's +3–5 ms was the fork alone. Building the sandbox rules once in the zygote and
+caching the snapshot hash per worker are the obvious next cuts. A snapshot change costs one
+WordPress boot in a new zygote, on the request that brings it.
 
 ## Tests
 
