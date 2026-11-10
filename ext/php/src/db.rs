@@ -11,7 +11,8 @@
 //! execute calls (`mysqli_stmt_execute`, `PDOStatement::execute`) carry no SQL: the statement was
 //! checked when it was prepared. PHP 8.3 has no `mysqli_send_query`; an async query
 //! (`MYSQLI_ASYNC`) is sent by `mysqli_query`. `select_db` and `change_user` are refused for a
-//! component (they are `USE` and a re-login), and `set_charset` to a charset the parser can't read
+//! component (they are `USE` and a re-login) — except `select_db` of the site's own `DB_NAME`,
+//! which `wpdb::db_connect()` runs on every reconnect — and `set_charset` to a charset the parser can't read
 //! the way MySQL does is refused for everyone.
 //!
 //! **Who.** The code that called the database layer, through core's passthrough helpers
@@ -226,6 +227,13 @@ unsafe fn check(ex: *mut zend_execute_data, hook: &Hook) -> Then {
     let component = who.is_component();
 
     match hook.kind {
+        // Selecting the site's own database (`DB_NAME`, exactly) is no `USE` of anything else: it
+        // is what `wpdb::db_connect()` does on every (re)connect, so refusing it to a component on
+        // the stack took the site down when a plugin's call made `$wpdb->check_connection()`
+        // reconnect (#53 review, finding 5).
+        Kind::NotForComponents if hook.route.ends_with("select_db") && constant("DB_NAME").is_some_and(|n| n == text) => {
+            return Then::Run;
+        }
         Kind::NotForComponents if component => return refuse(l2.mode, &who, hook.route, "statement", "", "-", Then::False),
         Kind::NotForComponents => return Then::Run,
         Kind::Charset if !safe_charset(&text) => return refuse(l2.mode, &who, hook.route, "charset", "", &text, Then::False),

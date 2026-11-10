@@ -8,6 +8,11 @@
 //! `update_option('active_plugins', …)`). While the chain of core frames from the query outward
 //! runs through one of these, the query is charged to the helper's caller, so a plugin can't
 //! launder a write to a protected option, or a read of `user_pass`, through core.
+//!
+//! **The database layer** is recognised by class, not by file: a method of `wpdb` or of a
+//! subclass of it. A `wp-content/db.php` drop-in (HyperDB, LudicrousDB, Query Monitor) subclasses
+//! `wpdb` from outside `class-wpdb.php`; matching the file let its frames stand between the query
+//! and the plugin, so every plugin query counted as core's (#53 review, finding 1).
 
 use securecore_attribution::Component;
 
@@ -21,6 +26,9 @@ pub struct Frame<'a> {
     /// The function the frame is running, lowercase; `None` for top-level code, a closure, or a
     /// method (no helper is a method).
     pub function: Option<&'a str>,
+    /// The frame is the database layer: a method (not a closure) of `wpdb` or a subclass of it,
+    /// wherever the class is defined. The extension reads it from the class entry's parent chain.
+    pub db_layer: bool,
 }
 
 /// Core functions that run SQL, or a table, column or option name, their caller hands them:
@@ -55,17 +63,13 @@ pub const PASSTHROUGH: &[&str] = &[
     "delete_network_option",
 ];
 
-fn is_wpdb(f: &Frame<'_>) -> bool {
-    f.component == Component::Core && f.file.ends_with("/wp-includes/class-wpdb.php")
-}
-
 fn is_passthrough(f: &Frame<'_>) -> bool {
     f.component == Component::Core && f.function.is_some_and(|n| PASSTHROUGH.contains(&n))
 }
 
 /// The component a query is charged to, from the user frames that issued it (innermost first).
 pub fn charged(frames: &[Frame<'_>]) -> Component {
-    let mut i = frames.iter().position(|f| !is_wpdb(f)).unwrap_or(frames.len());
+    let mut i = frames.iter().position(|f| !f.db_layer).unwrap_or(frames.len());
     let Some(first) = frames.get(i) else { return Component::Core };
     if first.component != Component::Core {
         // The component's own SQL: `$wpdb->query(...)` in its file, or its own mysqli / PDO.
@@ -95,12 +99,38 @@ mod tests {
 
     const WPDB: &str = "/var/www/html/wp-includes/class-wpdb.php";
 
+    /// A core frame; one in class-wpdb.php is a `wpdb` method, so it is the database layer.
     fn core<'a>(file: &'a str, function: Option<&'a str>) -> Frame<'a> {
-        Frame { component: Component::Core, file, function }
+        Frame { component: Component::Core, file, function, db_layer: file == WPDB }
     }
 
     fn plugin(slug: &str) -> Frame<'static> {
-        Frame { component: Component::Plugin(slug.into()), file: "/var/www/html/wp-content/plugins/p/p.php", function: None }
+        Frame { component: Component::Plugin(slug.into()), file: "/var/www/html/wp-content/plugins/p/p.php", function: None, db_layer: false }
+    }
+
+    /// A method of a `wpdb` subclass in a `db.php` drop-in: the file is core's (wp-content's
+    /// root), and the frame is the database layer by its class.
+    fn dropin() -> Frame<'static> {
+        Frame { component: Component::Core, file: "/var/www/html/wp-content/db.php", function: None, db_layer: true }
+    }
+
+    #[test]
+    fn a_db_php_drop_in_is_the_database_layer() {
+        // HyperDB / LudicrousDB: the drop-in's own query() sends the SQL; a plugin called it.
+        assert_eq!(charged(&[dropin(), plugin("acme")]), p("acme"));
+        // Query Monitor's shape: the drop-in overrides query() and calls parent::query().
+        let f = [core(WPDB, None), core(WPDB, None), dropin(), plugin("acme")];
+        assert_eq!(charged(&f), p("acme"));
+        // A drop-in that lives in a plugin's folder (a symlinked db.php) is still the DB layer.
+        let qm = Frame { db_layer: true, ..plugin("query-monitor") };
+        assert_eq!(charged(&[core(WPDB, None), qm, plugin("acme")]), p("acme"));
+        // Core's own SQL through the drop-in stays core's, and a passthrough helper still hands
+        // the charge to the plugin that called it.
+        let f = [core(WPDB, None), dropin(), core("/var/www/html/wp-includes/class-wp-user.php", Some("get_data_by")), plugin("acme")];
+        assert_eq!(charged(&f), Component::Core);
+        let opt = "/var/www/html/wp-includes/option.php";
+        let f = [dropin(), core(opt, Some("update_option")), plugin("acme")];
+        assert_eq!(charged(&f), p("acme"));
     }
 
     fn p(slug: &str) -> Component {

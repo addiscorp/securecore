@@ -6,6 +6,36 @@
  * "<route>|<case>=RAN:<errno>" when it reached the server (whatever the server then said).
  */
 
+// ?sc_db=dropin: with the db.php drop-in (test/ext/db-dropin.php) installed, the plugin's SQL
+// through the drop-in's own methods, printed as "dropin-query|<case>" (its query(), which calls
+// parent::query()) and "dropin-send|<case>" (its sc_send(), which sends the SQL itself).
+if (($_GET['sc_db'] ?? '') === 'dropin') {
+    add_action('init', static function (): void {
+        global $wpdb;
+        header('Content-Type: text/plain');
+        $p = $wpdb->prefix;
+        echo 'dropin|class=', get_class($wpdb), "\n";
+        $cases = [
+            'own-select' => "SELECT COUNT(*) FROM {$p}securecore_db_probe",
+            'user-pass'  => "SELECT user_pass FROM {$p}users LIMIT 1",
+            'core-posts' => "SELECT ID FROM {$p}posts LIMIT 1",
+        ];
+        $wpdb->suppress_errors(true);
+        foreach ($cases as $case => $sql) {
+            $r = $wpdb->query($sql);
+            echo "dropin-query|$case=", ($r === false && str_contains($wpdb->last_error, 'securecore')) ? 'BLOCKED' : 'RAN:0', "\n";
+            if (method_exists($wpdb, 'sc_send')) {
+                $r = $wpdb->sc_send($sql);
+                $err = mysqli_error($wpdb->dbh);
+                echo "dropin-send|$case=", ($r === false && str_contains($err, 'securecore')) ? 'BLOCKED' : 'RAN:' . mysqli_errno($wpdb->dbh), "\n";
+            }
+        }
+        echo "DONE\n";
+        exit;
+    }, 1);
+    return;
+}
+
 if (($_GET['sc_db'] ?? '') !== 'run') {
     return;
 }
@@ -173,7 +203,10 @@ add_action('init', static function (): void {
     $wpdb->suppress_errors(false);
 
     // Not queries: USE and a re-login are refused for a component, and an unsafe charset for all.
-    $out[] = 'select_db|use=' . (mysqli_select_db($own, DB_NAME) ? 'RAN:0' : 'BLOCKED');
+    // USE of another database is refused; re-selecting the site's own (what wpdb does on every
+    // reconnect) is not.
+    $out[] = 'select_db|use=' . (mysqli_select_db($own, 'information_schema') ? 'RAN:0' : 'BLOCKED');
+    $out[] = 'select_db|own-db=' . (mysqli_select_db($own, DB_NAME) ? 'RAN:0' : 'BLOCKED');
     $out[] = 'set_charset|gbk=' . ($own->set_charset('gbk') ? 'RAN:0' : 'BLOCKED');
     $own->set_charset('utf8mb4');
 

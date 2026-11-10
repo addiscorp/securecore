@@ -3,7 +3,7 @@
 //! process memory; everywhere PHP could look — the constant, the environment, `$_ENV`,
 //! `$_SERVER`, `getenv()`, `phpinfo()` — carries a placeholder. The extension puts the real
 //! value back only at the two points where it is used: inside the database `connect` call, and
-//! inside the native `wp_salt`/`wp_hash` the mu-plugin installs.
+//! inside the native `wp_salt`/`wp_hash` it defines at MINIT ([`define_pluggables`]).
 //!
 //! **Where the values are read (MINIT, in the fpm master before it forks).** For each secret:
 //! its value comes from the mapped environment variable (`env`), or from `vault.from` — the
@@ -25,7 +25,7 @@
 //! **Where the value is used.** `mysqli_connect`, `mysqli_real_connect`, `new mysqli` and
 //! `new PDO` get the placeholder swapped for the real password inside the handler, before the
 //! engine's own function runs, so the real value reaches libmysql/PDO and never a PHP zval the
-//! caller keeps. `wp_salt`/`wp_hash` (native, [`securecore_config::salt`]) compute over the real
+//! caller keeps — and only for core, to exactly the configured DB host and port or socket. `wp_salt`/`wp_hash` (native, [`securecore_config::salt`]) compute over the real
 //! keys, so the HMAC key never becomes a PHP value either.
 //!
 //! The vault is not a policy: it works in `log` mode as in `enforce`, and with no `vault` in the
@@ -33,19 +33,21 @@
 //! MINIT), which [`securecore_config::Reloader`] reports as `restart_needed`.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ext_php_rs::ffi::{
-    zend_execute_data, zend_function, zend_hash_str_find_ptr_lc, zval,
+    MODULE_PERSISTENT, zend_class_entry, zend_execute_data, zend_function, zend_hash_str_find_ptr_lc, zval, HashTable,
 };
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::Zval;
-use securecore_attribution::{Component, Rule};
+use ext_php_rs::zend::FunctionEntry;
+use securecore_attribution::Component;
+use securecore_config::dbhost::{self, DbTarget, Defaults, Endpoint};
 use securecore_config::salt::{self, Secrets};
-use securecore_config::{Config, Mode, Secret, Source};
+use securecore_config::{App, Config, Mode, Secret, Source};
 
 /// The placeholder a secret's real value is replaced by, everywhere PHP can see. Unique per
 /// secret (it carries the constant name), so the point of use knows which value to restore.
@@ -298,39 +300,57 @@ unsafe extern "C" {
 /// A Zend internal-function handler.
 pub(crate) type Zif = unsafe extern "C" fn(*mut zend_execute_data, *mut zval);
 
-/// Where a connect function carries the host to compare against the configured DB host: a plain
-/// argument (mysqli), or inside the PDO DSN (`host=…`).
+/// Where a connect function says where it connects, to compare against the configured DB host.
 #[derive(Clone, Copy)]
-enum HostArg {
-    /// The host is argument `n` (1-based).
-    Arg(u32),
-    /// The host is `host=` inside the DSN at argument `n`.
+enum Target {
+    /// mysqli: the host, port and socket arguments (1-based); what is unset comes from mysqli's
+    /// ini defaults (`mysqli.default_host` / `_port` / `_socket`).
+    Mysqli { host: u32, port: u32, socket: u32 },
+    /// PDO: `host=`, `port=` and `unix_socket=` inside the DSN at argument `n`; what is unset is
+    /// pdo_mysql's `localhost` / 3306.
     Dsn(u32),
 }
 
 /// A connect boundary where the DB password placeholder may be restored: which argument is the
-/// password, and where its host is.
+/// password, and where the connection goes.
 #[derive(Clone, Copy)]
 struct Swap {
     password_arg: u32,
-    host: HostArg,
+    target: Target,
 }
+
+/// `mysqli_connect` / `new mysqli` / `mysqli::real_connect`: `(host, user, password, db, port,
+/// socket)`.
+const MYSQLI: Swap = Swap { password_arg: 3, target: Target::Mysqli { host: 1, port: 5, socket: 6 } };
 
 /// Global functions we override. `getenv`/`define` have no connect swap; the mysqli/PDO
 /// constructors are handled as methods.
 const FUNCS: &[(&str, Option<Swap>)] = &[
     ("getenv", None),
     ("define", None),
-    ("mysqli_connect", Some(Swap { password_arg: 3, host: HostArg::Arg(1) })),
-    ("mysqli_real_connect", Some(Swap { password_arg: 4, host: HostArg::Arg(2) })),
+    ("mysqli_connect", Some(MYSQLI)),
+    // `mysqli_real_connect($link, host, user, password, db, port, socket, flags)`.
+    ("mysqli_real_connect", Some(Swap { password_arg: 4, target: Target::Mysqli { host: 2, port: 6, socket: 7 } })),
 ];
 /// Methods we override: `(class, method, swap)`. `mysqli::real_connect` has no link argument, so
-/// its host/password are one position earlier than the procedural `mysqli_real_connect`.
+/// its arguments are one position earlier than the procedural `mysqli_real_connect`.
 const METHODS: &[(&str, &str, Swap)] = &[
-    ("mysqli", "__construct", Swap { password_arg: 3, host: HostArg::Arg(1) }),
-    ("mysqli", "real_connect", Swap { password_arg: 3, host: HostArg::Arg(1) }),
-    ("pdo", "__construct", Swap { password_arg: 3, host: HostArg::Dsn(1) }),
+    ("mysqli", "__construct", MYSQLI),
+    ("mysqli", "real_connect", MYSQLI),
+    ("pdo", "__construct", Swap { password_arg: 3, target: Target::Dsn(1) }),
 ];
+
+/// Whether the internal call running at `ex` is a database connect — one of the routes above that
+/// carries a DB password. The host policy ([`crate::hosts`]) asks this to treat the connection the
+/// way the vault does ([`crate::attribution::db_connector`]).
+///
+/// # Safety
+/// `ex` is a live call frame (or NULL).
+pub(crate) unsafe fn is_db_connect(ex: *const zend_execute_data) -> bool {
+    let Some(key) = (unsafe { dispatch_key(ex.cast_mut()) }) else { return false };
+    FUNCS.iter().any(|&(name, swap)| swap.is_some() && name == key)
+        || METHODS.iter().any(|&(class, method, _)| key.split_once("::") == Some((class, method)))
+}
 
 /// The handlers we replaced, by a key (`"func"` or `"class::method"`), with the connect swap.
 struct Override {
@@ -464,13 +484,14 @@ pub(crate) unsafe fn dispatch_key(ex: *mut zend_execute_data) -> Option<String> 
 /// Restore the real DB password at a connect boundary — but only when all three hold, because the
 /// real value is about to leave the process. One: the password argument is the **DB password's**
 /// placeholder, never a salt's (a salt placeholder handed to a connect as the password is refused,
-/// not swapped). Two: the **caller is core**, by E2a's `frame` attribution — the innermost
-/// user-code frame that calls connect, so WordPress's `wpdb` counts and a plugin's own `new
-/// mysqli` does not. Three: the **host is the configured DB host** (`layer2.vault.dbHost`, or
-/// WordPress's `DB_HOST` constant), compared after normalising the `p:` prefix, a `:port` and a
-/// socket path. Otherwise the placeholder is left in place (so the connection fails) and the
-/// refusal is recorded. This holds in `log` mode too: the vault is not a policy, and leaking a
-/// secret is never "log and allow".
+/// not swapped). Two: the **connector is core**, by [`crate::attribution::db_connector`] — the
+/// database layer (`wpdb` or a subclass) or core code calling connect, never a component's own `new
+/// mysqli`. Three: the connection goes **exactly where the configured DB host says** — the same
+/// host and the same port or socket ([`securecore_config::dbhost`]), against `layer2.vault.dbHost`
+/// or WordPress's `DB_HOST` constant, with MySQL's defaults where either leaves one unset; the
+/// right host on another port is another server. Otherwise the placeholder is left in place (so
+/// the connection fails) and the refusal is recorded. This holds in `log` mode too: the vault is
+/// not a policy, and leaking a secret is never "log and allow".
 ///
 /// # Safety
 /// `ex` is a live connect call frame.
@@ -490,57 +511,128 @@ unsafe fn connect_swap(ex: *mut zend_execute_data, swap: Swap) {
         return;
     }
 
-    // 2. The caller must be core.
+    // 2. The connector must be core.
     let who = unsafe { caller(ex) };
     if who.as_ref() != Some(&Component::Core) {
         refuse("noncore-connect", who, None);
         return;
     }
 
-    // 3. The host must be the configured DB host.
-    let host = unsafe { connect_host(ex, swap.host) };
-    let expected = expected_db_host(v);
-    match (host.as_deref(), expected.as_deref()) {
-        (Some(h), Some(e)) if securecore_config::dbhost::normalize_host(h) == securecore_config::dbhost::normalize_host(e) => {
+    // 3. The connection must go exactly where the configured DB host says.
+    let actual = unsafe { connect_endpoint(ex, swap.target) };
+    let expected = expected_endpoint(v);
+    match (actual, expected) {
+        (Some(a), Some(e)) if a == e => {
             let val = db_val.to_owned();
             if let Some(zv) = unsafe { arg_mut(ex, swap.password_arg) } {
                 let _ = zv.set_string(&val, false);
             }
         }
-        (h, _) => refuse("wrong-host", who, h),
+        (a, _) => refuse("wrong-host", who, a.map(|a| describe(&a)).as_deref()),
     }
 }
 
-/// The component responsible for a connect call, by E2a's `frame` rule (the innermost user-code
-/// frame that made the call): WordPress's `wpdb` is core; a plugin's own connect is the plugin.
+/// `host:port` or `host:socket`, for the refusal line.
+fn describe(e: &Endpoint) -> String {
+    match &e.socket {
+        Some(s) => format!("{}:{} {s}", e.host, e.port),
+        None => format!("{}:{}", e.host, e.port),
+    }
+}
+
+/// Who is connecting, for a connect call: [`crate::attribution::db_connector`], the rule the host
+/// policy uses too.
 ///
 /// # Safety
 /// `ex` is a live call frame.
 unsafe fn caller(ex: *mut zend_execute_data) -> Option<Component> {
-    let from = unsafe { ex.as_ref() }?.prev_execute_data;
     let loaded = crate::live_arc()?;
-    Some(crate::attribution::responsible(Rule::Frame, &loaded.root, from))
+    Some(crate::attribution::db_connector(&loaded.root, ex))
 }
 
-/// The host a connect call targets: a plain argument (mysqli), or `host=` from the PDO DSN.
+/// Where a connect call really goes: its host, port and socket, with what it leaves unset filled
+/// in the way the driver fills it — mysqli from its ini defaults as they are **now** (a component
+/// can `ini_set('mysqli.default_port', …)` and pass no port), PDO from pdo_mysql's built-ins.
+/// `None` when it can't be told (a non-integer port, a DSN that isn't a plain `mysql:` one).
 ///
 /// # Safety
 /// `ex` is a live connect call frame.
-unsafe fn connect_host(ex: *mut zend_execute_data, host: HostArg) -> Option<String> {
-    match host {
-        HostArg::Arg(n) => unsafe { arg(ex, n) }.and_then(Zval::str).map(str::to_owned),
-        HostArg::Dsn(n) => {
+unsafe fn connect_endpoint(ex: *mut zend_execute_data, target: Target) -> Option<Endpoint> {
+    match target {
+        Target::Mysqli { host, port, socket } => {
+            // An absent or null argument is unset; anything else must be what it says it is.
+            let opt = |n: u32| unsafe { arg(ex, n) }.filter(|z| !z.is_null());
+            let host = match opt(host) {
+                None => String::new(),
+                Some(z) => z.str()?.to_owned(),
+            };
+            let port = match opt(port) {
+                None => None,
+                Some(z) => Some(u16::try_from(z.long()?).ok()?),
+            };
+            let socket = match opt(socket) {
+                None => None,
+                Some(z) => Some(z.str()?.to_owned()),
+            };
+            let defaults = MysqliIni::read(false);
+            Some(DbTarget { host, port, socket }.resolve(&defaults.as_defaults()))
+        }
+        Target::Dsn(n) => {
             let dsn = unsafe { arg(ex, n) }.and_then(Zval::str)?;
-            securecore_config::dbhost::dsn_host(dsn)
+            Some(dbhost::parse_dsn(dsn)?.resolve(&Defaults::MYSQL))
         }
     }
 }
 
-/// The DB host the password may be sent to: `layer2.vault.dbHost`, or WordPress's `DB_HOST`
-/// constant (the way WordPress reads it). `None` when neither is known — the swap is then refused,
-/// never guessed.
-fn expected_db_host(v: &Vault) -> Option<String> {
-    v.db_host.clone().or_else(|| constant("DB_HOST"))
+/// Where the DB password may be sent: `layer2.vault.dbHost`, or WordPress's `DB_HOST` constant,
+/// read the way WordPress reads it, with what it leaves unset taken from mysqli's ini defaults as
+/// php.ini set them (never a value a component changed at runtime). `None` when neither is known
+/// — the swap is then refused, never guessed.
+fn expected_endpoint(v: &Vault) -> Option<Endpoint> {
+    let configured = v.db_host.clone().or_else(|| constant("DB_HOST"))?;
+    let defaults = MysqliIni::read(true);
+    Some(dbhost::parse_db_host(&configured)?.resolve(&defaults.as_defaults()))
+}
+
+/// mysqli's connection defaults from its ini settings (`mysqli.default_host`, `_port`, `_socket`;
+/// all PHP_INI_ALL), as they are now or as php.ini set them (`orig`).
+struct MysqliIni {
+    host: String,
+    port: u16,
+    socket: Option<String>,
+}
+
+impl MysqliIni {
+    fn read(orig: bool) -> MysqliIni {
+        let port = ini_long("mysqli.default_port", orig);
+        MysqliIni {
+            host: ini_string("mysqli.default_host", orig).unwrap_or_default(),
+            // Out of range can't be a port the driver uses; MySQL's default stands in, and a
+            // mismatch with the other side then refuses.
+            port: u16::try_from(port).unwrap_or(0),
+            socket: ini_string("mysqli.default_socket", orig).filter(|s| !s.is_empty()),
+        }
+    }
+
+    fn as_defaults(&self) -> Defaults<'_> {
+        Defaults { host: &self.host, port: self.port, socket: self.socket.as_deref() }
+    }
+}
+
+fn ini_long(name: &str, orig: bool) -> i64 {
+    // SAFETY: a byte string and its length; the engine reads the ini table (0 when unset).
+    unsafe { zend_ini_long(name.as_ptr().cast(), name.len(), c_int::from(orig)) }
+}
+
+fn ini_string(name: &str, orig: bool) -> Option<String> {
+    let mut exists = false;
+    // SAFETY: as above; the returned string (if any) is owned by the ini entry.
+    let p = unsafe { zend_ini_string_ex(name.as_ptr().cast(), name.len(), c_int::from(orig), &raw mut exists) };
+    if !exists || p.is_null() {
+        return None;
+    }
+    // SAFETY: a NUL-terminated ini value.
+    unsafe { CStr::from_ptr(p) }.to_str().ok().map(str::to_owned)
 }
 
 /// A PHP constant's string value, or `None` when it is not defined.
@@ -554,6 +646,13 @@ fn constant(name: &str) -> Option<String> {
 unsafe extern "C" {
     /// Zend/zend_constants.h: the constant's value, or NULL when it is not defined.
     fn zend_get_constant_str(name: *const c_char, name_len: usize) -> *mut zval;
+    /// Zend/zend_ini.h: an ini setting's value now, or as php.ini set it (`orig`); 0 when unset.
+    fn zend_ini_long(name: *const c_char, name_length: usize, orig: c_int) -> i64;
+    /// Zend/zend_ini.h: as above for a string; NULL (and `exists` false) when unset.
+    fn zend_ini_string_ex(name: *const c_char, name_length: usize, orig: c_int, exists: *mut bool) -> *mut c_char;
+    /// Zend/zend_API.h: register internal functions (`functions`, NULL-terminated) into
+    /// `function_table` (NULL = CG(function_table)) for the module being started.
+    fn zend_register_functions(scope: *mut zend_class_entry, functions: *const FunctionEntry, function_table: *mut HashTable, type_: c_int) -> c_int;
 }
 
 /// Record a refused password swap (both modes): the reason, the component (if known) and the host
@@ -649,6 +748,68 @@ pub(crate) fn register(module: ModuleBuilder) -> ModuleBuilder {
     module
         .function(wrap_function!(securecore_vault_salt))
         .function(wrap_function!(securecore_vault_hash))
+}
+
+/// WordPress's key and salt constants: what `wp_salt()` / `wp_hash()` key from.
+const SALT_NAMES: [&str; 8] =
+    ["AUTH_KEY", "SECURE_AUTH_KEY", "LOGGED_IN_KEY", "NONCE_KEY", "AUTH_SALT", "SECURE_AUTH_SALT", "LOGGED_IN_SALT", "NONCE_SALT"];
+
+/// WordPress's `wp_salt($scheme = 'auth')`, native: the scheme's token, never the key (see
+/// [`securecore_vault_salt`]).
+#[php_function]
+#[php(name = "wp_salt")]
+pub fn securecore_native_wp_salt(scheme: Option<String>) -> String {
+    securecore_vault_salt(scheme)
+}
+
+/// WordPress's `wp_hash($data, $scheme = 'auth', $algo = 'md5')`, native: `hash_hmac($algo,
+/// $data, wp_salt($scheme))` over the real keys ([`securecore_vault_hash`]). `$data` is taken as
+/// PHP's string conversion of whatever it is, as stock `hash_hmac()` would.
+#[php_function]
+#[php(name = "wp_hash")]
+pub fn securecore_native_wp_hash(data: &Zval, scheme: Option<String>, algo: Option<String>) -> String {
+    securecore_vault_hash(data.coerce_to_string().unwrap_or_default(), scheme, algo)
+}
+
+/// At MINIT, after [`startup`]: when layer 2 is for WordPress and the vault holds its keys and
+/// salts, define `wp_salt()` and `wp_hash()` natively, before any PHP runs. pluggable.php then
+/// skips its own (`function_exists`), and no mu-plugin can define them first: with the
+/// definitions in a mu-plugin, a missing file or an earlier mu-plugin's `wp_salt` left WordPress
+/// keying its HMACs with the public placeholders (#53 review, finding 4). Returns whether they were
+/// defined; an error (fail closed) when the vault holds only some of the eight constants, which
+/// would leave a scheme keyed with a placeholder.
+pub(crate) fn define_pluggables(config: &Config) -> Result<bool, String> {
+    let Some(v) = vault() else { return Ok(false) };
+    if config.layer2.app != Some(App::Wordpress) {
+        return Ok(false);
+    }
+    let missing: Vec<&str> = SALT_NAMES.iter().copied().filter(|n| !v.by_name.contains_key(*n)).collect();
+    if missing.len() == SALT_NAMES.len() {
+        // Only the DB password is vaulted: the salts are ordinary constants and stock wp_salt()
+        // reads them.
+        return Ok(false);
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "layer2.vault: holds some of WordPress's keys and salts but not {}; list all eight or none",
+            missing.join(", ")
+        ));
+    }
+    let mut entries = Vec::with_capacity(3);
+    for builder in [wrap_function!(securecore_native_wp_salt), wrap_function!(securecore_native_wp_hash)] {
+        let (entry, args) = builder.build().map_err(|e| format!("layer2.vault: wp_salt/wp_hash: {e}"))?;
+        // The engine borrows the argument info for the life of the process.
+        Box::leak(args);
+        entries.push(entry);
+    }
+    entries.push(FunctionEntry::end());
+    let entries: &'static [FunctionEntry] = Box::leak(entries.into_boxed_slice());
+    // SAFETY: MINIT, with this module current; a NULL-terminated table that lives forever.
+    let rc = unsafe { zend_register_functions(std::ptr::null_mut(), entries.as_ptr(), std::ptr::null_mut(), MODULE_PERSISTENT as c_int) };
+    if rc != 0 {
+        return Err("layer2.vault: could not define wp_salt()/wp_hash() (already defined by another extension?)".to_owned());
+    }
+    Ok(true)
 }
 
 // --- argument access (mirrors attribution::arg, with a mutable form) -----------------------------

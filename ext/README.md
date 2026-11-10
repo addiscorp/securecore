@@ -45,7 +45,7 @@ Every release ships, in `securecore-releases/<version>/ext/` (APS 12):
 |---|---|
 | `securecore-php<v>-<ts>-linux-<arch>.so` | the extension, for PHP 8.1, 8.2, 8.3, 8.4 × `nts`/`zts` × `x86_64`/`arm64`: 16 cells |
 | `securecore-fpm-linux-<arch>` | the layer-1 launcher, one per architecture (plain Rust: every cell builds the same bytes, and the release refuses to ship if they differ) |
-| `securecore-vault.php` | the mu-plugin |
+| `securecore-vault.php` | the mu-plugin, now empty: the extension defines `wp_salt`/`wp_hash` itself |
 | `securecore.schema.json` | the JSON Schema for `securecore.json` |
 
 and `release.json` lists every file in the release with its sha256 and size.
@@ -253,22 +253,34 @@ means the swap is refused.
     connect boundary; a salt placeholder handed to a connect as the password is refused, not
     swapped (otherwise a component could read `new mysqli('attacker.example', 'x',
     SECURE_AUTH_KEY_placeholder)` and collect the salt).
-  - **the caller is core** — by E2a's `frame` attribution (the innermost user-code frame that
-    makes the call), so WordPress's `wpdb` counts and a plugin's own `new mysqli` does not.
-  - **the host is the configured DB host** — `layer2.vault.dbHost`, or the `DB_HOST` constant —
-    compared after normalising the `p:` prefix, a `:port` and a socket path
-    ([`config/src/dbhost.rs`](config/src/dbhost.rs)). A component pointing a connect at its own
-    server never matches, so the password is not sent there even over a cleartext or
-    RSA-under-attacker-key auth exchange.
-- **Salts:** the mu-plugin `securecore-vault.php` (installed in `wp-content/mu-plugins`, so it
-  loads before `pluggable.php`) defines `wp_salt()` and `wp_hash()` over the extension's native
-  `securecore_vault_salt`/`securecore_vault_hash`. `wp_hash()` computes `hash_hmac($algo, $data,
+  - **the connector is core** — by `attribution::db_connector`, the one rule the vault and the
+    host policy share: the code that called connect is the database layer (a method of `wpdb` or
+    of a subclass of it, such as a `db.php` drop-in) or core code, so WordPress's `wpdb` counts
+    and a plugin's own `new mysqli` does not.
+  - **the connection goes exactly where the configured DB host says** — `layer2.vault.dbHost`, or
+    the `DB_HOST` constant, read the way WordPress reads it — the same host **and** the same port
+    or socket ([`config/src/dbhost.rs`](config/src/dbhost.rs)). What a side leaves unset is filled
+    the way the driver fills it: mysqli from `mysqli.default_host` / `_port` / `_socket` (the
+    connect from their values now, the configured host from php.ini's), PDO from `localhost` /
+    3306, MySQL's default port 3306 underneath. The right host on another port is another server
+    (`new wpdb(DB_USER, DB_PASSWORD, DB_NAME, 'db:3307')` gets the placeholder), and a component
+    pointing a connect at its own server never matches, so the password is not sent there even
+    over a cleartext or RSA-under-attacker-key auth exchange. A PDO DSN that is not a plain
+    `mysql:` one (`uri:`, an ini alias) or names a key twice never matches.
+- **Salts:** when `layer2.app` is `wordpress` and the vault holds WordPress's eight keys and salts,
+  the extension defines `wp_salt()` and `wp_hash()` itself, natively, at module startup — before
+  any PHP runs, so `pluggable.php` skips its own and no mu-plugin can define them first (a vault
+  that holds some of the eight but not all refuses to start; one that holds none, only the DB
+  password, leaves WordPress's own). `wp_hash()` computes `hash_hmac($algo, $data,
   wp_salt($scheme))` over the **real** keys inside the extension — byte-identical to stock
   WordPress for the standard key/salt constants — so the HMAC key never becomes a PHP value, while
   login cookies, nonces and password-reset keys keep working. `wp_salt()` returns a scheme token,
   never the key, so a probe that calls it cannot recover the key. The reconstruction and hashing
   are one plain-Rust function ([`config/src/salt.rs`](config/src/salt.rs)), shared by the extension
-  and the host tests.
+  and the host tests; the same functions stay available as `securecore_vault_salt` /
+  `securecore_vault_hash`. The mu-plugin `securecore-vault.php` that used to define them is now
+  empty (kept so an install that copies it is harmless): defined in PHP, they failed open when
+  the file was missing or an earlier mu-plugin defined `wp_salt` first.
 
 The vault is **not a policy**: it works in `log` mode exactly as in `enforce` (it is where the
 value lives, not what is allowed), and with no `vault` in the config it does nothing.
@@ -373,7 +385,9 @@ As internal-function handlers, on the vault's hook mechanism (`vault::hook_with`
 `PDO::query` and `PDO::prepare`. `$wpdb` uses `mysqli_query`. A prepared statement is checked at
 prepare: the execute calls carry no SQL. PHP 8.3 has no `mysqli_send_query`; an async query is sent
 by `mysqli_query`. `select_db` and `change_user` are refused for a component (`USE` and a
-re-login); `set_charset` to an unsafe charset is refused for everyone. Every connection is checked,
+re-login), except `select_db` of the site's own `DB_NAME` (exactly): `wpdb::db_connect()` runs it on
+every reconnect, so refusing it killed a `$wpdb->check_connection()` a plugin's call triggered;
+`set_charset` to an unsafe charset is refused for everyone. Every connection is checked,
 not just `$wpdb`'s.
 
 ### What a refusal does
@@ -417,8 +431,11 @@ measures the page cost against main.
 ### Who a query is charged to
 
 **A database query is charged to whoever called the database layer, because core APIs run their
-own SQL on a plugin's behalf.** That is the innermost frame outside
-`wp-includes/class-wpdb.php` ([`db/src/caller.rs`](db/src/caller.rs), unit-tested):
+own SQL on a plugin's behalf.** That is the innermost frame outside the database layer
+([`db/src/caller.rs`](db/src/caller.rs), unit-tested). The database layer is known by its class,
+not its file: a method (not a closure) of `wpdb` or of a subclass of it, by the class entry's
+parent chain — so a `wp-content/db.php` drop-in (HyperDB, LudicrousDB, Query Monitor) is the
+database layer too, and a plugin's query through it is still the plugin's:
 
 - a component's own SQL is the component's: `$wpdb->query(...)` in its file, or its own mysqli
   or PDO connection;
@@ -698,7 +715,11 @@ allowlist cannot see; layer 1's port rules (no internal ports open) are its back
 not appear in `core.hosts`, and a vaulted password still connects. The DB goes through the transport
 factory (mysqlnd), where a connection attributed to core and aimed at `DB_HOST` is passed through
 before the allowlist is consulted; a *component* reaching the DB host directly is still checked
-against its own `hosts`.
+against its own `hosts`. A database connect (`mysqli_connect`, `mysqli_real_connect`, `new mysqli`,
+`mysqli::real_connect`, `new PDO`) is attributed by the vault's rule, `attribution::db_connector`,
+not by the configured rule: the database layer (`wpdb` or a subclass) connecting is core even with
+a plugin further out on the stack, so a `wpdb::check_connection()` reconnect a plugin's call
+triggers is never refused as the plugin's.
 
 `mode` decides the effect, as everywhere: `enforce` refuses the connection the way PHP fails a refused
 connection — the stream opener and the socket functions return `false` (and Requests turns that into a

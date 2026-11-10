@@ -12,7 +12,11 @@
 #   2. log mode: the same — the vault is where the value lives, not a policy, so it hides the
 #      secret in log mode too;
 #   3. the vault keeps WordPress working: the DB connects, and nonces, auth cookies and password
-#      reset round-trip; wp_hash is byte-identical to a known-salt HMAC;
+#      reset round-trip; wp_hash is byte-identical to a known-salt HMAC — with no vault mu-plugin
+#      installed, as the extension defines wp_salt/wp_hash itself;
+#   3b–3d. the connect boundary: a plugin, a foreign host, a salt placeholder and the DB host on
+#      another port all get the placeholder, never the value; an earlier mu-plugin defining
+#      wp_salt/wp_hash can't take them over;
 #   4. the backstop masks every env var whose value equals a secret, logging only the names;
 #   5. revert proof: with the vault removed from the config, and with the extension unloaded, the
 #      probe DOES see the real secret;
@@ -56,8 +60,10 @@ now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 wait_200() { i=0; until [ "$(code /)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 60 ] || return 1; sleep 1; done; }
 put_live() { compose exec -T php sh -c "cat > $conf.new && mv $conf.new $conf" < "$1"; }
 phplog() { compose logs --no-log-prefix --since "$1" php 2>&1; }
-# hmac_md5 <key>: HMAC-MD5 of "sc-vault-probe" (what the probe hashes), lowercase hex.
-hmac_md5() { printf 'sc-vault-probe' | openssl dgst -md5 -hmac "$1" | sed 's/.*= *//'; }
+# hmac_md5 <key>: HMAC-MD5 of "sc-vault-probe" (what the probe hashes), lowercase hex — stock PHP's
+# hash_hmac with no extension and no ini (php -n), so it needs nothing on the Docker host (openssl
+# is not on every one).
+hmac_md5() { compose exec -T php php -n -r 'echo hash_hmac("md5", "sc-vault-probe", $argv[1]);' "$1"; }
 
 [ "$(code /)" = 200 ] || { echo "FAIL the extension stack is not up on $base: run test/ext-config.sh first"; exit 1; }
 
@@ -81,32 +87,48 @@ in_php "mkdir -p $(dirname "$vaultfile")"
 compose cp "$dir/vault.json" "php:$vaultfile" >>"$dir/cp.log" 2>&1
 in_php "chown root:root $vaultfile && chmod 400 $vaultfile"
 
-# The vault mu-plugin (native wp_salt/wp_hash), the two read probes, the connect probes and the
-# fake MySQL server.
+# The two read probes, the connect probes and the fake MySQL server. No vault mu-plugin: the
+# extension defines wp_salt/wp_hash itself (#53 review, finding 4), so the site works without it.
 connect_plugin=$html/wp-content/plugins/securecore-vault-connect
 fakescript=/tmp/sc-fakemysql.php
 fakecap=/tmp/sc-fake.bin
 fakepid=/tmp/sc-fake.pid
-in_php "mkdir -p $plugin $connect_plugin $html/wp-content/mu-plugins"
-compose cp ext/mu-plugin/securecore-vault.php "php:$muplugin" >>"$dir/cp.log" 2>&1
+earlymu=$html/wp-content/mu-plugins/0-sc-early-salt.php
+in_php "mkdir -p $plugin $connect_plugin $html/wp-content/mu-plugins && rm -f $muplugin"
 compose cp test/ext/vault/plugin.php "php:$plugin/securecore-vault-probe.php" >>"$dir/cp.log" 2>&1
 compose cp test/ext/vault/routine.php "php:$html/sc-vault-routine.php" >>"$dir/cp.log" 2>&1
 compose cp test/ext/vault/core.php "php:$html/sc-vault-core.php" >>"$dir/cp.log" 2>&1
 compose cp test/ext/vault/connect-plugin.php "php:$connect_plugin/securecore-vault-connect.php" >>"$dir/cp.log" 2>&1
 compose cp test/ext/vault/connect-core.php "php:$html/sc-vault-connect-core.php" >>"$dir/cp.log" 2>&1
 compose cp test/ext/vault/fakemysql.php "php:$fakescript" >>"$dir/cp.log" 2>&1
-in_php "chown -R www-data:www-data $plugin $connect_plugin $muplugin $html/sc-vault-routine.php $html/sc-vault-core.php $html/sc-vault-connect-core.php"
+in_php "chown -R www-data:www-data $plugin $connect_plugin $html/sc-vault-routine.php $html/sc-vault-core.php $html/sc-vault-connect-core.php"
 wp plugin activate securecore-vault-probe securecore-vault-connect >/dev/null
 
 # fake_start / fake_stop: a fake MySQL server (cleartext-forcing) on $fakeport, by PID.
 fakeport=33070
 fake_start() { in_php "rm -f $fakecap; php $fakescript $fakeport $fakecap >/tmp/sc-fake.log 2>&1 & echo \$! > $fakepid"; sleep 1; }
 fake_stop() { in_php "[ -f $fakepid ] && kill \$(cat $fakepid) 2>/dev/null; rm -f $fakepid"; }
+# fakedb_start / fakedb_stop: the same fake server ON THE DB HOST, on another port: a container of
+# the php image (php -n: no extension, no config) sharing the db container's network namespace, so
+# "db:<port>" reaches it. Its capture is read with fakedb_capture.
+fakedb=${project}-fakedb
+fakedbport=33071
+fakedb_start() {
+  docker rm -f "$fakedb" >/dev/null 2>&1
+  docker create --name "$fakedb" --network "container:$(compose ps -q db)" --entrypoint php \
+    "$(docker inspect -f '{{.Image}}' "$(compose ps -q php)")" -n /fake.php "$fakedbport" /cap.bin >>"$dir/fakedb.log" 2>&1 &&
+    docker cp test/ext/vault/fakemysql.php "$fakedb:/fake.php" >>"$dir/fakedb.log" 2>&1 &&
+    docker start "$fakedb" >>"$dir/fakedb.log" 2>&1
+  sleep 1
+}
+fakedb_capture() { docker exec "$fakedb" cat /cap.bin 2>/dev/null; }
+fakedb_stop() { docker rm -f "$fakedb" >/dev/null 2>&1; }
 
 cleanup() {
   fake_stop
   wp plugin deactivate securecore-vault-probe securecore-vault-connect classic-editor wordpress-seo contact-form-7 >/dev/null 2>&1
-  in_php "rm -rf $plugin $connect_plugin $muplugin $html/sc-vault-routine.php $html/sc-vault-core.php $html/sc-vault-connect-core.php $html/sc-lit-config.php $fakescript $fakecap $fakepid"
+  fakedb_stop
+  in_php "rm -rf $plugin $connect_plugin $muplugin $earlymu $html/sc-vault-routine.php $html/sc-vault-core.php $html/sc-vault-connect-core.php $html/sc-lit-config.php $fakescript $fakecap $fakepid"
   compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
   # Restore the extension ini in case a revert step changed it, then restart.
   compose cp docker/securecore.ini "php:$ini" >/dev/null 2>&1
@@ -130,12 +152,15 @@ vault_cfg() { # $1 = mode
         "AUTH_SALT", "SECURE_AUTH_SALT", "LOGGED_IN_SALT", "NONCE_SALT"
       ]
     },
-    "default": {}, "components": {}
+    "core": { "hosts": ["127.0.0.1"] },
+    "default": { "hosts": ["127.0.0.1", "db"] }, "components": {}
   },
   "layer3": { "enabled": false }
 }
 JSON
 }
+# The hosts (E5) let the probes reach the fake server (127.0.0.1) and, for the plugins, the DB host,
+# so a connection that fails there fails because of the vault, not the host policy.
 
 # apply <mode>: put the config and restart php-fpm (the vault is read at MINIT).
 apply() {
@@ -176,6 +201,7 @@ for mode in enforce log; do
     is "$(field "$f" const_auth_key)" "'securecore-vault:AUTH_KEY'" "$mode $who: AUTH_KEY constant is the placeholder"
     is "$(field "$f" wpdb_dbpassword)" "'securecore-vault:DB_PASSWORD'" "$mode $who: \$wpdb->dbpassword is the placeholder"
     is "$(field "$f" wp_salt_auth)" "'securecore-vault-salt:auth'" "$mode $who: wp_salt('auth') is a token, not the key"
+    is "$(field "$f" wp_salt_defined_by)/$(field "$f" wp_hash_defined_by)" extension/extension "$mode $who: wp_salt/wp_hash are the extension's, with no vault mu-plugin installed"
   done
 
   # 3. the vault keeps WordPress working.
@@ -223,6 +249,50 @@ for mode in enforce log; do
   for sec in $secrets; do if phplog "$t" | grep -qF "$sec"; then leak="$leak $sec"; fi; done
   is "$leak" "" "$mode: the refusal log carries no real value"
 done
+
+# --- 3c. the right DB host on another port (#53 review, finding 3) ---------------------------
+# A plugin builds its own wpdb to DB_HOST:<other port>, where a fake server listens on the DB host
+# itself. wpdb connecting is core (the connector rule), so only the host gate stands between the
+# password and that server: host AND port must match, so it gets the placeholder.
+echo "# connect boundary: the DB host on another port"
+apply enforce
+fakedb_start
+t=$(now)
+curl -s "$base/?sc_conn=port&fp=$fakedbport" > "$dir/connect.port"
+sleep 1
+fakedb_capture > "$dir/capture.port"
+fakedb_stop
+is "$(sed -n '1s/^probe=//p' "$dir/connect.port")" connect-port "port: the probe ran"
+if grep -qF 'securecore-vault:DB_PASSWORD' "$dir/capture.port"; then pass "port: the server on db:$fakedbport received the placeholder"; else fail "port: the server on db:$fakedbport received the placeholder" "capture: $(tr -d '\0' < "$dir/capture.port" | tr '\n' ' ') $(cat "$dir/fakedb.log" | tr '\n' ' ')"; fi
+if grep -qF "$db_password" "$dir/capture.port"; then fail "port: the real DB password did not reach db:$fakedbport" "it did"; else pass "port: the real DB password did not reach db:$fakedbport"; fi
+if phplog "$t" | grep -q "vault: refused DB-password swap (wrong-host) for core connecting to \"db:$fakedbport\""; then pass "port: the refusal names the host and port"; else fail "port: the refusal names the host and port" "$(phplog "$t" | grep 'vault:' | tail -1)"; fi
+# Core's own connection (DB_HOST, no port, i.e. 3306) still gets the real password.
+curl -s "$base/sc-vault-core.php" > "$dir/core.port"
+is "$(field "$dir/core.port" db_ok)" true "port: core still connects to the DB with the real value"
+
+# --- 3d. a mu-plugin can't take over wp_salt/wp_hash (#53 review, finding 4) ---------------------
+# An earlier mu-plugin defines wp_salt/wp_hash the way pluggable.php does (if !function_exists),
+# keyed with a value it knows. The extension's definitions exist before any PHP runs, so its
+# functions are never defined and every HMAC still uses the real salts.
+echo "# an earlier mu-plugin defining wp_salt/wp_hash"
+cat > "$dir/early-salt.php" <<'PHP'
+<?php
+// test/ext-vault.sh: an mu-plugin that loads first and tries to own the salted pluggables.
+if (!function_exists('wp_salt')) {
+    function wp_salt($scheme = 'auth') { return 'sc-early-mu-plugin-salt'; }
+}
+if (!function_exists('wp_hash')) {
+    function wp_hash($data, $scheme = 'auth', $algo = 'md5') { return hash_hmac($algo, $data, 'sc-early-mu-plugin-salt'); }
+}
+PHP
+compose cp "$dir/early-salt.php" "php:$earlymu" >>"$dir/cp.log" 2>&1
+in_php "chown www-data:www-data $earlymu"
+curl -s "$base/sc-vault-core.php" > "$dir/core.early"
+in_php "rm -f $earlymu"
+is "$(field "$dir/core.early" wp_salt_defined_by)" extension "early mu-plugin: wp_salt is still the extension's"
+is "$(field "$dir/core.early" wp_salt_auth)" "'securecore-vault-salt:auth'" "early mu-plugin: wp_salt('auth') is the vault's token, not the mu-plugin's"
+is "$(field "$dir/core.early" wp_hash_auth)" "$(hmac_md5 "$auth_secret")" "early mu-plugin: wp_hash('auth') is still keyed with the real salts"
+is "$(field "$dir/core.early" nonce_roundtrip)" 1 "early mu-plugin: nonces still verify"
 
 # 4. the backstop masked the salt env vars (names only), and no value is in the log.
 t=$(now)
