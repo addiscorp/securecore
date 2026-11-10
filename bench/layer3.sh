@@ -7,7 +7,7 @@
 # helper and php-fpm stay up and the sides alternate round by round:
 #   plain     isolate []              the probe runs in the php-fpm worker
 #   isolated  isolate ["sc-l3probe"]  the probe runs in a child of the helper (fork per request)
-# Each side per round: 10 warm-up + N measured sequential requests (curl's time_starttransfer).
+# Each side per round: 40 warm-up (every php-fpm worker reloads the config and warms up) + N measured sequential requests (curl's time_starttransfer).
 # Prints each round's median per side, then the median of the round medians and their range.
 #   DOCKER_CONTEXT=colima bench/layer3.sh [rounds] [requests]     (default 7 rounds, 50 requests)
 set -eu
@@ -37,6 +37,7 @@ cleanup() {
   compose exec -T php sh -c "rm -rf $probe" || true
   compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1 || true
   compose restart php >/dev/null 2>&1 || true
+  i=0; until [ "$(code /)" = 200 ] || [ "$i" -ge 60 ]; do i=$((i + 1)); sleep 1; done
 }
 trap cleanup EXIT
 
@@ -67,7 +68,7 @@ side() {
   sleep 1.3 # > RELOAD_INTERVAL: every worker has the new config
   url="$base/?p=$post"
   curl -s "$url" | grep -q 'class="sc-l3-short">said bench' || { echo "the probe did not render ($1)" >&2; exit 1; }
-  j=0; while [ "$j" -lt 10 ]; do curl -s -o /dev/null "$url"; j=$((j + 1)); done
+  j=0; while [ "$j" -lt 40 ]; do curl -s -o /dev/null "$url"; j=$((j + 1)); done
   : > "$out/layer3-$1.times"
   j=0; while [ "$j" -lt "$n" ]; do
     curl -s -o /dev/null -w '%{http_code} %{time_starttransfer}\n' "$url" >> "$out/layer3-$1.times"
@@ -80,7 +81,8 @@ side() {
 plain="" isolated=""
 r=1
 while [ "$r" -le "$rounds" ]; do
-  a=$(side plain); b=$(side isolated)
+  # Alternate which side goes first, so neither always follows the other's config switch.
+  if [ $((r % 2)) = 1 ]; then a=$(side plain); b=$(side isolated); else b=$(side isolated); a=$(side plain); fi
   printf 'round %s: plain %.2f ms   isolated %.2f ms   delta %+.2f ms\n' "$r" "$a" "$b" "$(awk "BEGIN { print $b - $a }")"
   plain="$plain $a" isolated="$isolated $b"
   r=$((r + 1))
