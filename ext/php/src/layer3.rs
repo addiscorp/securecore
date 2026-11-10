@@ -276,7 +276,9 @@ fn stub(slug: &str, file: &str) -> *mut zend_op_array {
 
 /// The snapshot's option names for this site (WordPress's own, minus the protected ones),
 /// cached per worker by schema.php's mtime.
+// The PHP names are given: ext-php-rs would otherwise snake-case `layer3` into `layer_3`.
 #[php_function]
+#[php(name = "securecore_layer3_snapshot_names")]
 pub fn securecore_layer3_snapshot_names(abspath: String, prefix: String, stylesheet: String) -> Vec<String> {
     /// schema.php's path and mtime, and the names read from it.
     type CoreNames = (PathBuf, Option<SystemTime>, std::collections::BTreeSet<String>);
@@ -295,6 +297,7 @@ pub fn securecore_layer3_snapshot_names(abspath: String, prefix: String, stylesh
 /// The worker's side of loading an isolated plugin: get a child for it from the helper, and
 /// return what the plugin registered there (PHP-serialized), or null when it can't be had.
 #[php_function]
+#[php(name = "securecore_layer3_open")]
 pub fn securecore_layer3_open(slug: String, file: String, abspath: String, prefix: String, snapshot: &Zval) -> Zval {
     let mut out = Zval::new();
     let Some(live) = crate::live_arc() else { return out };
@@ -357,6 +360,7 @@ fn open(control: RawFd, hello: &Hello, snapshot: &[u8], timeout: Duration) -> Re
 /// The worker's side of one call into an isolated plugin's callback `id`: the child's answer
 /// (PHP-serialized), or null when the call failed (and the child is gone).
 #[php_function]
+#[php(name = "securecore_layer3_call")]
 pub fn securecore_layer3_call(slug: String, id: i64, args: &Zval) -> Zval {
     let mut out = Zval::new();
     let timeout_ms = crate::with_live(|l| l.config.layer3.limits.timeout_ms.get()).unwrap_or(5000);
@@ -401,6 +405,7 @@ struct Zygote {
 /// The helper's supervisor loop. Returns only in a newly forked zygote, with what it boots from:
 /// `abspath`, `prefix` and `snapshot` (the PHP-serialized core options).
 #[php_function]
+#[php(name = "securecore_layer3_helper")]
 pub fn securecore_layer3_helper() -> PhpResult<ZBox<ZendHashTable>> {
     if role() != Role::Helper {
         return Err("securecore_layer3_helper() runs only in the layer 3 helper".into());
@@ -558,6 +563,7 @@ static ZYGOTE: Mutex<Option<ZygoteState>> = Mutex::new(None);
 /// The zygote's loop, after WordPress booted. Returns only in a forked child, restricted and
 /// acting as its plugin, with `slug`, `file` and `memory_mb`.
 #[php_function]
+#[php(name = "securecore_layer3_zygote")]
 pub fn securecore_layer3_zygote() -> PhpResult<ZBox<ZendHashTable>> {
     let mut state = lock(&ZYGOTE).take().ok_or("securecore_layer3_zygote() runs only in a layer 3 zygote")?;
     loop {
@@ -708,6 +714,7 @@ fn child_sock<R>(f: impl FnOnce(BorrowedFd<'_>) -> R) -> Option<R> {
 
 /// The child's first frame to the worker: ready, its pid, and what the plugin registered.
 #[php_function]
+#[php(name = "securecore_layer3_ready")]
 pub fn securecore_layer3_ready(payload: &Zval) -> bool {
     let bytes = payload.zend_str().map_or(&b""[..], |s| s.as_bytes());
     let frame = wire::encode_ready(std::process::id(), bytes);
@@ -716,6 +723,7 @@ pub fn securecore_layer3_ready(payload: &Zval) -> bool {
 
 /// The child's answer to one call.
 #[php_function]
+#[php(name = "securecore_layer3_send")]
 pub fn securecore_layer3_send(payload: &Zval) -> bool {
     let bytes = payload.zend_str().map_or(&b""[..], |s| s.as_bytes());
     child_sock(|s| wire::write_frame(s, bytes, None).is_ok()).unwrap_or(false)
@@ -723,6 +731,7 @@ pub fn securecore_layer3_send(payload: &Zval) -> bool {
 
 /// The child's next call from the worker, or null when the worker's request is over.
 #[php_function]
+#[php(name = "securecore_layer3_recv")]
 pub fn securecore_layer3_recv() -> Zval {
     let mut out = Zval::new();
     if let Some(Ok(Some(frame))) = child_sock(|s| wire::read_frame(s, None)) {
