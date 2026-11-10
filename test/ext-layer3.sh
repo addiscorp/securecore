@@ -40,7 +40,9 @@ wp() { compose run --rm -T cli wp "$@" 2>>"$dir/wp.err" | tr -d '\r'; }
 in_php() { compose exec -T php sh -c "$1"; }
 code() { curl -s -o /dev/null -w '%{http_code}' "$base$1"; }
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-wait_200() { i=0; until [ "$(code /)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 60 ] || return 1; sleep 1; done; }
+# The login page: the front page lists the probe posts, and in the revert run the memory probe
+# kills any page that renders it.
+wait_200() { i=0; until [ "$(code /wp-login.php)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 60 ] || return 1; sleep 1; done; }
 put_live() { compose exec -T php sh -c "cat > $conf.new && mv $conf.new $conf" < "$1"; }
 phplog() { compose logs --no-log-prefix --since "$1" php 2>&1; }
 # has <since> <substring> <label>: php-fpm's log (the helper's included) has a securecore line with it.
@@ -150,7 +152,7 @@ get dash "/wp-admin/"
 is "$(status_of dash)" 200 "on: the dashboard renders"
 contains dash 'id="dolly"' "on: Hello Dolly (isolated) prints its lyric on the dashboard"
 # The helper: never root once serving, and an empty environment (no DB password, no salts).
-in_php 'for p in /proc/[0-9]*; do if tr "\0" " " < $p/cmdline 2>/dev/null | grep -q "securecore.layer3_role=helper"; then echo "$(basename $p) $(sed -n "s/^Uid:[[:space:]]*\([0-9]*\).*/\1/p" $p/status) $(tr "\0" "\n" < $p/environ | grep -c .)"; fi; done' > "$dir/helpers"
+in_php 'for p in /proc/[0-9]*; do if [ "$(cat $p/comm 2>/dev/null)" = php ] && tr "\0" " " < $p/cmdline 2>/dev/null | grep -q "securecore.layer3_role=helper"; then echo "$(basename $p) $(sed -n "s/^Uid:[[:space:]]*\([0-9]*\).*/\1/p" $p/status) $(tr "\0" "\n" < $p/environ | grep -c .)"; fi; done' > "$dir/helpers"
 if [ -s "$dir/helpers" ]; then pass "on: helper processes exist ($(wc -l < "$dir/helpers"))"; else fail "on: helper processes exist"; fi
 is "$(awk '$2 != 33' "$dir/helpers" | grep -c .)" 0 "on: every helper process runs as www-data (uid 33)"
 is "$(awk '$3 != 0' "$dir/helpers" | grep -c .)" 0 "on: every helper process has an empty environment"
@@ -175,6 +177,7 @@ contains loop "SC-L3-AFTER-LOOP" "limits: the rest of the loop page is there"
 lacks loop "loop-finished" "limits: the loop did not finish"
 if [ "$(secs_of loop)" -lt 6 ]; then pass "limits: the loop page took $(cut -d' ' -f2 "$dir/loop.meta") s, not the loop's 8"; else fail "limits: the loop page was cut short" "$(cut -d' ' -f2 "$dir/loop.meta") s"; fi
 has "$T" "timed out after 1500 ms; child" "limits: the timeout is logged"
+sleep 2 # the zygote reports a child's end when it reaps it (at most a second later)
 has "$T" "killed by signal 9" "limits: the child was killed"
 get mem "/?p=$p_mem"
 is "$(status_of mem)" 200 "limits: the too-much-memory page renders"
