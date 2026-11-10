@@ -4,6 +4,8 @@
 !probe/
 !bench/plugin/
 !bench/worker-breakdown.php
+!bench/microvm/init.sh
+!bench/microvm/zz-microvm.conf
 !test/plugin/
 !docker/
 !ext/

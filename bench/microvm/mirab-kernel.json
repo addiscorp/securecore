@@ -1,0 +1,9 @@
+{
+  "mirab": "0.2.1-canary-b0b093c",
+  "manifest": "https://mirab-releases.addis.gg/0.2.1-canary-b0b093c/vm/manifest.json",
+  "url": "https://mirab-releases.addis.gg/0.2.1-canary-b0b093c/vm/linux-x64/vmlinux.gz",
+  "sha256": "2122b85092a9ad9751b0881505decc621398230be2c4c57c916ae2e7f89ede92",
+  "unpacked_sha256": "3bfc869bc83476ebef9281c6fd4bb6d8c486413e7fb3debf0c75b75e7b308cf2",
+  "linux": "6.12.112",
+  "linux_sha256": "164dc9d1f6c93c61a15e1f071c48379b467f2b17c469cce7223471968208ed03"
+}
