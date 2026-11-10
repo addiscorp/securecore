@@ -1,0 +1,14 @@
+# securecore-microvm: the #68 spike's host-side driver for layer 1 as a Firecracker microVM.
+# Standard library only (no crates.io dependencies), outside the ext/ workspace on purpose: it
+# proves the numbers in docs/layer1-microvm.md, it is not the product launcher (that is a
+# follow-up in ext/fpm, see the doc's "Follow-up issues").
+[package]
+name = "securecore-microvm"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+
+[workspace]
