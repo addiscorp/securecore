@@ -12,7 +12,7 @@
 use std::ffi::{CStr, c_char, c_int};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use ext_php_rs::ffi::{
@@ -86,7 +86,7 @@ unsafe extern "C" {
     fn zend_get_constant_str(name: *const c_char, name_len: usize) -> *mut zval;
 }
 
-fn constant(name: &CStr) -> Option<String> {
+pub(crate) fn constant(name: &CStr) -> Option<String> {
     // SAFETY: a NUL-terminated name; the returned zval (if any) lives in the constants table.
     let zv = unsafe { zend_get_constant_str(name.as_ptr(), name.to_bytes().len()).cast::<Zval>().as_ref() }?;
     zv.str().map(str::to_owned)
@@ -130,8 +130,29 @@ fn user_frames(mut ex: *const zend_execute_data) -> impl Iterator<Item = &'stati
     })
 }
 
-/// The component responsible, by `rule`, for the code running from frame `from` outwards.
+/// Layer 3 (E7): the component an isolated child acts as. Set once, in the child, right after the
+/// fork and before the plugin loads; never in a php-fpm worker. While set, everything the process
+/// does is charged to that component, whatever the stack shows: the child exists to run it, so
+/// core code it calls (a filter, a file read) acts on its behalf.
+static ACT_AS: OnceLock<Component> = OnceLock::new();
+
+/// Charges everything in this process to `component` from now on (layer 3's child).
+pub fn act_as(component: Component) {
+    let _ = ACT_AS.set(component);
+}
+
+/// The component a file belongs to (by path, through the cached map).
+pub fn component_of(root: &Path, file: &str) -> Component {
+    let layout = layout(root);
+    lock(&MAP).frame(&layout, Instant::now(), file)
+}
+
+/// The component responsible, by `rule`, for the code running from frame `from` outwards. In a
+/// layer 3 child, the isolated component (see [`act_as`]).
 pub fn responsible(rule: Rule, root: &Path, from: *const zend_execute_data) -> Component {
+    if let Some(c) = ACT_AS.get() {
+        return c.clone();
+    }
     let layout = layout(root);
     let now = Instant::now();
     let mut map = lock(&MAP);
@@ -142,6 +163,9 @@ pub fn responsible(rule: Rule, root: &Path, from: *const zend_execute_data) -> C
 /// passthrough helpers (`dbDelta`, `update_option`, …) handing the charge to their caller. The
 /// rule is [`securecore_db::caller::charged`] (plain Rust, unit-tested); this collects its frames.
 pub fn db_caller(root: &Path, from: *const zend_execute_data) -> Component {
+    if let Some(c) = ACT_AS.get() {
+        return c.clone();
+    }
     let layout = layout(root);
     let now = Instant::now();
     let mut map = lock(&MAP);
@@ -352,7 +376,7 @@ pub fn request_startup() {
         return;
     }
     let logging = !settings().is_none_or(|s| s.log.is_empty());
-    if !logging && !crate::enforce::layer2_active() {
+    if !logging && !crate::enforce::layer2_active() && !crate::layer3::isolating() {
         return;
     }
     INCLUDES_HOOKED.store(true, Ordering::Relaxed);
@@ -379,6 +403,18 @@ unsafe extern "C" fn compile_file(file_handle: *mut ext_php_rs::ffi::zend_file_h
             .and_then(|o| watch::include_op(o.extended_value));
         (op, current)
     };
+    // E7: an isolated plugin's files never load in a php-fpm worker. WordPress loading its main
+    // file gets the layer 3 stand-in instead; any other include of its files is refused (fails
+    // as a missing file does). SAFETY: the file handle from the engine.
+    if op.is_some()
+        && let Some(path) = unsafe { file_handle.as_ref() }.and_then(|f| zstr(f.filename)).and_then(watch::plain_path)
+    {
+        match crate::layer3::include(path, current) {
+            crate::layer3::Include::Normal => {}
+            crate::layer3::Include::Refuse => return std::ptr::null_mut(),
+            crate::layer3::Include::Stub(op_array) => return op_array,
+        }
+    }
     // E2b: enforce the read policy on the file before compiling it. Blocking here (return null,
     // never compiling) makes a denied include fail exactly as a missing file does: a warning and
     // `false` for include, a fatal for require. SAFETY: the file handle from the engine.

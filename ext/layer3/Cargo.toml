@@ -1,0 +1,15 @@
+[package]
+name = "securecore-layer3"
+description = "Layer 3 for SecureCore: the clean helper, its wire protocol and the isolated child's limits (addiscorp/securecore#53, E7)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The options a snapshot must never carry are the database policy's read-protected ones (E4):
+# one list, so the snapshot and the policy can't disagree.
+securecore-db = { path = "../db" }
+# The isolated child restricts itself (Landlock + seccomp), as layer 1's launcher does.
+gelada.workspace = true
+libc.workspace = true

@@ -5,12 +5,14 @@
 #            the rules for who is responsible on a PHP stack. Plain Rust, no PHP.
 #   php/     securecore-php: the extension itself (ext-php-rs), built into securecore.so.
 #   fpm/     securecore-fpm: layer 1, the launcher that starts php-fpm inside gelada. Plain Rust.
+#   layer3/  securecore-layer3: layer 3's wire protocol, snapshot allowlist and the isolated
+#            child's limits. Plain Rust, no PHP.
 # The php crate needs PHP's headers (php-config) to build; docker/ext.Dockerfile builds it
 # against PHP 8.3 NTS. On a machine without PHP, `cargo test` (the default members) still works.
 [workspace]
 resolver = "3"
-members = ["config", "attribution", "db", "php", "fpm"]
-default-members = ["config", "attribution", "db", "fpm"]
+members = ["config", "attribution", "db", "layer3", "php", "fpm"]
+default-members = ["config", "attribution", "db", "layer3", "fpm"]
 
 [workspace.package]
 version = "0.1.0"

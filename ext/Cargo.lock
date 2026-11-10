@@ -1200,6 +1200,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "securecore-layer3"
+version = "0.1.0"
+dependencies = [
+ "gelada",
+ "libc",
+ "securecore-db",
+]
+
+[[package]]
 name = "securecore-php"
 version = "0.1.0"
 dependencies = [
@@ -1211,6 +1220,7 @@ dependencies = [
  "securecore-attribution",
  "securecore-config",
  "securecore-db",
+ "securecore-layer3",
  "sha1",
  "sha2",
 ]
