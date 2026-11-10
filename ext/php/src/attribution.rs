@@ -16,7 +16,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use ext_php_rs::ffi::{
-    ZEND_INTERNAL_FUNCTION, zend_execute_data, zend_observer_fcall_handlers, zend_observer_fcall_register, zend_op_array,
+    ZEND_ACC_CLOSURE, ZEND_ACC_LINKED, ZEND_INTERNAL_FUNCTION, zend_execute_data, zend_observer_fcall_handlers, zend_observer_fcall_register, zend_op_array,
     zend_string, zval,
 };
 use ext_php_rs::types::Zval;
@@ -146,21 +146,47 @@ pub fn db_caller(root: &Path, from: *const zend_execute_data) -> Component {
     let now = Instant::now();
     let mut map = lock(&MAP);
     // Lowercased function names, owned for the frames below (stacks are shallow).
-    let named: Vec<(&'static str, Option<String>)> = named_user_frames(from).collect();
+    let named: Vec<NamedFrame> = named_user_frames(from).collect();
     let frames: Vec<securecore_db::caller::Frame<'_>> = named
         .iter()
-        .map(|(file, function)| securecore_db::caller::Frame {
-            component: map.frame(&layout, now, file),
-            file,
-            function: function.as_deref(),
+        .map(|f| securecore_db::caller::Frame {
+            component: map.frame(&layout, now, f.file),
+            file: f.file,
+            function: f.function.as_deref(),
+            db_layer: f.db_layer,
         })
         .collect();
     securecore_db::caller::charged(&frames)
 }
 
-/// The user-code frames from `ex` outwards, innermost first: each one's file, and its function
-/// name lowercased when it is a plain function (`None` for top-level code, closures and methods).
-fn named_user_frames(mut ex: *const zend_execute_data) -> impl Iterator<Item = (&'static str, Option<String>)> {
+/// Who is connecting to the database, for the connect call running at `connect` (a mysqli / PDO
+/// connect route). The one answer the vault (may the real DB password be restored?) and the host
+/// policy (is this core reaching its own DB host?) both use, so they can't disagree (#53 review,
+/// finding 5): when the code that called connect is the database layer — a method of `wpdb` or of
+/// a subclass of it, such as a `db.php` drop-in — it is **core**, whatever is further out on the
+/// stack (a plugin whose call made `wpdb::check_connection()` reconnect); otherwise it is the
+/// component of that innermost user frame (E2a's `frame` rule), so a component's own `new mysqli`
+/// is the component's.
+pub fn db_connector(root: &Path, connect: *const zend_execute_data) -> Component {
+    let Some(first) = named_user_frames(connect).next() else { return Component::Core };
+    if first.db_layer {
+        return Component::Core;
+    }
+    let layout = layout(root);
+    lock(&MAP).frame(&layout, Instant::now(), first.file)
+}
+
+/// One user-code frame, as the database rules read it.
+struct NamedFrame {
+    file: &'static str,
+    /// Lowercased, for a plain function (`None` for top-level code, closures and methods).
+    function: Option<String>,
+    /// A method of `wpdb` or a subclass of it ([`is_db_layer`]).
+    db_layer: bool,
+}
+
+/// The user-code frames from `ex` outwards, innermost first.
+fn named_user_frames(mut ex: *const zend_execute_data) -> impl Iterator<Item = NamedFrame> {
     std::iter::from_fn(move || {
         // SAFETY: the engine's frame chain, valid while the code that asked is running.
         unsafe {
@@ -171,16 +197,40 @@ fn named_user_frames(mut ex: *const zend_execute_data) -> impl Iterator<Item = (
                     continue;
                 }
                 let Some(file) = zstr(func.op_array.filename) else { continue };
-                let name = if func.common.scope.is_null() {
+                let function = if func.common.scope.is_null() {
                     zstr(func.common.function_name).map(str::to_ascii_lowercase)
                 } else {
                     None
                 };
-                return Some((file, name));
+                return Some(NamedFrame { file, function, db_layer: is_db_layer(&func.common) });
             }
             None
         }
     })
+}
+
+/// Whether a user function is the database layer: a method — not a closure, which could be bound
+/// to any scope — whose class is `wpdb` or extends it, by the class entry's parent chain. Class
+/// names are unique, so the class named `wpdb` is WordPress's; where it (or a subclass, a `db.php`
+/// drop-in) is defined does not matter.
+fn is_db_layer(common: &ext_php_rs::ffi::_zend_function__bindgen_ty_1) -> bool {
+    if common.fn_flags & ZEND_ACC_CLOSURE != 0 {
+        return false;
+    }
+    let mut ce = common.scope.cast_const();
+    // SAFETY: a running method's scope is a live, linked class entry; a linked class's union holds
+    // the parent pointer (NULL at the root), never the parent's name. Bounded against a cycle.
+    for _ in 0..64 {
+        let Some(c) = (unsafe { ce.as_ref() }) else { return false };
+        if zstr(c.name).is_some_and(|n| n.eq_ignore_ascii_case("wpdb")) {
+            return true;
+        }
+        if c.ce_flags & ZEND_ACC_LINKED == 0 {
+            return false;
+        }
+        ce = unsafe { c.__bindgen_anon_1.parent }.cast_const();
+    }
+    false
 }
 
 /// Who is running now, by the configured rule: the stack of the code calling into the

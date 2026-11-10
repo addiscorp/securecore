@@ -943,8 +943,17 @@ fn check_host(from: *const zend_execute_data, host: &str, op: &str, detail: &str
     if !l2.enabled || l2.app.is_none() || l2.mode == Mode::Off {
         return false;
     }
-    let rule = attribution::settings().map_or(Rule::Component, |s| s.rule);
-    let component = attribution::responsible(rule, &loaded.root, from);
+    // A database connect is charged the way the vault charges it (attribution::db_connector): the
+    // database layer (`wpdb` or a subclass) connecting is core even with a plugin further out on
+    // the stack, so `wpdb::check_connection()` reconnecting on a plugin's call is core's connection
+    // to its own DB host, not the plugin's (#53 review, finding 5). Everything else, by the
+    // configured rule.
+    // SAFETY: `from` is the running frame (the connect call, for a DB connect).
+    let component = if unsafe { crate::vault::is_db_connect(from) } {
+        attribution::db_connector(&loaded.root, from)
+    } else {
+        attribution::responsible(attribution::settings().map_or(Rule::Component, |s| s.rule), &loaded.root, from)
+    };
     // Core's connection to the site's own database host is allowed implicitly (WordPress's
     // `DB_HOST`), so `core.hosts` need not list it and a vaulted password still connects; only
     // *core* gets this — a component reaching the DB host directly is still checked against its

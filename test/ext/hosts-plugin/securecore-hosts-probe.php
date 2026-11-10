@@ -269,6 +269,24 @@ add_action('init', function () {
         }
     };
 
+    // --- the database host (#53 review, finding 5) ---------------------------------------
+    // The plugin's own connection to the DB host is the plugin's: refused, as "db" is not in its
+    // hosts (OK in log/off: the server is real).
+    $cases['own-mysqli-dbhost'] = static function () {
+        mysqli_report(MYSQLI_REPORT_OFF);
+        $m = @mysqli_connect(DB_HOST, DB_USER, DB_PASSWORD, DB_NAME);
+        return $m instanceof mysqli ? 'OK' : 'BLOCKED';
+    };
+    // A wpdb reconnect on the plugin's call is core's connection to its own DB host: it must
+    // work in every mode, or enforce mode takes the site down. Last, so a refused reconnect
+    // can't break the cases above.
+    $cases['wpdb-reconnect'] = static function () {
+        global $wpdb;
+        $wpdb->close();
+        $ok = $wpdb->check_connection(false);
+        return $ok && $wpdb->get_var('SELECT 1') === '1' ? 'OK' : 'BLOCKED';
+    };
+
     foreach ($cases as $name => $fn) {
         echo "$name=" . $fn() . "\n";
     }
