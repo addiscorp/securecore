@@ -10,6 +10,18 @@
 defined('ABSPATH') || exit;
 
 add_action('init', function () {
+    // ?sc_conn=port&fp=<port>: the right DB host on another port, through wpdb itself (so the
+    // connector is core and only the host gate stands): new wpdb(DB_USER, DB_PASSWORD, DB_NAME,
+    // DB_HOST:<port>). A server there must receive the placeholder, never the password
+    // (#53 review, finding 3).
+    if (($_GET['sc_conn'] ?? '') === 'port') {
+        header('Content-Type: text/plain');
+        $fp = (int) ($_GET['fp'] ?? 0);
+        echo "probe=connect-port\n";
+        $other = new wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST . ':' . $fp);
+        echo 'other_port_connected=', ($other->dbh instanceof mysqli && @mysqli_ping($other->dbh) ? 'yes' : 'no'), "\n";
+        exit;
+    }
     if (($_GET['sc_conn'] ?? '') !== 'run') {
         return;
     }

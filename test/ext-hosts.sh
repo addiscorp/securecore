@@ -15,7 +15,9 @@
 # logged+allowed in log, allowed with the hosts layer off; a redirect allowed→disallowed refused
 # at the hop; a disallowed IP literal, an allowed.example@evil URL, and CURLOPT_RESOLVE /
 # CONNECT_TO overrides pointing an allowed name at a disallowed address all refused; and that core
-# is restricted to core.hosts. Then it quotes the enforce-mode refusals (the revert proof is the
+# is restricted to core.hosts. A database connect is attributed as the vault attributes it: the
+# plugin's own mysqli to the DB host is refused, while a $wpdb reconnect the plugin triggers is
+# core's and always works. Then it quotes the enforce-mode refusals (the revert proof is the
 # log run flipping every one to OK).
 #
 #   DOCKER_CONTEXT=colima test/ext-hosts.sh
@@ -162,9 +164,11 @@ want() { # $1 config $2 case $3 expected
 GROUP_A="stream-disallowed fopen-disallowed get_headers-disallowed userinfo-evil ip-literal \
 stream-redirect fsockopen-disallowed pfsockopen-disallowed ssc-disallowed socket-connect-disallowed \
 curl-disallowed curl-array-disallowed curlmulti-disallowed curl-resolve-evil curl-connectto-evil \
-curl-redirect curl-copy-disallowed"
-# Group B: an allowed host — OK in every mode.
-GROUP_B="stream-allowed wildcard-allowed fsockopen-allowed ssc-allowed curl-allowed curl-copy-allowed"
+curl-redirect curl-copy-disallowed own-mysqli-dbhost"
+# Group B: an allowed host — OK in every mode. wpdb-reconnect: the plugin makes
+# $wpdb->check_connection() reconnect to the DB host, which is core's connection (the vault's
+# attribution), never refused as the plugin's (#53 review, finding 5).
+GROUP_B="stream-allowed wildcard-allowed fsockopen-allowed ssc-allowed curl-allowed curl-copy-allowed wpdb-reconnect"
 # Enforce-only: refused in enforce; in log/off the call behaves in an extension-specific way we
 # don't pin (a file:// read succeeds in log; gopher/no-url fail in libcurl regardless).
 ENFORCE_ONLY="curl-file curl-gopher curl-nostate soap-disallowed"

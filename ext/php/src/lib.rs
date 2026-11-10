@@ -138,6 +138,11 @@ extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
             if let Err(e) = vault::startup(&live.config, &live.root) {
                 return refuse(&e);
             }
+            // WordPress's wp_salt()/wp_hash() over the vault's keys, defined natively before any
+            // PHP runs, so nothing in PHP can define them first.
+            if let Err(e) = vault::define_pluggables(&live.config) {
+                return refuse(&e);
+            }
             *state() = Some(reloader);
             attribution::startup(settings);
             ZEND_RESULT_CODE_SUCCESS
@@ -239,8 +244,8 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .request_startup_function(request_startup)
         .info_function(module_info)
         .function(wrap_function!(securecore_status));
-    // The vault's native salted pluggables (E3); the mu-plugin defines wp_salt/wp_hash as thin
-    // wrappers over these so the HMAC key never reaches PHP. Registered from their own module so
-    // the macro finds the glue it generates there.
+    // The vault's native salted pluggables (E3), under their own names; wp_salt/wp_hash themselves
+    // are defined at MINIT when the config asks for them (vault::define_pluggables). Registered from
+    // their own module so the macro finds the glue it generates there.
     vault::register(module)
 }

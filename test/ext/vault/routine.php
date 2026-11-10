@@ -68,6 +68,9 @@ function sc_vault_probe(): string {
 
     // 5. wp_salt and wp_hash for every scheme; the key must not be recoverable.
     if (function_exists('wp_salt')) {
+        // Who defined them: the extension (internal) or PHP code (a mu-plugin, pluggable.php).
+        $s('wp_salt_defined_by', (new ReflectionFunction('wp_salt'))->isInternal() ? 'extension' : 'php');
+        $s('wp_hash_defined_by', (new ReflectionFunction('wp_hash'))->isInternal() ? 'extension' : 'php');
         foreach (['auth', 'secure_auth', 'logged_in', 'nonce'] as $scheme) {
             $s('wp_salt_' . $scheme, $ex(wp_salt($scheme)));
             $s('wp_hash_' . $scheme, wp_hash('sc-vault-probe', $scheme));

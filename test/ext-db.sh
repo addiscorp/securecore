@@ -18,6 +18,8 @@
 #      wildcard, the protected option, another plugin's table and the shape refusals stay BLOCKED.
 #   5. core: may read user_pass and write siteurl, runs and logs an unparseable query, but is held
 #      to the statement allowlist (PREPARE, SET @ BLOCKED).
+#   5b. a wpdb subclass in wp-content/db.php: the plugin's SQL through the drop-in's query() and
+#      through its own mysqli_query is still the plugin's (user_pass BLOCKED), core's is core's.
 #   6. the extension unloaded: every case RAN (the check removed altogether).
 # Exits non-zero on any failure. Writes .tmp/ext-db/. Restores examples/wordpress.json at the end.
 #   DOCKER_CONTEXT=colima test/ext-config.sh && DOCKER_CONTEXT=colima test/ext-db.sh
@@ -59,7 +61,7 @@ wp plugin activate securecore-db-probe >/dev/null
 
 cleanup() {
   wp plugin deactivate securecore-db-probe >/dev/null 2>&1
-  in_php "rm -rf $plugin $html/sc-db-core.php"
+  in_php "rm -rf $plugin $html/sc-db-core.php $html/wp-content/db.php"
   dbq "DROP TABLE IF EXISTS wp_securecore_db_probe, wp_otherplugin_data" >/dev/null 2>&1
   [ -f "$dir/securecore.ini" ] && compose cp "$dir/securecore.ini" "php:$ini" >/dev/null 2>&1
   compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
@@ -69,6 +71,7 @@ cleanup() {
 trap cleanup EXIT
 
 # --- configs: layer 2 only, no vault (the probe opens its own connections with DB_PASSWORD) -----
+# The probe's own mysqli/PDO connections reach the DB host, so its hosts (E5) list it.
 cfg() { # $1 = name, $2 = mode, $3 = the probe's grants
   cat > "$dir/$1.json" <<JSON
 {
@@ -76,7 +79,7 @@ cfg() { # $1 = name, $2 = mode, $3 = the probe's grants
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "$2",
     "default": { "tables": "own", "options": "own" },
-    "components": { "securecore-db-probe": { "grants": [$3] } }
+    "components": { "securecore-db-probe": { "grants": [$3], "hosts": ["db"] } }
   },
   "layer3": { "enabled": false }
 }
@@ -163,7 +166,8 @@ for c in $own_cases; do expect enforce "$c" RAN; done
 for c in $refused_cases; do expect enforce "$c" BLOCKED; done
 is_() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$3" "got '$1', want '$2'"; fi; }
 is_ "$(line enforce 'strict|user-pass=')" BLOCKED "enforce: strict-mode mysqli throws mysqli_sql_exception 1142"
-is_ "$(line enforce 'select_db|use=')" BLOCKED "enforce: a component's select_db is refused"
+is_ "$(line enforce 'select_db|use=')" BLOCKED "enforce: a component's select_db of another database is refused"
+is_ "$(line enforce 'select_db|own-db=' | cut -c1-3)" RAN "enforce: re-selecting the site's own DB_NAME runs (wpdb's reconnect does it)"
 is_ "$(line enforce 'set_charset|gbk=')" BLOCKED "enforce: set_charset('gbk') is refused"
 p=plugin:securecore-db-probe
 has "$T" "layer2 enforce $p mysqli_query protected-column select wp_users" "enforce: user_pass audit line (route, rule, statement, table)"
@@ -214,6 +218,32 @@ for c in other-table user-pass users-star protected-opt prepare set-var load-fil
   expect granted "$c" BLOCKED
 done
 passthrough granted BLOCKED
+
+# --- 5b. a db.php drop-in (#53 review, finding 1) -------------------------------------------------
+# A wpdb subclass in wp-content/db.php (HyperDB, LudicrousDB, Query Monitor) is the database layer
+# by its class, not core's code: a plugin's SQL through it is still the plugin's, and core's own
+# SQL through it still core's. Matching class-wpdb.php by path charged every query to core.
+echo "# a db.php drop-in (enforce)"
+compose cp test/ext/db-dropin.php "php:$html/wp-content/db.php" >>"$dir/cp.log" 2>&1
+in_php "chown www-data:www-data $html/wp-content/db.php"
+put_live "$dir/enforce.json"
+sleep 1.3
+T=$(now); sleep 1
+curl -s "$base/?sc_db=dropin" > "$dir/out.dropin"
+curl -s "$base/sc-db-core.php" > "$dir/core.dropin"
+dropin_code=$(code /)
+sleep 1
+in_php "rm -f $html/wp-content/db.php"
+is_ "$(line dropin 'dropin|class=')" sc_dropin_db "dropin: \$wpdb is the drop-in's subclass"
+if grep -qx DONE "$dir/out.dropin"; then pass "dropin: the probe ran to the end"; else fail "dropin: the probe ran to the end" "$(tail -3 "$dir/out.dropin" | tr '\n' ' ')"; fi
+for route in dropin-query dropin-send; do
+  is_ "$(line dropin "$route|own-select=" | cut -c1-3)" RAN "dropin: $route own table RAN for the plugin"
+  is_ "$(line dropin "$route|user-pass=")" BLOCKED "dropin: $route user_pass is charged to the plugin (BLOCKED)"
+  is_ "$(line dropin "$route|core-posts=")" BLOCKED "dropin: $route core table is charged to the plugin (BLOCKED)"
+done
+has "$T" "layer2 enforce $p mysqli_query protected-column select wp_users" "dropin: the refusal names the plugin"
+is_ "$(coreline dropin user-pass | cut -c1-3)" RAN "dropin: core's own SQL through the drop-in is still core's"
+is_ "$dropin_code" 200 "dropin: the front page is 200 with the drop-in"
 
 # --- 6. the extension unloaded: the check removed altogether --------------------------------------
 echo "# extension unloaded"
