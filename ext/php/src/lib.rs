@@ -19,6 +19,7 @@ mod attribution;
 mod db;
 mod enforce;
 mod hosts;
+mod layer3;
 mod vault;
 
 use std::ffi::{CString, c_char, c_int};
@@ -47,8 +48,10 @@ pub const RELOAD_INTERVAL: Duration = Duration::from_millis(1000);
 /// `securecore.debug_attribution_rule` (`frame` | `component`, the rule
 /// `securecore_status()['caller']` and later phases use) and `securecore.debug_attribution_log`
 /// (`off` | `frame` | `component` | `both`: a log line per file open, per rule).
-static INI: IniEntryDefs<5> = IniEntryDefs::new([
+static INI: IniEntryDefs<6> = IniEntryDefs::new([
     IniEntryDef::new(c"securecore.config", c"", IniEntryPermission::System),
+    // E7, internal: set only on the layer 3 helper's command line (`helper`). Not configuration.
+    IniEntryDef::new(c"securecore.layer3_role", c"", IniEntryPermission::System),
     IniEntryDef::new(c"securecore.debug_attribution_rule", c"component", IniEntryPermission::System),
     IniEntryDef::new(c"securecore.debug_attribution_log", c"off", IniEntryPermission::System),
     // E4, research only: who a database query is charged to. `caller` is the rule; `component`
@@ -119,6 +122,7 @@ extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
     let mut ini = ExecutorGlobals::get().ini_values();
     let mut value = |key: &str| ini.remove(key).flatten().unwrap_or_default();
     let (path, rule, log) = (value(INI_CONFIG), value(attribution::INI_RULE), value(attribution::INI_LOG));
+    let role = value(layer3::INI_ROLE);
     if let Err(e) = db::startup(&value(db::INI_ATTRIBUTION)) {
         return refuse(&e);
     }
@@ -134,12 +138,20 @@ extern "C" fn module_startup(_ty: i32, module_number: i32) -> i32 {
             // The vault (E3): read the real secret values and mask the environment here, in the
             // fpm master before it forks, so the workers inherit only placeholders. A missing or
             // empty secret refuses MINIT, like a bad config.
-            let live = reloader.live();
-            if let Err(e) = vault::startup(&live.config, &live.root) {
+            let live = Arc::clone(reloader.live());
+            // The layer 3 helper (E7) holds no secret: it never reads the vault, and starts with an
+            // empty environment, so there is nothing to mask.
+            if !layer3::is_helper(&role)
+                && let Err(e) = vault::startup(&live.config, &live.root)
+            {
                 return refuse(&e);
             }
             *state() = Some(reloader);
             attribution::startup(settings);
+            // Layer 3 (E7): under php-fpm, start the clean helper now, in the master before it forks.
+            if let Err(e) = layer3::startup(&role, &live) {
+                return refuse(&e);
+            }
             ZEND_RESULT_CODE_SUCCESS
         }
         Err(e) => refuse(&e.to_string()),
@@ -237,10 +249,27 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .name("securecore")
         .startup_function(module_startup)
         .request_startup_function(request_startup)
+        .request_shutdown_function(request_shutdown)
         .info_function(module_info)
         .function(wrap_function!(securecore_status));
     // The vault's native salted pluggables (E3); the mu-plugin defines wp_salt/wp_hash as thin
     // wrappers over these so the HMAC key never reaches PHP. Registered from their own module so
     // the macro finds the glue it generates there.
-    vault::register(module)
+    layer3::register(vault::register(module))
+}
+
+extern "C" fn request_shutdown(_ty: i32, _module_number: i32) -> i32 {
+    // Layer 3: close this request's isolated children (each exits when its socket closes).
+    layer3::request_shutdown();
+    ZEND_RESULT_CODE_SUCCESS
+}
+
+/// Checks the file now, whatever the reload interval says, and reports a reload. A layer 3
+/// child does this right after the fork when the worker's config differs from its own.
+pub(crate) fn reload_now() {
+    if let Some(reloader) = state().as_mut()
+        && let Poll::Reloaded { .. } = reloader.poll(Instant::now() + 2 * RELOAD_INTERVAL)
+    {
+        log(LOG_NOTICE, &format!("reloaded {} (sha256 {})", reloader.live().path.display(), reloader.live().sha256));
+    }
 }

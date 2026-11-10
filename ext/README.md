@@ -6,14 +6,17 @@ validates and reloads the config and reports it; **E2a** works out which compone
 **E2b** enforces layer 2's file and process rules; **E3** is the [vault](#vault-e3), which keeps
 the DB password and the WordPress keys and salts out of PHP's reach; **E4** is the
 [database policy](#database-policy-e4), which checks every query PHP sends; **E6** is layer 1, the
-`securecore-fpm` launcher ([Layer 1](#layer-1-securecore-fpm-e6)). Still to come: the hostname
-policy (E5) and layer 3 (E7).
+`securecore-fpm` launcher ([Layer 1](#layer-1-securecore-fpm-e6)); **E5** is the
+[hostname policy](#hostnames-e5); **E7** is [layer 3](#layer-3-isolated-plugins-e7), which runs the
+plugins listed in `layer3.isolate` in a clean child process instead of the php-fpm worker (first
+part: filters, actions and shortcodes; see [Not yet](#not-yet)).
 
 | crate | what |
 |---|---|
 | `config/` (`securecore-config`) | the config types (serde), the loader, the reloader and the JSON Schema; and the vault's pure logic (E3): reading a secret's source ([`source`](config/src/source.rs)) and the salt reconstruction + keyed hashing ([`salt`](config/src/salt.rs)). Plain Rust, no PHP: the `securecore-fpm` launcher (E6) reads the file with the same code, and the extension and the host tests share the vault's bytes. |
 | `attribution/` (`securecore-attribution`) | E2a: path → component (plugin, mu-plugin, theme, core), the two "who is running" rules, the watched file functions, `securecore-attribution-report`; and E2b: the file/process [`policy`](attribution/src/policy.rs). Plain Rust, no PHP. |
 | `db/` (`securecore-db`) | E4: the [database policy](#database-policy-e4) — the SQL analysis ([`analyze`](db/src/analyze.rs), on sqlparser-rs's MySQL dialect), the per-component decision ([`policy`](db/src/policy.rs)), the per-worker query cache, and `securecore-db-suggest`. Plain Rust, no PHP. |
+| `layer3/` (`securecore-layer3`) | E7: layer 3's wire protocol ([`wire`](layer3/src/wire.rs)), the snapshot's option allowlist ([`options`](layer3/src/options.rs)) and the isolated child's sandbox and rlimits ([`child`](layer3/src/child.rs)). Plain Rust, no PHP. |
 | `php/` (`securecore-php`) | the extension, built as `securecore.so` |
 | `fpm/` (`securecore-fpm`) | E6: layer 1, the launcher that starts php-fpm inside [gelada](https://crates.io/crates/gelada) 0.3.0. Plain Rust, no PHP. |
 
@@ -821,6 +824,115 @@ as the entrypoint, so a new site volume still gets WordPress copied in.
 No `--security-opt` is needed: Docker's default seccomp profile allows Landlock and seccomp, and
 gelada stacks its filters on top of it.
 
+## Layer 3: isolated plugins (E7)
+
+A plugin listed in `layer3.isolate` never runs in the php-fpm worker. It runs in a clean child
+process, one per request, forked from a helper that booted WordPress without it, and restricted
+by the kernel before the plugin's first line:
+
+```json
+"layer3": {
+  "enabled": true,
+  "isolate": ["contact-form-7"],
+  "limits": { "timeoutMs": 5000, "memoryMb": 256 },
+  "write": { "contact-form-7": ["wp-content/uploads/wpcf7_uploads"] }
+}
+```
+
+It is the process model the #42 spike measured (`docs/realwp-spike.md`), moved into the
+extension. The wiring is [`php/src/layer3.rs`](php/src/layer3.rs); the parts that need no PHP
+(the wire, the snapshot's allowlist, the child's limits) are [`layer3/`](layer3/), unit-tested.
+
+### How it works
+
+1. **The helper.** At MINIT under php-fpm, with layer 3 enabled, the master fork+execs
+   `<PHP_BINDIR>/php -d securecore.layer3_role=helper -r <helper.php>`
+   ([`php/src/layer3/helper.php`](php/src/layer3/helper.php), compiled into the `.so`) with an
+   **empty environment**, stdin and stdout on `/dev/null`, stderr shared with php-fpm (so its lines
+   land in php-fpm's log), and one end of a `SOCK_SEQPACKET` control socket on fd 3. The master
+   keeps the other end, so every worker inherits it; a request socket is a `socketpair`, so layer
+   1's "no unix sockets" holds. The helper never reads the vault (`securecore.layer3_role=helper`
+   skips it) and never sees wp-config.php. It runs as the pool user: the control socket has
+   `SO_PASSCRED`, so the kernel stamps each worker's uid and gid on its message, and the helper
+   drops from root to them on the first one and ignores any other uid after.
+2. **The zygote.** The helper's supervisor forks a *zygote* per core-options snapshot. The zygote
+   boots WordPress once (`wp-settings.php`, not wp-config.php) from the snapshot the worker sent
+   — **WordPress's own options only** (#47): the names `populate_options()` in the site's
+   `wp-admin/includes/schema.php` installs, plus `<prefix>user_roles` and the active theme's mods,
+   minus the database policy's read-protected and never-readable options and the active-plugin
+   lists ([`options.rs`](layer3/src/options.rs), one list shared with E4). It boots against a
+   `$wpdb` with no connection that is **one object for the process's life** (#46): it serves
+   `wp_load_alloptions()` from the snapshot during the boot and answers nothing else. No plugin, no
+   mu-plugin and no theme code runs in it. When a worker's snapshot hash differs (a core option
+   changed), the supervisor boots a new zygote and the old one finishes its children and exits.
+3. **One child per request.** When `wp-settings.php` includes an isolated plugin, the
+   `zend_compile_file` wrapper (the place layer 2 sees includes) compiles a stand-in instead
+   ([`php/src/layer3/stub.php`](php/src/layer3/stub.php)). The stand-in sends the helper one end of
+   a fresh `socketpair` with a hello (slug, file, ABSPATH, table prefix, the snapshot's and the
+   config's sha256). The zygote forks a child; the child restricts itself, loads only that plugin,
+   and answers with what it registered: every new hook callback (`add_filter`/`add_action`, with
+   its priority and accepted args) and shortcode. The stand-in registers a forwarding callback for
+   each in the worker; when WordPress fires one, the call (its arguments PHP-serialized) goes to
+   the child, which runs the plugin's callback with its output captured and answers with the
+   return value, the output and anything the callback registered in turn. At request end the
+   worker closes the socket and the child exits: no state carries from one request to the next.
+4. **No isolated code in the worker.** Any other include of an isolated plugin's files in a worker
+   (another plugin including it, a CLI or CGI process with no helper) is refused, as a missing
+   file is, with a line. If the helper can't give a child, the plugin is simply not there for that
+   request; it is never loaded in the worker instead.
+5. **Attribution.** The child acts as the plugin: `attribution::responsible` (and the database
+   caller rule) return `plugin:<slug>` for everything in the child, whatever the stack shows, so
+   layer 2's checks there all charge the isolated plugin.
+
+### Limits
+
+| | where | what happens |
+|---|---|---|
+| **files** | gelada `restrict_self` in the child (Landlock + seccomp) | reads everything but securecore.json, the vault's `from` file and wp-config.php (at ABSPATH and the folder above); writes **only** `layer3.write.<slug>` (not uploads, not cache, not `/tmp`: gelada's own temporary folder is removed before the rules are built); no network (no TCP, no UDP, no new unix socket; the request socket it holds keeps working). With layer 2 active the child's file wrapper also refuses a write outside those folders first, with a line, in every layer 2 mode: `securecore: layer3 plugin:<slug> open write-outside <path>` |
+| **timeoutMs** | the worker, per call | each call's wall-clock deadline. Past it the worker logs `layer3 plugin:<slug> call <id> timed out after <ms> ms; child <pid> killed`, asks the helper to `SIGKILL` the child (only the zygote that forked it can, and only before it reaps it, so a pid is never reused), and the plugin's callbacks pass through for the rest of the request. The child's CPU time is also capped at `timeoutMs` (rounded up to whole seconds) for its whole life, a backstop for a loop while the plugin loads |
+| **memoryMb** | the child | PHP's `memory_limit`, and the address space above what the child inherited (`RLIMIT_AS`), so native allocations are capped too. A child over it dies; the worker logs `child <pid> ended during call <id>` and the zygote `child <pid> exited with status 255` |
+
+A failed call never fails the page: a filter returns its first argument unchanged, a shortcode
+renders empty, an action does nothing.
+
+### Not yet
+
+The first part covers what it proves end to end (`test/ext-layer3.sh`): a plugin that adds content
+through filters, actions and shortcodes, on the front end and the dashboard (Hello Dolly). Not yet:
+
+- **The database.** An isolated plugin's queries are refused (`layer3 plugin:<slug> database
+  refused …`, once per query text). It sees core's options from the snapshot; its own options read
+  as unset. Next: the #42 gateway, the child's queries run by the worker under E4's policy.
+- **Request state.** The child does not see the request: no current user, main query, `$post` or
+  `$_GET`/`$_POST`/cookies. Next: replay them, as the spike's `setup_request_state` did.
+- **Objects across the socket.** Arguments and return values cross PHP-serialized with objects
+  replaced by `null` (`WP_Post`, `WP_Query`, …). Filters on strings and arrays work; a filter whose
+  value is an object gets `null`. Next: the spike's marshalling (`sandbox/marshal.php`).
+- **Salted pluggables and mail.** Nonces, `wp_hash` and auth cookies made in the child use no real
+  salt (the helper holds none), and `wp_mail` does not send. Next: forward them to the worker.
+- **Admin pages, AJAX and REST of the plugin's own.** Admin menus and pages, `admin-ajax.php`
+  handlers and REST routes are registered through hooks whose callbacks need the request state and
+  objects above. Activating the plugin from the admin screen includes its file from
+  `wp-admin/includes/plugin.php`, which is refused; so does WP-CLI in a PHP with the extension
+  loaded (the test stack's WP-CLI container has no extension). Uninstall hooks likewise.
+- **Removing hooks.** A plugin that removes a core callback (`remove_action`) does so in its child
+  only.
+- **Outbound HTTP** from an isolated plugin (no network in the child). Next: forward through the
+  worker under E5's hostnames.
+- **A loop while the plugin loads** is stopped by the CPU limit, not at `timeoutMs` (the child's
+  pid is not known to the worker until it is ready).
+- **Drop-ins** (`db.php`, `object-cache.php`) load in the zygote like core.
+- **Themes and mu-plugins** can't be isolated yet: `isolate` names plugins.
+- **One pool user.** The helper serves the uid of the first worker that asks; a second pool under
+  another user gets no children (logged).
+- php-fpm only: under the CLI or CGI there is no helper, so an isolated plugin does not load at all.
+
+### Cost
+
+`bench/layer3.sh`: time to first byte of a post that goes through the probe plugin's
+`the_content` filter and one shortcode, the probe isolated vs the same probe in the worker,
+alternating round by round (see the PR for the numbers and the machine).
+
 ## Tests
 
 - `cargo test` (in Docker: the `check` target): the examples parse, unknown keys and bad
@@ -877,6 +989,20 @@ gelada stacks its filters on top of it.
   protected option are refused; its `wp_schedule_single_event` works, while its own `UPDATE` of
   `cron` is refused. The revert proof: in log mode, with layer 2 off, and with the extension unloaded,
   every refused case runs.
+- `DOCKER_CONTEXT=colima test/ext-layer3.sh` (after ext-config.sh): layer 3 with a probe plugin
+  (`test/ext/layer3-plugin`, isolated), a neighbour plugin that is not, and Hello Dolly (isolated).
+  With layer 3 on, a post renders with the probe's filter and shortcode output, made in a child
+  (another pid than the worker's, a fresh one per request); the probe's code does not exist in the
+  worker and a stray include of its files is refused; Hello Dolly prints its lyric on the dashboard
+  from its child; the helper processes run as www-data with an empty environment; a core option
+  change re-boots the helper. The limits: a write outside its folder (logged), reads of
+  wp-config.php and securecore.json and a connect to the database are stopped; a loop past
+  `timeoutMs` is killed (logged) and too much memory ends the child (logged), while each page still
+  renders. With layer 2 off the kernel alone still stops the write and the reads. The revert proof:
+  with layer 3 off the probe runs in the worker, every probe case goes through, the loop holds the
+  page and the memory probe kills it.
+- `DOCKER_CONTEXT=colima bench/layer3.sh` (after ext-config.sh): time to first byte of a post
+  through the probe's filter and shortcode, isolated vs in the worker, alternating, 7 rounds.
 - `DOCKER_CONTEXT=colima research/db/compat.sh` (after ext-config.sh): Classic Editor, Yoast and
   CF7 in log mode, entries suggested from the log, then enforce mode with them, every refusal
   listed.

@@ -443,6 +443,12 @@ fn guard(from: *const zend_execute_data, op: Op, token: &str, resolved: Resolved
         }
         Resolved::Path(resolved) => resolved,
     };
+    // Layer 3 (E7): in an isolated child, a write outside its `layer3.write` folders is refused
+    // here, with a line, in every layer 2 mode. The kernel (gelada) refuses it too; this is what
+    // makes the refusal visible and fail the way PHP fails on a permission error.
+    if op == Op::Write && crate::layer3::child_write_refused(token, &resolved) {
+        return true;
+    }
     match classify(op, &resolved, inode) {
         None => false,            // layer 2 not active
         Some(Verdict::Allow) => false,
