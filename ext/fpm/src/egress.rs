@@ -455,10 +455,19 @@ mod tests {
             eprintln!("no {} built: checked on the KVM host", exe.display());
             return;
         }
+        // Exec'd through a magic link to an fd opened here (inherited across fork), as the
+        // launcher's own /proc/self/exe is: no search right is needed on the folders above it.
+        let c = std::ffi::CString::new(exe.as_os_str().as_encoded_bytes()).expect("c");
+        // SAFETY: open(2) of the binary, read-only, without O_CLOEXEC (the child execs through it).
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0, "{}", exe.display());
+        let via = std::path::PathBuf::from(format!("/proc/self/fd/{fd}"));
         let l = TcpListener::bind("127.0.0.1:0").expect("bind");
         let local = l.local_addr().expect("addr");
         let (mut guest, host) = UnixStream::pair().expect("pair");
-        let child = crate::vm::spawn_egress_helper(&exe, host, &[local], crate::jail::User { uid: 65534, gid: 65534 }).expect("helper");
+        let child = crate::vm::spawn_egress_helper(&via, host, &[local], crate::jail::User { uid: 65534, gid: 65534 }).expect("helper");
+        // SAFETY: our fd, no longer needed here.
+        unsafe { libc::close(fd) };
         let (c, peer) = l.accept().expect("accept");
         assert_eq!(read_answer(&mut guest).expect("answer"), "OK\n");
         // The connecting socket's owner, from /proc/net/tcp (local address = the peer's).
