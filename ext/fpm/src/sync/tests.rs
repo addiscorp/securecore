@@ -550,7 +550,13 @@ fn a_mount_inside_the_folder_is_never_crossed() {
     fs::create_dir(&m).expect("mnt");
     let c = CString::new(m.as_os_str().as_bytes()).expect("c");
     // SAFETY: mount(2) of a tmpfs on our scratch folder, unmounted below.
-    assert_eq!(unsafe { libc::mount(c"tmpfs".as_ptr(), c.as_ptr(), c"tmpfs".as_ptr(), 0, c"size=1m".as_ptr().cast()) }, 0);
+    if unsafe { libc::mount(c"tmpfs".as_ptr(), c.as_ptr(), c"tmpfs".as_ptr(), 0, c"size=1m".as_ptr().cast()) } != 0 {
+        // Root without CAP_SYS_ADMIN (a container's build): checked on the KVM host.
+        let e = io::Error::last_os_error();
+        assert_eq!(e.raw_os_error(), Some(libc::EPERM), "mount: {e}");
+        eprintln!("no CAP_SYS_ADMIN ({e}): checked on the KVM host");
+        return;
+    }
     fs::write(m.join("theirs.txt"), "on another filesystem").expect("theirs");
     let mut w = writer(&h, 1 << 20);
     // Refused before its body: the header alone.
