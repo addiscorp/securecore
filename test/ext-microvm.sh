@@ -41,6 +41,8 @@
 #   test/ext-microvm.sh bench [n]  front-page p50, host php-fpm vs the microVM, extension off on
 #                                  both (bench/layer1.sh's method, #70's numbers), n rounds
 #   test/ext-microvm.sh restore [n]  the requests after a restore, timed
+#   test/ext-microvm.sh density    N sites' VMs at once: PSS, KSM, restores under load, p50
+#                                  (DENSITY_NS, DENSITY_MEM; docs/layer1-microvm.md "Density")
 # Needs: the guest kernel (KERNEL=, default .tmp/mvm/vmlinux-sc from bench/microvm/kernel.sh:
 # mirab's kernel plus Landlock and seccomp, until mirab#89 ships them); a host securecore-fpm
 # (SECURECORE_FPM=, default .target/release/securecore-fpm); docker, mke2fs, e2fsck, resize2fs,
@@ -272,6 +274,126 @@ if [ "$what" = restore ]; then
     done
   done
   rm -f "$site/sc-front.php"
+  exit 0
+fi
+
+if [ "$what" = density ]; then
+  # Density (#72, docs/layer1-microvm.md "Density"): N sites' microVMs on this host, for N in
+  # DENSITY_NS (default "1 4 8 16", stopping early when MemAvailable would drop under 700 MiB),
+  # guest memory DENSITY_MEM MiB (default 512). Each site is a copy of this one in its own Docker
+  # volume (sc-density-<k>), with its own state folder: one VM per site, as the product runs them.
+  # Two layouts: "own" (each site restores its own snapshot, as today) and "shared" (every site's
+  # vm.mem a hard link to site 1's: N VMs restored from one snapshot, so its clean pages are one
+  # copy in the page cache). Per N: Firecracker's total and per-VM PSS and RSS (smaps_rollup), with
+  # KSM off and then on (30 s of ksmd, pages_sharing), each start's restore time while the earlier
+  # VMs run and VM 1 serves a load, and VM 1's front-page p50 (oha, bench's method) with all N up.
+  mem=${DENSITY_MEM:-512}
+  ns=${DENSITY_NS:-"1 4 8 16"}
+  max=$(echo "$ns" | tr ' ' '\n' | sort -n | tail -1)
+  dd=$dir/density
+  mkdir -p "$dd"
+  oha() { docker run --rm --network "${project}_default" "$OHA" --no-tui --output-format json -H "Host: 127.0.0.1:$port" "$@"; }
+  avail() { awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo; }
+  # The sites: copies of this one without its uploads (the writable disk is sized from them).
+  find "$site/wp-content/uploads" -mindepth 1 -maxdepth 1 -name 'sc-big.bin' -delete
+  k=1
+  while [ "$k" -le "$max" ]; do
+    docker volume create "sc-density-$k" > /dev/null
+    s=$(docker volume inspect -f '{{.Mountpoint}}' "sc-density-$k")
+    [ -f "$s/wp-load.php" ] || cp -a "$site/." "$s/"
+    cp "$dir/microvm.json" "$s/securecore.json"
+    mkdir -p "$dd/state-$k" "$dd/run-$k"
+    k=$((k + 1))
+  done
+  # dstart <k> <log>: site k's launcher in the background (VM 1 listens where mvmweb sends PHP).
+  dstart() {
+    s=$(docker volume inspect -f '{{.Mountpoint}}' "sc-density-$1")
+    l=$dd/run-$1/fpm.sock
+    [ "$1" = 1 ] && l=$run/fpm.sock
+    fpm_env --config "$s/securecore.json" --vm-dir "$vm" --state-dir "$dd/state-$1" --listen "unix:$l" \
+      --listen-owner 0 --listen-group 101 --listen-mode 0660 --vm-user "$vmuser" --pool-user "$pool" \
+      --guest-root "$html" --mem "$mem" > "$2" 2>&1 &
+    echo $! > "$dd/pid-$1"
+    i=0
+    until grep -q 'securecore-fpm: serving FastCGI' "$2"; do
+      kill -0 "$(cat "$dd/pid-$1")" 2>/dev/null || { echo "  site $1's launcher exited: $(tail -2 "$2" | tr '\n' ' ')"; return 1; }
+      i=$((i + 1)); [ "$i" -lt 1800 ] || return 1
+      sleep 0.1
+    done
+  }
+  dstop() { for f in "$dd"/pid-*; do [ -f "$f" ] || continue; kill -TERM "$(cat "$f")" 2>/dev/null; wait "$(cat "$f")" 2>/dev/null; rm -f "$f"; done; }
+  trap 'dstop; [ -z "$PID" ] || kill -TERM "$PID" 2>/dev/null; kill "$peer_pid" 2>/dev/null; echo 0 > /sys/kernel/mm/ksm/run 2>/dev/null' EXIT
+  fcpid() { sed -n 's/.*Firecracker runs jailed as uid [0-9]* gid [0-9]* (pid \([0-9]*\)).*/\1/p' "$1" | tail -1; }
+  # pss <n>: "<total PSS MiB> <total RSS MiB>" of the n Firecracker processes.
+  pss() {
+    t=0 r=0 k=1
+    while [ "$k" -le "$1" ]; do
+      f=$(fcpid "$dd/run-$k.log")
+      t=$((t + $(awk '/^Pss:/ { print $2 }' "/proc/$f/smaps_rollup"))) r=$((r + $(awk '/^Rss:/ { print $2 }' "/proc/$f/smaps_rollup")))
+      k=$((k + 1))
+    done
+    echo "$((t / 1024)) $((r / 1024))"
+  }
+  # Every site's own snapshot first, one at a time.
+  k=1
+  while [ "$k" -le "$max" ]; do
+    dstart "$k" "$dd/prep-$k.log" || die "site $k's first start"
+    dstop
+    k=$((k + 1))
+  done
+  echo "density: guest memory $mem MiB, $(nproc) CPUs, $(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo) MiB, KSM $(cat /sys/kernel/mm/ksm/run 2>/dev/null || echo absent)"
+  for layout in own shared; do
+    if [ "$layout" = shared ]; then
+      one=$(find "$dd/state-1" -maxdepth 2 -path '*/snap-*/vm.mem' | head -1)
+      k=2
+      while [ "$k" -le "$max" ]; do
+        ln -f "$one" "$(find "$dd/state-$k" -maxdepth 2 -path '*/snap-*/vm.mem' | head -1)"
+        k=$((k + 1))
+      done
+    fi
+    for n in $ns; do
+      dstart 1 "$dd/run-1.log" || die "VM 1"
+      # VM 1 under load while the others restore (a named container, stopped by its name).
+      docker run --rm --name "$project-density-load" --network "${project}_default" "$OHA" --no-tui \
+        -H "Host: 127.0.0.1:$port" -z 600s -c 2 http://mvmweb/ > /dev/null 2>&1 &
+      load=$!
+      restores="" k=2 got=1
+      while [ "$k" -le "$n" ]; do
+        if [ "$(avail)" -lt $((700 + mem / 2)) ]; then echo "  stopping at $got VMs: $(avail) MiB available"; break; fi
+        dstart "$k" "$dd/run-$k.log" || break
+        restores="$restores $(sed -n 's/.*restored from snapshot [0-9a-f]* (load and php-fpm ping \([0-9.]*\) ms); ready \([0-9]*\) ms.*/\1\/\2/p' "$dd/run-$k.log")"
+        got=$k k=$((k + 1))
+      done
+      docker stop "$project-density-load" > /dev/null 2>&1; wait "$load" 2>/dev/null
+      sleep 5
+      # shellcheck disable=SC2046 # two numbers
+      set -- $(pss "$got")
+      off_t=$1 off_r=$2
+      oha -n 20 -c 1 http://mvmweb/ > /dev/null
+      oha -n 100 -c 1 http://mvmweb/ > "$dd/p50-$layout-$n.json"
+      p50=$(jq -r '.metrics.latency_ms.p50' "$dd/p50-$layout-$n.json")
+      ok=$(jq -r '.statusCodeDistribution["200"] // 0' "$dd/p50-$layout-$n.json")
+      on_t=- share=-
+      if [ -w /sys/kernel/mm/ksm/run ]; then
+        echo 1 > /sys/kernel/mm/ksm/run; sleep 30
+        # shellcheck disable=SC2046 # two numbers
+        set -- $(pss "$got"); on_t=$1
+        share=$(( $(cat /sys/kernel/mm/ksm/pages_sharing) * 4 / 1024 ))
+        echo 2 > /sys/kernel/mm/ksm/run; sleep 2; echo 0 > /sys/kernel/mm/ksm/run
+      fi
+      printf '%s N=%s: PSS %s MiB (%s/VM), RSS %s MiB | KSM on: PSS %s MiB, sharing %s MiB | restores (ping/ready ms):%s | VM 1 p50 %.2f ms (%s/100 200s) | %s MiB available\n' \
+        "$layout" "$got" "$off_t" "$((off_t / got))" "$off_r" "$on_t" "$share" "${restores:- -}" "$p50" "$ok" "$(avail)"
+      dstop
+    done
+  done
+  k=1
+  while [ "$k" -le "$max" ]; do
+    s=$dd/state-$k
+    awk -v s="$s/" 'index($5, s) == 1 { print $5 }' /proc/self/mountinfo | sort -r | while read -r m; do umount -l "$m"; done
+    find "$s" -mindepth 1 -xdev -delete
+    docker volume rm "sc-density-$k" > /dev/null
+    k=$((k + 1))
+  done
   exit 0
 fi
 
