@@ -881,6 +881,15 @@ only vsock, and `layer1` maps onto it as follows:
 | `deny`, outside the app root | nothing to do: the guest never has it |
 | `deny`, inside it | refused: the site disk is the whole root |
 
+**php-fpm's environment in the guest** (#72). The vault's env sources
+(`layer2.vault.secrets[].env`) always go to the guest, and so does each `--guest-env <NAME>`
+(repeatable; e.g. `WORDPRESS_DB_HOST`). Their values come from the launcher's own environment,
+where php-fpm on the host would have them, for example a systemd `EnvironmentFile`. The launcher
+sends them in every start message: after a cold boot, after every restore, and again to a
+reloaded php-fpm. They are never in the guest's image, its boot arguments, a snapshot or a
+log. A name the launcher's environment lacks stops the start. Firecracker and the sync writer
+run with an empty environment.
+
 The site is a read-only disk built from the app root with `mke2fs -d`, mounted at the same path
 (or `--guest-root`, the root nginx sends in `SCRIPT_FILENAME`). The guest's root is read-only
 too, so core, plugins and themes can't be written. Its PID 1 is `securecore-fpm` again, as

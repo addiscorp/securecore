@@ -488,6 +488,8 @@ impl Jail {
     /// `mem_mib` of guest memory plus Firecracker's own overhead.
     pub fn command(&self, jailer: &Path, firecracker: &Path, vcpus: u32, mem_mib: u32, args: &[&str]) -> Command {
         let mut cmd = Command::new(jailer);
+        // Nothing of the launcher's environment (which holds the guest's secrets, #72).
+        cmd.env_clear();
         cmd.arg("--id")
             .arg(&self.id)
             .arg("--exec-file")

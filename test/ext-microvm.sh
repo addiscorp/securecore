@@ -144,14 +144,16 @@ cp "$vm/vmlinux" "$dir/vmlinux-mirab"
 docker build -q -f docker/ext.Dockerfile --target guest -t "$project-guest" . > "$dir/guest-build.log" 2>&1 \
   || die "the guest image (see $dir/guest-build.log)"
 # The test site's environment for the guest's php-fpm (database settings and the vault's env
-# sources, the stack's fixed test values), with the database on the guest's loopback.
+# sources, the stack's fixed test values), with the database on the guest's loopback. The
+# launcher gets it as its own environment and delivers it in each start message (#72); no image
+# carries it.
 docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$(compose ps -q php)" | grep '^WORDPRESS_' \
   | sed 's|^WORDPRESS_DB_HOST=.*|WORDPRESS_DB_HOST=127.0.0.1:3306|' > "$dir/guest.env"
 grep -q '^WORDPRESS_DB_HOST=127.0.0.1:3306$' "$dir/guest.env" || die "the guest's env file"
 rootfs_built=$dir/rootfs.stamp
 img=$(docker image inspect -f '{{.Id}}' "$project-guest")
 if [ ! -s "$vm/rootfs.ext4" ] || [ "$(cat "$rootfs_built" 2>/dev/null)" != "$img" ]; then
-  scripts/guest-image.sh "$project-guest" "$vm/rootfs.ext4" "$dir/guest.env" > "$dir/rootfs.log" 2>&1 || die "rootfs.ext4 (see $dir/rootfs.log)"
+  scripts/guest-image.sh "$project-guest" "$vm/rootfs.ext4" > "$dir/rootfs.log" 2>&1 || die "rootfs.ext4 (see $dir/rootfs.log)"
   echo "$img" > "$rootfs_built"
 fi
 # installed.json, as the installer writes it, with the rootfs too (this test built it; no
@@ -216,10 +218,20 @@ fi
 
 # start <name> <config> [flags]: the host launcher in the background on <config> as the site's
 # securecore.json. Sets PID. Waits for "serving" (or for the launcher to exit).
+# fpm_env [flags] &: the launcher with the test site's environment as its own (php-fpm on a host
+# gets it the same way), each of those names passed on to the guest (--guest-env). Only ever
+# run in the background: it execs, so $! is the launcher.
+fpm_env() {
+  while IFS= read -r l; do export "$l"; done < "$dir/guest.env"
+  # shellcheck disable=SC2046 # the names are plain words
+  exec "$fpm" $(sed 's/=.*//; s/^/--guest-env /' "$dir/guest.env") "$@"
+}
+dbpass=$(sed -n 's/^WORDPRESS_DB_PASSWORD=//p' "$dir/guest.env")
+[ -n "$dbpass" ] || die "the test site's DB password"
 start() {
   name=$1 config=$2; shift 2
   cp "$config" "$site/securecore.json"
-  "$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --listen "unix:$run/fpm.sock" \
+  fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --listen "unix:$run/fpm.sock" \
     --listen-owner 0 --listen-group 101 --listen-mode 0660 --vm-user "$vmuser" --pool-user "$pool" \
     --guest-root "$html" "$@" > "$dir/$name.log" 2>&1 &
   PID=$!
@@ -255,7 +267,8 @@ standin="grep -E '^(NoNewPrivs|Seccomp_filters):' /proc/self/status | tr -s '\t 
 once() {
   name=$1 config=$2; shift 2
   cp "$config" "$site/securecore.json"
-  "$fpm" --config "$site/securecore.json" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" "$@" --php-fpm /bin/sh -- -c "$standin" > "$dir/value-$name.log" 2>&1
+  fpm_env --config "$site/securecore.json" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" "$@" --php-fpm /bin/sh -- -c "$standin" > "$dir/value-$name.log" 2>&1 &
+  wait $!
   echo "exit=$?" >> "$dir/value-$name.log"
 }
 
@@ -449,6 +462,14 @@ if [ "$started" = 1 ]; then
   has "$dir/first.log" "layer 1 isolation microvm: microvm" "microvm on the KVM host: the microVM"
   has "$dir/first.log" "made the snapshot" "the first start makes a snapshot"
   has "$dir/first.log" "microVM restored from snapshot" "and serves from a restore of it"
+  # The secrets (#72): delivered at each start, never in an image, a snapshot or a console.
+  has "$dir/first.log" "the guest's php-fpm gets WORDPRESS_" "the launcher delivers php-fpm's environment by name"
+  lacks "$dir/first.log" "$dbpass" "the DB password is in no launcher log line"
+  snapd=$(find "$state" -maxdepth 1 -name 'snap-*' | head -1)
+  for f in "$vm/rootfs.ext4" "$snapd/vm.mem" "$snapd/vm.snap" "$state/console.log"; do
+    is "$(grep -c -a -F -- "$dbpass" "$f")" 0 "the DB password is not in $(basename "$f")"
+  done
+  is "$(grep -c -a -F -- "$(printf %s "$dbpass" | od -An -tx1 | tr -d ' \n')" "$snapd/vm.mem")" 0 "nor hex-encoded in the snapshot's memory"
   sitedisk=$(find "$state" -maxdepth 1 -name 'site-*.ext4' | head -1)
   is "$(debugfs -R 'ls /wp-content/uploads' "$sitedisk" 2>/dev/null | grep -c sc-big.bin)" 0 \
     "the site disk holds no upload (the writable folders are only mount points in it)"

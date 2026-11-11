@@ -163,6 +163,44 @@ pub struct Options {
     pub snapshot: bool,
     /// Extra guest boot arguments (e.g. `sc.ext=0`).
     pub guest_args: Vec<String>,
+    /// Variables of the launcher's environment the guest's php-fpm gets, besides the vault's
+    /// own (`layer2.vault.secrets[].env`), which it always gets ([`guest_env`]).
+    pub guest_env: Vec<String>,
+}
+
+/// php-fpm's environment in the guest: each name in `--guest-env` and each vault secret's `env`,
+/// with its value from the launcher's own environment (as php-fpm on the host would have it).
+/// Delivered in every start message, never in an image, a boot argument or a snapshot. A name
+/// the launcher's environment lacks is refused: the guest's vault would fail closed anyway.
+pub fn guest_env(loaded: &Loaded, names: &[String], get: impl Fn(&str) -> Option<String>) -> Result<Vec<(String, String)>, String> {
+    let mut all: Vec<String> = names.to_vec();
+    let l2 = &loaded.config.layer2;
+    if l2.enabled
+        && let Some(v) = &l2.vault
+    {
+        for s in &v.secrets {
+            if let securecore_config::Secret::Env(e) = s {
+                all.push(e.env.clone());
+            }
+        }
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for name in all {
+        if out.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if !crate::guest::env_name_ok(&name) {
+            return Err(format!("--guest-env {name:?} is not a variable name"));
+        }
+        let value = get(&name).ok_or_else(|| {
+            format!("the launcher's environment has no {name}, which the guest's php-fpm needs (--guest-env, or layer2.vault.secrets[].env)")
+        })?;
+        if value.len() > crate::guest::MAX_ENV_VALUE {
+            return Err(format!("{name} is longer than {} bytes", crate::guest::MAX_ENV_VALUE));
+        }
+        out.push((name, value));
+    }
+    Ok(out)
 }
 
 /// A writable folder inside the app root: its own disk.
@@ -895,8 +933,10 @@ fn api(sock: &Path, method: &str, path: &str, body: &str) -> Result<(), String> 
     }
 }
 
-/// The guest's boot arguments, without the clock (that part goes into no key).
-fn boot_args(plan: &Plan, opts: &Options) -> String {
+/// The guest's boot arguments, without the clock (that part goes into no key). `env_names`: the
+/// names (never the values) of php-fpm's delivered environment, so php-fpm can start at boot
+/// with a placeholder for each ([`crate::guest::NOT_DELIVERED`]).
+fn boot_args(plan: &Plan, opts: &Options, env_names: &[&str]) -> String {
     // mirab's (src/isolation/firecracker.ts): the i8042 flags skip a 500 ms keyboard probe.
     // Firecracker adds root=/dev/vda ro for a read-only root drive.
     let mut a = format!(
@@ -907,6 +947,9 @@ fn boot_args(plan: &Plan, opts: &Options) -> String {
     let ports: Vec<String> = plan.sockets.iter().map(|(p, _)| p).chain(plan.addresses.iter().map(|(p, _)| p)).map(u16::to_string).collect();
     if !ports.is_empty() {
         let _ = write!(a, " sc.ports={}", ports.join(","));
+    }
+    if !env_names.is_empty() {
+        let _ = write!(a, " sc.env={}", env_names.join(","));
     }
     if !plan.egress.is_empty() {
         let _ = write!(a, " sc.egress={}", plan.egress.iter().map(u16::to_string).collect::<Vec<_>>().join(","));
@@ -1189,9 +1232,10 @@ fn take_out(inside: &Path, out: &Path, user: User) -> Result<(), String> {
 
 /// The start message: the clock, fresh randomness, the workers' refresh after a restore, then
 /// the writable disks and tmpfs folders.
-fn start_message(plan: &Plan, restored: bool, entropy: [u8; 64]) -> Vec<Ctl> {
+fn start_message(plan: &Plan, restored: bool, entropy: [u8; 64], env: &[(String, String)]) -> Vec<Ctl> {
     let (secs, nanos) = now();
     let mut lines = vec![Ctl::Time { secs, nanos }, Ctl::Entropy { hex: hex(&entropy) }];
+    lines.extend(env.iter().map(|(name, value)| Ctl::Env { name: name.clone(), hex: hex(value.as_bytes()) }));
     if restored {
         lines.push(Ctl::Refresh);
     }
@@ -1627,7 +1671,7 @@ fn spawn_writer(uds: &Path, root: &Path, rels: &[PathBuf], cap: u64, pool: User)
     let mut high = vec![0 as libc::c_int; raw.len()];
     let caps = vec![cap.to_string(); rels.len()].join(",");
     let mut cmd = Command::new("/proc/self/exe");
-    cmd.arg0("securecore-fpm").arg("--sync-writer").arg(caps).stdin(Stdio::from(OwnedFd::from(conn))).stdout(Stdio::null());
+    cmd.env_clear().arg0("securecore-fpm").arg("--sync-writer").arg(caps).stdin(Stdio::from(OwnedFd::from(conn))).stdout(Stdio::null());
     // SAFETY: only syscalls between fork and exec, on values made before the fork.
     unsafe {
         cmd.pre_exec(move || {
@@ -1751,6 +1795,11 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     let mounts: Vec<PathBuf> = plan.sockets.iter().map(|(p, _)| jail.root.join(format!("sock-{p}"))).collect();
     let _watchdog = jail.watchdog(&mounts)?;
     claim_state(&plan)?;
+    let env = guest_env(loaded, &opts.guest_env, |n| std::env::var(n).ok())?;
+    if !env.is_empty() {
+        // The names only, never a value.
+        log(&format!("the guest's php-fpm gets {} from the launcher's environment, in each start message", env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(" ")));
+    }
     let egress = crate::egress::Egress::new(loaded, plan.egress.clone());
     if !plan.egress.is_empty() {
         log(&format!(
@@ -1777,7 +1826,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     for d in &plan.disks {
         disks.push((d.id.clone(), write_disk(&plan, d, opts.write_disk_mib, user)?));
     }
-    let args = boot_args(&plan, opts);
+    let args = boot_args(&plan, opts, &env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>());
     let key = Key {
         files,
         site,
@@ -1794,7 +1843,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     let (mut vm, mut how) = start(&plan, opts, &m)?;
     let t_ready = ms(t0);
     let restored = matches!(how, Started::Restored { .. });
-    if let Err(e) = tell_guest(&vm.vsock, &start_message(&plan, restored, random64()?), START_TIMEOUT) {
+    if let Err(e) = tell_guest(&vm.vsock, &start_message(&plan, restored, random64()?, &env), START_TIMEOUT) {
         if !restored {
             return Err(e);
         }
@@ -1804,7 +1853,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         let _ = fs::remove_dir_all(snap_dir(&plan, &m));
         let mut cold = cold_boot(&plan, opts, &m, Wiring::Full)?;
         cold.wait_ready(&plan.state, Duration::from_secs(60))?;
-        tell_guest(&cold.vsock, &start_message(&plan, false, random64()?), START_TIMEOUT)?;
+        tell_guest(&cold.vsock, &start_message(&plan, false, random64()?, &env), START_TIMEOUT)?;
         vm = cold;
         how = Started::Cold;
     }
@@ -1934,7 +1983,34 @@ mod tests {
             pool_user: Some("33:33".into()),
             snapshot: true,
             guest_args: vec![],
+            guest_env: vec![],
         }
+    }
+
+    #[test]
+    fn the_guests_environment_is_the_vaults_and_the_named_variables() {
+        let dir = scratch("env");
+        let path = dir.join("securecore.json");
+        let json = r#"{"layer1":{"isolation":"microvm"},"layer2":{"enabled":true,"app":"wordpress","mode":"enforce",
+            "vault":{"secrets":[{"name":"DB_PASSWORD","env":"WORDPRESS_DB_PASSWORD"},{"name":"AUTH_KEY","env":"WORDPRESS_AUTH_KEY"}]}},
+            "layer3":{"enabled":false}}"#;
+        fs::write(&path, json).expect("write");
+        let l = securecore_config::load(&path).expect("valid");
+        let get = |n: &str| match n {
+            "WORDPRESS_DB_PASSWORD" => Some("pw".to_owned()),
+            "WORDPRESS_AUTH_KEY" => Some("key".to_owned()),
+            "WORDPRESS_DB_HOST" => Some("127.0.0.1:3306".to_owned()),
+            _ => None,
+        };
+        let env = guest_env(&l, &["WORDPRESS_DB_HOST".into(), "WORDPRESS_DB_PASSWORD".into()], get).expect("all there");
+        let names: Vec<&str> = env.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["WORDPRESS_DB_HOST", "WORDPRESS_DB_PASSWORD", "WORDPRESS_AUTH_KEY"], "the vault's always, each once");
+        let e = guest_env(&l, &["MISSING".into()], get).expect_err("missing");
+        assert!(e.contains("has no MISSING") && !e.contains("pw"), "{e}");
+        assert!(guest_env(&l, &["BAD-NAME".into()], get).is_err());
+        let e = guest_env(&l, &[], |_| None).expect_err("the vault's own, missing");
+        assert!(e.contains("WORDPRESS_DB_PASSWORD"), "{e}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1953,7 +2029,7 @@ mod tests {
         assert_eq!(p.sockets, [(3306, PathBuf::from("/run/mysqld/mysqld.sock"))]);
         assert_eq!(p.addresses, [(6379, "10.0.0.5:6379".to_owned())]);
         assert_eq!(p.egress, [443], "no socket or address: named hosts through the host");
-        assert!(boot_args(&p, &opts()).contains(" sc.egress=443"), "the guest learns its egress ports");
+        assert!(boot_args(&p, &opts(), &[]).contains(" sc.egress=443"), "the guest learns its egress ports");
         let e = plan(
             &loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"connect":[{"port":1517,"address":"10.0.0.1:1"}]}}"#),
             &opts(),
@@ -1963,19 +2039,23 @@ mod tests {
         assert_eq!(p.listen, Listen::Tcp("127.0.0.1:9000".into()), "the first bind port, on loopback");
         assert!(p.state.starts_with(DEFAULT_STATE_DIR));
         assert!(p.id.starts_with("sc-") && p.id.len() == 19, "{}", p.id);
-        let args = boot_args(&p, &opts());
+        let args = boot_args(&p, &opts(), &["WORDPRESS_DB_PASSWORD"]);
+        assert!(args.contains(" sc.env=WORDPRESS_DB_PASSWORD"), "the names, for php-fpm's placeholders at boot: {args}");
         assert!(args.contains(" sc.root=/var/www/html") && args.contains(" sc.ports=3306,6379"), "{args}");
         assert!(args.contains(" sc.user=33:33"), "the guest's pool runs as the host's pool user: {args}");
         assert!(args.contains(" sc.sock=3306:/run/mysqld/mysqld.sock"), "{args}");
         assert!(!args.contains("sc.time"), "the clock is in no key: {args}");
-        let msg = start_message(&p, true, [7; 64]);
+        let env = [("WORDPRESS_DB_PASSWORD".to_owned(), "s3cret".to_owned())];
+        let msg = start_message(&p, true, [7; 64], &env);
         assert!(matches!(msg[0], Ctl::Time { .. }), "the clock first");
         assert_eq!(msg[1], Ctl::Entropy { hex: "07".repeat(64) }, "then fresh randomness");
-        assert_eq!(msg[2], Ctl::Refresh, "a restore replaces the workers forked before the snapshot");
-        assert_eq!(msg[3], Ctl::Mount { device: "/dev/vdc".into(), path: "/var/www/html/wp-content/uploads".into() });
-        assert_eq!(msg[4], Ctl::Tmpfs { path: "/var/cache/sc".into() });
+        assert_eq!(msg[2], Ctl::Env { name: "WORDPRESS_DB_PASSWORD".into(), hex: hex(b"s3cret") }, "then php-fpm's environment");
+        assert_eq!(msg[3], Ctl::Refresh, "a restore replaces the workers forked before the snapshot");
+        assert_eq!(msg[4], Ctl::Mount { device: "/dev/vdc".into(), path: "/var/www/html/wp-content/uploads".into() });
+        assert_eq!(msg[5], Ctl::Tmpfs { path: "/var/cache/sc".into() });
         assert_eq!(msg.last(), Some(&Ctl::Done));
-        assert!(!start_message(&p, false, [7; 64]).contains(&Ctl::Refresh), "a cold boot's workers are fresh");
+        assert!(!start_message(&p, false, [7; 64], &env).contains(&Ctl::Refresh), "a cold boot's workers are fresh");
+        assert!(!args.contains("s3cret") && !args.contains(&hex(b"s3cret")), "never a boot argument");
         assert_ne!(random64().expect("random"), random64().expect("random"), "every start message gets its own");
         let _ = fs::remove_dir_all(&dir);
     }

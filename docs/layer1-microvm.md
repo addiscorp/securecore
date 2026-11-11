@@ -729,6 +729,35 @@ host   securecore-fpm: is 443 an egress port, and is the name in layer 2's host 
   (curl handles that). `getpeername`/`getsockname` on such a socket answer AF_INET addresses.
 - The snapshot's warm-up VM has no egress listener, like its missing database.
 
+## Secrets: delivered at each start (#72)
+
+The guest's php-fpm needs the vault's env sources (`WORDPRESS_DB_PASSWORD`, the salts) and the
+site's settings (`WORDPRESS_DB_HOST`, …). Until #72 the test image baked them into
+`/etc/securecore/guest.env` on the root image. Now:
+
+- **The launcher delivers them in every start message**, after a cold boot and after every
+  restore. They travel as `env <NAME> <hex>` control lines on vsock 1515, which only the host
+  can open. The set is each `layer2.vault.secrets[].env` (always) plus each `--guest-env <NAME>`,
+  with the values from the launcher's own environment, as php-fpm on the host gets them (a
+  systemd `EnvironmentFile`, compose's `environment`). A name the launcher lacks stops the start
+  with the name, never a value.
+- **Never baked in.** `scripts/guest-image.sh` takes no env file any more, and the guest reads
+  none. The values are not boot arguments, so they are not in `/proc/cmdline`. Neither side
+  logs them, and a malformed `env` line is refused without being echoed.
+- **Never in a snapshot.** The snapshot is taken before any start message, so its memory has no
+  value. php-fpm still has to start at boot for the warm-up and the snapshot, and the
+  extension's vault refuses to load without its variables. So the host passes the *names*
+  (`sc.env=WORDPRESS_DB_PASSWORD,…`, never a value) as a boot argument, and at boot each gets
+  the placeholder `securecore-not-delivered-yet`. On a start message with `env` lines, init keeps them in its own memory and starts a
+  fresh php-fpm master with them (graceful stop, start, then waits until it listens). A restore
+  gets them again from its own start message. A `reload` (SIGUSR2/SIGHUP) starts php-fpm with
+  them too.
+- **Firecracker and the sync writer get an empty environment**, so the secrets are in neither
+  process's `/proc/<pid>/environ`.
+- `test/ext-microvm.sh` checks that the DB password appears in none of these: `rootfs.ext4`,
+  the snapshot's `vm.mem` (as text or hex) and `vm.snap`, `console.log`, the launcher's log. It
+  also checks that a restored guest still reaches the database.
+
 ## Follow-up issues (not filed)
 
 1. **mirab: Landlock and seccomp in the x86_64 guest kernel.** Add `SECURITY`,
