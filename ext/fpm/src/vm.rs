@@ -39,7 +39,7 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
@@ -180,13 +180,63 @@ pub struct Options {
 
 /// The site's php.ini settings as the guest gets them: `None` without `--guest-ini` or while the
 /// file is missing; refused with the reason when it sets anything else.
-pub fn read_site_ini(path: Option<&Path>) -> Result<Option<String>, String> {
+pub fn read_site_ini(path: Option<&Path>, who: User) -> Result<Option<String>, String> {
     let Some(path) = path else { return Ok(None) };
-    match fs::read_to_string(path) {
-        Ok(text) => crate::guest::site_ini(&text).map(Some).map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{}: {e}", path.display())),
+    match read_regular(path, MAX_SITE_INI, who) {
+        Ok(None) => Ok(None),
+        Ok(Some(b)) => {
+            let text = String::from_utf8(b).map_err(|_| format!("{}: not UTF-8", path.display()))?;
+            crate::guest::site_ini(&text).map(Some).map_err(|e| format!("{}: {e}", path.display()))
+        }
+        Err(e) => Err(e),
     }
+}
+
+/// The largest `--guest-ini` file read.
+pub const MAX_SITE_INI: usize = 16 * 1024;
+
+/// Reads a file the site's owner controls (`securecore.json`, the `--guest-ini` file) the way
+/// the pool user would (#90 review): this thread's filesystem uid and gid are the pool user's for
+/// the open, the last component is never followed (a link is refused), it must be a regular
+/// file, and at most `cap` bytes are read (a larger one is refused, a device never read).
+/// `Ok(None)`: it doesn't exist. No error ever quotes the file's bytes.
+pub fn read_regular(path: &Path, cap: usize, who: User) -> Result<Option<Vec<u8>>, String> {
+    let c = cpath(path)?;
+    // SAFETY: setfsuid(2)/setfsgid(2) change only this thread's filesystem ids, and are put
+    // back right after the open.
+    let (old_gid, old_uid) = unsafe { (libc::setfsgid(who.gid), libc::setfsuid(who.uid)) };
+    // SAFETY: open(2) with a NUL-terminated path.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    let err = io::Error::last_os_error();
+    // SAFETY: as above.
+    unsafe {
+        libc::setfsuid(old_uid as libc::uid_t);
+        libc::setfsgid(old_gid as libc::gid_t);
+    }
+    if fd < 0 {
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return Err(format!("{} is a link: refused (it is read only as itself)", path.display()));
+        }
+        return Err(format!("{}: {err}", path.display()));
+    }
+    // SAFETY: fd was just returned by open(2).
+    let f = unsafe { fs::File::from_raw_fd(fd) };
+    let m = f.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
+    if !m.file_type().is_file() {
+        return Err(format!("{} is not a regular file: refused", path.display()));
+    }
+    if m.len() > cap as u64 {
+        return Err(format!("{} is larger than {cap} bytes: refused", path.display()));
+    }
+    let mut b = Vec::new();
+    f.take(cap as u64 + 1).read_to_end(&mut b).map_err(|e| format!("{}: {e}", path.display()))?;
+    if b.len() > cap {
+        return Err(format!("{} is larger than {cap} bytes: refused", path.display()));
+    }
+    Ok(Some(b))
 }
 
 /// php-fpm's environment in the guest: each name in `--guest-env` and each vault secret's `env`,
@@ -1501,43 +1551,64 @@ pub fn live_change(started: &Loaded, new: &Loaded, opts: &Options) -> Result<Vec
 /// valid one is put in place in the guest, where the extension reloads it as on a host (and the
 /// host's egress takes its layer 2 hosts). A changed php.ini is delivered and php-fpm started
 /// again gracefully with it.
-fn watch_live(started: &Loaded, opts: &Options, uds: &Path, egress: &std::sync::RwLock<crate::egress::Egress>, ports: &[u16], mut ini: Option<String>) {
-    let mut reloader: Option<securecore_config::Reloader> = None;
+#[allow(clippy::too_many_arguments)] // the watcher's whole state, handed over once at the start
+fn watch_live(
+    started: &Loaded,
+    opts: &Options,
+    uds: &Path,
+    egress: &std::sync::RwLock<crate::egress::Egress>,
+    ports: &[u16],
+    mut ini: Option<String>,
+    pool: User,
+) {
     let mut in_guest = started.sha256.clone();
+    // The file's bytes last looked at (by sha256), and what was said about them: each version is
+    // judged once, as the extension's Reloader does.
+    let mut seen = started.sha256.clone();
     let mut refused: Option<String> = None;
-    let mut start_error: Option<String> = None;
+    let mut read_error: Option<String> = None;
     let mut ini_refused: Option<String> = None;
     loop {
         thread::sleep(WATCH_INTERVAL);
-        let r = match &mut reloader {
-            Some(r) => r,
-            None => match securecore_config::Reloader::start(&started.path, Duration::ZERO, Instant::now()) {
-                Ok(r) => reloader.insert(r),
-                Err(e) => {
-                    let e = e.to_string();
-                    if start_error.as_deref() != Some(&e) {
-                        log(&format!("{e}; keeping the last valid config in the guest (sha256 {})", short_sha(&in_guest)));
-                        start_error = Some(e);
-                    }
-                    continue;
+        // Read as the pool user, never through a link, at most MAX_CONFIG bytes (#90 review).
+        let bytes = match read_regular(&started.path, crate::guest::MAX_CONFIG, pool) {
+            Ok(Some(b)) => {
+                read_error = None;
+                Some(b)
+            }
+            other => {
+                let e = other.err().unwrap_or_else(|| format!("{}: missing", started.path.display()));
+                if read_error.as_deref() != Some(&e) {
+                    log(&format!("{e}; keeping the last valid config in the guest (sha256 {})", short_sha(&in_guest)));
+                    read_error = Some(e);
                 }
-            },
+                None
+            }
         };
-        if let securecore_config::Poll::Rejected(e) = r.poll(Instant::now()) {
-            log(&format!("{e}; keeping the last valid config in the guest (sha256 {})", short_sha(&in_guest)));
-        }
-        let live = r.live().clone();
-        if live.sha256 != in_guest && refused.as_deref() != Some(&live.sha256) {
+        let live = match bytes {
+            Some(b) if securecore_config::sha256_hex(&b) != seen => {
+                let sha = securecore_config::sha256_hex(&b);
+                seen = sha.clone();
+                match securecore_config::Config::from_slice(&b) {
+                    Ok(config) => Some((Loaded { path: started.path.clone(), config, sha256: sha, root: started.root.clone() }, b)),
+                    Err(problem) => {
+                        let e = securecore_config::LoadError { path: started.path.clone(), problem };
+                        log(&format!("{e}; keeping the last valid config in the guest (sha256 {})", short_sha(&in_guest)));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some((live, b)) = live
+            && live.sha256 != in_guest
+            && refused.as_deref() != Some(&live.sha256)
+        {
             let t = Instant::now();
-            let bytes = fs::read(&live.path).ok().filter(|b| securecore_config::sha256_hex(b) == live.sha256);
-            let result = match (bytes, live_change(started, &live, opts)) {
-                // Changed again since it was read: the next look takes the newer one.
-                (None, _) => continue,
-                (_, Err(e)) => Err(e),
-                (Some(b), Ok(notes)) => tell_guest(uds, &[Ctl::Config { hex: hex(&b) }, Ctl::Done], SYNC_TIMEOUT_LIVE).map(|()| notes),
-            };
+            let result = live_change(started, &live, opts).and_then(|notes| deliver_config(uds, &b, &live.sha256).map(|how| (notes, how)));
             match result {
-                Ok(notes) => {
+                Ok((mut notes, how)) => {
+                    notes.extend(how);
                     log(&format!(
                         "delivered {} (sha256 {}) to the running guest in {:.0} ms; its extension reloads it",
                         live.path.display(),
@@ -1562,13 +1633,8 @@ fn watch_live(started: &Loaded, opts: &Options, uds: &Path, egress: &std::sync::
             }
         }
         if let Some(path) = &opts.guest_ini {
-            let now = match fs::read_to_string(path) {
-                Ok(text) => Some(text),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(_) => continue,
-            };
-            let checked = now.as_deref().map(crate::guest::site_ini).transpose();
-            match checked {
+            // As the pool user, never through a link, capped; a refusal never quotes the file.
+            match read_site_ini(Some(path), pool) {
                 Ok(text) if text != ini => {
                     ini_refused = None;
                     let t = Instant::now();
@@ -1587,7 +1653,7 @@ fn watch_live(started: &Loaded, opts: &Options, uds: &Path, egress: &std::sync::
                 Ok(_) => {}
                 Err(e) => {
                     if ini_refused.as_deref() != Some(e.as_str()) {
-                        log(&format!("{}: {e}; the guest keeps its php.ini settings", path.display()));
+                        log(&format!("{e}; the guest keeps its php.ini settings"));
                     }
                     ini_refused = Some(e);
                 }
@@ -1598,6 +1664,49 @@ fn watch_live(started: &Loaded, opts: &Options, uds: &Path, egress: &std::sync::
 
 /// How long a live config delivery waits for the guest's `ok`.
 const SYNC_TIMEOUT_LIVE: Duration = Duration::from_secs(10);
+
+/// Puts `bytes` (whose sha256 is `sha`) in the running guest. The guest's answer decides (#90
+/// review): an `error` reply is a refusal; when no answer came (a timeout, a broken connection)
+/// the guest is asked which config it reads now, and if that is `sha` the delivery stands. `Ok`
+/// carries a note when it was decided that way.
+fn deliver_config(uds: &Path, bytes: &[u8], sha: &str) -> Result<Option<String>, String> {
+    let sent = tell_guest(uds, &[Ctl::Config { hex: hex(bytes) }, Ctl::Done], SYNC_TIMEOUT_LIVE);
+    let asked = match &sent {
+        Err(e) if !guest_answered(e) => Some(ask_config_sha(uds)),
+        _ => None,
+    };
+    delivery_outcome(sent, asked, sha)
+}
+
+/// Whether a [`tell_guest`] error is the guest's own `error` reply (as opposed to no reply).
+fn guest_answered(e: &str) -> bool {
+    e.starts_with("the guest refused ")
+}
+
+/// [`deliver_config`]'s decision, given the delivery's result and, when it had no answer, the
+/// guest's answer to "which config do you read now".
+pub fn delivery_outcome(sent: Result<(), String>, asked: Option<Result<String, String>>, sha: &str) -> Result<Option<String>, String> {
+    match (sent, asked) {
+        (Ok(()), _) => Ok(None),
+        (Err(e), Some(Ok(now))) if now == sha => Ok(Some(format!("its reply was lost ({e}), but it reads that config now: delivered"))),
+        (Err(e), Some(Ok(now))) => Err(format!("{e}; the guest reads sha256 {} now", short_sha(&now))),
+        (Err(e), Some(Err(q))) => Err(format!("{e}; asking the guest which config it reads failed too ({q})")),
+        (Err(e), None) => Err(e),
+    }
+}
+
+/// The sha256 of the config the guest's extension reads now ([`Ctl::ConfigSha`]).
+fn ask_config_sha(uds: &Path) -> Result<String, String> {
+    let mut s = vsock::connect_through(uds, CTL_PORT, Duration::from_secs(2)).map_err(|e| format!("the guest's control port: {e}"))?;
+    let message: String = [Ctl::ConfigSha, Ctl::Done].iter().map(Ctl::line).collect();
+    s.write_all(message.as_bytes()).map_err(|e| format!("the guest's control port: {e}"))?;
+    s.set_read_timeout(Some(SYNC_TIMEOUT_LIVE)).map_err(|e| e.to_string())?;
+    let reply = read_reply(s)?;
+    match reply.trim_end().split_once(' ') {
+        Some(("sha", sha)) if sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(sha.to_owned()),
+        _ => Err(format!("the guest answered {:?}", reply.trim_end())),
+    }
+}
 
 fn short_sha(sha: &str) -> &str {
     &sha[..sha.len().min(16)]
@@ -2408,7 +2517,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         ),
     };
     let egress: &'static std::sync::RwLock<crate::egress::Egress> = Box::leak(Box::new(std::sync::RwLock::new(egress)));
-    let ini = read_site_ini(opts.guest_ini.as_deref())?;
+    let ini = read_site_ini(opts.guest_ini.as_deref(), plan.pool)?;
     if let (Some(path), Some(text)) = (&opts.guest_ini, &ini) {
         log(&format!("the guest's php-fpm gets the site's php.ini settings from {} ({} lines), in each start message", path.display(), text.lines().count()));
     }
@@ -2483,8 +2592,8 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     // An edited securecore.json and php.ini settings reach the running guest (#90).
     {
         let (loaded, opts, uds) = (loaded.clone(), opts.clone(), vm.vsock.clone());
-        let ports = plan.egress.clone();
-        thread::spawn(move || watch_live(&loaded, &opts, &uds, egress, &ports, ini));
+        let (ports, pool) = (plan.egress.clone(), plan.pool);
+        thread::spawn(move || watch_live(&loaded, &opts, &uds, egress, &ports, ini, pool));
     }
     let sig = loop {
         let sig = wait_for_signal(&set);
@@ -3203,6 +3312,55 @@ mod tests {
         );
         let disk = refused(&lines, "error the writable folders did not sync to the host: timed out").expect_err("refused");
         assert!(stop_sync_failed(&disk).starts_with("the guest did not sync its disks before the stop: "), "{}", stop_sync_failed(&disk));
+    }
+
+    /// #90 review: the config and the --guest-ini file are read as themselves (never through a
+    /// link: another site's config, /dev/zero), regular files only, within a cap, and an error
+    /// never quotes their bytes.
+    #[test]
+    fn a_site_file_is_read_as_itself_regular_and_capped() {
+        let dir = scratch("regular");
+        // SAFETY: getuid/getgid only read this process's ids.
+        let me = User { uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() } };
+        let file = dir.join("securecore.json");
+        fs::write(&file, "{\"secret\":\"s3cr3t\"}").expect("write");
+        assert_eq!(read_regular(&file, 1024, me), Ok(Some(b"{\"secret\":\"s3cr3t\"}".to_vec())));
+        assert_eq!(read_regular(&dir.join("missing.json"), 1024, me), Ok(None));
+        let other = dir.join("other-tenant.json");
+        fs::write(&other, "theirs").expect("write");
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&other, &link).expect("link");
+        let e = read_regular(&link, 1024, me).expect_err("a link");
+        assert!(e.contains("is a link: refused"), "{e}");
+        let zero = dir.join("zero.json");
+        std::os::unix::fs::symlink("/dev/zero", &zero).expect("link");
+        assert!(read_regular(&zero, 1024, me).is_err(), "/dev/zero through a link");
+        assert!(read_regular(Path::new("/dev/zero"), 1024, me).expect_err("a device").contains("not a regular file"));
+        let e = read_regular(&file, 4, me).expect_err("over the cap");
+        assert!(e.contains("larger than 4 bytes") && !e.contains("s3cr3t"), "{e}");
+        let ini = dir.join("site.ini");
+        fs::write(&ini, "securecore.debug_attribution_log = ${WORDPRESS_DB_PASSWORD}\n").expect("write");
+        let e = read_site_ini(Some(&ini), me).expect_err("a ${} value");
+        assert!(!e.contains("WORDPRESS_DB_PASSWORD"), "{e}");
+        let ini_link = dir.join("ini-link.ini");
+        std::os::unix::fs::symlink(&ini, &ini_link).expect("link");
+        assert!(read_site_ini(Some(&ini_link), me).expect_err("a link").contains("is a link"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #90 review: the guest's answer decides a delivery. An `error` reply is a refusal; a lost
+    /// reply is settled by asking which config the guest reads now.
+    #[test]
+    fn a_delivery_whose_reply_was_lost_is_decided_by_the_guests_config() {
+        let sha = "ab".repeat(32);
+        assert_eq!(delivery_outcome(Ok(()), None, &sha), Ok(None));
+        let timeout = Err("the guest's control port: timed out".to_owned());
+        let ok = delivery_outcome(timeout.clone(), Some(Ok(sha.clone())), &sha).expect("it runs it");
+        assert!(ok.is_some_and(|n| n.contains("delivered")));
+        assert!(delivery_outcome(timeout.clone(), Some(Ok("cd".repeat(32))), &sha).is_err(), "it runs another one");
+        assert!(delivery_outcome(timeout, Some(Err("no answer".into())), &sha).is_err());
+        assert!(guest_answered("the guest refused [\"config\", \"done\"]: error mount …"));
+        assert!(!guest_answered("the guest's control port: timed out"));
     }
 
     #[test]

@@ -183,6 +183,9 @@ pub enum Ctl {
     /// from connections that present it (#86). Alone on its connection, at any time; only the
     /// host can reach this port, and no other process in the guest learns the key.
     LogKey { hex: String },
+    /// A question, alone on its connection: the sha256 of the config the guest's extension reads
+    /// now, answered `sha <hex>` (#90 review: a delivery whose reply was lost is decided by it).
+    ConfigSha,
     Done,
 }
 
@@ -200,10 +203,16 @@ pub const IMAGE_INI: &str = "/usr/local/etc/php/conf.d";
 /// configs of the usual size. A restart starts the count again.
 pub const MAX_CONFIG_SWAPS: usize = 200;
 
+/// A value a site's php.ini setting may have in the guest: `[a-z0-9_.,:-]{0,64}`.
+pub fn site_ini_value_ok(value: &str) -> bool {
+    value.len() <= 64 && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.,:-".contains(&b))
+}
+
 /// The settings a site's php.ini may give the guest's php-fpm (#90): the extension's per-site
-/// debug settings only. Everything else in php.ini is the image's (the same for every site); a
-/// line setting anything else, or that isn't `key = value`, is refused with the reason. Returns
-/// the file as the guest writes it.
+/// debug settings only, with plain-word values ([`site_ini_value_ok`]). Everything else in
+/// php.ini is the image's (the same for every site); a line setting anything else, or that
+/// isn't `key = value`, is refused with the reason, which never quotes the file. Returns the
+/// file as the guest writes it.
 pub fn site_ini(text: &str) -> Result<String, String> {
     let mut out = String::new();
     for (n, raw) in text.lines().enumerate() {
@@ -211,19 +220,23 @@ pub fn site_ini(text: &str) -> Result<String, String> {
         if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
             continue;
         }
+        // Nothing from the file is ever quoted back (#90 review): a refused line could hold
+        // anything, a secret among it, and the reason goes to the launcher's log.
+        let n = n + 1;
         let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("line {}: want `key = value`, got {line:?}", n + 1));
+            return Err(format!("line {n}: not `key = value`"));
         };
         let (key, value) = (key.trim(), value.trim());
         let ok = key.strip_prefix("securecore.debug_").is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
         if !ok {
             return Err(format!(
-                "line {}: {key:?}: a site's php.ini may set only the extension's securecore.debug_* settings in the guest (the rest of php.ini is the guest image's)",
-                n + 1
+                "line {n}: a site's php.ini may set only the extension's securecore.debug_* settings in the guest (the rest of php.ini is the guest image's)"
             ));
         }
-        if value.bytes().any(|b| b.is_ascii_control()) || value.len() > 256 {
-            return Err(format!("line {}: {key}: the value holds a control character or is too long", n + 1));
+        // Plain words only: PHP's ini parser expands ${VAR} from php-fpm's environment, where the
+        // vault's secrets are, and quotes would let a value say more than a word (#90 review).
+        if !site_ini_value_ok(value) {
+            return Err(format!("line {n}: {key}: a value may hold only a-z, 0-9 and _ . , : - (at most 64)"));
         }
         out.push_str(&format!("{key} = {value}\n"));
     }
@@ -246,6 +259,7 @@ impl Ctl {
             Ctl::Ini { hex } if hex.is_empty() => "ini\n".into(),
             Ctl::Ini { hex } => format!("ini {hex}\n"),
             Ctl::LogKey { hex } => format!("logkey {hex}\n"),
+            Ctl::ConfigSha => "configsha\n".into(),
             Ctl::Done => "done\n".into(),
         }
     }
@@ -277,6 +291,7 @@ impl Ctl {
             ["logkey", hex] if hex.len() == 2 * crate::guestlog::KEY_LEN && hex.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(Ctl::LogKey { hex: (*hex).into() }),
             // Never echo it: it is a secret.
             ["logkey", ..] => Err("a malformed logkey line".into()),
+            ["configsha"] => Ok(Ctl::ConfigSha),
             ["done"] => Ok(Ctl::Done),
             // Never echo an env line: it carries a secret.
             ["env", ..] => Err("a malformed env line".into()),
@@ -532,12 +547,51 @@ fn put_config(bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
     }
     let target = format!("{}/securecore.json", boot.root);
-    mount(&file, &target, "", libc::MS_BIND, "")?;
-    // A bind mount takes its flags only on a remount.
-    mount("", &target, "", libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, "")?;
+    // Mounted on the file itself, never through a link (#90 review): the site disk is the site's,
+    // and `<root>/securecore.json` there could be a link to anywhere in the guest. Opened without
+    // following one, it must be a regular file, and the mount goes on that very file.
+    let at = regular_target(&target)?;
+    mount(&file, &fd_path(&at), "", libc::MS_BIND, "")?;
+    // A bind mount takes its flags only on a remount: on the new mount, again by its file.
+    let top = regular_target(&target)?;
+    mount("", &fd_path(&top), "", libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, "")?;
     // The file stays: the next config is mounted on this one, and Linux refuses a mount on a
     // file that has been unlinked. (Under /run, which php-fpm's pool user can't write.)
     Ok(())
+}
+
+/// `path` opened `O_PATH | O_NOFOLLOW`: refused unless it is a regular file itself (a link is
+/// not followed, and is refused).
+pub fn regular_target(path: &str) -> io::Result<OwnedFd> {
+    let c = cstr(path)?;
+    // SAFETY: open(2) with a NUL-terminated path; the fd is owned below.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("{path}: {e}")));
+    }
+    // SAFETY: fd was just returned by open(2).
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let f = fs::File::from(fd);
+    let m = f.metadata().map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
+    if !m.file_type().is_file() {
+        return Err(io::Error::other(format!("{path} is not a regular file (a link, a folder or a device): not replaced")));
+    }
+    Ok(OwnedFd::from(f))
+}
+
+/// `/proc/self/fd/<n>`: the open file itself, for a call that takes a path.
+fn fd_path(fd: &OwnedFd) -> String {
+    format!("/proc/self/fd/{}", fd.as_raw_fd())
+}
+
+/// The sha256 of the config the guest's extension reads now (`<root>/securecore.json`), for the
+/// host to ask after a delivery whose answer it didn't get (#90 review).
+fn config_sha() -> io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    let boot = BOOT.get().ok_or_else(|| io::Error::other("no boot settings"))?;
+    let bytes = fs::read(format!("{}/securecore.json", boot.root))?;
+    Ok(hex_of(&Sha256::digest(&bytes)))
 }
 
 /// Applies one control line.
@@ -617,12 +671,14 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             fs::rename(format!("{path}.new"), &path)?;
             Ok(())
         }
-        // Checked before anything is applied ([`protocol_ok`]).
         Ctl::LogKey { hex } => {
             let key: crate::guestlog::Key = unhex(hex).try_into().map_err(|_| io::Error::other("logkey: not a key"))?;
             LOG.set_key(key);
             Ok(())
         }
+        // Answered by serve_ctl itself.
+        Ctl::ConfigSha => Ok(()),
+        // Checked before anything is applied ([`protocol_ok`]).
         Ctl::Proto { .. } | Ctl::Done => Ok(()),
     }
 }
@@ -655,6 +711,12 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
     }
     if !done {
         return say("ctl: a control connection closed or timed out before `done`; nothing applied");
+    }
+    // The one question: which config the extension reads now.
+    if failed.is_none() && lines == [Ctl::ConfigSha] {
+        let reply = config_sha().map_or_else(|e| format!("error {e}\n"), |sha| format!("sha {sha}\n"));
+        let _ = out.write_all(reply.as_bytes());
+        return;
     }
     let started = STARTED.load(Ordering::SeqCst);
     if failed.is_none() {
@@ -1205,5 +1267,40 @@ mod tests {
             assert!(site_ini(bad).is_err(), "{bad}");
         }
         assert!(site_ini("securecore.debug_attribution_log = a\u{7}b").is_err());
+        // #90 review: values are plain words (PHP expands ${VAR} from php-fpm's environment,
+        // where the vault's secrets are), and a refusal never quotes the file.
+        for bad in [
+            "securecore.debug_attribution_log = ${WORDPRESS_DB_PASSWORD}",
+            "securecore.debug_attribution_log = \"both\"",
+            "securecore.debug_attribution_log = {x}",
+            "securecore.debug_attribution_log = Both",
+            "securecore.debug_attribution_log = $SECRET",
+        ] {
+            let e = site_ini(bad).expect_err(bad);
+            assert!(!e.contains("WORDPRESS") && !e.contains("SECRET") && !e.contains("both") && !e.contains("Both"), "{e}");
+        }
+        for bad in ["sk_live_SECRET = 1", "SECRET-NO-EQUALS"] {
+            let e = site_ini(bad).expect_err(bad);
+            assert!(!e.contains("SECRET") && !e.contains("sk_live"), "a refused line is never quoted: {e}");
+        }
+        assert_eq!(site_ini("securecore.debug_db_attribution = component").as_deref(), Ok("securecore.debug_db_attribution = component\n"));
+    }
+
+    /// #90 review: the config is mounted on `<root>/securecore.json` only when that is a regular
+    /// file itself, never through a link the site disk holds.
+    #[test]
+    fn a_mount_target_must_be_a_regular_file_not_a_link() {
+        let dir = std::env::temp_dir().join(format!("sc-guest-target-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("securecore.json");
+        fs::write(&file, "{}").expect("write");
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&file, &link).expect("link");
+        assert!(regular_target(file.to_str().expect("utf8")).is_ok());
+        let e = regular_target(link.to_str().expect("utf8")).expect_err("a link");
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+        assert!(regular_target(dir.to_str().expect("utf8")).is_err(), "a folder");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

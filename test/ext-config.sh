@@ -175,6 +175,17 @@ if on_microvm; then
   is "$(code /)" 200 "invalid edit: still serving on the last valid config"
   is "$(phplog "$t" | grep -F "securecore-fpm: $(site_dir)/securecore.json: invalid: unknown variant \`block\`" | grep -cF 'keeping the last valid config in the guest' | grep -c '^[1-9]')" 1 \
     "invalid edit: the launcher's log says why and that the last valid config is kept"
+  # A link in place of the file (#90 review): never read through, whatever it points at.
+  t=$(now)
+  mvm_conf "$dir/log-mode.json" > "$tdir/elsewhere.json"
+  _s=$(site_dir)
+  ln -sfn "$tdir/elsewhere.json" "$_s/securecore.json.lnk" && mv -fT "$_s/securecore.json.lnk" "$_s/securecore.json"
+  i=0; until phplog "$t" | grep -q 'securecore.json is a link: refused'; do i=$((i + 1)); [ "$i" -lt 50 ] || break; sleep 0.1; done
+  wait_reload
+  status
+  is "$(field sha256)" "$(conf_sha "$dir/off.json")" "a link in place of securecore.json: the guest keeps its config"
+  is "$(phplog "$t" | grep -c 'securecore.json is a link: refused')" 1 "and the launcher says the link is refused, once"
+  put "$dir/off.json"
 else
   t=$(now)
   put_live "$dir/bad-mode.json"

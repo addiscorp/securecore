@@ -911,7 +911,9 @@ them (#87). Layers 2 and 3 run in the guest's php-fpm unchanged; layer 3's
 isolated children need Landlock and seccomp in the guest kernel (mirab#89 adds them to mirab's).
 
 **Editing `securecore.json` while the guest runs** (#90). The launcher follows the file, as the
-extension does on a host (a `stat` a second, the same loader): an invalid file is refused and
+extension does on a host (a look a second, the same parser), reading it as the pool user, never
+through a link and at most 128 KiB (a link, a device or a larger file is refused and logged): an
+invalid file is refused and
 logged, and the guest keeps the last valid config; a valid one is also checked against what a
 start would check (a config the microVM can't run is refused the same way), then put in place
 of the guest's copy, where the extension reloads it within a second. As on a host, layers 2 and
@@ -920,7 +922,8 @@ of the guest's copy, where the extension reloads it within a second. As on a hos
 
 **The site's php.ini settings** (#90). php.ini in the guest is the root image's, the same for
 every site. `--guest-ini <file>` names a file of the extension's per-site debug settings
-(`securecore.debug_* = …` lines; any other setting is refused with the reason), delivered in
+(`securecore.debug_* = …` lines with plain-word values, `[a-z0-9_.,:-]`, so no `${VAR}`; any
+other setting is refused with the reason, which never quotes the file), delivered in
 each start message and again whenever the file changes, with php-fpm started again gracefully,
 as a php.ini change needs on a host. A value the extension refuses stops php-fpm, as it would
 on a host, and the launcher's log says why.
