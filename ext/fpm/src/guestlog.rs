@@ -1074,20 +1074,22 @@ mod tests {
         let _ = c.set_read_timeout(Some(Duration::from_secs(3)));
         let _ = c.read_to_end(&mut sink);
         assert!(sink.is_empty(), "nothing acknowledged");
-        // A key line dripped slower than the deadline: refused, though each byte came in time.
+        // The right key line, dripped a byte every 60 ms (4 s in all): each byte comes well within
+        // a second of the last, but the whole line doesn't come within the one second a
+        // connection has, so it is cut then and refused (K3).
         let t = Instant::now();
-        let mut d = UnixStream::connect(&path).expect("connect");
-        for b in hello_line(&key).bytes().take(20) {
-            if d.write_all(&[b]).is_err() {
+        let d = UnixStream::connect(&path).expect("connect");
+        let mut cut = None;
+        for b in hello_line(&key).bytes() {
+            if (&d).write_all(&[b]).is_err() {
+                cut = Some(t.elapsed());
                 break;
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(60));
         }
-        let mut sink = Vec::new();
-        let _ = d.set_read_timeout(Some(Duration::from_secs(3)));
-        let _ = d.read_to_end(&mut sink);
-        assert!(t.elapsed() < Duration::from_secs(3), "cut at the deadline");
-        thread::sleep(Duration::from_millis(100));
+        let cut = cut.unwrap_or_else(|| t.elapsed());
+        assert!(cut < Duration::from_millis(2500), "cut at the deadline, not after the whole line ({cut:?})");
+        thread::sleep(Duration::from_millis(200));
         server.flush();
         let text = log.text();
         assert!(!text.contains("from the snapshot's key"), "{text}");
