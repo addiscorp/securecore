@@ -831,7 +831,23 @@ namespaces, and in the cgroup `securecore/<id>` with `cpu.max` (the vCPUs) and `
 guest's memory plus 256 MiB). A `connect[].socket`'s folder is bind-mounted read-only into the
 jail, so a guest's database connection reaches MariaDB with the jailed user's credentials
 (`SO_PEERCRED`): `unix_socket` authentication never makes it root. Every start empties the jail
-first, so no link from an earlier config survives. One launcher per state folder (a lock).
+first, so no link from an earlier config survives. One launcher per state folder (a lock). A
+watchdog process takes the VM down when the launcher goes, however it goes (a crash, SIGKILL):
+it waits on a pipe only the launcher holds, then kills the VM's cgroup (`cgroup.kill`),
+unmounts the jail and removes the cgroup. When Firecracker exits on its own, the launcher
+clears the jail and exits non-zero. Firecracker's console goes to `<state>/console.log`, capped
+at 8 MiB (then `console.log.1`); guest log lines are cut at 8 KiB, at most 4 log connections and
+64 connections per `address` forward are served at once.
+
+**The site's files are copied as the site's pool user, never as root** (`--pool-user`, a name
+or `<uid>:<gid>`, default the app root's owner; a root-owned root needs the flag). `mke2fs -d`
+runs as that user in a private mount namespace where every writable folder is covered by an
+empty tmpfs, so the site disk holds the code and not the uploads (the writable folders are only
+mount points in it), and a file only root may read fails the build instead of reaching the
+guest. A writable folder must be a real folder in the root: `..` and a symlink anywhere along
+its path are refused. `e2fsck`/`resize2fs` on a guest-written disk run as the jailed user. The
+guest's php-fpm pool runs as the pool user's uid and gid (`sc.user`, so uploads keep the host's
+ownership), and a unix `--listen` socket's group defaults to the pool user's group.
 
 **In the microVM** the launcher stays in the foreground (like `php-fpm -F`) and is the guest's
 only way in or out. SIGTERM, SIGINT and SIGQUIT sync the guest's disks, stop the VM and exit 0;
@@ -846,7 +862,7 @@ only vsock, and `layer1` maps onto it as follows:
 | `layer1` | in the microVM |
 |---|---|
 | `network.bind` | the first port is where the launcher takes FastCGI, on `127.0.0.1` (`--listen unix:<path>` or `<host>:<port>` for another), and passes it to php-fpm over vsock |
-| `network.connect` with `socket` | the guest's `127.0.0.1:<port>` reaches that unix socket on the host, with nothing in between (Firecracker connects it; mysqlnd's connect goes onto vsock in place, #70). With the socket under `/run`, the same path works in the guest too (WordPress's `DB_HOST=localhost`) |
+| `network.connect` with `socket` | the guest's `127.0.0.1:<port>` reaches that unix socket on the host, with nothing in between (Firecracker connects it, as the jailed user; mysqlnd's connect goes onto vsock in place, #70). Only a socket the jailed user can reach and open itself counts (its real path; every folder above it too). With the socket under `/run`, the same path works in the guest too (WordPress's `DB_HOST=localhost`) |
 | `network.connect` with `address` | the launcher connects the guest's `127.0.0.1:<port>` to that TCP `host:port` |
 | `network.connect` port 1514 | refused: it is the guest's log channel |
 | `network.connect`, neither | unreachable from the guest (logged). Outbound HTTPS and DNS are #72 |

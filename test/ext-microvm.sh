@@ -469,11 +469,19 @@ if [ "$started" = 1 ]; then
   has "$dir/first.log" "SIGUSR1: nothing to reopen" "SIGUSR1 is acknowledged"
   has "$dir/first.log" "reloaded the guest's php-fpm gracefully" "SIGUSR2 reloads the guest's php-fpm"
   is "$(vcode /)" 200 "the front page after the reload: 200"
-  # A reload, and at once a stop: the stop's sync must still reach the guest (the upload above
-  # must survive into the next start).
+  is "$(stat -c '%a %u %g' "$(find "$state" -maxdepth 2 -path '*/snap-*/vm.mem' | head -1)")" "640 0 64000" \
+    "the snapshot is root's, read-only to the VM's group"
+  # A slow reload (a 15 s request in flight, which php-fpm's graceful stop waits for), and a stop
+  # during it: the stop's sync must still reach the guest at once (the upload above must survive
+  # into the next start), not wait behind the reload.
+  vget "/sc-mvm-probe.php?sleep=15" > /dev/null &
+  slow=$!
+  sleep 1
   kill -USR2 "$PID"
+  sleep 1
   stop
-  is "$STOPPED" 0 "SIGTERM right after SIGUSR2: the launcher exits 0"
+  kill "$slow" 2>/dev/null
+  is "$STOPPED" 0 "SIGTERM during a slow reload: the launcher exits 0"
   lacks "$dir/first.log" "did not sync" "and the guest synced its disks first"
   has "$dir/first.log" "stopped by signal 15" "and says so"
   is "$(pgrep -fc "api-sock /fc.sock")" 0 "no Firecracker left running"

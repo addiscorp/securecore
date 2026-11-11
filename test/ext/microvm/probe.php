@@ -4,6 +4,10 @@
 // it; what it can't do is layer 1's (the microVM's) doing. Copied into the test site only.
 header('Content-Type: text/plain');
 $root = __DIR__;
+// A slow request (?sleep=N): keeps a php-fpm worker busy, so a graceful reload has to wait.
+if (isset($_GET['sleep'])) {
+    sleep(min(60, (int) $_GET['sleep']));
+}
 echo 'kernel=', php_uname('r'), "\n";
 // The worker's effective uid, from the kernel (no posix extension needed).
 echo 'euid=', preg_match('/^Uid:\s+\d+\s+(\d+)/m', (string) @file_get_contents('/proc/self/status'), $u) ? $u[1] : '?', "\n";
