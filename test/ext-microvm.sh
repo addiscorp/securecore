@@ -87,6 +87,13 @@ chown 999:999 "$mysqld"
 echo "starting the stack (project $project, ports $port and $vport)"
 compose build php mvmweb > "$dir/build.log" 2>&1 || die "docker build (see $dir/build.log)"
 compose up -d db php web mvmweb > "$dir/up.log" 2>&1 || die "compose up (see $dir/up.log)"
+# A site volume from an earlier run may hold an older securecore.json (one with the retired
+# layer1.enabled is refused, so php-fpm wouldn't start): the current example, then php again.
+site=$(docker volume inspect -f '{{.Mountpoint}}' "${project}_wp")
+if [ -f "$site/securecore.json" ]; then
+  cp ext/examples/wordpress.json "$site/securecore.json"
+  compose restart php > /dev/null 2>&1
+fi
 i=0
 until compose exec -T db mariadb -uwordpress -pwordpress-db-password -e 'select 1' wordpress >/dev/null 2>&1; do
   i=$((i + 1)); [ "$i" -lt 90 ] || die "the database did not start"; sleep 1
