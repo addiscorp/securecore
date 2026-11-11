@@ -351,12 +351,14 @@ if [ -n "$ENMOD" ]; then
 fi
 
 # What PHP sees now, with the site's ini.
-if out=$("$PHP" -r 'echo extension_loaded("securecore") ? "loaded" : "not loaded";' 2>&1) && [ "$out" = loaded ]; then
+# Its answer on stdout; stderr carries the extension's startup notes (the vault's count) and,
+# on a refusal, the reason.
+if out=$("$PHP" -r 'echo extension_loaded("securecore") ? "loaded" : "not loaded";' 2>"$WORK/loaded.err") && [ "$out" = loaded ]; then
   step "$OK" "Loaded" "php -m lists securecore, config $CONFIG"
 elif [ -n "$NEW_CONFIG" ]; then
-  die "PHP doesn't load SecureCore after the install: $out"
+  die "PHP doesn't load SecureCore after the install: $out $(cat "$WORK/loaded.err")"
 else
-  step "$NOTE" "Loaded" "this PHP refuses $CONFIG here: $out"
+  step "$NOTE" "Loaded" "this PHP refuses $CONFIG here: $out $(cat "$WORK/loaded.err")"
   say "  php-fpm refuses it the same way unless its environment differs (vault env variables). Fix the file before restarting php-fpm."
 fi
 
