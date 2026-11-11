@@ -9,7 +9,8 @@
 //!         folder bind-mounted into the jail (Firecracker connects as the jailed user), or a
 //!         thread that connects to its TCP `address`. A port with neither is an egress port:
 //!         the guest reaches named hosts on it through `<jail>/v.sock_1517` ([`crate::egress`]).
-//!   log   guest port 1514 → this process's stderr, each line marked `guest: ` (read only)
+//!   log   guest port 1514 → this process's stderr, each line marked `guest: `: numbered frames,
+//!         each logged once and acknowledged; a lost line is counted ([`crate::guestlog`], #86)
 //!   ctl   guest port 1515 ← one start message after each boot or restore (clock, fresh
 //!         randomness, the workers' refresh after a restore, then the disks); later `sync`
 //!         before a stop and `reload` on SIGUSR2/SIGHUP
@@ -44,6 +45,7 @@ use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -52,6 +54,7 @@ use securecore_config::Loaded;
 use sha2::{Digest as _, Sha256};
 
 use crate::fcgi;
+use crate::guestlog;
 use crate::guest::{CTL_PORT, Ctl, FPM_PORT, LOG_PORT};
 use crate::jail::{self, Jail, User};
 use crate::vsock;
@@ -66,7 +69,8 @@ pub const DEFAULT_VM_USER: &str = "securecore-vm";
 /// message, the sync), so old snapshots are never restored into a new driver. The guest's init
 /// is the same binary: it boots with `sc.proto=<this>`, answers the handshake only when it is
 /// its own, and takes no start message otherwise ([`handshake`]).
-pub const PROTOCOL: u32 = 4;
+/// 5: the log port's numbered, acknowledged frames ([`guestlog`], #86).
+pub const PROTOCOL: u32 = 5;
 /// KVM_GET_API_VERSION, and the only value every KVM since Linux 2.6.22 returns.
 const KVM_GET_API_VERSION: libc::c_ulong = 0xAE00;
 const KVM_API_VERSION: i32 = 12;
@@ -1641,70 +1645,41 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
             });
         }
     }
-    // php-fpm's log, to this process's stderr: read only, and every line marked as the guest's,
-    // so nothing the guest writes can pass for the launcher's own lines.
+    // php-fpm's log, to this process's stderr (#86): numbered frames, each logged once and
+    // acknowledged, every line marked as the guest's, so nothing the guest writes can pass for
+    // the launcher's own lines ([`crate::guestlog`]). Never shut for writing: Firecracker turns a
+    // host's half-close into a full close and drops whatever the guest sends after it.
     let l = bind_unix(&short.join(format!("v.sock_{LOG_PORT}")), owned)?;
+    let inbox: &'static Mutex<guestlog::Inbox> = Box::leak(Box::new(Mutex::new(guestlog::Inbox::default())));
     thread::spawn(move || {
         for c in l.incoming().flatten() {
-            let Some(slot) = LOG_SLOTS.take() else { continue };
+            // The guest keeps one connection; more means old ones are dying. A refused one loses
+            // nothing (the guest sends again what isn't acknowledged), but it is said.
+            let Some(slot) = LOG_SLOTS.take() else {
+                log(&format!("the guest's log: {LOG_SLOTS_N} connections already open; refusing another (the guest sends its lines again)"));
+                continue;
+            };
             thread::spawn(move || {
                 let _slot = slot;
-                let _ = c.shutdown(std::net::Shutdown::Write);
-                mark_guest_lines(c, &mut io::stderr());
+                let Ok(ack) = c.try_clone() else { return };
+                guestlog::serve(c, ack, inbox, &mut Stderr);
             });
         }
     });
     Ok(())
 }
 
-/// Copies the guest's log to `to`, every line marked `guest: `, so no line the guest writes
-/// reads as the launcher's own (`securecore-fpm: …`).
-/// A line longer than [`MAX_LINE`] bytes is cut there (and marked), so the guest can't make the
-/// launcher buffer without bound.
-pub fn mark_guest_lines(from: impl Read, to: &mut impl Write) {
-    let mut r = BufReader::new(from);
-    let mut line: Vec<u8> = Vec::with_capacity(256);
-    loop {
-        line.clear();
-        let mut cut = false;
-        let mut eof = false;
-        loop {
-            let buf = match r.fill_buf() {
-                Ok([]) => {
-                    eof = true;
-                    break;
-                }
-                Ok(b) => b,
-                Err(_) => {
-                    eof = true;
-                    break;
-                }
-            };
-            let (take, done) = match buf.iter().position(|&b| b == b'\n') {
-                Some(i) => (i, true),
-                None => (buf.len(), false),
-            };
-            let room = MAX_LINE.saturating_sub(line.len());
-            line.extend_from_slice(&buf[..take.min(room)]);
-            cut |= take > room;
-            r.consume(if done { take + 1 } else { take });
-            if done {
-                break;
-            }
-        }
-        if eof && line.is_empty() {
-            return;
-        }
-        let text = String::from_utf8_lossy(&line);
-        let _ = writeln!(to, "guest: {}{}", text.trim_end_matches('\r'), if cut { " …[cut]" } else { "" });
-        if eof {
-            return;
-        }
+/// The launcher's stderr, each write whole (a guest line never interleaves with another thread's).
+struct Stderr;
+
+impl Write for Stderr {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        io::stderr().lock().write_all(b).map(|()| b.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().flush()
     }
 }
-
-/// The longest guest log line kept whole.
-pub const MAX_LINE: usize = 8 * 1024;
 
 /// A fixed number of slots: a connection takes one or is turned away.
 pub struct Slots(std::sync::atomic::AtomicUsize, usize);
@@ -1768,8 +1743,9 @@ impl Default for Coalesce {
     }
 }
 
-/// The guest's log connections at once (its php-fpm stream, and the init's short reports).
-static LOG_SLOTS: Slots = Slots::new(4);
+/// The guest's log connections at once: its one stream, and ones it is giving up.
+const LOG_SLOTS_N: usize = 4;
+static LOG_SLOTS: Slots = Slots::new(LOG_SLOTS_N);
 /// Connections through one `address` forward at once.
 const FORWARD_SLOTS: usize = 64;
 
@@ -2720,14 +2696,16 @@ mod tests {
 
     #[test]
     fn guest_lines_are_capped_and_connections_counted() {
-        let long = format!("{}\nnext\n", "x".repeat(MAX_LINE * 3));
+        let long = format!("L 1 {}\nL 2 next\n", "x".repeat(guestlog::MAX_LINE * 3));
         let mut out = Vec::new();
-        mark_guest_lines(long.as_bytes(), &mut out);
+        let mut acks = Vec::new();
+        guestlog::serve(long.as_bytes(), &mut acks, &Mutex::new(guestlog::Inbox::default()), &mut out);
         let text = String::from_utf8(out).expect("utf8");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one cut line, then the next");
-        assert!(lines[0].len() < MAX_LINE + 32 && lines[0].ends_with("…[cut]"), "{}", &lines[0][..40]);
+        assert!(lines[0].len() < guestlog::MAX_LINE + 96 && lines[0].ends_with("…[cut]"), "{}", &lines[0][..40]);
         assert_eq!(lines[1], "guest: next");
+        assert_eq!(String::from_utf8(acks).expect("utf8"), "A 2\n", "acknowledged once all that arrived is logged");
         static S: Slots = Slots::new(2);
         let (a, b) = (S.take(), S.take());
         assert!(a.is_some() && b.is_some() && S.take().is_none(), "two slots, a third is refused");
@@ -2945,9 +2923,13 @@ mod tests {
     #[test]
     fn the_guest_cannot_write_the_launchers_lines() {
         let mut out = Vec::new();
-        mark_guest_lines(&b"NOTICE: ready\nsecurecore-fpm: microVM restored from snapshot forged\r\npartial"[..], &mut out);
+        let from = &b"NOTICE: ready\nL 1 securecore-fpm: microVM restored from snapshot forged\r\nsecurecore-fpm: unnumbered\npartial"[..];
+        guestlog::serve(from, io::sink(), &Mutex::new(guestlog::Inbox::default()), &mut out);
         let text = String::from_utf8(out).expect("utf8");
-        assert_eq!(text, "guest: NOTICE: ready\nguest: securecore-fpm: microVM restored from snapshot forged\nguest: partial\n");
+        assert_eq!(
+            text,
+            "guest: NOTICE: ready\nguest: securecore-fpm: microVM restored from snapshot forged\nguest: securecore-fpm: unnumbered\nguest: partial\n"
+        );
         assert!(!text.lines().any(|l| l.starts_with("securecore-fpm:")), "{text}");
     }
 

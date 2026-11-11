@@ -7,7 +7,9 @@
 //!   out   php-fpm's connect to 127.0.0.1:<port> is a vsock connect to the host on that port
 //!         (libsc-vsock-connect.so, #70), for each port the host forwards (sc.ports); a unix
 //!         socket under /run (sc.sock) reaches the same port through a forwarder here
-//!   log   php-fpm's stdout and stderr → vsock host:1514 (the serial console is too slow)
+//!   log   php-fpm's stdout and stderr, and this init's own lines → vsock host:1514 (the serial
+//!         console is too slow), numbered and held until the host acknowledges them (#86,
+//!         [`crate::guestlog`])
 //!   ctl   vsock 1515: the host's start message, sent after every cold boot and every restore:
 //!         the clock, then the writable disks to mount; and `sync` before it stops the VM
 //!         (see [`Ctl`])
@@ -21,7 +23,7 @@
 
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
@@ -493,11 +495,13 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             // SAFETY: sync(2) takes nothing and can't fail.
             unsafe { libc::sync() };
             // And every change to a writable folder is on the host's copy of it (#72).
-            if WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
-                return Ok(());
+            if !WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
+                let drain = DRAIN.get().ok_or_else(|| io::Error::other("the folder sync never started"))?;
+                drain.wait(SYNC_DRAIN).map_err(|e| io::Error::other(format!("the writable folders did not sync to the host: {e}")))?;
             }
-            let drain = DRAIN.get().ok_or_else(|| io::Error::other("the folder sync never started"))?;
-            drain.wait(SYNC_DRAIN).map_err(|e| io::Error::other(format!("the writable folders did not sync to the host: {e}")))
+            // The host stops the VM after a sync: every log line must be in its log by then, or
+            // counted there as lost (the reply is the launcher's to log).
+            LOG.drain(LOG_DRAIN).map_err(|n| io::Error::other(crate::guestlog::lost(n as u64, "not acknowledged by the host before the stop")))
         }
         // Checked before anything is applied ([`protocol_ok`]).
         Ctl::Proto { .. } | Ctl::Done => Ok(()),
@@ -569,15 +573,28 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
     {
         report(&format!("ctl: the start message was refused: {e}"));
     }
+    // A refusal may end the launcher: the lines that explain it reach its log first.
+    if failed.is_some() {
+        let _ = LOG.drain(LOG_DRAIN);
+    }
     let reply = failed.map_or_else(|| "ok\n".to_owned(), |e| format!("error {e}\n"));
     let _ = out.write_all(reply.as_bytes());
 }
 
+/// Every line for the host's log (php-fpm's output and this init's own), held until the host
+/// acknowledges it (#86): one numbered stream on one connection ([`crate::guestlog`]).
+static LOG: crate::guestlog::Outbox = crate::guestlog::Outbox::new(crate::guestlog::OUTBOX_BYTES);
+/// How long a `sync` waits for the host to have every log line (inside [`SYNC_TIMEOUT`]).
+const LOG_DRAIN: Duration = Duration::from_secs(1);
+
+/// The log's sender, once per boot (a restore resumes it with the snapshot).
+fn start_log() {
+    thread::spawn(|| crate::guestlog::send(&LOG, || Vsock::connect(HOST_CID, LOG_PORT)));
+}
+
 /// One line to the host's log, from this init (the host marks every guest line as the guest's).
 fn report(message: &str) {
-    if let Ok(mut c) = Vsock::connect(HOST_CID, LOG_PORT) {
-        let _ = c.write_all(format!("securecore-init: {message}\n").as_bytes());
-    }
+    LOG.line(format!("securecore-init: {message}").as_bytes());
 }
 
 /// Warns once a writable disk passes 90 % (and again past 98 %): beyond it, php-fpm's writes
@@ -608,28 +625,16 @@ fn watch_space() {
     }
 }
 
-/// php-fpm's output to the host, reconnecting when the connection breaks (every restore
-/// resets the guest's vsock connections).
-fn pump_log(mut from: fs::File) {
-    let mut conn: Option<Vsock> = None;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match from.read(&mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
-        };
-        for _ in 0..50 {
-            if conn.is_none() {
-                conn = Vsock::connect(HOST_CID, LOG_PORT).ok();
-            }
-            match conn.as_mut().map(|c| c.write_all(&buf[..n])) {
-                Some(Ok(())) => break,
-                _ => {
-                    conn = None;
-                    thread::sleep(Duration::from_millis(20));
-                }
-            }
+/// php-fpm's output to the host's log, a line at a time ([`LOG`] delivers it). Never blocks on
+/// the host: php-fpm's master writes every worker's lines to this pipe.
+fn pump_log(from: fs::File) {
+    let mut r = BufReader::with_capacity(64 << 10, from);
+    let mut line = Vec::with_capacity(256);
+    while let Some(cut) = crate::guestlog::read_capped(&mut r, &mut line, crate::guestlog::MAX_LINE) {
+        if cut {
+            line.extend_from_slice(" …[cut]".as_bytes());
         }
+        LOG.line(&line);
     }
 }
 
@@ -818,6 +823,7 @@ fn boot_guest() -> io::Result<u32> {
     // (`commit=1` on the mount). The defaults are 30 s and 5 s.
     fs::write("/proc/sys/vm/dirty_expire_centisecs", "100")?;
     fs::write("/proc/sys/vm/dirty_writeback_centisecs", "50")?;
+    start_log();
     listen_forwards(&boot)?;
     let pid = start_php_fpm(&boot)?;
     FPM_MASTER.store(pid as i32, Ordering::SeqCst);

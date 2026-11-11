@@ -22,6 +22,7 @@ pub mod egress;
 pub mod fcgi;
 #[cfg(target_os = "linux")]
 pub mod guest;
+pub mod guestlog;
 #[cfg(target_os = "linux")]
 pub mod jail;
 #[cfg(target_os = "linux")]

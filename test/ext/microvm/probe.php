@@ -12,6 +12,14 @@ if (isset($_GET['sleep'])) {
         usleep(0);
     }
 }
+// The guest's log (#86): ?log=<n>&id=<id> writes n numbered lines to php-fpm's log, as layer 2's
+// audit lines go; the test finds every one in the launcher's log.
+if (isset($_GET['log'])) {
+    $id = preg_replace('/[^a-z0-9-]/', '', (string) ($_GET['id'] ?? 'x'));
+    for ($i = 0, $n = min(1000, (int) $_GET['log']); $i < $n; $i++) {
+        error_log(sprintf('sc86 %s %03d %s', $id, $i, str_repeat('.', 80)));
+    }
+}
 echo 'kernel=', php_uname('r'), "\n";
 // The worker's effective uid, from the kernel (no posix extension needed).
 echo 'euid=', preg_match('/^Uid:\s+\d+\s+(\d+)/m', (string) @file_get_contents('/proc/self/status'), $u) ? $u[1] : '?', "\n";
