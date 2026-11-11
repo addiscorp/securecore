@@ -61,6 +61,8 @@ pub const MAX_STREAMS: usize = 2;
 /// [`OUTBOX_BYTES`]): a jump in the numbers larger than this is no loss but a broken stream.
 pub const MAX_JUMP: u64 = (OUTBOX_BYTES / 64) as u64;
 
+/// The part of the guest's buffer only the init's own lines may use.
+pub const INIT_RESERVE: usize = 256 << 10;
 /// A log key: [`KEY_LEN`] random bytes.
 pub type Key = [u8; KEY_LEN];
 /// Where the host's log lines go (whole lines, each call one write).
@@ -69,21 +71,25 @@ pub type Emit = Box<dyn Fn(&str) -> io::Result<()> + Send + Sync>;
 /// One frame from the guest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// php-fpm's output (its master's and every worker's stderr).
     Line { seq: u64, text: Vec<u8> },
+    /// The init's own line: tagged apart on the wire, so nothing php-fpm writes can read as it.
+    Init { seq: u64, text: Vec<u8> },
     Lost { seq: u64, count: u64 },
 }
 
 impl Frame {
     pub fn seq(&self) -> u64 {
         match self {
-            Frame::Line { seq, .. } | Frame::Lost { seq, .. } => *seq,
+            Frame::Line { seq, .. } | Frame::Init { seq, .. } | Frame::Lost { seq, .. } => *seq,
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Frame::Line { seq, text } => {
-                let mut out = format!("L {seq} ").into_bytes();
+            Frame::Line { seq, text } | Frame::Init { seq, text } => {
+                let kind = if matches!(self, Frame::Init { .. }) { "I" } else { "L" };
+                let mut out = format!("{kind} {seq} ").into_bytes();
                 out.extend_from_slice(text);
                 out.push(b'\n');
                 out
@@ -104,6 +110,7 @@ impl Frame {
         let seq = std::str::from_utf8(num).ok()?.parse::<u64>().ok().filter(|s| *s > 0)?;
         match kind {
             b'L' if sp.is_some() => Some(Frame::Line { seq, text: tail.to_vec() }),
+            b'I' if sp.is_some() => Some(Frame::Init { seq, text: tail.to_vec() }),
             b'X' => Some(Frame::Lost { seq, count: std::str::from_utf8(tail).ok()?.parse().ok()? }),
             _ => None,
         }
@@ -123,6 +130,34 @@ fn parse_ack(line: &str) -> Option<u64> {
 pub fn hello_line(key: &Key) -> String {
     let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
     format!("K {hex}\n")
+}
+
+/// A key line's length, its newline included.
+const HELLO_LEN: usize = 2 + 2 * KEY_LEN + 1;
+
+/// Bytes waiting to be read on `c` (0 if it can't say).
+fn waiting(c: &UnixStream) -> usize {
+    use std::os::fd::AsRawFd as _;
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int, on a socket we hold.
+    if unsafe { libc::ioctl(c.as_raw_fd(), libc::FIONREAD, &mut n) } < 0 { 0 } else { n.max(0) as usize }
+}
+
+/// The first line of a connection, read a byte at a time (so nothing after it is taken), by
+/// `deadline` at the latest, however slowly the bytes come: `None` when none came in time, or
+/// the connection ended first, or it is longer than a key line.
+fn read_hello(mut c: &UnixStream, deadline: Instant) -> Option<Vec<u8>> {
+    let mut line = Vec::with_capacity(HELLO_LEN);
+    let mut b = [0u8; 1];
+    loop {
+        let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())?;
+        c.set_read_timeout(Some(left)).ok()?;
+        match c.read(&mut b) {
+            Ok(1) if b[0] == b'\n' => return Some(line),
+            Ok(1) if line.len() < HELLO_LEN => line.push(b[0]),
+            _ => return None,
+        }
+    }
 }
 
 /// Whether `line` (without its newline) presents `key`. Compared in constant time.
@@ -236,6 +271,17 @@ impl Outbox {
     /// slow host never blocks php-fpm. When the buffer is full the line is counted as lost, and
     /// the count is sent, in order, before the next line that fits.
     pub fn line(&self, text: &[u8]) {
+        self.queue(text, false);
+    }
+
+    /// The init's own line ([`Frame::Init`]): it may use the last [`INIT_RESERVE`] bytes of the
+    /// buffer, which php-fpm's lines never take, so a flood on php-fpm's stderr can't crowd it
+    /// out (#86 verification review).
+    pub fn init_line(&self, text: &[u8]) {
+        self.queue(text, true);
+    }
+
+    fn queue(&self, text: &[u8], init: bool) {
         let mut text = text.to_vec();
         if text.len() > MAX_LINE {
             text.truncate(MAX_LINE);
@@ -244,12 +290,13 @@ impl Outbox {
         let mut q = self.lock();
         // A count frame is small; the line must fit beside it.
         let need = text.len() + 64;
-        if q.bytes + need > self.cap {
+        let room = if init { self.cap } else { self.cap.saturating_sub(INIT_RESERVE.min(self.cap / 2)) };
+        if q.bytes + need > room {
             q.lost += 1;
             return;
         }
         q.push_lost();
-        q.push(|seq| Frame::Line { seq, text });
+        q.push(|seq| if init { Frame::Init { seq, text } } else { Frame::Line { seq, text } });
         self.cv.notify_all();
     }
 
@@ -465,12 +512,15 @@ impl Inbox {
         }
         self.last = Some(seq);
         match frame {
-            Frame::Line { text, .. } => {
+            Frame::Line { text, .. } | Frame::Init { text, .. } => {
+                let init = matches!(frame, Frame::Init { .. });
                 if self.recent.len() == RECENT {
                     self.recent.pop_front();
                 }
-                self.recent.push_back(String::from_utf8_lossy(text).chars().take(1024).collect());
-                out.push(guest_line(text, cut));
+                // Quoted with its label (#87): which of the guest's lines is the init's own.
+                let label = if init { "guest-init: " } else { "" };
+                self.recent.push_back(format!("{label}{}", String::from_utf8_lossy(text).chars().take(1024).collect::<String>()));
+                out.push(if init { init_line(text, cut) } else { guest_line(text, cut) });
             }
             Frame::Lost { count, .. } => out.push(lost_line(*count, "the guest's log buffer was full")),
         }
@@ -504,7 +554,29 @@ pub fn lost(count: u64, why: &str) -> String {
 
 /// A guest's line as the launcher logs it: marked, so it never reads as the launcher's own.
 pub fn guest_line(text: &[u8], cut: bool) -> String {
-    format!("guest: {}{}", String::from_utf8_lossy(text), if cut { " …[cut]" } else { "" })
+    format!("guest: {}{}", escaped(text), if cut { " …[cut]" } else { "" })
+}
+
+/// The init's own line as the launcher logs it: a label of its own, which nothing php-fpm writes
+/// can produce (its lines are always `guest: `).
+pub fn init_line(text: &[u8], cut: bool) -> String {
+    format!("guest-init: {}{}", escaped(text), if cut { " …[cut]" } else { "" })
+}
+
+/// A guest's text with every control character but the tab, and the Unicode line separators
+/// (U+0085, U+2028, U+2029), written as `\u{…}` (#86 verification review): one guest line stays
+/// one log line, whatever a terminal or a log viewer makes of its bytes. (A tab can't end a line
+/// or move the cursor back, and SQL in PHP's lines is full of them.)
+pub fn escaped(text: &[u8]) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in String::from_utf8_lossy(text).chars() {
+        if (c.is_control() && c != '\t') || matches!(c, '\u{85}' | '\u{2028}' | '\u{2029}') {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The longest frame line the host reads whole: a line, its number and its kind.
@@ -570,10 +642,14 @@ pub struct LogServer {
     next: AtomicU64,
     refused: AtomicU64,
     said: Mutex<(Option<Instant>, u64)>,
+    /// A restored VM's snapshot key: the restored init presents it until it gets this VM's own
+    /// (a moment later), so it is refused quietly, counted apart, and never let in.
+    stale: Option<Key>,
+    stale_refused: AtomicU64,
 }
 
 impl LogServer {
-    pub fn new(key: Key, emit: Emit) -> LogServer {
+    pub fn new(key: Key, stale: Option<Key>, emit: Emit) -> LogServer {
         LogServer {
             key,
             inbox: Mutex::new(Inbox::default()),
@@ -583,6 +659,30 @@ impl LogServer {
             next: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             said: Mutex::new((None, 0)),
+            stale,
+            stale_refused: AtomicU64::new(0),
+        }
+    }
+
+    /// Says what hasn't been said yet (the last second's refusals, the stale key's), when the VM
+    /// stops (#86 verification review).
+    pub fn flush(&self) {
+        let n = self.refused();
+        let mut said = self.said.lock().unwrap_or_else(|p| p.into_inner());
+        if n > said.1 {
+            let _ = (self.emit)(&format!(
+                "securecore-fpm: refused {} more guest log connection{} without this VM's log key before the stop ({n} in all)\n",
+                n - said.1,
+                if n - said.1 == 1 { "" } else { "s" }
+            ));
+            *said = (Some(Instant::now()), n);
+        }
+        let stale = self.stale_refused.swap(0, Ordering::SeqCst);
+        if stale > 0 {
+            let _ = (self.emit)(&format!(
+                "securecore-fpm: refused {stale} guest log connection{} with the snapshot's old log key (the restored init's, until this VM's own reached it)\n",
+                if stale == 1 { "" } else { "s" }
+            ));
         }
     }
 
@@ -596,12 +696,16 @@ impl LogServer {
         self.refused.load(Ordering::SeqCst)
     }
 
-    /// Keeps `conn` among at most `max` in `set`, shutting the oldest out; its id.
+    /// Keeps `conn` among at most `max` in `set`, shutting one out to make room: the oldest that
+    /// hasn't a whole key line waiting to be read. One that has (the init's, its hello written the
+    /// moment it connected) is spared, so a churn of keyless connections can't keep evicting it
+    /// (#86 verification review). Its id.
     fn hold(&self, set: &Mutex<VecDeque<(u64, UnixStream)>>, conn: &UnixStream, max: usize) -> u64 {
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let mut s = set.lock().unwrap_or_else(|p| p.into_inner());
         while s.len() >= max {
-            if let Some((_, old)) = s.pop_front() {
+            let victim = s.iter().position(|(_, c)| waiting(c) < HELLO_LEN).unwrap_or(0);
+            if let Some((_, old)) = s.remove(victim) {
                 let _ = old.shutdown(std::net::Shutdown::Both);
             }
         }
@@ -631,19 +735,25 @@ impl LogServer {
     /// Serves one connection to the log port, to its end.
     pub fn take(&self, conn: UnixStream) {
         let id = self.hold(&self.pending, &conn, MAX_PENDING);
-        let _ = conn.set_read_timeout(Some(HELLO_TIMEOUT));
-        let mut r = BufReader::with_capacity(64 << 10, conn);
-        let mut hello = Vec::new();
-        let got = read_capped(&mut r, &mut hello, 2 * KEY_LEN + 8);
+        let hello = read_hello(&conn, Instant::now() + HELLO_TIMEOUT);
         self.release(&self.pending, id);
-        match got {
-            Some(false) if hello_ok(&hello, &self.key) => {}
-            None => return self.refuse("it closed or sent nothing in time"),
-            _ => {
-                let _ = r.get_ref().shutdown(std::net::Shutdown::Both);
+        match hello {
+            Some(h) if hello_ok(&h, &self.key) => {}
+            Some(h) if self.stale.is_some_and(|k| hello_ok(&h, &k)) => {
+                let _ = conn.shutdown(std::net::Shutdown::Both);
+                self.stale_refused.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            None => {
+                let _ = conn.shutdown(std::net::Shutdown::Both);
+                return self.refuse("it sent no key line within a second");
+            }
+            Some(_) => {
+                let _ = conn.shutdown(std::net::Shutdown::Both);
                 return self.refuse("it sent something else first");
             }
         }
+        let r = BufReader::with_capacity(64 << 10, conn);
         let conn = r.get_ref();
         let _ = conn.set_read_timeout(None);
         let id = self.hold(&self.streams, conn, MAX_STREAMS);
@@ -838,7 +948,7 @@ mod tests {
         let l = UnixListener::bind(&path).expect("bind");
         let key = [3u8; KEY_LEN];
         let log = Log::default();
-        let server = Arc::new(LogServer::new(key, log.emit()));
+        let server = Arc::new(LogServer::new(key, None, log.emit()));
         let conns = Arc::new(AtomicUsize::new(0));
         {
             let (server, conns) = (server.clone(), conns.clone());
@@ -886,7 +996,7 @@ mod tests {
         let l = UnixListener::bind(&path).expect("bind");
         let key = [9u8; KEY_LEN];
         let log = Log::default();
-        let server = Arc::new(LogServer::new(key, log.emit()));
+        let server = Arc::new(LogServer::new(key, None, log.emit()));
         {
             let server = server.clone();
             thread::spawn(move || {
@@ -933,6 +1043,84 @@ mod tests {
         let launcher: Vec<&str> = text.lines().filter(|l| l.starts_with("securecore-fpm: ")).collect();
         assert!(!launcher.is_empty() && launcher.iter().all(|l| l.starts_with("securecore-fpm: refused ")), "only refusal counts: {launcher:?}");
         assert!(server.refused() >= 3, "the forgers were counted: {}", server.refused());
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// K4: the init's lines have a label of their own, which a php-fpm line can't produce, and a
+    /// part of the buffer php-fpm's lines can't fill.
+    #[test]
+    fn the_inits_lines_are_labelled_apart_and_never_crowded_out() {
+        let ob = leak(OUTBOX_BYTES);
+        let flood = "w".repeat(1000);
+        for _ in 0..(OUTBOX_BYTES / 1000) {
+            ob.line(flood.as_bytes());
+        }
+        assert!(ob.pending().1 > 0, "php-fpm's flood filled its part and was counted");
+        ob.line(format!("securecore-init: php-fpm exited (forged by a worker) {flood}").as_bytes());
+        ob.init_line(b"php-fpm exited at boot (exit code 78)");
+        let log = Log::default();
+        let frames: Vec<u8> = ob.lock().frames.iter().flat_map(|(_, b)| b.clone()).collect();
+        serve(&frames[..], io::sink(), &Mutex::new(Inbox::default()), &*log.emit()).expect("serves");
+        let text = log.text();
+        assert!(text.lines().any(|l| l == "guest-init: php-fpm exited at boot (exit code 78)"), "the init's line is there, under its label");
+        assert!(!text.contains("forged by a worker"), "the worker's line was counted as lost, not queued");
+        assert_eq!(guest_line(b"securecore-init: forged", false), "guest: securecore-init: forged", "a worker's line is always guest:");
+        assert!(text.lines().filter(|l| l.starts_with("guest-init: ")).count() == 1);
+    }
+
+    /// N1: control characters and the Unicode line separators are escaped; a tab is kept.
+    #[test]
+    fn a_guest_line_stays_one_line() {
+        let s = escaped("a\rb\u{1b}[2Jc\u{85}d\u{2028}e\u{2029}f\tg\u{7f}".as_bytes());
+        assert_eq!(s, "a\\u{d}b\\u{1b}[2Jc\\u{85}d\\u{2028}e\\u{2029}f\tg\\u{7f}");
+        assert!(!s.chars().any(|c| (c.is_control() && c != '\t') || matches!(c, '\u{85}' | '\u{2028}' | '\u{2029}')));
+        assert_eq!(init_line(b"x\x08y", false), "guest-init: x\\u{8}y");
+    }
+
+    /// K2 and K3: a restored init's old key is refused quietly and counted apart; a key line
+    /// dripped a byte at a time past the deadline is refused; the refusals not yet said are said
+    /// by `flush` (N3).
+    #[test]
+    fn an_old_key_and_a_slow_hello_are_refused_and_said_at_the_stop() {
+        let path = scratch("stale");
+        let l = UnixListener::bind(&path).expect("bind");
+        let (key, old) = ([5u8; KEY_LEN], [6u8; KEY_LEN]);
+        let log = Log::default();
+        let server = Arc::new(LogServer::new(key, Some(old), log.emit()));
+        {
+            let server = server.clone();
+            thread::spawn(move || {
+                for c in l.incoming().flatten() {
+                    let server = server.clone();
+                    thread::spawn(move || server.take(c));
+                }
+            });
+        }
+        let mut c = UnixStream::connect(&path).expect("connect");
+        c.write_all(format!("{}L 1 from the snapshot's key\n", hello_line(&old)).as_bytes()).expect("write");
+        let mut sink = Vec::new();
+        let _ = c.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = c.read_to_end(&mut sink);
+        assert!(sink.is_empty(), "nothing acknowledged");
+        // A key line dripped slower than the deadline: refused, though each byte came in time.
+        let t = Instant::now();
+        let mut d = UnixStream::connect(&path).expect("connect");
+        for b in hello_line(&key).bytes().take(20) {
+            if d.write_all(&[b]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let mut sink = Vec::new();
+        let _ = d.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = d.read_to_end(&mut sink);
+        assert!(t.elapsed() < Duration::from_secs(3), "cut at the deadline");
+        thread::sleep(Duration::from_millis(100));
+        server.flush();
+        let text = log.text();
+        assert!(!text.contains("from the snapshot's key"), "{text}");
+        assert!(text.contains("refused 1 guest log connection with the snapshot's old log key"), "{text}");
+        assert!(text.contains("guest log connection") && server.refused() == 1, "the slow one: {text}");
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 }

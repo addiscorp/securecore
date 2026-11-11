@@ -215,7 +215,9 @@ refuses() {
   problem=$2
   if on_microvm; then
     is "$(php_state)" "exited 125" "$1: the launcher exits 125"
-    if grep -qF "securecore-fpm: $(site_dir)/securecore.json: ${problem#\$conf: }" "$dir/refuse.log"; then
+    # The launcher's words, when they differ (<the launcher's problem>, a third argument): it
+    # never quotes the file, so a JSON or schema error says where and what kind (#90 review).
+    if grep -qF "securecore-fpm: $(site_dir)/securecore.json: ${3:-${problem#\$conf: }}" "$dir/refuse.log"; then
       pass "$1: the log says why: $(grep -F 'securecore-fpm' "$dir/refuse.log" | head -1 | cut -c1-200)"
     else
       fail "$1: the log names the file and the problem" "$(tr '\n' ' ' < "$dir/refuse.log" | cut -c1-400)"
@@ -231,11 +233,12 @@ refuses() {
 }
 # (Single quotes: '$conf' is the literal placeholder refuses() fills in.)
 put "$dir/bad-mode.json"
-refuses "invalid mode" '$conf: invalid: unknown variant `block`'
+refuses "invalid mode" '$conf: invalid: unknown variant `block`' "invalid at line "
+! on_microvm || is "$(grep -c 'block' "$dir/refuse.log")" 0 "invalid mode: the launcher's log doesn't quote the file's value"
 
 printf '{"layer1":{"isolation":"off"},"layer2":{"enabled":false},"layer3":{"enabled":false},"layer4":{}}\n' > "$dir/unknown-key.json"
 put "$dir/unknown-key.json"
-refuses "unknown key" '$conf: invalid: unknown field `layer4`'
+refuses "unknown key" '$conf: invalid: unknown field `layer4`' "invalid at line "
 
 # layer1.enabled is retired: the extension refuses a file that still sets it, saying why.
 printf '{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$dir/retired.json"
