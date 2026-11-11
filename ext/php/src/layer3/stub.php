@@ -46,17 +46,26 @@
     // but unbuffered (MYSQLI_USE_RESULT): rows are read one at a time and copied only up to
     // $limit bytes (layer3.limits.dbResultBytes). Past it the rest is drained unread and the
     // answer is a refusal, so a result far over the cap never sits in the worker's memory.
-    $run = static function (int $limit) use ($slug, $clean): string {
+    // The worker's mysqli connection for an exchange, the one every query of it and every
+    // bookkeeping statement after it uses ($wpdb->dbh: a db.php drop-in's current connection
+    // too); null when $wpdb has none (an SQLite drop-in), and then the gateway refuses.
+    $conn = static function (): ?\mysqli {
         global $wpdb;
+        $dbh = $wpdb->dbh ?? null;
+        if (!$dbh instanceof \mysqli && !empty($wpdb->ready) && $wpdb->check_connection(false)) $dbh = $wpdb->dbh ?? null;
+        return $dbh instanceof \mysqli ? $dbh : null;
+    };
+    $run = static function (?\mysqli $dbh, int $limit) use ($slug, $clean): string {
         $sql = \securecore_layer3_db_begin($slug);
         if (!is_string($sql)) {
             return serialize(['ret' => false, 'error' => 'securecore: layer3 had no query to run']);
         }
+        if ($dbh === null) {
+            return serialize(['ret' => false, 'error' => "securecore: layer3: the worker's \$wpdb has no mysqli connection (a db.php drop-in such as SQLite), so an isolated plugin can't use the database"]);
+        }
         $sql = (string) apply_filters('query', $sql);
-        $dbh = $wpdb->dbh ?? null;
-        if (!$dbh instanceof \mysqli && $wpdb->check_connection(false)) $dbh = $wpdb->dbh ?? null;
-        if ($sql === '' || !$dbh instanceof \mysqli) {
-            return serialize(['ret' => false, 'error' => $sql === '' ? '' : 'securecore: layer3: the worker has no database connection']);
+        if ($sql === '') {
+            return serialize(['ret' => false, 'error' => '']);
         }
         $ret = false;
         $error = '';
@@ -78,7 +87,10 @@
             $bytes = 0;
             while (($row = mysqli_fetch_assoc($res)) !== null && $row !== false) {
                 if ($keys === []) $keys = array_keys($row);
-                // What serialize() writes for each value, near enough (its text and ~16 bytes).
+                // What a row costs the worker while it's copied, not only what serialize() writes:
+                // ~200 bytes for the row's array, ~16 more per value, and the value's text. A
+                // million one-byte rows count 200 MB, not 17.
+                $bytes += 200;
                 foreach ($row as $x) $bytes += strlen((string) $x) + 16;
                 if ($limit > 0 && $bytes > $limit) {
                     $rows = [];
@@ -120,51 +132,106 @@
     // past the deadline on the server), then the session's own value again (read once per
     // request). MariaDB's max_statement_time covers every statement; MySQL's max_execution_time
     // only SELECTs (addiscorp/securecore#99).
+    //
+    // Every bookkeeping statement (the cap, the state, the rollback) goes straight to mysqli on
+    // the exchange's connection: never through $wpdb->query() and its `query` filters, which a
+    // plugin could use to rewrite them (an isolated plugin's `query` callback isn't mirrored at
+    // all, below, but another plugin's would run there too).
+    $one = static function (\mysqli $dbh, string $sql): ?array {
+        try {
+            $r = mysqli_query($dbh, $sql);
+        } catch (\Throwable $e) {
+            return null;
+        }
+        if ($r instanceof \mysqli_result) {
+            $row = mysqli_fetch_row($r);
+            mysqli_free_result($r);
+            return is_array($row) ? $row : null;
+        }
+        return $r === true ? [] : null;
+    };
     $before = null;
-    $cap = static function (?int $ms) use (&$before, $mariadb): void {
-        global $wpdb;
+    $cap = static function (\mysqli $dbh, ?int $ms) use (&$before, $mariadb, $one): void {
         $var = $mariadb() ? 'max_statement_time' : 'max_execution_time';
-        $before ??= (string) $wpdb->get_var("SELECT @@SESSION.$var");
+        $before ??= (string) ($one($dbh, "SELECT @@SESSION.$var")[0] ?? '0');
         if ($ms === null) {
             $value = is_numeric($before) ? $before : '0';
         } else {
             $value = $var === 'max_statement_time' ? sprintf('%.3F', $ms / 1000) : (string) $ms;
         }
-        $wpdb->query("SET SESSION $var = $value");
+        $one($dbh, "SET SESSION $var = $value");
     };
     // The connection's transaction state, as the server reports it (never read from the SQL
-    // text): [autocommit on, a transaction open].
-    $state = static function () use ($mariadb): array {
+    // text): [autocommit on, a transaction open (null: MySQL can't say)], or null when it can't
+    // be read (then it counts as open). MariaDB has @@in_transaction; on MySQL only autocommit is
+    // readable without the PROCESS privilege, and InnoDB starts a transaction lazily anyway.
+    $state = static function (\mysqli $dbh) use ($mariadb, $one): ?array {
+        $r = $one($dbh, $mariadb() ? 'SELECT @@autocommit, @@in_transaction' : 'SELECT @@autocommit');
+        if ($r === null || !isset($r[0])) return null;
+        return [(int) $r[0] === 1, isset($r[1]) ? (int) $r[1] > 0 : null];
+    };
+    // After an exchange: put the connection back as it was. On MariaDB, a transaction the
+    // plugin left open or autocommit it turned off (or a state that can't be read) is rolled back
+    // and autocommit turned on, then the state read again; if it still isn't clean, the
+    // connection is replaced. On MySQL, where an open transaction can't be seen, the rollback
+    // runs whenever autocommit was on before the plugin's first query (a no-op if nothing is
+    // open). `AND NO CHAIN`: no completion_type turns the rollback into a new transaction (and the
+    // gateway refuses any change to it).
+    $restore = static function (\mysqli $dbh, ?array $was) use ($slug, $mariadb, $state, $one): void {
         global $wpdb;
-        $open = $mariadb()
-            ? '@@in_transaction'
-            : '(SELECT COUNT(*) FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID())';
-        $r = $wpdb->get_row("SELECT @@autocommit, $open", ARRAY_N);
-        return [(int) ($r[0] ?? 1) === 1, (int) ($r[1] ?? 0) > 0];
+        $was_ac = $was[0] ?? true;
+        $was_open = $was[1] ?? false;
+        $now = $state($dbh);
+        if ($mariadb()) {
+            $left = $now === null || ($now[1] && !$was_open) || (!$now[0] && $was_ac);
+        } else {
+            $left = $was_ac;
+        }
+        if (!$left) return;
+        $one($dbh, 'ROLLBACK AND NO CHAIN');
+        if ($was_ac) $one($dbh, 'SET autocommit = 1');
+        $after = $state($dbh);
+        $clean = $after !== null && ($after[1] ?? false) === false && ($after[0] || !$was_ac);
+        if ($mariadb() || $now === null || !$now[0]) {
+            $what = $now === null ? 'its state unreadable' : ($now[1] ? 'a transaction open' : 'autocommit off');
+            error_log("securecore: layer3 plugin:$slug left $what on the worker's connection: rolled back"
+                . ($now !== null && !$now[0] && $was_ac ? ', autocommit restored' : ''));
+        }
+        if (!$clean) {
+            error_log("securecore: layer3 plugin:$slug: the worker's connection is still not clean after the rollback; reconnecting");
+            $wpdb->close();
+            $wpdb->db_connect(false);
+        }
     };
     // Waits out the child's queries: the answer (a string), or null. However the exchange ended
-    // (an answer, a timeout, a crash), a transaction the plugin opened, or autocommit it turned
-    // off, is rolled back and restored, so core's later writes in the request never join it.
-    $pump = static function ($answer) use ($slug, $run, $cap, $state) {
-        global $wpdb;
+    // (an answer, a timeout, a crash, an exception in the worker), the slug's frames stop being
+    // the plugin's and the connection is put back ($restore), so core's later writes in the
+    // request never join what the plugin left.
+    $pump = static function ($answer) use ($slug, $run, $cap, $state, $restore, $conn) {
+        $dbh = null;
         $was = null;
+        $started = false;
         $set_at = null;
-        while (is_array($answer)) {
-            $was ??= $state();
-            if ($set_at === null || microtime(true) - $set_at > 0.05) {
-                $cap(max(1, (int) ($answer['ms'] ?? 1)));
-                $set_at = microtime(true);
+        try {
+            while (is_array($answer)) {
+                if (!$started) {
+                    $started = true;
+                    $dbh = $conn();
+                    if ($dbh !== null) $was = $state($dbh);
+                }
+                if ($dbh !== null && ($set_at === null || microtime(true) - $set_at > 0.05)) {
+                    $cap($dbh, max(1, (int) ($answer['ms'] ?? 1)));
+                    $set_at = microtime(true);
+                }
+                $answer = \securecore_layer3_db_reply($slug, $run($dbh, (int) ($answer['bytes'] ?? 0)));
             }
-            $answer = \securecore_layer3_db_reply($slug, $run((int) ($answer['bytes'] ?? 0)));
-        }
-        if ($was !== null) {
-            $cap(null);
-            [$autocommit, $open] = $state();
-            if (($open && !$was[1]) || (!$autocommit && $was[0])) {
-                $wpdb->query('ROLLBACK');
-                if (!$autocommit && $was[0]) $wpdb->query('SET autocommit = 1');
-                error_log("securecore: layer3 plugin:$slug left " . ($open ? 'a transaction open' : 'autocommit off')
-                    . " on the worker's connection: rolled back" . (!$autocommit && $was[0] ? ', autocommit restored' : ''));
+        } finally {
+            if ($started) {
+                \securecore_layer3_db_end($slug);
+                if ($dbh !== null) {
+                    $cap($dbh, null);
+                    $restore($dbh, $was);
+                }
             }
         }
         return $answer;
@@ -190,7 +257,9 @@
             };
             if ($kind === 'shortcode') {
                 add_shortcode((string) $r['name'], $forward);
-            } else {
+            } elseif (\securecore_layer3_mirrorable($slug, (string) $r['name'])) {
+                // Never a hook whose value is SQL the worker runs (`query`, `posts_where`, …):
+                // from the child it would rewrite core's queries.
                 add_filter((string) $r['name'], $forward, (int) ($r['priority'] ?? 10), (int) ($r['args'] ?? 1));
             }
         }

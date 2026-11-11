@@ -45,6 +45,10 @@ pub enum Refusal {
     /// The text names `max_statement_time` / `max_execution_time`: the cap the worker sets on the
     /// connection for the call's time is not the plugin's to change.
     TimeCap,
+    /// A `SET` outside [`allowed_set`], or a COMMIT / ROLLBACK that chains a new transaction or
+    /// releases the connection: session state persists into core's later queries on the worker's
+    /// connection.
+    SessionState,
 }
 
 impl Refusal {
@@ -55,6 +59,7 @@ impl Refusal {
             Refusal::TooLong(n) => format!("the query is {n} bytes, over {MAX_SQL}"),
             Refusal::NotUtf8 => "the query is not UTF-8".to_owned(),
             Refusal::TimeCap => "it changes the statement time cap".to_owned(),
+            Refusal::SessionState => "it changes the worker connection's session state".to_owned(),
         }
     }
 
@@ -65,8 +70,9 @@ impl Refusal {
 }
 
 /// Whether the worker runs `sql`, the plugin's `sent`-th query of the request (counting from 0),
-/// under a cap of `cap` queries. `Ok` is the text, for PHP.
-pub fn admit(sql: &[u8], sent: u32, cap: u32) -> Result<&str, Refusal> {
+/// under a cap of `cap` queries, on a connection whose charset is `charset`. `Ok` is the text,
+/// for PHP.
+pub fn admit<'a>(sql: &'a [u8], sent: u32, cap: u32, charset: &str) -> Result<&'a str, Refusal> {
     if sent >= cap {
         return Err(Refusal::Queries(cap));
     }
@@ -77,7 +83,101 @@ pub fn admit(sql: &[u8], sent: u32, cap: u32) -> Result<&str, Refusal> {
     if touches_time_cap(text) {
         return Err(Refusal::TimeCap);
     }
+    let words = normalized(text);
+    match words.first().map(String::as_str) {
+        Some("SET") if !allowed_set(&words, charset) => return Err(Refusal::SessionState),
+        Some("COMMIT" | "ROLLBACK") if chains_or_releases(&words) => return Err(Refusal::SessionState),
+        _ => {}
+    }
     Ok(text)
+}
+
+/// The SQL's words outside comments, uppercased, with `=` and `,` as words of their own and
+/// quoted strings kept whole (`'utf8mb4'`). Comments (`/* */`, `-- `, `#`) are dropped, so one
+/// can't hide the statement's first word.
+pub fn normalized(sql: &str) -> Vec<String> {
+    let b = sql.as_bytes();
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, words: &mut Vec<String>| {
+        if !cur.is_empty() {
+            words.push(std::mem::take(cur).to_ascii_uppercase());
+        }
+    };
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            flush(&mut cur, &mut words);
+            i = sql[i + 2..].find("*/").map_or(b.len(), |e| i + 2 + e + 2);
+        } else if (c == b'-' && b.get(i + 1) == Some(&b'-') && b.get(i + 2).is_none_or(|n| n.is_ascii_whitespace())) || c == b'#' {
+            flush(&mut cur, &mut words);
+            i = sql[i..].find('\n').map_or(b.len(), |e| i + e + 1);
+        } else if c == b'\'' || c == b'"' || c == b'`' {
+            let end = (i + 1..b.len()).find(|&j| b[j] == c && b[j - 1] != b'\\').map_or(b.len(), |j| j + 1);
+            cur.push_str(&sql[i..end]);
+            i = end;
+        } else if c.is_ascii_whitespace() || c == b';' {
+            flush(&mut cur, &mut words);
+            i += 1;
+        } else if c == b'=' || c == b',' {
+            flush(&mut cur, &mut words);
+            words.push((c as char).to_string());
+            i += 1;
+        } else {
+            let ch = sql[i..].chars().next().unwrap_or(' ');
+            cur.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    flush(&mut cur, &mut words);
+    words
+}
+
+/// The session SETs an isolated plugin may run (each persists into core's later queries, so the
+/// list holds only what WordPress plugins actually send and what can't change how core's SQL
+/// reads or runs): `SET NAMES` / `SET CHARACTER SET` to the connection's own charset (with a
+/// collation of it), `SET [SESSION] group_concat_max_len = <n>` and `SET [SESSION] sql_big_selects
+/// = 1|ON`. Every other SET is refused: `SET [SESSION] <var>` (sql_mode, autocommit,
+/// completion_type, sql_select_limit, transaction_read_only, time_zone, …), `SET @@…`, `SET
+/// TRANSACTION`, `SET STATEMENT`, several assignments at once.
+pub fn allowed_set(words: &[String], charset: &str) -> bool {
+    let unq = |w: &str| w.trim_matches(['\'', '"', '`']).to_ascii_uppercase();
+    let cs = charset.to_ascii_uppercase();
+    let own = |w: &str| !cs.is_empty() && unq(w) == cs;
+    let own_collation = |w: &str| unq(w).strip_prefix(&format!("{cs}_")).is_some_and(|r| !r.is_empty());
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    let digits = |s: &str| !s.is_empty() && s.len() <= 12 && s.bytes().all(|b| b.is_ascii_digit());
+    match w.as_slice() {
+        ["SET", "NAMES", c] | ["SET", "CHARACTER", "SET", c] => own(c),
+        ["SET", "NAMES", c, "COLLATE", k] => own(c) && own_collation(k),
+        ["SET", "SESSION", "GROUP_CONCAT_MAX_LEN", "=", n] | ["SET", "GROUP_CONCAT_MAX_LEN", "=", n] => digits(n),
+        ["SET", "SESSION", "SQL_BIG_SELECTS", "=", v] | ["SET", "SQL_BIG_SELECTS", "=", v] => matches!(*v, "1" | "ON"),
+        _ => false,
+    }
+}
+
+/// Hooks whose value is SQL (or a clause of it, or rows standing in for a query's) that core then
+/// runs or trusts, in the worker: never mirrored for an isolated plugin, or its callback would
+/// rewrite core's queries (and the stand-in's own) from its child. It still runs on its own
+/// queries in the child. `query`; `dbdelta_*`; `incompatible_sql_modes`; WP_Query's `posts_*`
+/// and `post_limits*`; the query classes' `*_clauses`, `*_pre_query` and `found_*_query`;
+/// `comment_feed_*`, `getarchives_*`, `get_terms_fields` / `_orderby`, `get_meta_sql`,
+/// `get_date_sql`, `split_the_query`.
+pub fn shapes_sql(hook: &str) -> bool {
+    let h = hook.to_ascii_lowercase();
+    let h = h.as_str();
+    matches!(h, "query" | "incompatible_sql_modes" | "get_meta_sql" | "get_date_sql" | "split_the_query" | "get_terms_fields" | "get_terms_orderby")
+        || ["dbdelta_", "posts_", "post_limits", "comment_feed_", "getarchives_"].iter().any(|p| h.starts_with(p))
+        || h.ends_with("_clauses")
+        || h.ends_with("_pre_query")
+        || (h.starts_with("found_") && h.ends_with("_query"))
+}
+
+/// A COMMIT / ROLLBACK `AND CHAIN` (opens a new transaction) or `RELEASE` (drops the worker's
+/// connection). `AND NO CHAIN`, `NO RELEASE` and `ROLLBACK TO SAVEPOINT` are fine.
+fn chains_or_releases(words: &[String]) -> bool {
+    words.iter().enumerate().any(|(i, w)| (w == "CHAIN" || w == "RELEASE") && (i == 0 || words[i - 1] != "NO"))
 }
 
 fn touches_time_cap(sql: &str) -> bool {
@@ -106,16 +206,18 @@ mod tests {
 
     #[test]
     fn admit_counts_sizes_and_reads_utf8() {
-        assert_eq!(admit(b"SELECT 1", 0, 1), Ok("SELECT 1"));
-        assert_eq!(admit(b"SELECT 1", 1, 1), Err(Refusal::Queries(1)));
-        assert_eq!(admit(b"SELECT 1", 7, 3), Err(Refusal::Queries(3)));
+        assert_eq!(admit(b"SELECT 1", 0, 1, U), Ok("SELECT 1"));
+        assert_eq!(admit(b"SELECT 1", 1, 1, U), Err(Refusal::Queries(1)));
+        assert_eq!(admit(b"SELECT 1", 7, 3, U), Err(Refusal::Queries(3)));
         let long = vec![b'x'; MAX_SQL + 1];
-        assert_eq!(admit(&long, 0, 10), Err(Refusal::TooLong(MAX_SQL + 1)));
-        assert_eq!(admit(&long[..MAX_SQL], 0, 10).map(str::len), Ok(MAX_SQL));
+        assert_eq!(admit(&long, 0, 10, U), Err(Refusal::TooLong(MAX_SQL + 1)));
+        assert_eq!(admit(&long[..MAX_SQL], 0, 10, U).map(str::len), Ok(MAX_SQL));
         // Layer 2 reads text: a byte that is not UTF-8 (hidden in a comment) is refused here.
-        assert_eq!(admit(b"SELECT LOAD_FILE('/etc/passwd') /* \xff */", 0, 10), Err(Refusal::NotUtf8));
-        assert_eq!(admit("SELECT 'é'".as_bytes(), 0, 10), Ok("SELECT 'é'"));
+        assert_eq!(admit(b"SELECT LOAD_FILE('/etc/passwd') /* \xff */", 0, 10, U), Err(Refusal::NotUtf8));
+        assert_eq!(admit("SELECT 'é'".as_bytes(), 0, 10, U), Ok("SELECT 'é'"));
     }
+
+    const U: &str = "utf8mb4";
 
     #[test]
     fn the_time_cap_is_not_the_plugins() {
@@ -125,9 +227,83 @@ mod tests {
             "SET STATEMENT MAX_STATEMENT_TIME=100 FOR SELECT SLEEP(100)",
             "SELECT @@max_statement_time",
         ] {
-            assert_eq!(admit(sql.as_bytes(), 0, 10), Err(Refusal::TimeCap), "{sql}");
+            assert_eq!(admit(sql.as_bytes(), 0, 10, U), Err(Refusal::TimeCap), "{sql}");
         }
-        assert!(admit(b"SET SESSION sql_mode = 'TRADITIONAL'", 0, 10).is_ok());
+    }
+
+    #[test]
+    fn session_state_is_an_allowlist() {
+        for sql in [
+            "SET NAMES utf8mb4",
+            "set names 'utf8mb4' collate 'utf8mb4_unicode_520_ci'",
+            "SET CHARACTER SET utf8mb4",
+            "SET SESSION group_concat_max_len = 100000",
+            "SET group_concat_max_len=4096;",
+            "SET SQL_BIG_SELECTS=1",
+            "set session sql_big_selects = ON",
+        ] {
+            assert!(admit(sql.as_bytes(), 0, 10, U).is_ok(), "{sql}");
+        }
+        for sql in [
+            "SET SESSION completion_type = 'CHAIN'",
+            "SET completion_type=1",
+            "SET SESSION sql_select_limit = 1",
+            "SET SESSION transaction_read_only = 1",
+            "SET SESSION sql_mode = 'TRADITIONAL'",
+            "SET autocommit = 0",
+            "SET autocommit = FALSE",
+            "SET time_zone = '+05:00'",
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET SESSION TRANSACTION READ ONLY",
+            "SET @@session.sql_select_limit = 1",
+            "SET NAMES latin1",
+            "SET NAMES utf8mb4 COLLATE latin1_swedish_ci",
+            "SET NAMES utf8mb4, sql_select_limit = 1",
+            "SET group_concat_max_len = 1, sql_select_limit = 1",
+            "/* hidden */ SET sql_select_limit = 1",
+            "-- note\nSET sql_select_limit = 1",
+            "# note\nset sql_select_limit=1",
+            "SET SQL_BIG_SELECTS = 0",
+            "COMMIT AND CHAIN",
+            "ROLLBACK AND CHAIN",
+            "commit work release",
+            "ROLLBACK /* x */ RELEASE",
+        ] {
+            assert_eq!(admit(sql.as_bytes(), 0, 10, U), Err(Refusal::SessionState), "{sql}");
+        }
+        for sql in ["COMMIT", "ROLLBACK AND NO CHAIN NO RELEASE", "ROLLBACK TO SAVEPOINT a", "RELEASE SAVEPOINT a", "SELECT 'SET x = 1'"] {
+            assert!(admit(sql.as_bytes(), 0, 10, U).is_ok(), "{sql}");
+        }
+        // No charset known: no SET NAMES either.
+        assert_eq!(admit(b"SET NAMES utf8mb4", 0, 10, ""), Err(Refusal::SessionState));
+    }
+
+    #[test]
+    fn sql_shaping_hooks_are_never_mirrored() {
+        for h in [
+            "query",
+            "dbdelta_queries",
+            "dbdelta_create_queries",
+            "posts_where",
+            "posts_request",
+            "posts_clauses",
+            "post_limits_request",
+            "comments_clauses",
+            "terms_clauses",
+            "users_pre_query",
+            "posts_pre_query",
+            "found_posts_query",
+            "comment_feed_join",
+            "getarchives_where",
+            "get_meta_sql",
+            "incompatible_sql_modes",
+            "Query",
+        ] {
+            assert!(shapes_sql(h), "{h}");
+        }
+        for h in ["the_content", "init", "wp_head", "the_title", "query_vars", "pre_get_posts", "shortcode_atts_x", "admin_notices"] {
+            assert!(!shapes_sql(h), "{h}");
+        }
     }
 
     #[test]

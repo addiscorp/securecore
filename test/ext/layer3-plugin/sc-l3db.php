@@ -8,6 +8,13 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+// A hostile `query` filter: it answers any query that reads the connection's transaction state
+// with "nothing open". Mirrored into the worker, it would hide the transactions below from the
+// stand-in's check; it must never be mirrored.
+add_filter('query', static function ($q) {
+    return is_string($q) && stripos($q, '@@in_transaction') !== false ? 'SELECT 1, 0' : $q;
+});
+
 // A query while the plugin loads (before its child reports ready): its own option.
 $GLOBALS['sc_l3db_loaded'] = get_option('sc_l3db_greeting', 'none');
 
@@ -143,6 +150,60 @@ add_shortcode('sc_l3db_autocommit_off', static function () {
     return sc_l3db_out(['returned' => 'yes']);
 });
 
+// completion_type = CHAIN would turn the stand-in's ROLLBACK into a new transaction: set it,
+// then leave a transaction open.
+add_shortcode('sc_l3db_chain', static function () {
+    global $wpdb;
+    $set = $wpdb->query("SET SESSION completion_type = 'CHAIN'");
+    $wpdb->query('START TRANSACTION');
+    $wpdb->insert($wpdb->prefix . 'sc_l3db_items', ['name' => 'chain1', 'n' => 8]);
+    return sc_l3db_out(['returned' => 'yes', 'completion_type' => sc_l3db_ran($set)]);
+});
+
+// Session state: what the gateway lets an isolated plugin SET, and what it refuses (each would
+// persist into core's later queries on the worker's connection).
+add_shortcode('sc_l3db_session', static function () {
+    global $wpdb;
+    $r = [];
+    foreach ([
+        'names' => 'SET NAMES utf8mb4',
+        'group_concat' => 'SET SESSION group_concat_max_len = 100000',
+        'big_selects' => 'SET SQL_BIG_SELECTS = 1',
+        'completion_type' => "SET SESSION completion_type = 'CHAIN'",
+        'select_limit' => 'SET SESSION sql_select_limit = 1',
+        'read_only' => 'SET SESSION transaction_read_only = 1',
+        'sql_mode' => "SET SESSION sql_mode = 'TRADITIONAL'",
+        'autocommit' => 'SET autocommit = 0',
+        'time_zone' => "SET time_zone = '+05:00'",
+        'isolation' => 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE',
+        'hidden' => '/* x */ SET sql_select_limit = 2',
+        'names_other' => 'SET NAMES latin1',
+        'chain' => 'COMMIT AND CHAIN',
+    ] as $k => $sql) {
+        $r[$k] = sc_l3db_ran($wpdb->query($sql));
+    }
+    return sc_l3db_out($r);
+});
+
+// The result cap against a million tiny rows (one byte each): refused long before the cap's
+// worth of serialized text, because each row costs the worker far more than its bytes.
+add_shortcode('sc_l3db_tiny', static function () {
+    global $wpdb;
+    $c = 'information_schema.COLLATIONS';
+    $v = $wpdb->get_col("SELECT 1 FROM $c a, $c b, $c c LIMIT 1000000");
+    return sc_l3db_out(['tiny' => count($v) === 1000000 ? 'OK' : 'BLOCKED', 'error' => str_contains($wpdb->last_error, 'dbResultBytes') ? 'dbResultBytes' : 'other']);
+});
+
+// An exception in the worker while it runs this plugin's query (the neighbour's `query` filter
+// throws on this one), with a transaction open: the stand-in still cleans up.
+add_shortcode('sc_l3db_throw', static function () {
+    global $wpdb;
+    $wpdb->query('START TRANSACTION');
+    $wpdb->insert($wpdb->prefix . 'sc_l3db_items', ['name' => 'thrown1', 'n' => 8]);
+    $wpdb->query("SELECT 'sc_l3db_throw_marker'");
+    return sc_l3db_out(['returned' => 'yes']);
+});
+
 // The result cap against a result far larger than it: 40 rows of 1 MiB.
 add_shortcode('sc_l3db_huge', static function () {
     global $wpdb;
@@ -193,8 +254,8 @@ add_shortcode('sc_l3db_time', static function ($atts) {
 // The result cap: one answer of 300 KB.
 add_shortcode('sc_l3db_big', static function () {
     global $wpdb;
-    $v = $wpdb->get_var("SELECT REPEAT('x', 300000)");
-    return sc_l3db_out(['big' => is_string($v) && strlen($v) === 300000 ? 'OK' : 'BLOCKED', 'error' => str_contains($wpdb->last_error, 'dbResultBytes') ? 'dbResultBytes' : 'other']);
+    $v = $wpdb->get_var("SELECT REPEAT('x', 5000000)");
+    return sc_l3db_out(['big' => is_string($v) && strlen($v) === 5000000 ? 'OK' : 'BLOCKED', 'error' => str_contains($wpdb->last_error, 'dbResultBytes') ? 'dbResultBytes' : 'other']);
 });
 
 // The time cap: a 5 s statement.

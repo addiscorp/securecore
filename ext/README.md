@@ -1095,19 +1095,51 @@ isolated plugin, where the same `get_option()` in the worker is core's.
 | cap | where | what happens |
 |---|---|---|
 | `limits.dbQueries` (default 1000) | the worker, per request and plugin (its load and its calls) | each query past it fails (`last_error`: `over the dbQueries cap`); one line per request |
-| `limits.dbResultBytes` (default 4 MiB, at most 16 MiB) | the worker, per answer | the result is read unbuffered (`MYSQLI_USE_RESULT`) and the stand-in counts the bytes as it copies each row: past the cap the rest is drained unread and the answer fails (the query ran), with a line, so a result far over the cap never sits in the worker's memory. The serialized answer is checked again on the way out |
+| `limits.dbResultBytes` (default 4 MiB, at most 16 MiB) | the worker, per answer | the result is read unbuffered (`MYSQLI_USE_RESULT`) and the stand-in counts the bytes as it copies each row (each row ~200 bytes, each value ~16 more plus its text: what it costs the worker, not only its serialized size, so a million one-byte rows count 200 MB): past the cap the rest is drained unread and the answer fails (the query ran), with a line, so a result far over the cap never sits in the worker's memory. The serialized answer is checked again on the way out |
 | `limits.timeoutMs` | the worker, per call, queries included | the time left before the call's deadline caps each statement on the server (`SET SESSION max_statement_time` on MariaDB; `max_execution_time` on MySQL, which covers SELECTs only, #99), re-set before a query whenever the last setting is over 50 ms old (so no statement runs more than 50 ms past the deadline there), and the session's own value restored after; past the deadline the child is killed as for any call. A plugin's query naming either variable is refused |
 
 **Transactions.** The plugin's statements run on the worker's connection, as unisolated. After
 every exchange that queried (the load or a call, however it ended: an answer, a timeout, a
-crash), the stand-in asks the server for the connection's state (`@@autocommit` and
-`@@in_transaction` on MariaDB; on MySQL `information_schema.innodb_trx` for the connection), never
-the SQL text, which a comment, `SET autocommit = FALSE` or the like would hide. If the plugin left
-a transaction open or autocommit off that wasn't before, it rolls back, turns autocommit on again
-and writes `layer3 plugin:<slug> left a transaction open on the worker's connection: rolled back`,
-so core's later writes in the request never join it and no row lock outlives the call. (A
-transaction the plugin opens and ends within one call is its own, as unisolated; XA transactions
-never open, layer 2 refuses `XA`.)
+crash, an exception in the worker, in a `finally`), the stand-in puts the connection back:
+- **MariaDB:** it asks the server for `@@autocommit` and `@@in_transaction` (never the SQL text,
+  which a comment would hide). If the plugin left a transaction open, or the state can't be read,
+  it runs `ROLLBACK AND NO CHAIN`, turns autocommit on, reads the state again, and replaces the
+  connection if it still isn't clean; with the line `layer3 plugin:<slug> left a transaction open
+  on the worker's connection: rolled back`.
+- **MySQL:** an open transaction can't be seen without the PROCESS privilege (and InnoDB starts
+  one lazily), so whenever autocommit was on before the plugin's first query, the same
+  `ROLLBACK AND NO CHAIN` and `SET autocommit = 1` run unconditionally (a no-op when nothing is
+  open). A transaction core itself held open around a call into an isolated plugin would be
+  rolled back too; WordPress core holds none while rendering.
+
+So core's later writes in the request never join what the plugin left, and no row lock outlives
+the call. A transaction the plugin opens and ends within one call is its own, as unisolated. XA
+transactions never open (layer 2 refuses `XA`).
+
+**Bookkeeping never goes through filters.** The cap, the state reads, the rollback and `SET
+autocommit` are `mysqli_query()` calls on the exchange's own connection, never `$wpdb->query()`,
+whose `query` filters a plugin could use to answer "nothing open".
+
+**SQL-shaping hooks are never mirrored.** An isolated plugin's callbacks on hooks whose value is
+SQL the worker runs (`query`, `dbdelta_*`, `incompatible_sql_modes`, WP_Query's `posts_*` and
+`post_limits*`, the query classes' `*_clauses`, `*_pre_query`, `found_*_query`, `comment_feed_*`,
+`getarchives_*`, `get_terms_fields`/`_orderby`, `get_meta_sql`, `get_date_sql`, `split_the_query`;
+`gateway::shapes_sql`) are not mirrored into the worker, with a line (`layer3 plugin:<slug> hook
+<name> not mirrored: it shapes SQL the worker runs`). Mirrored, they would rewrite core's queries
+from the child. They still run on the plugin's own queries in the child.
+
+**Session state is an allowlist.** Every `SET` persists into core's later queries on the
+worker's connection, so the gateway refuses all but `SET NAMES` / `SET CHARACTER SET` to the
+connection's own charset (with a collation of it), `SET [SESSION] group_concat_max_len = <n>` and
+`SET [SESSION] sql_big_selects = 1|ON`. Refused: every other `SET` (`autocommit`,
+`completion_type`, `sql_select_limit`, `transaction_read_only`, `sql_mode`, `time_zone`, `SET
+TRANSACTION`, `SET @@…`, several assignments at once), also behind a comment, plus `COMMIT` /
+`ROLLBACK … AND CHAIN` or `RELEASE`. Each refusal logs `layer3 plugin:<slug> database refused: it
+changes the worker connection's session state`.
+
+**db.php drop-ins.** The gateway uses `$wpdb->dbh`, the drop-in's current connection for HyperDB
+or LudicrousDB, for the plugin's query and for all bookkeeping after it. A drop-in whose `dbh`
+isn't a mysqli (SQLite) gets a refusal: `the worker's $wpdb has no mysqli connection`.
 
 **Errors.** The child gets the server's error code and text with the connection's database name,
 user and host taken out (`[1146] Table 'wp_x' doesn't exist`, not `'<database>.wp_x'`; a user

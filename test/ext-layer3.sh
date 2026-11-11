@@ -107,6 +107,10 @@ d_aco=$(page "L3 db autocommit off" '[sc_l3db_autocommit_off] SC-L3DB-AFTER-ACO'
 d_huge=$(page "L3 db huge" '[sc_l3db_huge] SC-L3DB-AFTER-HUGE')
 d_err=$(page "L3 db error" '[sc_l3db_err]')
 d_sleeps=$(page "L3 db sleeps" '[sc_l3db_sleeps] SC-L3DB-AFTER-SLEEPS')
+d_chain=$(page "L3 db chain" '[sc_l3db_chain] SC-L3DB-AFTER-CHAIN')
+d_session=$(page "L3 db session" '[sc_l3db_session]')
+d_tiny=$(page "L3 db tiny" '[sc_l3db_tiny] SC-L3DB-AFTER-TINY')
+d_throw=$(page "L3 db throw" '[sc_l3db_throw] SC-L3DB-AFTER-THROW')
 # scan_secrets <name>: fetch the secrets page into $dir/<name> and, while the process serving its
 # call waits, read that process's environment and memory from outside (as root with
 # CAP_SYS_PTRACE in the php container: a layer 3 child isn't dumpable) into $dir/<name>.scan,
@@ -131,7 +135,7 @@ cost() {
 
 cleanup() {
   wp plugin deactivate sc-l3probe sc-l3-neighbour hello sc-l3db >/dev/null 2>&1
-  for p in $p_main $p_loop $p_mem $p_probe $d_rw $d_l2 $d_l3 $d_many $d_big $d_sleep $d_secrets $d_time $d_txn $d_txo $d_aco $d_huge $d_err $d_sleeps; do wp post delete "$p" --force >/dev/null 2>&1; done
+  for p in $p_main $p_loop $p_mem $p_probe $d_rw $d_l2 $d_l3 $d_many $d_big $d_sleep $d_secrets $d_time $d_txn $d_txo $d_aco $d_huge $d_err $d_sleeps $d_chain $d_session $d_tiny $d_throw; do wp post delete "$p" --force >/dev/null 2>&1; done
   wp option update blogname SecureCore >/dev/null 2>&1
   db_exec "DROP TABLE IF EXISTS wp_sc_l3db_items, wp_sc_l3_neighbour_data; DELETE FROM wp_options WHERE option_name LIKE 'sc\\_l3db\\_%' OR option_name LIKE '\\_transient\\_%sc\\_l3db%' OR option_name = 'sc_l3_neighbour_mark'"
   in_php "rm -rf $probe $content/plugins/sc-l3-neighbour.php $content/plugins/sc-l3db.php $content/uploads/sc-l3db $content/uploads/sc-l3probe $content/uploads/sc-l3-up.txt"
@@ -155,7 +159,7 @@ cfg() { # $1 name, $2 layer2 mode, $3 layer3 enabled
   "layer3": {
     "enabled": $3,
     "isolate": ["sc-l3probe", "hello", "sc-l3db"],
-    "limits": { "timeoutMs": 1500, "memoryMb": 64, "dbQueries": 60, "dbResultBytes": 65536 },
+    "limits": { "timeoutMs": 1500, "memoryMb": 64, "dbQueries": 60, "dbResultBytes": 4194304 },
     "write": { "sc-l3probe": ["wp-content/uploads/sc-l3probe"], "sc-l3db": ["wp-content/uploads/sc-l3db"] }
   }
 }
@@ -257,7 +261,7 @@ want dbl3 not-utf8-direct none "db gateway: the child has no connection of its o
 want dbl3 time-cap BLOCKED "db gateway"
 has "$T" "layer3 plugin:sc-l3db database refused: the query is not UTF-8" "db gateway: SQL that isn't UTF-8 is refused, logged"
 has "$T" "layer3 plugin:sc-l3db database refused: it changes the statement time cap" "db gateway: a change to the time cap is refused, logged"
-# The caps (dbQueries 60, dbResultBytes 65536, timeoutMs 1500).
+# The caps (dbQueries 60, dbResultBytes 4 MiB, timeoutMs 1500).
 T=$(now); sleep 1
 get many "/?page_id=$d_many"
 ran=$(verdict many ran)
@@ -269,7 +273,7 @@ is "$(phplog "$T" | grep -c 'layer3 plugin:sc-l3db database refused: over the db
 get big "/?page_id=$d_big"
 want big big BLOCKED "caps"
 want big error dbResultBytes "caps"
-has "$T" "over the dbResultBytes cap of 65536" "caps: the result cap is logged"
+has "$T" "over the dbResultBytes cap of 4194304" "caps: the result cap is logged"
 get sleep "/?page_id=$d_sleep"
 is "$(status_of sleep)" 200 "caps: the 5 s statement's page renders"
 contains sleep SC-L3DB-AFTER-SLEEP "caps: the rest of the page is there"
@@ -289,19 +293,41 @@ is "$(db_exec "SELECT option_value FROM wp_options WHERE option_name = 'sc_l3_ne
   "transactions: a later write in the same request (another plugin's) committed, not swallowed by the open transaction"
 # Left open on a normal return: a START TRANSACTION behind a comment, and autocommit turned off.
 # Read from the server's state, not the SQL: rolled back, autocommit restored, core's write commits.
-for c in txo:open1 aco:ac1; do
+# (txo: behind a comment; chain: after trying completion_type = CHAIN; the plugin's own `query`
+# filter answers the stand-in's state read with "nothing open" if it is ever mirrored; throw: a
+# `query` filter in the worker throws while the plugin's query runs, caught around the shortcodes.)
+for c in txo:open1 chain:chain1 throw:thrown1; do
   n=${c%%:*} row=${c#*:}
   eval "pg=\$d_$n"
   T=$(now); sleep 1
   mark=m$$${n}$(date +%s)
-  get "$n" "/?page_id=$pg&sc_l3_mark=$mark"
-  want "$n" returned yes "transactions ($n): the call returned normally"
+  get "$n" "/?page_id=$pg&sc_l3_mark=$mark&sc_l3_throw=1&sc_l3_session=1"
+  [ "$n" = throw ] || want "$n" returned yes "transactions ($n): the call returned normally"
   has "$T" "layer3 plugin:sc-l3db left a transaction open on the worker's connection: rolled back" "transactions ($n): the worker rolled back what the plugin left open"
   is "$(db_exec "SELECT COUNT(*) FROM wp_sc_l3db_items WHERE name = '$row'")" 0 "transactions ($n): the plugin's uncommitted row is not in the database"
   is "$(db_exec "SELECT option_value FROM wp_options WHERE option_name = 'sc_l3_neighbour_mark'")" "$mark" \
     "transactions ($n): core's later write in the same request committed"
+  is "$(verdict "$n" core_rows)" 5 "transactions ($n): core's next query on the connection is unaffected"
 done
-has "$T" "rolled back, autocommit restored" "transactions (aco): autocommit is restored"
+has "$T" "layer3 plugin:sc-l3db hook query not mirrored: it shapes SQL the worker runs" "hooks: the plugin's own query filter is never mirrored into the worker"
+want chain completion_type BLOCKED "transactions (chain): completion_type is refused"
+contains throw "caught=RuntimeException" "transactions (throw): the worker's exception reached the page's own catch"
+has "$T" "layer3 plugin:sc-l3db exchange aborted: the worker failed while running its query" "transactions (throw): the aborted exchange ends the channel, with a line"
+# autocommit off is refused now (session state), so the plugin's write is an ordinary committed one.
+T=$(now); sleep 1
+mark=m$$aco$(date +%s)
+get aco "/?page_id=$d_aco&sc_l3_mark=$mark"
+want aco returned yes "transactions (aco): the call returned normally"
+has "$T" "layer3 plugin:sc-l3db database refused: it changes the worker connection's session state" "transactions (aco): SET autocommit is refused"
+is "$(db_exec "SELECT option_value FROM wp_options WHERE option_name = 'sc_l3_neighbour_mark'")" "$mark" "transactions (aco): core's later write committed"
+# Session state: the allowlist, and core's next queries see the session as it was.
+get sbase "/?page_id=$d_err&sc_l3_session=1"
+get session "/?page_id=$d_session&sc_l3_session=1"
+for c in names group_concat big_selects; do want session "$c" OK "session: allowed"; done
+for c in completion_type select_limit read_only sql_mode autocommit time_zone isolation hidden names_other chain; do want session "$c" BLOCKED "session: refused"; done
+base=$(verdict sbase session)
+is "$(verdict session session)" "$base" "session: core's next query sees the session unchanged ($base)"
+is "$(verdict session core_rows)" 5 "session: core's LIMIT 5 query returns 5 rows (no sql_select_limit)"
 # dbResultBytes against a result far over it (40 MiB, cap 64 KiB): refused while the rows are
 # copied, and the worker stays within memory_limit.
 get huge "/?page_id=$d_huge&sc_l3_peak=1"
@@ -310,7 +336,16 @@ contains huge SC-L3DB-AFTER-HUGE "result cap: the rest of the page is there"
 want huge huge BLOCKED "result cap"
 want huge error dbResultBytes "result cap"
 peak=$(verdict huge peak)
-if [ -n "$peak" ] && [ "$peak" -lt 40000000 ]; then pass "result cap: the worker's peak memory stayed at $peak bytes, under the 40 MiB result"; else fail "result cap: the worker's peak memory stayed under the 40 MiB result" "'$peak'"; fi
+if [ -n "$peak" ] && [ "$peak" -lt 20000000 ]; then pass "result cap: the worker's peak memory stayed at $peak bytes, under the 40 MiB result"; else fail "result cap: the worker's peak memory stayed under 20 MB" "'$peak'"; fi
+# A million one-byte rows under the 4 MiB cap: refused early (each row counts ~200 bytes), the
+# worker's memory bounded.
+get tiny "/?page_id=$d_tiny&sc_l3_peak=1"
+is "$(status_of tiny)" 200 "result cap: the million-row page renders"
+contains tiny SC-L3DB-AFTER-TINY "result cap: the rest of the page is there"
+want tiny tiny BLOCKED "result cap: a million tiny rows"
+want tiny error dbResultBytes "result cap: a million tiny rows"
+peak=$(verdict tiny peak)
+if [ -n "$peak" ] && [ "$peak" -lt 20000000 ]; then pass "result cap: the worker's peak memory for a million rows stayed at $peak bytes"; else fail "result cap: the worker's peak memory for a million rows stayed under 20 MB" "'$peak'"; fi
 # The error the child sees names neither the database nor its user.
 get err "/?page_id=$d_err"
 e=$(verdict err err)

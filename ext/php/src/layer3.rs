@@ -210,6 +210,8 @@ struct Channel {
     queries: u32,
     /// The query cap's line was written (once per request).
     cap_logged: bool,
+    /// The worker connection's charset (the only one `SET NAMES` may name, [`gateway::admit`]).
+    charset: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -230,6 +232,8 @@ static CHANNELS: Mutex<Option<HashMap<String, Option<Channel>>>> = Mutex::new(No
 /// Slugs whose query the stand-in is running now (a stack: a query's `query` filter may call
 /// another isolated plugin that queries in turn). Read by [`gateway_component`].
 static GATEWAY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// `slug\0hook` pairs whose not-mirrored line was written this request.
+static UNMIRRORED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The name the stand-in for `slug` is compiled under (its frames' filename).
 fn stub_name(slug: &str) -> String {
@@ -252,6 +256,7 @@ pub(crate) fn gateway_component(file: &str) -> Option<Component> {
 pub(crate) fn request_shutdown() {
     lock(&CHANNELS).take();
     lock(&GATEWAY).clear();
+    lock(&UNMIRRORED).clear();
 }
 
 /// Whether the `zend_compile_file` wrapper is needed for layer 3: a worker with plugins to
@@ -381,6 +386,7 @@ pub fn securecore_layer3_open(slug: String, file: String, abspath: String, prefi
                 busy: false,
                 queries: 0,
                 cap_logged: false,
+                charset: hello.db.charset.clone(),
             };
             let slot = channels.entry(slug.clone()).or_insert(Some(channel));
             pump(&slug, slot, Some(first))
@@ -505,7 +511,7 @@ fn pump(slug: &str, slot: &mut Option<Channel>, mut first: Option<Vec<u8>>) -> Z
             }
         };
         if let Some(sql) = gateway::decode_query(&frame) {
-            match gateway::admit(sql, ch.queries, cap) {
+            match gateway::admit(sql, ch.queries, cap, &ch.charset) {
                 Ok(text) => {
                     ch.queries += 1;
                     ch.pending = Some(text.to_owned());
@@ -568,6 +574,49 @@ pub fn securecore_layer3_db_begin(slug: String) -> Option<String> {
     ch.busy = true;
     lock(&GATEWAY).push(slug);
     Some(sql)
+}
+
+/// The end of the stand-in's exchange with `slug`'s child, however it ended (its `finally`): the
+/// slug's frames stop being the plugin's, and a query whose answer never went back (an exception
+/// in the worker while it ran) ends the channel, since the child is still waiting for it.
+#[php_function]
+#[php(name = "securecore_layer3_db_end")]
+pub fn securecore_layer3_db_end(slug: String) {
+    {
+        let mut gateway = lock(&GATEWAY);
+        if let Some(i) = gateway.iter().rposition(|s| *s == slug) {
+            gateway.remove(i);
+        }
+    }
+    let mut channels = lock(&CHANNELS);
+    let Some(slot) = channels.as_mut().and_then(|c| c.get_mut(&slug)) else { return };
+    if slot.as_ref().is_some_and(|ch| ch.busy) {
+        log(LOG_WARNING, &format!("layer3 plugin:{slug} exchange aborted: the worker failed while running its query"));
+        if let Some(ch) = slot.take()
+            && let Some(&control) = CONTROL.get()
+            && ch.pid > 0
+        {
+            // SAFETY: the control socket, open for the process's life.
+            let _ = wire::send_packet(unsafe { BorrowedFd::borrow_raw(control) }, &wire::encode_kill(ch.pid), None);
+        }
+    }
+}
+
+/// Whether the stand-in mirrors the isolated plugin's callback on `hook` in the worker: never for
+/// a hook whose value is SQL core runs ([`gateway::shapes_sql`]), with a line once per request.
+#[php_function]
+#[php(name = "securecore_layer3_mirrorable")]
+pub fn securecore_layer3_mirrorable(slug: String, hook: String) -> bool {
+    if !gateway::shapes_sql(&hook) {
+        return true;
+    }
+    let key = format!("{slug}\0{hook}");
+    let mut seen = lock(&UNMIRRORED);
+    if !seen.contains(&key) {
+        log(LOG_NOTICE, &format!("layer3 plugin:{slug} hook {hook} not mirrored: it shapes SQL the worker runs"));
+        seen.push(key);
+    }
+    false
 }
 
 /// The stand-in's answer to the child's query (PHP-serialized). Sends it (or a refusal, when it
@@ -987,6 +1036,8 @@ pub(crate) fn register(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(securecore_layer3_call))
         .function(wrap_function!(securecore_layer3_db_begin))
         .function(wrap_function!(securecore_layer3_db_reply))
+        .function(wrap_function!(securecore_layer3_db_end))
+        .function(wrap_function!(securecore_layer3_mirrorable))
         .function(wrap_function!(securecore_layer3_db))
         .function(wrap_function!(securecore_layer3_helper))
         .function(wrap_function!(securecore_layer3_zygote))

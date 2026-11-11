@@ -375,6 +375,11 @@ fn core_is_unrestricted_but_for_the_allowlist() {
     }
     // ...and reads the connection's transaction state after each exchange, as core.
     assert_eq!(core("SELECT @@autocommit, @@in_transaction"), Decision::Allow);
+    // (`NO RELEASE` isn't in the parser's grammar; RELEASE would come only from a completion_type
+    // the gateway never lets a plugin set.)
+    for sql in ["ROLLBACK AND NO CHAIN", "SET autocommit = 1"] {
+        assert_eq!(core(sql), Decision::Allow, "{sql}");
+    }
     // XA transactions (which a plain ROLLBACK can't end) never open for a component.
     for sql in ["XA START 'x'", "XA BEGIN 'x'"] {
         assert!(matches!(verdict(&plain(), sql), Decision::Refuse(_)), "{sql}");
