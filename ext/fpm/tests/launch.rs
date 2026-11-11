@@ -55,7 +55,9 @@ fn an_invalid_config_exits_125_without_running_php_fpm() {
     let out = launch(&path, &format!("touch {}", marker.display()));
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
     assert!(!marker.exists(), "php-fpm must not run on an invalid config");
-    assert!(stderr(&out).contains(&format!("securecore-fpm: {}: invalid:", path.display())), "{}", stderr(&out));
+    // Where and what kind, never the file's token (#90 review: serde quotes what it met).
+    assert!(stderr(&out).contains(&format!("securecore-fpm: {}: invalid at line 1 column ", path.display())), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("`0`"), "{}", stderr(&out));
     assert!(stderr(&out).contains("refusing to start php-fpm"), "{}", stderr(&out));
 
     // A missing file, and no --config at all, fail the same way.
