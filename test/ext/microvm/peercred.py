@@ -19,6 +19,11 @@ os.chmod(path, 0o777)
 s.listen(16)
 while True:
     c, _ = s.accept()
-    pid, uid, gid = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
-    c.sendall(f"uid={uid} gid={gid}\n".encode())
-    c.close()
+    try:
+        pid, uid, gid = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        c.sendall(f"uid={uid} gid={gid}\n".encode())
+    except OSError:
+        # A peer that hung up first (the launcher's pre-boot probe connects and closes).
+        pass
+    finally:
+        c.close()
