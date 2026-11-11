@@ -362,7 +362,12 @@ fn deliver<C: Conn>(outbox: &'static Outbox, mut conn: C) -> io::Result<()> {
 #[derive(Debug, Default)]
 pub struct Inbox {
     last: Option<u64>,
+    /// The guest's last few lines, for the launcher to quote when the VM stops on its own (#87).
+    recent: VecDeque<String>,
 }
+
+/// How many of the guest's last lines an [`Inbox`] keeps to quote.
+pub const RECENT: usize = 6;
 
 impl Inbox {
     /// What `frame` adds to the launcher's log: nothing for a frame already logged; a count of
@@ -380,7 +385,13 @@ impl Inbox {
         }
         self.last = Some(seq);
         match frame {
-            Frame::Line { text, .. } => out.push(guest_line(text, cut)),
+            Frame::Line { text, .. } => {
+                if self.recent.len() == RECENT {
+                    self.recent.pop_front();
+                }
+                self.recent.push_back(String::from_utf8_lossy(text).chars().take(1024).collect());
+                out.push(guest_line(text, cut));
+            }
             Frame::Lost { count, .. } => out.push(lost_line(*count, "the guest's log buffer was full")),
         }
         out
@@ -388,6 +399,11 @@ impl Inbox {
 
     pub fn last(&self) -> Option<u64> {
         self.last
+    }
+
+    /// The guest's last lines, oldest first, as one quotable string (`a | b | c`).
+    pub fn recent(&self) -> String {
+        self.recent.iter().map(String::as_str).collect::<Vec<_>>().join(" | ")
     }
 }
 
@@ -473,6 +489,11 @@ mod tests {
         assert_eq!(inbox.take(&line(7, "d"), false), ["securecore-fpm: 2 guest log lines lost (missing from the guest's numbered stream)", "guest: d"]);
         assert_eq!(inbox.take(&Frame::Lost { seq: 8, count: 1 }, false), ["securecore-fpm: 1 guest log line lost (the guest's log buffer was full)"]);
         assert_eq!(inbox.take(&line(9, "long"), true), ["guest: long …[cut]"]);
+        // The last RECENT lines, to quote when the guest stops on its own (#87).
+        for i in 10..20 {
+            inbox.take(&line(i, &format!("l{i}")), false);
+        }
+        assert_eq!(inbox.recent(), "l14 | l15 | l16 | l17 | l18 | l19");
     }
 
     #[test]
@@ -506,7 +527,7 @@ mod tests {
         ob.ack(u64::MAX);
         ob.line(b"after");
         let mut log = Vec::new();
-        let inbox = Mutex::new(Inbox { last: Some(queued as u64) });
+        let inbox = Mutex::new(Inbox { last: Some(queued as u64), ..Inbox::default() });
         let frames: Vec<u8> = ob.lock().frames.iter().flat_map(|(_, b)| b.clone()).collect();
         serve(&frames[..], io::sink(), &inbox, &mut log);
         let log = String::from_utf8(log).expect("utf8");

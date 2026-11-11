@@ -1084,6 +1084,8 @@ struct Vm {
     _root: fs::File,
     /// Emptied (bind mounts unmounted first) when the VM is dropped, on every path out.
     jail: Jail,
+    /// Its log, as the launcher received it: quoted when the VM stops on its own (#87).
+    log: &'static Mutex<guestlog::Inbox>,
 }
 
 /// An `O_PATH` handle on `dir` and the short path prefix that reaches into it.
@@ -1166,7 +1168,7 @@ impl Vm {
             j.user_dir(IN_SNAP_NEW)?;
         }
         let (root, short) = short_dir(&j.root)?;
-        wire(plan, m, j, &short, wiring)?;
+        let log = wire(plan, m, j, &short, wiring)?;
         let mut cmd = j.command(&opts.assets.jailer, &opts.assets.firecracker, opts.vcpus, opts.mem_mib, &["--api-sock", IN_API]);
         // stdout and stderr together, through a pipe, into a capped console.log.
         let (rd, wr) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
@@ -1179,7 +1181,7 @@ impl Vm {
         let pid = child.id() as i32;
         let _ = fs::write(j.base.join("firecracker.pid"), pid.to_string());
         let inside = |p: &str| short.join(p.trim_start_matches('/'));
-        let mut vm = Vm { child: Some(child), pid, api: inside(IN_API), vsock: inside(IN_VSOCK), _root: root, jail: j.clone() };
+        let mut vm = Vm { child: Some(child), pid, api: inside(IN_API), vsock: inside(IN_VSOCK), _root: root, jail: j.clone(), log };
         let t = Instant::now();
         while UnixStream::connect(&vm.api).is_err() {
             if let Some(st) = vm.exited() {
@@ -1216,7 +1218,7 @@ impl Vm {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if let Some(st) = self.exited() {
-                        return Err(format!("Firecracker exited ({st}) before php-fpm answered; see {}", state.join("console.log").display()));
+                        return Err(exited_before_ready(&st, &self.log.lock().unwrap_or_else(|p| p.into_inner()).recent(), state));
                     }
                     if t.elapsed() > timeout {
                         return Err(format!("php-fpm did not answer over vsock in {} s: {e}", timeout.as_secs()));
@@ -1225,6 +1227,18 @@ impl Vm {
                 }
             }
         }
+    }
+}
+
+/// Why the launcher stops when Firecracker exits before php-fpm answered: the guest's own last
+/// lines (php-fpm's reason and init's exit status, which the guest delivers before it stops,
+/// #87), or, when it said nothing, where to look.
+pub fn exited_before_ready(st: &str, recent: &str, state: &Path) -> String {
+    let console = state.join("console.log");
+    if recent.is_empty() {
+        format!("Firecracker exited ({st}) before php-fpm answered, and the guest logged nothing; see {}", console.display())
+    } else {
+        format!("Firecracker exited ({st}) before php-fpm answered; the guest's last lines: {recent} (and {})", console.display())
     }
 }
 
@@ -1584,7 +1598,7 @@ fn bind_unix(path: &Path, mode: SocketMode) -> Result<UnixListener, String> {
 /// The host ends of the guest's ports, in the jail: each `connect[].socket` as a link into its
 /// folder bind-mounted read-only, each `address` as a listener here, and the log listener. The
 /// jail was emptied first, so nothing from an earlier config is left.
-fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Result<(), String> {
+fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Result<&'static Mutex<guestlog::Inbox>, String> {
     let user = m.user;
     let owned = SocketMode { owner: Some(user.uid), group: Some(user.gid), mode: 0o600 };
     if wiring == Wiring::Full {
@@ -1666,7 +1680,7 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
             });
         }
     });
-    Ok(())
+    Ok(inbox)
 }
 
 /// The launcher's stderr, each write whole (a guest line never interleaves with another thread's).
@@ -2253,10 +2267,12 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     }
     let mut child = vm.child.take().ok_or("no Firecracker")?;
     let state = plan.state.clone();
+    let guest_log = vm.log;
     thread::spawn(move || {
         let st = child.wait();
         if !QUITTING.load(Ordering::SeqCst) {
-            log(&format!("Firecracker exited ({st:?}); see {}; stopping", state.join("console.log").display()));
+            let recent = guest_log.lock().unwrap_or_else(|p| p.into_inner()).recent();
+            log(&format!("Firecracker exited ({st:?}); the guest's last lines: {recent}; see {}; stopping", state.join("console.log").display()));
             // The main thread stops as for a signal, so the jail is cleared on the way out.
             FIRECRACKER_EXITED.store(true, Ordering::SeqCst);
             // SAFETY: kill(2) to this process, whose main thread waits for SIGTERM.
@@ -2918,6 +2934,20 @@ mod tests {
         let old = fs::metadata(path.with_extension("log.1")).expect("console.log.1").len();
         assert!(now <= 1000 && old <= 1000, "{now} {old}: never more than the cap in one file");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A guest that stops before php-fpm answers: the launcher's error quotes what the guest said
+    /// (#87), and says so when it said nothing.
+    #[test]
+    fn a_guest_that_stops_at_boot_is_quoted() {
+        let inbox = Mutex::new(guestlog::Inbox::default());
+        let mut out = Vec::new();
+        let from = b"L 1 PHP Fatal error: SC_LIT_SECRET is a string literal\nL 2 securecore-init: php-fpm exited at boot, before it served (exit code 78)\n";
+        guestlog::serve(&from[..], io::sink(), &inbox, &mut out);
+        let e = exited_before_ready("exit status: 0", &inbox.lock().expect("inbox").recent(), Path::new("/s"));
+        assert!(e.contains("SC_LIT_SECRET is a string literal | securecore-init: php-fpm exited at boot, before it served (exit code 78)"), "{e}");
+        let e = exited_before_ready("exit status: 0", "", Path::new("/s"));
+        assert!(e.contains("the guest logged nothing; see /s/console.log"), "{e}");
     }
 
     #[test]
