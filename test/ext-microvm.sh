@@ -8,7 +8,7 @@
 #   1. the values: off runs php-fpm as it is; gelada sandboxes it in place; auto is gelada even
 #      on this KVM host (until #72) and says why; auto with a config the VM can't express falls
 #      back with that reason and microvm refuses it; microvm refuses a root image nothing
-#      verified, and mirab's kernel (no Landlock) when layer 3 is on; in the php container (no
+#      verified, and a kernel without Landlock when layer 3 is on; in the php container (no
 #      /dev/kvm) auto falls back and microvm exits 125 without php-fpm ever running;
 #   2. a real WordPress front page from the guest (its kernel, loopback only, securecore-init as
 #      PID 1), with layer 2 enforcing and layer 3's child running there, the database through
@@ -161,7 +161,10 @@ record() {
     "$(sum "$1/firecracker")" "$(sum "$1/jailer")" "$(sum "$1/vmlinux")" "$r" > "$1/installed.json"
 }
 record "$vm"
-# Variants for the refusals: nothing verified for the rootfs; mirab's kernel (no Landlock).
+# Variants for the refusals: nothing verified for the rootfs; a kernel without Landlock and
+# seccomp filters. (mirab's own kernel had neither until mirab 0.2.1; the kernel here is the
+# kernel's bytes with both symbols renamed, recorded like any other, so it is refused by the
+# check and never booted.)
 for v in vm-norootfs vm-mirabkernel; do
   mkdir -p "$dir/$v"
   find "$dir/$v" -mindepth 1 -delete
@@ -169,7 +172,7 @@ for v in vm-norootfs vm-mirabkernel; do
 done
 record "$dir/vm-norootfs" no-rootfs
 rm -f "$dir/vm-mirabkernel/vmlinux"
-cp "$dir/vmlinux-mirab" "$dir/vm-mirabkernel/vmlinux"
+LC_ALL=C sed -e 's/landlock_merge_ruleset/landlock_merge_rulesex/g' -e 's/__seccomp_filter/__seccomp_filtex/g' "$vm/vmlinux" > "$dir/vm-mirabkernel/vmlinux"
 record "$dir/vm-mirabkernel"
 # The jailed user, and nginx's group (the alpine image's nginx is 101:101) for fpm.sock.
 vmuser=${SC_VM_USER:-64000:64000}
@@ -378,7 +381,7 @@ for v in deny norootfs mirabkernel link dotdot locked; do
 done
 has "$dir/value-microvm-deny.log" "is inside the app root" "microvm with a denied path in the root: says why"
 has "$dir/value-microvm-norootfs.log" "the guest root image isn't verified" "microvm without a verified root image: says why"
-has "$dir/value-microvm-mirabkernel.log" "has no Landlock and seccomp filters" "microvm with layer 3 on mirab's kernel: says why"
+has "$dir/value-microvm-mirabkernel.log" "has no Landlock and seccomp filters" "microvm with layer 3 on a kernel without Landlock: says why"
 has "$dir/value-microvm-link.log" "wp-content/sc-evil is a symlink" "a writable folder that is a link (to a root-only folder) is refused, never read"
 has "$dir/value-microvm-dotdot.log" "holds \"..\"" "a writable folder with \"..\" is refused, never read"
 has "$dir/value-microvm-locked.log" "may not connect to $sockdir/locked/inner/db.sock (Permission denied" \
