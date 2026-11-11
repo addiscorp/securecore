@@ -17,3 +17,12 @@ add_filter('the_content', static function ($content) {
     }
     return $content . '<p class="sc-l3-neighbour">neighbour pid=' . getmypid() . ' ' . $where . $inc . '</p>';
 }, 20);
+
+// ?sc_l3_mark=<v>: after the content, a write on the worker's connection (its own option, through
+// core's update_option): it lands only if no transaction is left open on that connection (#94).
+add_filter('the_content', static function ($content) {
+    if (isset($_GET['sc_l3_mark'])) {
+        update_option('sc_l3_neighbour_mark', sanitize_key($_GET['sc_l3_mark']), false);
+    }
+    return $content;
+}, 30);

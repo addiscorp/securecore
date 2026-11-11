@@ -39,7 +39,7 @@ use ext_php_rs::types::{ZendHashTable, ZendStr, Zval};
 use securecore_attribution::Component;
 use securecore_config::Loaded;
 use securecore_layer3::child::{self, Plan};
-use securecore_layer3::options;
+use securecore_layer3::{gateway, options};
 use securecore_layer3::wire::{self, Hello};
 
 use crate::{LOG_NOTICE, LOG_WARNING, attribution, log};
@@ -197,14 +197,66 @@ fn close_from(first: RawFd) {
 /// its callbacks pass through for the rest of the request.
 struct Channel {
     sock: OwnedFd,
+    /// The child's pid, from its ready frame (0 while it loads).
     pid: i32,
+    /// What the worker is waiting for from the child, and until when.
+    waiting: Option<Waiting>,
+    /// The query the child sent, until the stand-in takes it ([`securecore_layer3_db_begin`]).
+    pending: Option<String>,
+    /// The stand-in is running this channel's query: a call into the plugin passes through
+    /// meanwhile (the child is waiting for the answer, not for a call).
+    busy: bool,
+    /// Queries sent through the gateway this request (`layer3.limits.dbQueries`).
+    queries: u32,
+    /// The query cap's line was written (once per request).
+    cap_logged: bool,
+    /// The plugin's last transaction-control statement left a transaction open.
+    transaction: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Waiting {
+    deadline: Instant,
+    phase: Phase,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Phase {
+    /// The plugin is loading: the answer is the ready frame.
+    Load,
+    /// A call to callback `id`: the answer is its result.
+    Call(i64),
 }
 
 static CHANNELS: Mutex<Option<HashMap<String, Option<Channel>>>> = Mutex::new(None);
+/// Slugs whose query the stand-in is running now (a stack: a query's `query` filter may call
+/// another isolated plugin that queries in turn). Read by [`gateway_component`].
+static GATEWAY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Slugs whose child died with a transaction open: the stand-in rolls it back.
+static ROLLBACK: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The name the stand-in for `slug` is compiled under (its frames' filename).
+fn stub_name(slug: &str) -> String {
+    format!("{STUB_PREFIX}{slug}")
+}
+const STUB_PREFIX: &str = "securecore-layer3:";
+
+/// The database gateway's attribution (#94): a frame of the stand-in for an isolated plugin
+/// whose child's query the stand-in is running now is that plugin. So the query is charged to
+/// the plugin by layer 2's own caller rule ([`crate::attribution::db_caller`]), exactly as its
+/// `$wpdb->query()` would be in the worker; code that a filter on the query runs is charged to
+/// itself, as ever. Only the extension compiles code under that name, and the slug is the one the
+/// worker opened the channel for: nothing the child sends names it.
+pub(crate) fn gateway_component(file: &str) -> Option<Component> {
+    let slug = file.strip_prefix(STUB_PREFIX)?;
+    lock(&GATEWAY).iter().any(|s| s == slug).then(|| Component::Plugin(slug.to_owned()))
+}
 
 /// At request end: close every child's socket; each child exits.
 pub(crate) fn request_shutdown() {
     lock(&CHANNELS).take();
+    lock(&GATEWAY).clear();
+    lock(&ROLLBACK).clear();
 }
 
 /// Whether the `zend_compile_file` wrapper is needed for layer 3: a worker with plugins to
@@ -268,7 +320,7 @@ fn php_quote(s: &str) -> String {
 fn stub(slug: &str, file: &str) -> *mut zend_op_array {
     let body = STUB_PHP.trim_start().strip_prefix("<?php").unwrap_or(STUB_PHP);
     let source = body.replace("__SC_SLUG__", &php_quote(slug)).replace("__SC_FILE__", &php_quote(file));
-    let Ok(name) = CString::new(format!("securecore-layer3:{slug}")) else { return std::ptr::null_mut() };
+    let Ok(name) = CString::new(stub_name(slug)) else { return std::ptr::null_mut() };
     let source = ZendStr::new(source, false);
     // SAFETY: a live zend_string and filename for the call; the engine copies what it keeps.
     unsafe { ext_php_rs::ffi::ext_php_rs_zend_compile_string(source.as_ptr().cast_mut(), name.as_ptr()) }
@@ -294,12 +346,14 @@ pub fn securecore_layer3_snapshot_names(abspath: String, prefix: String, stylesh
     options::snapshot_allowlist(&core, &prefix, &stylesheet).into_iter().collect()
 }
 
-/// The worker's side of loading an isolated plugin: get a child for it from the helper, and
-/// return what the plugin registered there (PHP-serialized), or null when it can't be had.
+/// The worker's side of loading an isolated plugin: get a child for it from the helper. Returns
+/// what the plugin registered there (PHP-serialized); or, while it loads, a query it sent through
+/// the gateway (an array: run it, then [`securecore_layer3_db_reply`]); or null when it can't be
+/// had. `db` is the worker's `$wpdb` facts: charset, collate, `db_version()`, `db_server_info()`.
 #[php_function]
 #[php(name = "securecore_layer3_open")]
-pub fn securecore_layer3_open(slug: String, file: String, abspath: String, prefix: String, snapshot: &Zval) -> Zval {
-    let mut out = Zval::new();
+pub fn securecore_layer3_open(slug: String, file: String, abspath: String, prefix: String, snapshot: &Zval, db: Vec<String>) -> Zval {
+    let out = Zval::new();
     let Some(live) = crate::live_arc() else { return out };
     if role() != Role::Fpm || !live.config.layer3.enabled || !live.config.layer3.isolate.contains(&slug) {
         return out;
@@ -311,6 +365,7 @@ pub fn securecore_layer3_open(slug: String, file: String, abspath: String, prefi
     }
     let Some(&control) = CONTROL.get() else { return out };
     let snapshot = snapshot.zend_str().map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+    let fact = |i: usize| db.get(i).cloned().unwrap_or_default();
     let hello = Hello {
         slug: slug.clone(),
         file,
@@ -318,22 +373,34 @@ pub fn securecore_layer3_open(slug: String, file: String, abspath: String, prefi
         prefix,
         snapshot_sha: securecore_config::sha256_hex(&snapshot),
         config_sha: live.sha256.clone(),
+        db: wire::DbFacts { charset: fact(0), collate: fact(1), version: fact(2), server_info: fact(3) },
     };
     let timeout = Duration::from_millis(u64::from(live.config.layer3.limits.timeout_ms.get()));
     match open(control, &hello, &snapshot, timeout) {
-        Ok((channel, payload)) => {
-            channels.insert(slug, Some(channel));
-            out.set_binary(payload);
+        Ok((sock, first, deadline)) => {
+            let channel = Channel {
+                sock,
+                pid: 0,
+                waiting: Some(Waiting { deadline, phase: Phase::Load }),
+                pending: None,
+                busy: false,
+                queries: 0,
+                cap_logged: false,
+                transaction: false,
+            };
+            let slot = channels.entry(slug.clone()).or_insert(Some(channel));
+            pump(&slug, slot, Some(first))
         }
         Err(e) => {
             log(LOG_WARNING, &format!("layer3 plugin:{slug} not loaded: {e}"));
             channels.insert(slug, None);
+            out
         }
     }
-    out
 }
 
-fn open(control: RawFd, hello: &Hello, snapshot: &[u8], timeout: Duration) -> Result<(Channel, Vec<u8>), String> {
+/// The hand-off: the request socket, the first frame after it and the deadline for the load.
+fn open(control: RawFd, hello: &Hello, snapshot: &[u8], timeout: Duration) -> Result<(OwnedFd, Vec<u8>, Instant), String> {
     let (ours, theirs) = wire::socketpair(libc::SOCK_STREAM).map_err(|e| format!("socketpair: {e}"))?;
     // SAFETY: the control socket, open for the process's life.
     let control = unsafe { BorrowedFd::borrow_raw(control) };
@@ -344,53 +411,225 @@ fn open(control: RawFd, hello: &Hello, snapshot: &[u8], timeout: Duration) -> Re
         if e.kind() == io::ErrorKind::TimedOut { format!("timed out waiting for {what}") } else { format!("{what}: {e}") }
     };
     wire::write_frame(ours.as_fd(), &hello.encode()?, Some(start + HANDSHAKE)).map_err(|e| fail("the helper", e))?;
-    let mut frame = wire::read_frame(ours.as_fd(), Some(start + HANDSHAKE + timeout)).map_err(|e| fail("the child", e))?;
+    let mut deadline = start + HANDSHAKE + timeout;
+    let mut frame = wire::read_frame(ours.as_fd(), Some(deadline)).map_err(|e| fail("the child", e))?;
     if frame.as_deref() == Some(wire::NEED_SNAPSHOT) {
         wire::write_frame(ours.as_fd(), snapshot, Some(Instant::now() + HANDSHAKE)).map_err(|e| fail("the helper", e))?;
-        frame = wire::read_frame(ours.as_fd(), Some(Instant::now() + BOOT_ALLOWANCE + timeout)).map_err(|e| fail("the helper to boot", e))?;
+        deadline = Instant::now() + BOOT_ALLOWANCE + timeout;
+        frame = wire::read_frame(ours.as_fd(), Some(deadline)).map_err(|e| fail("the helper to boot", e))?;
     }
     let frame = frame.ok_or("the helper closed the request")?;
-    if let Some(error) = frame.strip_prefix(wire::ERROR) {
-        return Err(String::from_utf8_lossy(error).into_owned());
-    }
-    let (pid, payload) = wire::decode_ready(&frame).ok_or("the child's answer is not a ready frame")?;
-    Ok((Channel { sock: ours, pid }, payload.to_vec()))
+    Ok((ours, frame, deadline))
 }
 
 /// The worker's side of one call into an isolated plugin's callback `id`: the child's answer
-/// (PHP-serialized), or null when the call failed (and the child is gone).
+/// (PHP-serialized); or a query the callback sent through the gateway (an array: run it, then
+/// [`securecore_layer3_db_reply`]); or null when the call failed (and the child is gone), or the
+/// plugin is waiting on its own query (a `query` filter of its own, re-entered).
 #[php_function]
 #[php(name = "securecore_layer3_call")]
 pub fn securecore_layer3_call(slug: String, id: i64, args: &Zval) -> Zval {
-    let mut out = Zval::new();
+    let out = Zval::new();
     let timeout_ms = crate::with_live(|l| l.config.layer3.limits.timeout_ms.get()).unwrap_or(5000);
     let mut channels = lock(&CHANNELS);
     let Some(slot) = channels.as_mut().and_then(|c| c.get_mut(&slug)) else { return out };
-    let Some(channel) = slot.as_ref() else { return out };
+    let Some(channel) = slot.as_mut() else { return out };
+    if channel.busy || channel.waiting.is_some() {
+        log(LOG_NOTICE, &format!("layer3 plugin:{slug} call {id} passed through: the plugin is waiting on its own query"));
+        return out;
+    }
     let mut body = format!("{id}\n").into_bytes();
     body.extend_from_slice(args.zend_str().map_or(&b""[..], |s| s.as_bytes()));
     let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
-    let answer = wire::write_frame(channel.sock.as_fd(), &body, Some(deadline)).and_then(|()| wire::read_frame(channel.sock.as_fd(), Some(deadline)));
-    match answer {
-        Ok(Some(frame)) => out.set_binary(frame),
-        Ok(None) => {
-            log(LOG_WARNING, &format!("layer3 plugin:{slug} child {} ended during call {id}", channel.pid));
-            *slot = None;
-        }
-        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-            log(LOG_WARNING, &format!("layer3 plugin:{slug} call {id} timed out after {timeout_ms} ms; child {} killed", channel.pid));
-            if let Some(&control) = CONTROL.get() {
-                // SAFETY: the control socket, open for the process's life.
-                let _ = wire::send_packet(unsafe { BorrowedFd::borrow_raw(control) }, &wire::encode_kill(channel.pid), None);
+    channel.waiting = Some(Waiting { deadline, phase: Phase::Call(id) });
+    if let Err(e) = wire::write_frame(channel.sock.as_fd(), &body, Some(deadline)) {
+        fail(&slug, slot, Failure::Io(e));
+        return out;
+    }
+    pump(&slug, slot, None)
+}
+
+/// Why a channel ended mid-exchange.
+enum Failure {
+    /// The child closed its socket (it exited, or died).
+    Ended,
+    /// The deadline passed.
+    TimedOut,
+    Io(io::Error),
+}
+
+/// Ends `slot`'s channel after a failed exchange, with the line for it; a child past its deadline
+/// is killed. A transaction the plugin left open is noted for the stand-in to roll back.
+fn fail(slug: &str, slot: &mut Option<Channel>, failure: Failure) {
+    let Some(ch) = slot.take() else { return };
+    let phase = ch.waiting.map_or(Phase::Load, |w| w.phase);
+    let timeout_ms = crate::with_live(|l| l.config.layer3.limits.timeout_ms.get()).unwrap_or(5000);
+    let pid = ch.pid;
+    let line = match (phase, &failure) {
+        (Phase::Load, Failure::Ended) => "not loaded: the child closed the request".to_owned(),
+        (Phase::Load, Failure::TimedOut) => "not loaded: timed out waiting for the child".to_owned(),
+        (Phase::Load, Failure::Io(e)) => format!("not loaded: the child: {e}"),
+        (Phase::Call(id), Failure::Ended) => format!("child {pid} ended during call {id}"),
+        (Phase::Call(id), Failure::TimedOut) => format!("call {id} timed out after {timeout_ms} ms; child {pid} killed"),
+        (Phase::Call(id), Failure::Io(e)) => format!("child {pid} failed during call {id}: {e}"),
+    };
+    log(LOG_WARNING, &format!("layer3 plugin:{slug} {line}"));
+    if matches!(failure, Failure::TimedOut)
+        && pid > 0
+        && let Some(&control) = CONTROL.get()
+    {
+        // SAFETY: the control socket, open for the process's life.
+        let _ = wire::send_packet(unsafe { BorrowedFd::borrow_raw(control) }, &wire::encode_kill(pid), None);
+    }
+    if ch.transaction {
+        lock(&ROLLBACK).push(slug.to_owned());
+    }
+}
+
+/// Reads the child's frames until the answer the channel waits for. A query frame on the way is
+/// admitted ([`gateway::admit`]) and handed to the stand-in (an array with the milliseconds left
+/// before the deadline), or answered as refused without PHP seeing it. Returns the answer (a
+/// string), a query (an array), or null when the channel failed.
+fn pump(slug: &str, slot: &mut Option<Channel>, mut first: Option<Vec<u8>>) -> Zval {
+    let mut out = Zval::new();
+    let cap = crate::with_live(|l| l.config.layer3.limits.db_queries.get()).unwrap_or(1000);
+    loop {
+        let Some(ch) = slot.as_mut() else { return out };
+        let Some(w) = ch.waiting else { return out };
+        let frame = match first.take().map(|f| Ok(Some(f))).unwrap_or_else(|| wire::read_frame(ch.sock.as_fd(), Some(w.deadline))) {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                fail(slug, slot, Failure::Ended);
+                return out;
             }
-            *slot = None;
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                fail(slug, slot, Failure::TimedOut);
+                return out;
+            }
+            Err(e) => {
+                fail(slug, slot, Failure::Io(e));
+                return out;
+            }
+        };
+        if let Some(sql) = gateway::decode_query(&frame) {
+            match gateway::admit(sql, ch.queries, cap) {
+                Ok(text) => {
+                    ch.queries += 1;
+                    if let Some(open) = gateway::transaction_effect(text) {
+                        ch.transaction = open;
+                    }
+                    ch.pending = Some(text.to_owned());
+                    let left = w.deadline.saturating_duration_since(Instant::now());
+                    let mut q = ZendHashTable::new();
+                    let ms = i64::try_from(left.as_millis()).unwrap_or(i64::MAX).max(1);
+                    if q.insert("ms", ms).is_err() {
+                        return out;
+                    }
+                    out.set_hashtable(q);
+                    return out;
+                }
+                Err(refusal) => {
+                    if !refusal.once_per_request() || !ch.cap_logged {
+                        log(LOG_WARNING, &format!("layer3 plugin:{slug} database refused: {}", refusal.reason()));
+                        ch.cap_logged |= refusal.once_per_request();
+                    }
+                    let answer = gateway::failed_answer(&format!("securecore: layer3 refused this query ({})", refusal.reason()));
+                    if let Err(e) = wire::write_frame(ch.sock.as_fd(), &answer, Some(w.deadline)) {
+                        let failure = if e.kind() == io::ErrorKind::TimedOut { Failure::TimedOut } else { Failure::Io(e) };
+                        fail(slug, slot, failure);
+                        return out;
+                    }
+                    continue;
+                }
+            }
         }
-        Err(e) => {
-            log(LOG_WARNING, &format!("layer3 plugin:{slug} child {} failed during call {id}: {e}", channel.pid));
-            *slot = None;
+        // The answer the channel was waiting for.
+        ch.waiting = None;
+        match w.phase {
+            Phase::Call(_) => out.set_binary(frame),
+            Phase::Load => {
+                if let Some(error) = frame.strip_prefix(wire::ERROR) {
+                    log(LOG_WARNING, &format!("layer3 plugin:{slug} not loaded: {}", String::from_utf8_lossy(error)));
+                    *slot = None;
+                } else if let Some((pid, payload)) = wire::decode_ready(&frame) {
+                    ch.pid = pid;
+                    out.set_binary(payload.to_vec());
+                } else {
+                    log(LOG_WARNING, &format!("layer3 plugin:{slug} not loaded: the child's answer is not a ready frame"));
+                    *slot = None;
+                }
+            }
+        }
+        return out;
+    }
+}
+
+/// The stand-in takes the query the child sent (the text), and runs it now: until
+/// [`securecore_layer3_db_reply`], its frames are the plugin's ([`gateway_component`]). Null when
+/// there is none.
+#[php_function]
+#[php(name = "securecore_layer3_db_begin")]
+pub fn securecore_layer3_db_begin(slug: String) -> Option<String> {
+    let mut channels = lock(&CHANNELS);
+    let ch = channels.as_mut()?.get_mut(&slug)?.as_mut()?;
+    let sql = ch.pending.take()?;
+    ch.busy = true;
+    lock(&GATEWAY).push(slug);
+    Some(sql)
+}
+
+/// The stand-in's answer to the child's query (PHP-serialized). Sends it (or a refusal, when it
+/// is over `layer3.limits.dbResultBytes` or the deadline passed), then waits on as
+/// [`securecore_layer3_call`] does: the answer, the next query, or null.
+#[php_function]
+#[php(name = "securecore_layer3_db_reply")]
+pub fn securecore_layer3_db_reply(slug: String, answer: &Zval) -> Zval {
+    let out = Zval::new();
+    let cap = crate::with_live(|l| l.config.layer3.limits.db_result_bytes.get()).unwrap_or(4 << 20);
+    {
+        let mut gateway = lock(&GATEWAY);
+        if let Some(i) = gateway.iter().rposition(|s| *s == slug) {
+            gateway.remove(i);
         }
     }
-    out
+    let mut channels = lock(&CHANNELS);
+    let Some(slot) = channels.as_mut().and_then(|c| c.get_mut(&slug)) else { return out };
+    let Some(ch) = slot.as_mut() else { return out };
+    if !ch.busy {
+        return out;
+    }
+    ch.busy = false;
+    let Some(w) = ch.waiting else { return out };
+    if Instant::now() >= w.deadline {
+        fail(&slug, slot, Failure::TimedOut);
+        return out;
+    }
+    let bytes = answer.zend_str().map_or(&b""[..], |s| s.as_bytes());
+    let refused;
+    let bytes = if bytes.len() > cap as usize {
+        log(LOG_WARNING, &format!("layer3 plugin:{slug} database answer of {} bytes refused: over the dbResultBytes cap of {cap}", bytes.len()));
+        refused = gateway::failed_answer(&format!("securecore: layer3 refused this answer (over the dbResultBytes cap of {cap})"));
+        &refused[..]
+    } else {
+        bytes
+    };
+    if let Err(e) = wire::write_frame(ch.sock.as_fd(), bytes, Some(w.deadline)) {
+        let failure = if e.kind() == io::ErrorKind::TimedOut { Failure::TimedOut } else { Failure::Io(e) };
+        fail(&slug, slot, failure);
+        return out;
+    }
+    pump(&slug, slot, None)
+}
+
+/// Whether the plugin's child died with a transaction open on the worker's connection (once):
+/// the stand-in then rolls it back, so core's later writes don't join it.
+#[php_function]
+#[php(name = "securecore_layer3_take_rollback")]
+pub fn securecore_layer3_take_rollback(slug: String) -> bool {
+    let mut owed = lock(&ROLLBACK);
+    let before = owed.len();
+    owed.retain(|s| *s != slug);
+    owed.len() != before
 }
 
 // --- the helper: supervisor ---------------------------------------------------------------------
@@ -694,6 +933,10 @@ fn become_child(hello: &Hello, _sock: RawFd) -> Result<ZBox<ZendHashTable>, Stri
     info.insert("slug", hello.slug.as_str()).map_err(|e| e.to_string())?;
     info.insert("file", hello.file.as_str()).map_err(|e| e.to_string())?;
     info.insert("memory_mb", i64::from(memory_mb)).map_err(|e| e.to_string())?;
+    let d = &hello.db;
+    for (k, v) in [("charset", &d.charset), ("collate", &d.collate), ("db_version", &d.version), ("db_server_info", &d.server_info)] {
+        info.insert(k, v.as_str()).map_err(|e| e.to_string())?;
+    }
     Ok(info)
 }
 
@@ -729,6 +972,21 @@ pub fn securecore_layer3_send(payload: &Zval) -> bool {
     child_sock(|s| wire::write_frame(s, bytes, None).is_ok()).unwrap_or(false)
 }
 
+/// In a child: one query through the database gateway. Sends the SQL to the worker, which runs it
+/// on its connection under layer 2, charged to this plugin; returns the worker's answer
+/// (PHP-serialized), or null when the worker is gone.
+#[php_function]
+#[php(name = "securecore_layer3_db")]
+pub fn securecore_layer3_db(sql: &Zval) -> Zval {
+    let mut out = Zval::new();
+    let frame = gateway::encode_query(sql.zend_str().map_or(&b""[..], |s| s.as_bytes()));
+    let answer = child_sock(|s| wire::write_frame(s, &frame, None).and_then(|()| wire::read_frame(s, None)));
+    if let Some(Ok(Some(a))) = answer {
+        out.set_binary(a);
+    }
+    out
+}
+
 /// The child's next call from the worker, or null when the worker's request is over.
 #[php_function]
 #[php(name = "securecore_layer3_recv")]
@@ -746,6 +1004,10 @@ pub(crate) fn register(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(securecore_layer3_snapshot_names))
         .function(wrap_function!(securecore_layer3_open))
         .function(wrap_function!(securecore_layer3_call))
+        .function(wrap_function!(securecore_layer3_db_begin))
+        .function(wrap_function!(securecore_layer3_db_reply))
+        .function(wrap_function!(securecore_layer3_take_rollback))
+        .function(wrap_function!(securecore_layer3_db))
         .function(wrap_function!(securecore_layer3_helper))
         .function(wrap_function!(securecore_layer3_zygote))
         .function(wrap_function!(securecore_layer3_ready))

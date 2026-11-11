@@ -362,6 +362,17 @@ fn core_is_unrestricted_but_for_the_allowlist() {
     assert_eq!(core("this is not a query"), Decision::AllowLogged("unparseable"));
     assert_eq!(verdict(&plain(), "this is not a query"), Decision::Refuse("unparseable"));
     assert_eq!(core("PREPARE s FROM 'SELECT 1'"), Decision::Refuse("prepare"));
+    // Layer 3's gateway (#94) caps each statement's time on the worker's connection with these,
+    // as core, around an isolated plugin's queries.
+    for sql in [
+        "SELECT @@SESSION.max_statement_time",
+        "SET SESSION max_statement_time = 1.500",
+        "SET SESSION max_statement_time = 0.000000",
+        "SELECT @@SESSION.max_execution_time",
+        "SET SESSION max_execution_time = 1500",
+    ] {
+        assert_eq!(core(sql), Decision::Allow, "{sql}");
+    }
 }
 
 // --- the WordPress shapes the parser must take (a component in place of core) -------------------
