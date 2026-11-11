@@ -15,9 +15,13 @@
 #   base / code <path>   the site's URL (on microvm: mvmweb's port, the guest's PHP)
 #   stack_up             build, start, install WordPress, put examples/wordpress.json, serve 200
 #   put <json>           the site's securecore.json (on microvm: as the guest needs it, below)
-#   put_live <json>      replace it while serving (docker: in place, reloaded by the extension;
-#                        microvm: the guest's site disk is a copy made at each start, so a
-#                        restart of the launcher)
+#   put_live <json>      replace it while serving, with site files changed just before (docker:
+#                        in place, reloaded by the extension; microvm: the guest's site disk is a
+#                        copy made at each start, so a restart of the launcher)
+#   put_delivered <json> microvm: replace only the config while serving: the launcher delivers it
+#                        to the running guest, whose extension reloads it (#90)
+#   $tdir/guest.ini      microvm: the site's php.ini settings (securecore.debug_*), which the
+#                        launcher delivers to the guest (--guest-ini, #90)
 #   conf_sha <json>      the sha256 of what `put` writes for <json>
 #   php_restart [args]   restart php-fpm (microvm: the launcher; args go to it, e.g.
 #                        --guest-arg sc.ext=0); php_start; php_state ("<state> <exit code>");
@@ -110,11 +114,29 @@ conf_for() { if on_microvm; then mvm_conf "$1" > "$2"; else cp "$1" "$2"; fi; }
 conf_sha() { conf_for "$1" "$tdir/conf-sha.json"; sha "$tdir/conf-sha.json"; }
 put() {
   if on_microvm; then
-    mvm_conf "$1" > "$tdir/conf.json" && cp "$tdir/conf.json" "$(site_dir)/securecore.json"
+    # In one rename, as an editor saves: the launcher follows the file while the guest runs (#90).
+    _s=$(site_dir)
+    mvm_conf "$1" > "$tdir/conf.json" && cp "$tdir/conf.json" "$_s/securecore.json.new" && mv "$_s/securecore.json.new" "$_s/securecore.json"
   else
     compose cp "$1" "php:$conf" >> "$tdir/cp.log" 2>&1
   fi
 }
+# put_delivered <json>: on microvm, `put` into the running guest without a restart (#90): waits
+# until the launcher has delivered it or refused it (its log says which). Sets delivered_ms: from
+# the write to the launcher's "delivered" line.
+put_delivered() {
+  _m=$(now); _t0=$(date +%s%N); delivered_ms=never
+  put "$1" || return 1
+  _want=$(sha "$tdir/conf.json" | cut -c1-16)
+  _i=0
+  until phplog "$_m" | grep -qE "\(sha256 $_want\) to the running guest|refused for the running guest|keeping the last valid config in the guest"; do
+    _i=$((_i + 1)); [ "$_i" -lt 300 ] || return 1
+    sleep 0.05
+  done
+  delivered_ms=$(( ($(date +%s%N) - _t0) / 1000000 ))
+}
+# Changing the site's files with a config: on microvm the guest sees files only at a start, so a
+# restart (a config alone is put_delivered).
 put_live() {
   if on_microvm; then put "$1" && php_restart; else compose exec -T php sh -c "cat > $conf.new && mv $conf.new $conf" < "$1"; fi
 }
@@ -158,7 +180,7 @@ launcher_start() {
     "$mvm_fpm" $(sed 's/=.*//; s/^/--guest-env /' "$tdir/guest.env") \
     --config "$_site/securecore.json" --vm-dir "$mvm_vm" --state-dir "$mvm_state" --listen "unix:$mvm_run/fpm.sock" \
     --listen-owner 0 --listen-group 101 --listen-mode 0660 --vm-user "$mvm_vmuser" --pool-user "$mvm_pool" \
-    --guest-root "$html" "$@" >> "$mvm_log" 2>&1 < /dev/null &
+    --guest-root "$html" --guest-ini "$tdir/guest.ini" "$@" >> "$mvm_log" 2>&1 < /dev/null &
   _i=0
   until phplog "$_mark" | grep -q 'securecore-fpm: serving FastCGI'; do
     [ -s "$tdir/launcher.exit" ] && return 1
@@ -256,6 +278,8 @@ stack_up() {
     chown 999:999 "$mvm_mysqld"
     mvm_clean_state "$mvm_state" > "$tdir/state.log" 2>&1 || { echo "FAIL $(cat "$tdir/state.log")"; exit 1; }
     : > "$mvm_log"
+    # The site's php.ini settings for the guest (--guest-ini, #90): none until a suite sets some.
+    rm -f "$tdir/guest.ini"
     builds="php mvmweb" services="db php web mvmweb"
   else
     builds=php services="db php web"

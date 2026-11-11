@@ -904,8 +904,26 @@ The site is a read-only disk built from the app root with `mke2fs -d`, mounted a
 (or `--guest-root`, the root nginx sends in `SCRIPT_FILENAME`). The guest's root is read-only
 too, so core, plugins and themes can't be written. Its PID 1 is `securecore-fpm` again, as
 `/sbin/securecore-init`: it mounts the disks, forwards vsock and starts php-fpm, whose log comes
-back to the launcher's stderr. Layers 2 and 3 run in the guest's php-fpm unchanged; layer 3's
+back to the launcher's stderr, every line numbered and acknowledged, so a line that can't be
+delivered is counted in the launcher's log, never silently dropped (#86). When php-fpm exits,
+the guest sends its last lines and its exit status first, and the launcher's stop line quotes
+them (#87). Layers 2 and 3 run in the guest's php-fpm unchanged; layer 3's
 isolated children need Landlock and seccomp in the guest kernel (mirab#89 adds them to mirab's).
+
+**Editing `securecore.json` while the guest runs** (#90). The launcher follows the file, as the
+extension does on a host (a `stat` a second, the same loader): an invalid file is refused and
+logged, and the guest keeps the last valid config; a valid one is also checked against what a
+start would check (a config the microVM can't run is refused the same way), then put in place
+of the guest's copy, where the extension reloads it within a second. As on a host, layers 2 and
+3 change in place, and a change to `layer1` or the vault applies at the next start
+(`restart_needed`); the host's egress takes layer 2's new hosts at once.
+
+**The site's php.ini settings** (#90). php.ini in the guest is the root image's, the same for
+every site. `--guest-ini <file>` names a file of the extension's per-site debug settings
+(`securecore.debug_* = …` lines; any other setting is refused with the reason), delivered in
+each start message and again whenever the file changes, with php-fpm started again gracefully,
+as a php.ini change needs on a host. A value the extension refuses stops php-fpm, as it would
+on a host, and the launcher's log says why.
 
 **Snapshots.** A start restores a snapshot of a warmed-up VM when there is one for this key: the
 sha256s of Firecracker, the kernel, the root image, the site tree (every path, mode, owner, size

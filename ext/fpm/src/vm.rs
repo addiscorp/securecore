@@ -172,6 +172,21 @@ pub struct Options {
     /// Variables of the launcher's environment the guest's php-fpm gets, besides the vault's
     /// own (`layer2.vault.secrets[].env`), which it always gets ([`guest_env`]).
     pub guest_env: Vec<String>,
+    /// The site's php.ini settings for the guest's php-fpm (#90): a file of `securecore.debug_*`
+    /// lines ([`crate::guest::site_ini`]), delivered at each start and again whenever it changes.
+    /// A missing file is no settings.
+    pub guest_ini: Option<PathBuf>,
+}
+
+/// The site's php.ini settings as the guest gets them: `None` without `--guest-ini` or while the
+/// file is missing; refused with the reason when it sets anything else.
+pub fn read_site_ini(path: Option<&Path>) -> Result<Option<String>, String> {
+    let Some(path) = path else { return Ok(None) };
+    match fs::read_to_string(path) {
+        Ok(text) => crate::guest::site_ini(&text).map(Some).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
 /// php-fpm's environment in the guest: each name in `--guest-env` and each vault secret's `env`,
@@ -1127,7 +1142,7 @@ struct Machine {
     /// The `connect[].socket` folders, checked and held ([`open_sockets`]).
     sockets: Vec<(u16, jail::SocketDir)>,
     /// What the guest may reach by name.
-    egress: crate::egress::Egress,
+    egress: &'static std::sync::RwLock<crate::egress::Egress>,
 }
 
 /// What a jail holds for one spawn: the host ends of the guest's ports come with it.
@@ -1342,10 +1357,12 @@ fn take_out(inside: &Path, out: &Path, user: User) -> Result<(), String> {
 
 /// The start message: the clock, fresh randomness, the workers' refresh after a restore, then
 /// the writable disks and tmpfs folders.
-fn start_message(plan: &Plan, restored: bool, entropy: [u8; 64], env: &[(String, String)]) -> Vec<Ctl> {
+fn start_message(plan: &Plan, restored: bool, entropy: [u8; 64], env: &[(String, String)], ini: Option<&str>) -> Vec<Ctl> {
     let (secs, nanos) = now();
     let mut lines = vec![Ctl::Time { secs, nanos }, Ctl::Entropy { hex: hex(&entropy) }];
     lines.extend(env.iter().map(|(name, value)| Ctl::Env { name: name.clone(), hex: hex(value.as_bytes()) }));
+    // The site's php.ini settings (#90): php-fpm starts again with them, as with `env`.
+    lines.extend(ini.map(|text| Ctl::Ini { hex: hex(text.as_bytes()) }));
     if restored {
         lines.push(Ctl::Refresh);
     }
@@ -1400,6 +1417,135 @@ fn refused(lines: &[Ctl], reply: &str) -> Result<(), String> {
         return Err(format!("the guest refused {kinds:?} (its reply isn't shown: the message carried secrets; the guest's own log line says why)"));
     }
     Err(format!("the guest refused {kinds:?}: {reply}"))
+}
+
+/// How often the launcher looks at the config and the site's php.ini settings: the extension's
+/// own reload interval, so an edit reaches the guest's workers about as soon as a host's.
+pub const WATCH_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Whether a running guest can take `new` (#90), the config it started with being `started`:
+/// `Err(why)` when the microVM can't express it (the same check a start makes, [`plan`]), so the
+/// guest keeps what it has; else what the launcher says about it. As on a host, a change to
+/// `layer1` or to the vault takes effect only at the next start (the extension in the guest
+/// reports `restart_needed`); layers 2 and 3 reload in place.
+pub fn live_change(started: &Loaded, new: &Loaded, opts: &Options) -> Result<Vec<String>, String> {
+    plan(new, opts).map_err(|e| format!("the microVM can't run it ({e})"))?;
+    let mut notes = Vec::new();
+    if new.config.layer1 != started.config.layer1 {
+        notes.push("layer1 differs from the one this VM started with: it applies at the next start (restart_needed)".to_owned());
+    }
+    if securecore_config::started_vault(&new.config) != securecore_config::started_vault(&started.config) {
+        notes.push("layer2.vault differs from the one this VM started with: it applies at the next start (restart_needed)".to_owned());
+    }
+    Ok(notes)
+}
+
+/// Follows the config file and the site's php.ini settings for the running guest (#90), every
+/// [`WATCH_INTERVAL`], with the extension's own [`securecore_config::Reloader`]: an invalid file
+/// or one the microVM can't run is refused with the reason, and the guest keeps what it has; a
+/// valid one is put in place in the guest, where the extension reloads it as on a host (and the
+/// host's egress takes its layer 2 hosts). A changed php.ini is delivered and php-fpm started
+/// again gracefully with it.
+fn watch_live(started: &Loaded, opts: &Options, uds: &Path, egress: &std::sync::RwLock<crate::egress::Egress>, ports: &[u16], mut ini: Option<String>) {
+    let mut reloader: Option<securecore_config::Reloader> = None;
+    let mut in_guest = started.sha256.clone();
+    let mut refused: Option<String> = None;
+    let mut start_error: Option<String> = None;
+    let mut ini_refused: Option<String> = None;
+    loop {
+        thread::sleep(WATCH_INTERVAL);
+        let r = match &mut reloader {
+            Some(r) => r,
+            None => match securecore_config::Reloader::start(&started.path, Duration::ZERO, Instant::now()) {
+                Ok(r) => reloader.insert(r),
+                Err(e) => {
+                    let e = e.to_string();
+                    if start_error.as_deref() != Some(&e) {
+                        log(&format!("{e}; keeping the last valid config in the guest (sha256 {})", short_sha(&in_guest)));
+                        start_error = Some(e);
+                    }
+                    continue;
+                }
+            },
+        };
+        if let securecore_config::Poll::Rejected(e) = r.poll(Instant::now()) {
+            log(&format!("{e}; keeping the last valid config in the guest (sha256 {})", short_sha(&in_guest)));
+        }
+        let live = r.live().clone();
+        if live.sha256 != in_guest && refused.as_deref() != Some(&live.sha256) {
+            let t = Instant::now();
+            let bytes = fs::read(&live.path).ok().filter(|b| securecore_config::sha256_hex(b) == live.sha256);
+            let result = match (bytes, live_change(started, &live, opts)) {
+                // Changed again since it was read: the next look takes the newer one.
+                (None, _) => continue,
+                (_, Err(e)) => Err(e),
+                (Some(b), Ok(notes)) => tell_guest(uds, &[Ctl::Config { hex: hex(&b) }, Ctl::Done], SYNC_TIMEOUT_LIVE).map(|()| notes),
+            };
+            match result {
+                Ok(notes) => {
+                    log(&format!(
+                        "delivered {} (sha256 {}) to the running guest in {:.0} ms; its extension reloads it",
+                        live.path.display(),
+                        short_sha(&live.sha256),
+                        ms(t)
+                    ));
+                    for n in notes {
+                        log(&n);
+                    }
+                    *egress.write().unwrap_or_else(|p| p.into_inner()) = crate::egress::Egress::new(&live, ports.to_vec());
+                    in_guest = live.sha256.clone();
+                    refused = None;
+                }
+                Err(e) => {
+                    log(&format!(
+                        "{}: refused for the running guest: {e}; keeping the last valid config in the guest (sha256 {})",
+                        live.path.display(),
+                        short_sha(&in_guest)
+                    ));
+                    refused = Some(live.sha256.clone());
+                }
+            }
+        }
+        if let Some(path) = &opts.guest_ini {
+            let now = match fs::read_to_string(path) {
+                Ok(text) => Some(text),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => continue,
+            };
+            let checked = now.as_deref().map(crate::guest::site_ini).transpose();
+            match checked {
+                Ok(text) if text != ini => {
+                    ini_refused = None;
+                    let t = Instant::now();
+                    let body = text.clone().unwrap_or_default();
+                    match tell_guest(uds, &[Ctl::Ini { hex: hex(body.as_bytes()) }, Ctl::Done], crate::guest::RELOAD_TIMEOUT) {
+                        Ok(()) => log(&format!(
+                            "delivered the site's php.ini settings from {} ({} lines) to the running guest and started its php-fpm again gracefully in {:.0} ms",
+                            path.display(),
+                            body.lines().count(),
+                            ms(t)
+                        )),
+                        Err(e) => log(&format!("the site's php.ini settings from {}: the guest refused them: {e}", path.display())),
+                    }
+                    ini = text;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if ini_refused.as_deref() != Some(e.as_str()) {
+                        log(&format!("{}: {e}; the guest keeps its php.ini settings", path.display()));
+                    }
+                    ini_refused = Some(e);
+                }
+            }
+        }
+    }
+}
+
+/// How long a live config delivery waits for the guest's `ok`.
+const SYNC_TIMEOUT_LIVE: Duration = Duration::from_secs(10);
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(16)]
 }
 
 /// The protocol handshake, alone on its connection before any start message: `proto <N>`. The
@@ -1528,6 +1674,7 @@ struct Real<'a> {
     opts: &'a Options,
     m: &'a Machine,
     env: &'a [(String, String)],
+    ini: Option<&'a str>,
 }
 
 impl Lifecycle for Real<'_> {
@@ -1574,7 +1721,7 @@ impl Lifecycle for Real<'_> {
 
     fn tell(&mut self, vm: &Vm, restored: bool) -> Result<(), String> {
         handshake(&vm.vsock)?;
-        tell_guest(&vm.vsock, &start_message(self.plan, restored, random64()?, self.env), START_TIMEOUT)
+        tell_guest(&vm.vsock, &start_message(self.plan, restored, random64()?, self.env, self.ini), START_TIMEOUT)
     }
 }
 
@@ -1634,9 +1781,10 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
             });
         }
         // Named hosts on the egress ports (#72): each connection's request line is checked here.
-        if !m.egress.ports.is_empty() {
+        // The rules are read per connection: a delivered config changes layer 2's hosts (#90).
+        let egress = m.egress;
+        if !egress.read().unwrap_or_else(|p| p.into_inner()).ports.is_empty() {
             let l = bind_unix(&short.join(format!("v.sock_{}", crate::egress::EGRESS_PORT)), owned)?;
-            let egress: &'static crate::egress::Egress = Box::leak(Box::new(m.egress.clone()));
             let slots: &'static Slots = Box::leak(Box::new(Slots::new(FORWARD_SLOTS)));
             let pool = plan.pool;
             thread::spawn(move || {
@@ -1650,7 +1798,8 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
                         // The host's addresses now (an interface may have come up since the start).
                         let own = crate::egress::host_addresses();
                         let connect = |conn: UnixStream, addrs: &[std::net::SocketAddr]| egress_as_pool(conn, addrs, pool);
-                        match crate::egress::serve(c, egress, &own, &connect) {
+                        let rules = egress.read().unwrap_or_else(|p| p.into_inner()).clone();
+                        match crate::egress::serve(c, &rules, &own, &connect) {
                             Ok(what) => log(&format!("egress: {what} closed")),
                             Err(why) => log(&format!("egress refused: {why}")),
                         }
@@ -2225,8 +2374,13 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
             sizes.join(",")
         ),
     };
+    let egress: &'static std::sync::RwLock<crate::egress::Egress> = Box::leak(Box::new(std::sync::RwLock::new(egress)));
+    let ini = read_site_ini(opts.guest_ini.as_deref())?;
+    if let (Some(path), Some(text)) = (&opts.guest_ini, &ini) {
+        log(&format!("the guest's php-fpm gets the site's php.ini settings from {} ({} lines), in each start message", path.display(), text.lines().count()));
+    }
     let m = Machine { site: site_path, disks, args, key: key.sha256(), user, sockets, egress };
-    let (mut vm, how, ready) = bring_up(&mut Real { plan: &plan, opts, m: &m, env: &env }, opts.snapshot)?;
+    let (mut vm, how, ready) = bring_up(&mut Real { plan: &plan, opts, m: &m, env: &env, ini: ini.as_deref() }, opts.snapshot)?;
     let t_ready = ready.duration_since(t0).as_secs_f64() * 1000.0;
     let t_started = ms(t0);
     match how {
@@ -2293,6 +2447,12 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
             }
         }
     });
+    // An edited securecore.json and php.ini settings reach the running guest (#90).
+    {
+        let (loaded, opts, uds) = (loaded.clone(), opts.clone(), vm.vsock.clone());
+        let ports = plan.egress.clone();
+        thread::spawn(move || watch_live(&loaded, &opts, &uds, egress, &ports, ini));
+    }
     let sig = loop {
         let sig = wait_for_signal(&set);
         match sig {
@@ -2360,6 +2520,7 @@ mod tests {
             snapshot: true,
             guest_args: vec![],
             guest_env: vec![],
+            guest_ini: None,
         }
     }
 
@@ -2423,7 +2584,7 @@ mod tests {
         assert!(args.contains(" sc.sock=3306:/run/mysqld/mysqld.sock"), "{args}");
         assert!(!args.contains("sc.time"), "the clock is in no key: {args}");
         let env = [("WORDPRESS_DB_PASSWORD".to_owned(), "s3cret".to_owned())];
-        let msg = start_message(&p, true, [7; 64], &env);
+        let msg = start_message(&p, true, [7; 64], &env, None);
         assert!(matches!(msg[0], Ctl::Time { .. }), "the clock first");
         assert_eq!(msg[1], Ctl::Entropy { hex: "07".repeat(64) }, "then fresh randomness");
         assert_eq!(msg[2], Ctl::Env { name: "WORDPRESS_DB_PASSWORD".into(), hex: hex(b"s3cret") }, "then php-fpm's environment");
@@ -2431,7 +2592,11 @@ mod tests {
         assert_eq!(msg[4], Ctl::Mount { device: "/dev/vdc".into(), path: "/var/www/html/wp-content/uploads".into() });
         assert_eq!(msg[5], Ctl::Tmpfs { path: "/var/cache/sc".into() });
         assert_eq!(msg.last(), Some(&Ctl::Done));
-        assert!(!start_message(&p, false, [7; 64], &env).contains(&Ctl::Refresh), "a cold boot's workers are fresh");
+        assert!(!start_message(&p, false, [7; 64], &env, None).contains(&Ctl::Refresh), "a cold boot's workers are fresh");
+        // The site's php.ini settings (#90), after the environment.
+        let ini = "securecore.debug_attribution_log = both\n";
+        let msg = start_message(&p, false, [7; 64], &env, Some(ini));
+        assert_eq!(msg[3], Ctl::Ini { hex: hex(ini.as_bytes()) });
         assert!(!args.contains("s3cret") && !args.contains(&hex(b"s3cret")), "never a boot argument");
         assert_ne!(random64().expect("random"), random64().expect("random"), "every start message gets its own");
         let _ = fs::remove_dir_all(&dir);
@@ -2455,6 +2620,24 @@ mod tests {
         o.guest_root = Some("/var/www/my site".into());
         let e = plan(&loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}]}}"#), &o).expect_err("space");
         assert!(e.contains("holds a space"), "{e}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A live edit (#90): refused when the microVM can't run it; else delivered, with layer1 and
+    /// vault changes flagged for the next start (restart_needed), as on a host.
+    #[test]
+    fn a_live_edit_is_refused_when_the_vm_cant_run_it_and_flags_what_needs_a_start() {
+        let dir = scratch("live");
+        let base = r#"{"isolation":"microvm","network":{"bind":[{"port":9000}]}}"#;
+        let started = loaded(&dir, base);
+        let same_l1 = started.clone();
+        assert_eq!(live_change(&started, &same_l1, &opts()), Ok(vec![]), "layers 2 and 3 only: delivered, nothing for the next start");
+        let more = loaded(&dir, r#"{"isolation":"microvm","write":["wp-content/uploads"],"network":{"bind":[{"port":9000}]}}"#);
+        let notes = live_change(&started, &more, &opts()).expect("the VM can run it");
+        assert!(notes.len() == 1 && notes[0].contains("restart_needed"), "{notes:?}");
+        let socks = loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"unixSockets":["/run/x.sock"]}}"#);
+        let e = live_change(&started, &socks, &opts()).expect_err("unixSockets");
+        assert!(e.starts_with("the microVM can't run it"), "{e}");
         let _ = fs::remove_dir_all(&dir);
     }
 
