@@ -511,8 +511,9 @@ fn the_writer_is_confined_to_its_folders() {
         // SAFETY: socket(2) with constant arguments; closed right after.
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         ok(s >= 0, "inet-socket");
-        // SAFETY: as above.
-        ok(unsafe { libc::syscall(libc::SYS_ptrace, 0, 0, 0, 0) } == 0, "ptrace");
+        // A call the writer never makes (harmless either way): EPERM under the seccomp filter.
+        // SAFETY: getppid(2) takes nothing.
+        ok(unsafe { libc::syscall(libc::SYS_getppid) } > 0, "unlisted-syscall");
         // (NoNewPrivs and Seccomp are checked on the real writer, in test/ext-microvm.sh.)
         return;
     }
@@ -530,7 +531,7 @@ fn the_writer_is_confined_to_its_folders() {
         eprintln!("no Landlock here ({text}): checked on the KVM host");
         return;
     }
-    for (what, want) in [("unix-io", "yes"), ("write-inside", "yes"), ("write-outside", "no"), ("read-etc", "no"), ("inet-socket", "no"), ("ptrace", "no")] {
+    for (what, want) in [("unix-io", "yes"), ("write-inside", "yes"), ("write-outside", "no"), ("read-etc", "no"), ("inet-socket", "no"), ("unlisted-syscall", "no")] {
         assert!(text.contains(&format!("{what}={want}")), "{what} should be {want}: {text}\n{}", String::from_utf8_lossy(&out.stderr));
     }
 }
