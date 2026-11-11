@@ -64,8 +64,23 @@ na() { echo "n/a  $1 (on the microVM target: $2)"; nas=$((nas + 1)); }
 # check helpers start with `na_now <label> && return`, so each check in it is still named, n/a.
 NA_WHY=
 na_now() { [ -n "$NA_WHY" ] || return 1; na "$1" "$NA_WHY"; }
-# The suite's last line: how many checks didn't apply here.
-na_summary() { [ "$nas" -eq 0 ] || echo "$nas check(s) not applicable on the $SC_TARGET target (n/a above, each with why)"; }
+# The suite's last line: how many checks didn't apply here. On the microVM target the count is
+# gated (#86 review): it must be the suite's number in test/lib/na-expected.txt, so a change that
+# turns real checks into n/a fails the suite (and one that turns n/a into real checks updates the
+# file in the same change). Counts as a failed check (the suite's `fails`).
+na_summary() {
+  [ "$nas" -eq 0 ] || echo "$nas check(s) not applicable on the $SC_TARGET target (n/a above, each with why)"
+  on_microvm || return 0
+  _suite=$(basename "$0" .sh)
+  _want=$(awk -v s="$_suite" '$1 == s { print $2 }' test/lib/na-expected.txt 2>/dev/null)
+  if [ -z "$_want" ]; then
+    echo "FAIL n/a count: $_suite has no line in test/lib/na-expected.txt (it has $nas)"; fails=$((fails + 1))
+  elif [ "$nas" != "$_want" ]; then
+    echo "FAIL n/a count: $nas check(s) n/a on the microVM target, test/lib/na-expected.txt says $_want"; fails=$((fails + 1))
+  else
+    echo "ok   n/a count: $nas, as test/lib/na-expected.txt says"
+  fi
+}
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 code() { curl -s -o /dev/null -w '%{http_code}' "$base$1"; }
 # wait_200 [path]

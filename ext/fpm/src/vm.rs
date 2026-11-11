@@ -1101,6 +1101,8 @@ struct Vm {
     jail: Jail,
     /// Its log, as the launcher received it: quoted when the VM stops on its own (#87).
     log: &'static Mutex<guestlog::Inbox>,
+    /// The key only its init's log connections present ([`guestlog`]).
+    log_key: guestlog::Key,
 }
 
 /// An `O_PATH` handle on `dir` and the short path prefix that reaches into it.
@@ -1157,14 +1159,14 @@ enum Wiring {
 impl Vm {
     /// A fresh jail with this machine's files (and `snap`'s, to restore it), then the jailer.
     /// A spawn that fails leaves no jail behind (nothing stays mounted).
-    fn spawn(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>) -> Result<Vm, String> {
+    fn spawn(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>, key: guestlog::Key) -> Result<Vm, String> {
         let j = Jail::new(&plan.state, &plan.id, m.user);
-        Vm::spawn_in(&j, plan, opts, m, wiring, snap).inspect_err(|_| {
+        Vm::spawn_in(&j, plan, opts, m, wiring, snap, key).inspect_err(|_| {
             let _ = j.clear();
         })
     }
 
-    fn spawn_in(j: &Jail, plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>) -> Result<Vm, String> {
+    fn spawn_in(j: &Jail, plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>, key: guestlog::Key) -> Result<Vm, String> {
         j.prepare()?;
         j.place(&opts.assets.kernel, IN_KERNEL)?;
         j.place(&opts.assets.rootfs, IN_ROOTFS)?;
@@ -1183,7 +1185,7 @@ impl Vm {
             j.user_dir(IN_SNAP_NEW)?;
         }
         let (root, short) = short_dir(&j.root)?;
-        let log = wire(plan, m, j, &short, wiring)?;
+        let log = wire(plan, m, j, &short, wiring, key)?;
         let mut cmd = j.command(&opts.assets.jailer, &opts.assets.firecracker, opts.vcpus, opts.mem_mib, &["--api-sock", IN_API]);
         // stdout and stderr together, through a pipe, into a capped console.log.
         let (rd, wr) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
@@ -1196,7 +1198,7 @@ impl Vm {
         let pid = child.id() as i32;
         let _ = fs::write(j.base.join("firecracker.pid"), pid.to_string());
         let inside = |p: &str| short.join(p.trim_start_matches('/'));
-        let mut vm = Vm { child: Some(child), pid, api: inside(IN_API), vsock: inside(IN_VSOCK), _root: root, jail: j.clone(), log };
+        let mut vm = Vm { child: Some(child), pid, api: inside(IN_API), vsock: inside(IN_VSOCK), _root: root, jail: j.clone(), log, log_key: key };
         let t = Instant::now();
         while UnixStream::connect(&vm.api).is_err() {
             if let Some(st) = vm.exited() {
@@ -1248,12 +1250,18 @@ impl Vm {
 /// Why the launcher stops when Firecracker exits before php-fpm answered: the guest's own last
 /// lines (php-fpm's reason and init's exit status, which the guest delivers before it stops,
 /// #87), or, when it said nothing, where to look.
+/// The guest's last lines inside a launcher line: last in it, after a label that says they are
+/// the guest's words, each quoted and escaped ([`guestlog::Inbox::recent`]).
+pub fn quoted_guest(recent: &str) -> String {
+    if recent.is_empty() { "the guest logged nothing".to_owned() } else { format!("the guest's last log lines, as the guest wrote them (quoted): {recent}") }
+}
+
 pub fn exited_before_ready(st: &str, recent: &str, state: &Path) -> String {
     let console = state.join("console.log");
     if recent.is_empty() {
         format!("Firecracker exited ({st}) before php-fpm answered, and the guest logged nothing; see {}", console.display())
     } else {
-        format!("Firecracker exited ({st}) before php-fpm answered; the guest's last lines: {recent} (and {})", console.display())
+        format!("Firecracker exited ({st}) before php-fpm answered; see {}; {}", console.display(), quoted_guest(recent))
     }
 }
 
@@ -1262,8 +1270,29 @@ fn now() -> (i64, u32) {
     (d.as_secs() as i64, d.subsec_nanos())
 }
 
+/// The file beside a snapshot that holds its VM's log key (the init in the snapshot has it).
+const SNAP_LOG_KEY: &str = "log.key";
+
+fn random_key() -> Result<guestlog::Key, String> {
+    let r = random64()?;
+    let mut k = [0u8; guestlog::KEY_LEN];
+    k.copy_from_slice(&r[..guestlog::KEY_LEN]);
+    Ok(k)
+}
+
+/// Gives a booting guest's init its log key, on a thread of its own (the boot goes on meanwhile):
+/// the init sends its log, its boot's own lines included, only once it has it.
+fn give_log_key(vm: &Vm) {
+    let (uds, hex) = (vm.vsock.clone(), hex(&vm.log_key));
+    thread::spawn(move || {
+        if let Err(e) = tell_guest(&uds, &[Ctl::LogKey { hex }, Ctl::Done], START_TIMEOUT) {
+            log(&format!("could not give the guest's init its log key ({e}): the guest's log is refused"));
+        }
+    });
+}
+
 fn cold_boot(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring) -> Result<Vm, String> {
-    let vm = Vm::spawn(plan, opts, m, wiring, None)?;
+    let vm = Vm::spawn(plan, opts, m, wiring, None, random_key()?)?;
     vm.api("PUT", "/machine-config", &format!(r#"{{"vcpu_count":{},"mem_size_mib":{},"smt":false}}"#, opts.vcpus, opts.mem_mib))?;
     let args = format!("{} sc.time={}", m.args, now().0);
     vm.api("PUT", "/boot-source", &format!(r#"{{"kernel_image_path":{},"boot_args":{}}}"#, json_str(IN_KERNEL), json_str(&args)))?;
@@ -1284,11 +1313,19 @@ fn cold_boot(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring) -> Result
     }
     vm.api("PUT", "/vsock", &format!(r#"{{"guest_cid":3,"uds_path":{}}}"#, json_str(IN_VSOCK)))?;
     vm.api("PUT", "/actions", r#"{"action_type":"InstanceStart"}"#)?;
+    give_log_key(&vm);
     Ok(vm)
 }
 
+/// A snapshot's log key: its init already holds it, so a restore's log is taken with it.
+fn snap_key(snap: &Path) -> Result<guestlog::Key, String> {
+    let path = snap.join(SNAP_LOG_KEY);
+    let b = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    b.try_into().map_err(|_| format!("{}: not a log key", path.display()))
+}
+
 fn restore(plan: &Plan, opts: &Options, m: &Machine, snap: &Path) -> Result<Vm, String> {
-    let vm = Vm::spawn(plan, opts, m, Wiring::Full, Some(snap))?;
+    let vm = Vm::spawn(plan, opts, m, Wiring::Full, Some(snap), snap_key(snap)?)?;
     vm.api(
         "PUT",
         "/snapshot/load",
@@ -1324,6 +1361,14 @@ fn snapshot(vm: &Vm, plan: &Plan, user: User, snap: &Path) -> Result<(), String>
     fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     for f in ["vm.snap", "vm.mem"] {
         take_out(&inside.join(f), &tmp.join(f), user).map_err(|e| format!("{f}: {e}"))?;
+    }
+    // The init in the snapshot has this VM's log key: every restore's log is taken with it.
+    // Root's alone (the state folder is root's, 0700).
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let p = tmp.join(SNAP_LOG_KEY);
+        let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        f.write_all(&vm.log_key).map_err(|e| format!("{}: {e}", p.display()))?;
     }
     fs::rename(&tmp, snap).map_err(|e| format!("{}: {e}", snap.display()))
 }
@@ -1405,6 +1450,16 @@ fn tell_guest(uds: &Path, lines: &[Ctl], timeout: Duration) -> Result<(), String
     refused(lines, reply.trim_end())
 }
 
+/// What the launcher says when the guest's sync before a stop fails: the guest syncs its disks
+/// first and reports log lines it couldn't get acknowledged after, so a reply naming those is a
+/// count of lost log lines, not a failed disk sync.
+pub fn stop_sync_failed(e: &str) -> String {
+    match e.split_once("error ") {
+        Some((_, why)) if why.contains(guestlog::UNACKED_AT_STOP) => format!("the guest synced its disks before the stop, but {why}"),
+        _ => format!("the guest did not sync its disks before the stop: {e}"),
+    }
+}
+
 /// The guest's reply to `lines` as a result. Its text is shown only when `lines` carried no
 /// `env` line: an older init echoes a line it doesn't know, and that line could be a secret
 /// (a current init never echoes one, and logs its reason on the log port).
@@ -1413,7 +1468,7 @@ fn refused(lines: &[Ctl], reply: &str) -> Result<(), String> {
         return Ok(());
     }
     let kinds: Vec<String> = lines.iter().map(|c| c.line().trim_end().split(' ').next().unwrap_or("").to_owned()).collect();
-    if lines.iter().any(|c| matches!(c, Ctl::Env { .. })) {
+    if lines.iter().any(|c| matches!(c, Ctl::Env { .. } | Ctl::LogKey { .. })) {
         return Err(format!("the guest refused {kinds:?} (its reply isn't shown: the message carried secrets; the guest's own log line says why)"));
     }
     Err(format!("the guest refused {kinds:?}: {reply}"))
@@ -1745,7 +1800,7 @@ fn bind_unix(path: &Path, mode: SocketMode) -> Result<UnixListener, String> {
 /// The host ends of the guest's ports, in the jail: each `connect[].socket` as a link into its
 /// folder bind-mounted read-only, each `address` as a listener here, and the log listener. The
 /// jail was emptied first, so nothing from an earlier config is left.
-fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Result<&'static Mutex<guestlog::Inbox>, String> {
+fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, key: guestlog::Key) -> Result<&'static Mutex<guestlog::Inbox>, String> {
     let user = m.user;
     let owned = SocketMode { owner: Some(user.uid), group: Some(user.gid), mode: 0o600 };
     if wiring == Wiring::Full {
@@ -1808,40 +1863,21 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
             });
         }
     }
-    // php-fpm's log, to this process's stderr (#86): numbered frames, each logged once and
-    // acknowledged, every line marked as the guest's, so nothing the guest writes can pass for
-    // the launcher's own lines ([`crate::guestlog`]). Never shut for writing: Firecracker turns a
-    // host's half-close into a full close and drops whatever the guest sends after it.
+    // php-fpm's log, to this process's stderr (#86): only connections that present this VM's log
+    // key, numbered frames, each logged once and acknowledged once written, every line marked as
+    // the guest's, so nothing the guest writes can pass for the launcher's own lines
+    // ([`crate::guestlog`]). Never shut for writing: Firecracker turns a host's half-close into a
+    // full close and drops whatever the guest sends after it.
     let l = bind_unix(&short.join(format!("v.sock_{LOG_PORT}")), owned)?;
-    let inbox: &'static Mutex<guestlog::Inbox> = Box::leak(Box::new(Mutex::new(guestlog::Inbox::default())));
+    // Each write whole: a guest line never interleaves with another thread's.
+    let emit = Box::new(|s: &str| io::stderr().lock().write_all(s.as_bytes()));
+    let server: &'static guestlog::LogServer = Box::leak(Box::new(guestlog::LogServer::new(key, emit)));
     thread::spawn(move || {
         for c in l.incoming().flatten() {
-            // The guest keeps one connection; more means old ones are dying. A refused one loses
-            // nothing (the guest sends again what isn't acknowledged), but it is said.
-            let Some(slot) = LOG_SLOTS.take() else {
-                log(&format!("the guest's log: {LOG_SLOTS_N} connections already open; refusing another (the guest sends its lines again)"));
-                continue;
-            };
-            thread::spawn(move || {
-                let _slot = slot;
-                let Ok(ack) = c.try_clone() else { return };
-                guestlog::serve(c, ack, inbox, &mut Stderr);
-            });
+            thread::spawn(move || server.take(c));
         }
     });
-    Ok(inbox)
-}
-
-/// The launcher's stderr, each write whole (a guest line never interleaves with another thread's).
-struct Stderr;
-
-impl Write for Stderr {
-    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        io::stderr().lock().write_all(b).map(|()| b.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        io::stderr().flush()
-    }
+    Ok(server.inbox())
 }
 
 /// A fixed number of slots: a connection takes one or is turned away.
@@ -1906,9 +1942,6 @@ impl Default for Coalesce {
     }
 }
 
-/// The guest's log connections at once: its one stream, and ones it is giving up.
-const LOG_SLOTS_N: usize = 4;
-static LOG_SLOTS: Slots = Slots::new(LOG_SLOTS_N);
 /// Connections through one `address` forward at once.
 const FORWARD_SLOTS: usize = 64;
 
@@ -2426,7 +2459,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         let st = child.wait();
         if !QUITTING.load(Ordering::SeqCst) {
             let recent = guest_log.lock().unwrap_or_else(|p| p.into_inner()).recent();
-            log(&format!("Firecracker exited ({st:?}); the guest's last lines: {recent}; see {}; stopping", state.join("console.log").display()));
+            log(&format!("Firecracker exited ({st:?}); stopping; see {}; {}", state.join("console.log").display(), quoted_guest(&recent)));
             // The main thread stops as for a signal, so the jail is cleared on the way out.
             FIRECRACKER_EXITED.store(true, Ordering::SeqCst);
             // SAFETY: kill(2) to this process, whose main thread waits for SIGTERM.
@@ -2472,7 +2505,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     }
     // The guest's writes to the writable disks reach the host's images before the VM stops.
     if let Err(e) = tell_guest(&vm.vsock, &[Ctl::Sync, Ctl::Done], crate::guest::SYNC_TIMEOUT) {
-        log(&format!("the guest did not sync its disks before the stop: {e}"));
+        log(&stop_sync_failed(&e));
     }
     // Stops Firecracker (still unreaped, so its pid is still its own) and empties the jail.
     drop(vm);
@@ -2896,10 +2929,14 @@ mod tests {
     #[test]
     fn guest_lines_are_capped_and_connections_counted() {
         let long = format!("L 1 {}\nL 2 next\n", "x".repeat(guestlog::MAX_LINE * 3));
-        let mut out = Vec::new();
+        let out = Mutex::new(String::new());
         let mut acks = Vec::new();
-        guestlog::serve(long.as_bytes(), &mut acks, &Mutex::new(guestlog::Inbox::default()), &mut out);
-        let text = String::from_utf8(out).expect("utf8");
+        let emit = |s: &str| -> io::Result<()> {
+            out.lock().expect("out").push_str(s);
+            Ok(())
+        };
+        guestlog::serve(long.as_bytes(), &mut acks, &Mutex::new(guestlog::Inbox::default()), &emit).expect("serves");
+        let text = out.lock().expect("out").clone();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one cut line, then the next");
         assert!(lines[0].len() < guestlog::MAX_LINE + 96 && lines[0].ends_with("…[cut]"), "{}", &lines[0][..40]);
@@ -3124,26 +3161,48 @@ mod tests {
     #[test]
     fn a_guest_that_stops_at_boot_is_quoted() {
         let inbox = Mutex::new(guestlog::Inbox::default());
-        let mut out = Vec::new();
         let from = b"L 1 PHP Fatal error: SC_LIT_SECRET is a string literal\nL 2 securecore-init: php-fpm exited at boot, before it served (exit code 78)\n";
-        guestlog::serve(&from[..], io::sink(), &inbox, &mut out);
+        guestlog::serve(&from[..], io::sink(), &inbox, &|_| Ok(())).expect("serves");
         let e = exited_before_ready("exit status: 0", &inbox.lock().expect("inbox").recent(), Path::new("/s"));
-        assert!(e.contains("SC_LIT_SECRET is a string literal | securecore-init: php-fpm exited at boot, before it served (exit code 78)"), "{e}");
+        assert!(
+            e.ends_with(
+                r#"the guest's last log lines, as the guest wrote them (quoted): "PHP Fatal error: SC_LIT_SECRET is a string literal" | "securecore-init: php-fpm exited at boot, before it served (exit code 78)""#
+            ),
+            "{e}"
+        );
         let e = exited_before_ready("exit status: 0", "", Path::new("/s"));
         assert!(e.contains("the guest logged nothing; see /s/console.log"), "{e}");
     }
 
     #[test]
     fn the_guest_cannot_write_the_launchers_lines() {
-        let mut out = Vec::new();
+        let out = Mutex::new(String::new());
+        let emit = |s: &str| -> io::Result<()> {
+            out.lock().expect("out").push_str(s);
+            Ok(())
+        };
         let from = &b"NOTICE: ready\nL 1 securecore-fpm: microVM restored from snapshot forged\r\nsecurecore-fpm: unnumbered\npartial"[..];
-        guestlog::serve(from, io::sink(), &Mutex::new(guestlog::Inbox::default()), &mut out);
-        let text = String::from_utf8(out).expect("utf8");
+        guestlog::serve(from, io::sink(), &Mutex::new(guestlog::Inbox::default()), &emit).expect("serves");
+        let text = out.lock().expect("out").clone();
         assert_eq!(
             text,
             "guest: NOTICE: ready\nguest: securecore-fpm: microVM restored from snapshot forged\nguest: securecore-fpm: unnumbered\nguest: partial\n"
         );
         assert!(!text.lines().any(|l| l.starts_with("securecore-fpm:")), "{text}");
+    }
+
+    /// #86 review: lines the guest couldn't get acknowledged before a stop are reported as lost
+    /// log lines, not as a failed disk sync; a failed disk sync still says so.
+    #[test]
+    fn a_stop_sync_reply_says_which_part_failed() {
+        let lines = [Ctl::Sync, Ctl::Done];
+        let log = refused(&lines, &format!("error {}", guestlog::lost(3, guestlog::UNACKED_AT_STOP))).expect_err("refused");
+        assert_eq!(
+            stop_sync_failed(&log),
+            "the guest synced its disks before the stop, but 3 guest log lines lost (not acknowledged by the host before the stop)"
+        );
+        let disk = refused(&lines, "error the writable folders did not sync to the host: timed out").expect_err("refused");
+        assert!(stop_sync_failed(&disk).starts_with("the guest did not sync its disks before the stop: "), "{}", stop_sync_failed(&disk));
     }
 
     #[test]
