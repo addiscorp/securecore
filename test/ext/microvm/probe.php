@@ -18,13 +18,11 @@ echo 'read_uploads=', is_file($upload) ? trim((string) file_get_contents($upload
 echo 'write_root=', @file_put_contents("$root/sc-mvm-root.txt", 'x') !== false ? 'OK' : 'BLOCKED', "\n";
 echo 'write_plugins=', @file_put_contents("$root/wp-content/plugins/sc-mvm.txt", 'x') !== false ? 'OK' : 'BLOCKED', "\n";
 echo 'write_tmp=', @file_put_contents('/tmp/sc-mvm.txt', 'x') !== false ? 'OK' : 'BLOCKED', "\n";
-// MySQL as root with no password, over the guest's database path (127.0.0.1:3306 → vsock →
-// MariaDB's unix socket). With unix_socket auth for root@localhost this works only if the
-// connection reaches MariaDB with uid 0's credentials (Firecracker as root).
-if (isset($_GET['dbroot'])) {
-    mysqli_report(MYSQLI_REPORT_OFF);
-    $m = @mysqli_connect('127.0.0.1', 'root', '', '', 3306);
-    echo 'db_root=', $m ? 'OK' : 'REFUSED ' . str_replace("\n", ' ', (string) mysqli_connect_error()), "\n";
+// Who the host sees on the guest's connections: a forwarded port (4444) whose host socket answers
+// with its peer's SO_PEERCRED (test/ext/microvm/peercred.py).
+if (isset($_GET['peer'])) {
+    $f = @stream_socket_client('tcp://127.0.0.1:4444', $en, $es, 3);
+    echo 'peer=', $f ? trim((string) fgets($f)) : "FAILED $en $es", "\n";
 }
 // Fresh randomness: the kernel's (random_bytes) and a worker's userland generator (mt_rand).
 echo 'random=', bin2hex(random_bytes(16)), "\n";

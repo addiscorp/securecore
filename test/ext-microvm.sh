@@ -163,12 +163,24 @@ cp test/ext/securecore-status.php "$site/sc-status.php"
 mkdir -p "$site/wp-content/uploads" "$site/wp-content/cache"
 chown 33:33 "$site/wp-content/uploads" "$site/wp-content/cache" "$site/wp-content/plugins" "$site"
 # layer1 for the microVM: the example's, with MySQL's port pointed at MariaDB's socket.
+# Port 4444 goes to the peer-credential listener; layer 2 lets core (the probe) reach 127.0.0.1.
 conf() {
   # The first "enabled" is layer1's.
-  sed -e "s|{ \"port\": 3306 }|{ \"port\": 3306, \"socket\": \"$mysqld/mysqld.sock\" }|" \
-      -e "0,/\"enabled\": true,/s//\"enabled\": true, \"isolation\": \"$1\",/" ext/examples/wordpress.json
+  sed -e "s|{ \"port\": 3306 }|{ \"port\": 3306, \"socket\": \"$mysqld/mysqld.sock\" }, { \"port\": 4444, \"socket\": \"$peer/peer.sock\" }|" \
+      -e "0,/\"enabled\": true,/s//\"enabled\": true, \"isolation\": \"$1\",/" \
+      -e 's#"hosts": \["api.wordpress.org", "downloads.wordpress.org"\]#"hosts": ["api.wordpress.org", "downloads.wordpress.org", "127.0.0.1"]#' \
+      ext/examples/wordpress.json
 }
+peer=$dir/peer
+mkdir -p "$peer"
+chmod 755 "$peer"
+python3 -I test/ext/microvm/peercred.py "$peer/peer.sock" > "$dir/peercred.log" 2>&1 &
+peer_pid=$!
+i=0; until [ -S "$peer/peer.sock" ]; do i=$((i + 1)); [ "$i" -lt 50 ] || die "the peer-credential listener"; sleep 0.1; done
 conf microvm > "$dir/microvm.json"
+if ! grep -q '"port": 4444' "$dir/microvm.json" || ! grep -q '"127.0.0.1"\]' "$dir/microvm.json"; then
+  die "the microvm config fixture (4444, core hosts)"
+fi
 if ! grep -q '"isolation": "microvm"' "$dir/microvm.json" || ! grep -q "\"socket\": \"$mysqld/mysqld.sock\"" "$dir/microvm.json"; then
   die "the microvm config fixture"
 fi
@@ -195,7 +207,7 @@ stop() {
   kill -TERM "$PID"; wait "$PID"; STOPPED=$?; PID=""
 }
 PID=""
-trap '[ -z "$PID" ] || kill -TERM "$PID" 2>/dev/null' EXIT
+trap '[ -z "$PID" ] || kill -TERM "$PID" 2>/dev/null; kill "$peer_pid" 2>/dev/null' EXIT
 first_page() {
   t0=$(date +%s%N)
   c=$(vcode /)
@@ -367,7 +379,7 @@ if [ "$started" = 1 ]; then
   r=$(first_page)
   is "${r% *}" 200 "the front page through the jailed microVM: 200 (first page after the restore: ${r#* } ms)"
   is "$(vget / | grep -c yoast-schema-graph)" 1 "it carries Yoast's output"
-  probe "?write=first-$$&dbroot=1" first
+  probe "?write=first-$$&peer=1" first
   is "$(val first kernel | cut -d. -f1-2)/$( [ "$(val first kernel)" != "$(uname -r)" ] && echo other)" 6.12/other \
     "PHP runs on the guest's kernel, mirab's Linux 6.12 ($(val first kernel); this host is $(uname -r))"
   is "$(val first guest_init)" 1 "PID 1 is securecore-init"
@@ -375,13 +387,11 @@ if [ "$started" = 1 ]; then
   is "$(val first write_uploads)" OK "uploads are writable (their own disk)"
   is "$(val first write_root)/$(val first write_plugins)" BLOCKED/BLOCKED "the site itself is read-only"
   is "$(val first write_tmp)" OK "/tmp is writable (tmpfs)"
-  # The same socket from uid 0 is the database's root: the guest's path must not be uid 0.
+  # Who a host socket sees on the guest's connections (SO_PEERCRED): the jailed uid. With
+  # unix_socket auth, uid 0 on MariaDB's socket is the database's root (the control shows it).
+  is "$(val first peer)" "uid=64000 gid=64000" "a host socket sees the guest's connections as uid 64000 (SO_PEERCRED), not root"
   is "$(docker run --rm -v "$mysqld:/run/mysqld" --entrypoint mariadb mariadb:11.4 -uroot -N -e 'select 1' 2>/dev/null)" 1 \
-    "control: uid 0 on MariaDB's socket is the database's root (unix_socket)"
-  case $(val first db_root) in
-    REFUSED*) pass "the guest's database path is not root: mysqli('127.0.0.1','root','') refused ($(val first db_root | cut -c1-90))" ;;
-    *) fail "the guest's database path is not root" "db_root=$(val first db_root)" ;;
-  esac
+    "control: uid 0 on MariaDB's socket is the database's root (unix_socket), which the guest never gets"
   skew=$(( $(date +%s) - $(val first time) ))
   is "$( [ "${skew#-}" -le 2 ] && echo ok )" ok "the guest's clock matches the host's (skew ${skew} s)"
   vget /sc-status.php > "$dir/status.first"
@@ -431,7 +441,7 @@ if start second "$dir/microvm.json"; then
   lacks "$dir/second.log" "made the snapshot" "the same key: no new snapshot"
   has "$dir/second.log" "microVM restored from snapshot" "restored from the snapshot"
   is "$(find "$state/jail" -name 'v.sock_7777' | grep -c .)" 0 "the stale v.sock_7777 link is gone: every start begins with an empty jail"
-  is "$(find "$(jail_root)" -maxdepth 1 -name 'v.sock_*' -printf '%f\n' | sort | tr '\n' ' ')" "v.sock_1514 v.sock_3306 " "the jail holds only the planned ports"
+  is "$(find "$(jail_root)" -maxdepth 1 -name 'v.sock_*' -printf '%f\n' | sort | tr '\n' ' ')" "v.sock_1514 v.sock_3306 v.sock_4444 " "the jail holds only the planned ports"
   r=$(first_page)
   is "${r% *}" 200 "the front page after a restore: 200 (${r#* } ms; $(sed -n 's/.*restored from snapshot [0-9a-f]* (load and php-fpm ping \([0-9.]*\) ms).*/load and ping \1 ms/p' "$dir/second.log"))"
   probe "" second
