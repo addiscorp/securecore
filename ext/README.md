@@ -887,8 +887,11 @@ only vsock, and `layer1` maps onto it as follows:
 where php-fpm on the host would have them, for example a systemd `EnvironmentFile`. The launcher
 sends them in every start message: after a cold boot, after every restore, and again to a
 reloaded php-fpm. They are never in the guest's image, its boot arguments, a snapshot or a
-log. A name the launcher's environment lacks stops the start. Firecracker and the sync writer
-run with an empty environment.
+log. A name the launcher's environment lacks stops the start. Firecracker, the sync writer and
+the egress helper run with an empty environment, and mke2fs, e2fsck and resize2fs with PATH
+only. A protocol handshake (`sc.proto`) comes first: an init of another protocol (an older
+root image) gets no start message, and a guest's reply to one that carried values is never
+shown. Guest memory can be swapped on the host: run microVM hosts with no swap or encrypted swap.
 
 The site is a read-only disk built from the app root with `mke2fs -d`, mounted at the same path
 (or `--guest-root`, the root nginx sends in `SCRIPT_FILENAME`). The guest's root is read-only
