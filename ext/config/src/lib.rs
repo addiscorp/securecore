@@ -10,6 +10,7 @@
 
 pub mod dbhost;
 pub mod grant;
+pub mod migrate;
 pub mod salt;
 pub mod source;
 
@@ -489,7 +490,8 @@ impl Config {
         if self.layer1.retired_enabled.is_some() {
             return Err(Problem::Invalid(
                 "layer1.enabled is retired: layer1.isolation is layer 1's only switch. Remove \"enabled\" and set \
-                 \"isolation\": \"off\" to turn layer 1 off, or \"auto\" (the default), \"gelada\" or \"microvm\""
+                 \"isolation\": \"off\" to turn layer 1 off, or \"auto\" (the default), \"gelada\" or \"microvm\" \
+                 (securecore-fpm --migrate-config <file> does this, keeping a backup; the installer runs it)"
                     .into(),
             ));
         }

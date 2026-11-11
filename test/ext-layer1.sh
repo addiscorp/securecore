@@ -68,6 +68,9 @@ compose up -d db php web > "$dir/up.log" 2>&1 || { echo "FAIL compose up (see $d
 i=0
 until [ "$(php_state | cut -d' ' -f1)" = running ] && in_php 'grep -q "^php-fpm" /proc/1/comm' >/dev/null 2>&1; do
   i=$((i + 1)); [ "$i" -lt 120 ] || { echo "FAIL php-fpm did not start"; exit 1; }
+  # A site volume from an earlier run may hold a config the launcher refuses (one that still
+  # sets the retired layer1.enabled): the current example, then start it again.
+  if php_state | grep -q '^exited'; then put ext/examples/wordpress.json; compose start php >/dev/null 2>&1; fi
   sleep 1
 done
 i=0

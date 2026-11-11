@@ -778,6 +778,10 @@ securecore-fpm: layer 1 on from /var/www/html/securecore.json (sha256 2ad59919�
 With `layer1.isolation: "off"` it execs php-fpm as it is and says so (`layer 1 is off in …`).
 `isolation` is layer 1's only switch: `layer1.enabled` is retired, and a file that still sets it
 is refused (`layer1.enabled is retired: layer1.isolation is layer 1's only switch …`).
+The installer upgrades such a file when it keeps it (`securecore-fpm --migrate-config <file>`):
+`"enabled": false` becomes `"isolation": "off"`, `"enabled": true` is removed (leaving
+`isolation` as it is, `auto` when absent), and the original is kept beside it as
+`<file>.before-isolation` (`.1`, `.2`, … if that exists), with the same owner and mode.
 A change to `layer1` applies at the next php-fpm (launcher) restart; the extension flags it as
 `restart_needed`.
 

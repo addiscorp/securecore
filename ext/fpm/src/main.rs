@@ -28,7 +28,7 @@ const USAGE: &str = "usage: securecore-fpm --config <securecore.json> [--php-fpm
 [--vm-dir <dir>] [--vm-user <name>|<uid>:<gid>] [--pool-user <name>|<uid>:<gid>] [--kvm <device>] [--state-dir <dir>] \
 [--listen unix:<path>|<host>:<port>] [--listen-owner <user>] [--listen-group <group>] [--listen-mode <octal>] \
 [--guest-root <path>] [--mem <MiB>] [--vcpus <n>] [--write-disk-mib <MiB>] [--no-snapshot] \
-[--guest-arg <word>]... [--] [php-fpm args...]";
+[--guest-arg <word>]... [--] [php-fpm args...] | securecore-fpm --migrate-config <securecore.json>";
 
 struct Args {
     config: PathBuf,
@@ -218,10 +218,50 @@ fn guest_init() -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// `securecore-fpm --migrate-config <file>`: upgrades a securecore.json an earlier release wrote
+/// (the installer runs it on a config it keeps; [`securecore_config::migrate`]). One line on
+/// stdout, `unchanged <file>` or `migrated <file>: …`; exit 1 with the reason on stderr when it
+/// can't, or when the file is still invalid for another reason afterwards.
+fn migrate_config(file: &std::path::Path) -> ExitCode {
+    use securecore_config::migrate::{Migrated, migrate_file, still_invalid};
+    match migrate_file(file) {
+        Ok(Migrated::Unchanged) => {
+            println!("unchanged {}", file.display());
+            ExitCode::SUCCESS
+        }
+        Ok(Migrated::Rewritten { backup, changes }) => {
+            let what = format!("migrated {}: {}; the original is kept at {}", file.display(), changes.join(", "), backup.display());
+            match still_invalid(file) {
+                None => {
+                    println!("{what}");
+                    ExitCode::SUCCESS
+                }
+                Some(problem) => {
+                    eprintln!("{what}, but it is still invalid: {problem}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("could not migrate: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();
     if argv.first().map(PathBuf::from).is_some_and(|p| p.file_name().is_some_and(|n| n == "securecore-init")) {
         return guest_init();
+    }
+    if argv.get(1).is_some_and(|a| a == "--migrate-config") {
+        return match argv.get(2..) {
+            Some([file]) => migrate_config(std::path::Path::new(file)),
+            _ => {
+                eprintln!("usage: securecore-fpm --migrate-config <securecore.json>");
+                ExitCode::from(2)
+            }
+        };
     }
     let args = match parse(argv.into_iter().skip(1)) {
         Ok(Some(args)) => args,

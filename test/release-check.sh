@@ -13,7 +13,9 @@
 #      a second run changes nothing; a tampered .so is refused and changes nothing;
 #   2. config load: PHP refuses to start on a missing config (fail closed); with
 #      examples/wordpress.json the front page is 200 and securecore_status() (core) reports the
-#      file's sha256, all three layers, enforce, wordpress and caller=core;
+#      file's sha256, all three layers, enforce, wordpress and caller=core; a config an earlier
+#      release wrote (the retired layer1.enabled) is upgraded by install-ext.sh, which keeps
+#      the original, and the site serves again;
 #   3. attribution: a mu-plugin's call to securecore_status() is charged to mu-plugin:sc-smoke
 #      and refused;
 #   4. one enforce refusal: the mu-plugin can't write core's folders (but can write uploads),
@@ -203,6 +205,43 @@ is "$(field status layer2_mode)/$(field status layer2_app)" enforce/wordpress "s
 is "$(field status caller)" core "attribution: a web-root script is core"
 core plain
 is "$(field plain write-wp-includes)" OK "plain SAPI: core can write wp-includes (layer 1 is not running)"
+
+# The upgrade from an earlier release: a config that still sets the retired layer1.enabled makes
+# every PHP process refuse to start (the installer's own PHP calls included); install-ext.sh
+# upgrades it, keeping the original beside it, and the site serves again.
+sed 's|"isolation": "auto",|"enabled": true, "isolation": "auto",|' ext/examples/wordpress.json > "$dir/old-on.json"
+grep -q '"enabled": true, "isolation"' "$dir/old-on.json" || fail "the old-style (enabled: true) fixture was made"
+put_conf "$dir/old-on.json"
+in_root "chmod 644 $conf"
+out=$(in_php 'php -r "echo \"ran\";"' 2>&1)
+case $out in
+  *"layer1.enabled is retired"*) pass "an old-style config: PHP refuses to start (what an upgrade used to leave behind)" ;;
+  *) fail "an old-style config: PHP refuses to start" "$out" ;;
+esac
+in_root 'cd / && sh /release/install-ext.sh --from file:///release' > "$dir/install-migrate.log" 2>&1; rc=$?
+is "$rc" 0 "install-ext.sh over an old-style config: exit 0"
+has "$dir/install-migrate.log" "migrated $conf: layer1.enabled true removed" "install-ext.sh migrated the old-style config"
+has "$dir/install-migrate.log" "ok Loaded" "and PHP loads the extension with the migrated config"
+is "$(in_php "sha256sum $conf.before-isolation" | cut -d' ' -f1)" "$(sha "$dir/old-on.json")" "the original is kept at $conf.before-isolation, byte for byte"
+compose restart php > /dev/null 2>&1
+if wait_200 /securecore-status.php && [ "$(code /)" = 200 ]; then
+  pass "the site serves after the upgrade"
+else
+  fail "the site serves after the upgrade" "$(compose logs php 2>&1 | tail -5 | tr '\n' '|')"
+fi
+curl -s "$base/securecore-status.php" > "$dir/status-migrated"
+is "$(field status-migrated layer1)" 1 "status: layer 1 still on (enabled true → isolation auto)"
+printf '{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$dir/old-off.json"
+put_conf "$dir/old-off.json"
+in_root "chmod 644 $conf"
+in_root "/usr/local/bin/securecore-fpm --migrate-config $conf" > "$dir/migrate-off.log" 2>&1 || fail "securecore-fpm --migrate-config (enabled: false)" "$(cat "$dir/migrate-off.log")"
+is "$(in_php "php -n -r 'echo json_encode(json_decode(file_get_contents(\"$conf\"))->layer1);'")" '{"isolation":"off"}' "enabled false → isolation off"
+is "$(in_php "test -f $conf.before-isolation.1 && echo yes")" yes "a second migration keeps the first backup and adds $conf.before-isolation.1"
+in_root "rm -f $conf.before-isolation $conf.before-isolation.1"
+put_conf ext/examples/wordpress.json
+in_root "chmod 644 $conf"
+compose restart php > /dev/null 2>&1
+wait_200 /securecore-status.php || fail "php serves again with examples/wordpress.json"
 
 # --- 3-5. attribution, an enforce refusal, the vault --------------------------------------------
 t=$(now)
