@@ -71,7 +71,7 @@ na_now() { [ -n "$NA_WHY" ] || return 1; na "$1" "$NA_WHY"; }
 na_summary() {
   [ "$nas" -eq 0 ] || echo "$nas check(s) not applicable on the $SC_TARGET target (n/a above, each with why)"
   on_microvm || return 0
-  _suite=$(basename "$0" .sh)
+  _suite=$(basename "$0" .sh); _suite=${_suite#ext-}
   _want=$(awk -v s="$_suite" '$1 == s { print $2 }' test/lib/na-expected.txt 2>/dev/null)
   if [ -z "$_want" ]; then
     echo "FAIL n/a count: $_suite has no line in test/lib/na-expected.txt (it has $nas)"; fails=$((fails + 1))
