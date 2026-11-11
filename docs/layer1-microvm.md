@@ -604,8 +604,8 @@ The product version of items 1, 2 and 4 is in `ext/fpm` (`securecore-fpm`; `ext/
   clock is set; a stop syncs them first.
 - After the security review (PR #75): Firecracker runs under its jailer as an unprivileged
   user, chrooted, in its own namespaces and cgroup, so the guest's socket connections carry that
-  user's credentials, not root's; only files the installer recorded by sha256 boot; `auto` was
-  gated off until #72 synced uploads back (it is now open, below); the snapshot is warmed without the database; every
+  user's credentials, not root's; only files the installer recorded by sha256 boot; `auto` is
+  gated off until #72 syncs uploads back; the snapshot is warmed without the database; every
   start message brings fresh entropy and replaces php-fpm's workers.
 - Nothing is pinned: `scripts/mirab-vm.sh` resolves mirab's newest stable release, its
   `vm/manifest.json` and the Firecracker mirab pins at that commit, and `install-ext.sh` checks
@@ -691,9 +691,6 @@ The sync costs a page nothing: its threads wait in `poll` until a writable folde
 - **Reading the guest's ext4 image on the host** means root parsing an image the guest wrote,
   which #75 rules out.
 - **Offload plugins** (object storage) work unchanged in the guest, but they aren't a default.
-
-**`auto` now picks the microVM** wherever it can run (`AUTO_SELECTS_MICROVM = true`, pinned
-on by a compile-time assert). That was the gate #75 left for this work.
 
 ## Follow-up issues (not filed)
 

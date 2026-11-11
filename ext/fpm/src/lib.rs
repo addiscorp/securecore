@@ -40,10 +40,10 @@ pub enum Choice {
     Microvm,
 }
 
-/// Whether `auto` may pick the microVM. It was gated off until the guest's writes to its writable
-/// folders (uploads) synced back to the host, which nginx and backups see; that is
-/// addiscorp/securecore#72 ([`sync`]), so `auto` is the microVM wherever it can run.
-pub const AUTO_SELECTS_MICROVM: bool = true;
+/// Whether `auto` may pick the microVM. Not until the guest's writes to its writable folders
+/// (uploads) sync back to the host (addiscorp/securecore#72): until then a microVM keeps them in
+/// its own disk image, which nginx and backups don't see, so only an explicit `microvm` gets one.
+pub const AUTO_SELECTS_MICROVM: bool = false;
 
 /// Why `auto` is gelada on a host that could run the microVM.
 pub const AUTO_GATE: &str = "auto doesn't pick the microVM until its writable folders sync back to the host \
