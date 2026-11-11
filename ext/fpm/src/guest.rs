@@ -399,6 +399,14 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             drop(dev);
             mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV, WRITABLE_MOUNT_DATA)?;
             WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).push(path.clone());
+            // Every file closed after writing is made durable at once, whatever the host's sync
+            // is doing (it may be stuck behind a host that doesn't answer).
+            let mount_path = path.clone();
+            thread::spawn(move || {
+                if let Err(e) = crate::sync::keep_durable(&mount_path) {
+                    report(&format!("sync: making {mount_path} durable on close stopped: {e}"));
+                }
+            });
             Ok(())
         }
         Ctl::Tmpfs { path } => mount("tmpfs", path, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777"),

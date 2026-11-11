@@ -665,6 +665,11 @@ if start sync "$dir/microvm.json"; then
   if start sync2 "$dir/microvm.json"; then
     ms=$(synced crash/c.bin 1048576 "$(val crash put_sha)")
     is "$( [ "$ms" != never ] && echo synced)" synced "after the crash, the next start's listing sends the upload (${ms} ms after serving)"
+    if [ "$ms" = never ]; then
+      probe "?sha=crash/c.bin" crash-guest
+      echo "  the guest's copy: $(val crash-guest sha); the host's: $(stat -c %s "$up/crash/c.bin" 2>&1); want $(val crash put_sha)"
+      grep -E 'crash|refused|sync:' "$dir/sync2.log" | tail -8 | sed 's/^/  | /'
+    fi
     eventually 300 "grep -q 'folder 0 reconciled' \"$dir/sync2.log\"" || true
     pushed=$(grep -m1 'folder 0 reconciled' "$dir/sync2.log")
     echo "  import at the start: ${pushed#*sync: }"

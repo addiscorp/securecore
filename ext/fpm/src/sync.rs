@@ -1956,6 +1956,115 @@ const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_DONT_FOLLOW
     | libc::IN_EXCL_UNLINK;
 
+/// The guest's writable disk at `mount`, made durable as it is written: a watch on each of its
+/// folders, and a `syncfs` once a burst of closes-after-writing (and renames into place) is
+/// over, so an upload is on the host's disk image within milliseconds of its close. Independent
+/// of the sync's connection, which may be waiting on the host: the guest's disk never depends on
+/// the host keeping up. Runs for the boot's life.
+pub fn keep_durable(mount: &str) -> io::Result<()> {
+    const MASK: u32 = libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_ONLYDIR;
+    // SAFETY: inotify_init1(2) with a constant flag.
+    let ino = cvt(unsafe { libc::inotify_init1(libc::IN_CLOEXEC) })?;
+    // SAFETY: just returned.
+    let ino = unsafe { OwnedFd::from_raw_fd(ino) };
+    let c = cbytes(mount.as_bytes())?;
+    let fd = openat2_raw(libc::AT_FDCWD, &c, libc::O_RDONLY | libc::O_DIRECTORY, crate::jail::NO_LINKS);
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: just returned.
+    let root = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut dirs: HashMap<i32, Vec<u8>> = HashMap::new();
+    let watch = |dirs: &mut HashMap<i32, Vec<u8>>, rel: &[u8]| -> io::Result<()> {
+        let mut stack = vec![(rel.to_vec(), 0usize)];
+        while let Some((rel, depth)) = stack.pop() {
+            let Ok(dir) = open_beneath(root.as_raw_fd(), &rel, DIR_FLAGS) else { continue };
+            let p = cbytes(format!("/proc/self/fd/{}", dir.as_raw_fd()).as_bytes())?;
+            // SAFETY: inotify_add_watch(2) on a folder we hold, through its /proc link.
+            let wd = unsafe { libc::inotify_add_watch(ino.as_raw_fd(), p.as_ptr(), MASK) };
+            if wd < 0 {
+                continue;
+            }
+            dirs.insert(wd, rel.clone());
+            if depth >= MAX_DEPTH {
+                continue;
+            }
+            for n in list_dir(dir.as_raw_fd())? {
+                if stat_at(dir.as_raw_fd(), &n).ok().and_then(|s| kind_of(&s)) == Some(Kind::Dir) {
+                    stack.push((join(&rel, n.to_bytes()), depth + 1));
+                }
+            }
+        }
+        Ok(())
+    };
+    watch(&mut dirs, b"")?;
+    let mut buf = vec![0u8; 64 << 10];
+    let head = std::mem::size_of::<libc::inotify_event>();
+    loop {
+        let mut wrote = false;
+        let mut timeout = -1;
+        let mut since = Instant::now();
+        loop {
+            // A burst that never goes quiet is synced every 250 ms all the same.
+            if wrote && since.elapsed() > Duration::from_millis(250) {
+                break;
+            }
+            let mut p = libc::pollfd { fd: ino.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: poll(2) on one fd. Once something was written, 20 ms of quiet ends a burst.
+            let r = unsafe { libc::poll(&mut p, 1, timeout) };
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if r == 0 {
+                break;
+            }
+            // SAFETY: read(2) into our buffer.
+            let n = unsafe { libc::read(ino.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut at = 0usize;
+            let mut new_dirs = Vec::new();
+            while at + head <= n as usize {
+                // SAFETY: whole inotify_event records, read unaligned.
+                let ev: libc::inotify_event = unsafe { std::ptr::read_unaligned(buf[at..].as_ptr().cast()) };
+                let len = ev.len as usize;
+                let raw = &buf[at + head..(at + head + len).min(n as usize)];
+                let name = raw.split(|b| *b == 0).next().unwrap_or(&[]);
+                if ev.mask & libc::IN_Q_OVERFLOW != 0 {
+                    wrote = true;
+                } else if ev.mask & libc::IN_ISDIR != 0 && ev.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
+                    if let Some(parent) = dirs.get(&ev.wd) {
+                        new_dirs.push(join(parent, name));
+                    }
+                    wrote = true;
+                } else if ev.mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0 {
+                    wrote = true;
+                }
+                if ev.mask & libc::IN_IGNORED != 0 {
+                    dirs.remove(&ev.wd);
+                }
+                at += head + len;
+            }
+            for d in new_dirs {
+                watch(&mut dirs, &d)?;
+            }
+            if wrote && timeout < 0 {
+                timeout = 20;
+                since = Instant::now();
+            }
+        }
+        if wrote {
+            // SAFETY: syncfs(2) on the disk's root folder: its data and its journal.
+            cvt(unsafe { libc::syncfs(root.as_raw_fd()) })?;
+        }
+    }
+}
+
 /// What [`Guest::each`] calls for each entry: its path, kind and stat.
 type EachFn<'a> = dyn FnMut(&[u8], Kind, &libc::stat) -> io::Result<()> + 'a;
 
