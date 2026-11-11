@@ -44,7 +44,7 @@
 # Needs: the guest kernel (KERNEL=, default .tmp/mvm/vmlinux-sc from bench/microvm/kernel.sh:
 # mirab's kernel plus Landlock and seccomp, until mirab#89 ships them); a host securecore-fpm
 # (SECURECORE_FPM=, default .target/release/securecore-fpm); docker, mke2fs, e2fsck, resize2fs,
-# curl, jq, socat. mirab's files come from scripts/mirab-vm.sh: stable, or MIRAB_MANIFEST=<url>,
+# curl, jq, python3 (test/sock.py stands in for socat). mirab's files come from scripts/mirab-vm.sh: stable, or MIRAB_MANIFEST=<url>,
 # or mirab's newest canary while stable has no vm/.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -62,6 +62,7 @@ run=$dir/run
 sockdir=/run/$project
 mysqld=$sockdir/mysqld
 fpm=${SECURECORE_FPM:-$PWD/.target/release/securecore-fpm}
+sockpy="$PWD/test/sock.py"
 kernel=${KERNEL:-$PWD/.tmp/mvm/vmlinux-sc}
 OHA=ghcr.io/hatoo/oha@sha256:3ec3dbf549ea197793482d47a6324797411406bbf438c2fe8b91f244ec641a2f # oha 1.16.0
 html=/var/www/html
@@ -94,7 +95,7 @@ val() { sed -n "s/^$2=//p" "$dir/probe.$1"; }
 [ -c /dev/kvm ] || die "this host has no /dev/kvm: the microVM tests need KVM (they never skip)"
 [ -x "$fpm" ] || die "no host securecore-fpm at $fpm (cd ext && cargo build --release -p securecore-fpm)"
 [ "$kernel" = "$vm/vmlinux" ] || [ -s "$kernel" ] || die "no guest kernel at $kernel (bench/microvm/kernel.sh; KERNEL=$vm/vmlinux for mirab's)"
-for t in socat mke2fs e2fsck resize2fs jq; do command -v "$t" >/dev/null 2>&1 || die "$t isn't on PATH"; done
+for t in python3 mke2fs e2fsck resize2fs jq; do command -v "$t" >/dev/null 2>&1 || die "$t isn't on PATH"; done
 chown 999:999 "$mysqld"
 echo "starting the stack (project $project, ports $port and $vport)"
 compose build php mvmweb > "$dir/build.log" 2>&1 || die "docker build (see $dir/build.log)"
@@ -365,7 +366,7 @@ mkdir -p "$sockdir/locked/inner"
 chmod 700 "$sockdir/locked"
 chmod 755 "$sockdir/locked/inner"
 rm -f "$sockdir/locked/inner/db.sock"
-socat UNIX-LISTEN:"$sockdir/locked/inner/db.sock",fork,mode=777 /dev/null > /dev/null 2>&1 &
+python3 "$sockpy" listen "$sockdir/locked/inner/db.sock" > /dev/null 2>&1 &
 locked_pid=$!
 i=0; until [ -S "$sockdir/locked/inner/db.sock" ]; do i=$((i + 1)); [ "$i" -lt 50 ] || die "the locked socket"; sleep 0.1; done
 sed "s|{ \"port\": 4444|{ \"port\": 5555, \"socket\": \"$sockdir/locked/inner/db.sock\" }, { \"port\": 4444|" "$dir/microvm.json" > "$dir/microvm-locked.json"
@@ -441,7 +442,7 @@ chown "$pool" "$site/wp-content/uploads/sc-big.bin"
 qa=$(questions); qb=$(questions); qbase=$((qb - qa))
 q0=$(questions)
 rm -f "$dir/notify.sock" "$dir/notify.msg"
-socat -u "UNIX-RECV:$dir/notify.sock" "OPEN:$dir/notify.msg,creat" &
+python3 "$sockpy" recv "$dir/notify.sock" "$dir/notify.msg" &
 notify_pid=$!
 sleep 0.3
 export NOTIFY_SOCKET="$dir/notify.sock"
@@ -511,7 +512,7 @@ if [ "$started" = 1 ]; then
   # (From inside the jail: its full path is longer than a unix socket address holds. The lines go
   # after Firecracker's OK: it drops what follows the CONNECT line in the same write, #70.)
   { printf 'CONNECT 1515\n'; sleep 1; printf 'time 1 0\nentropy %s\ndone\n' "$(printf '00%.0s' $(seq 64))"; sleep 3; } \
-    | (cd "$(jail_root)" && socat -t 5 - UNIX-CONNECT:v.sock) > "$dir/second-start.out" 2>&1
+    | (cd "$(jail_root)" && python3 "$sockpy" connect v.sock) > "$dir/second-start.out" 2>&1
   has "$dir/second-start.out" "error this boot's start message was already taken" "the guest refuses a second start message"
   # A second launcher on the same state folder.
   "$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" --listen "unix:$run/other.sock" > "$dir/second-launcher.log" 2>&1
