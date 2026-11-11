@@ -1198,6 +1198,7 @@ dependencies = [
  "gelada",
  "libc",
  "securecore-config",
+ "serde_json",
  "sha2",
 ]
 

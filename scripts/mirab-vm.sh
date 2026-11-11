@@ -75,24 +75,38 @@ get "$furl" "$work/fc.tgz"
 want "$work/fc.tgz" "$fsha" "$furl" "$pin_url"
 tar -xzf "$work/fc.tgz" -C "$work" "$member"
 want "$work/$member" "$msha" "$member" "$pin_url"
+# The jailer, from the same tarball. mirab's pin lists no jailer, so it is trusted through the
+# tarball's sha256 (which the pin does list) and checked against the tarball's own SHA256SUMS.
+jmember=release-v$fv-x86_64/jailer-v$fv-x86_64
+sums=release-v$fv-x86_64/SHA256SUMS
+tar -xzf "$work/fc.tgz" -C "$work" "$jmember" "$sums"
+jsha=$(sha "$work/$jmember")
+jlisted=$(awk -v f="jailer-v$fv-x86_64" '$2 == f || $2 == "./" f || $2 == "*" f { print $1 }' "$work/$sums")
+[ "$jlisted" = "$jsha" ] || { echo "$0: $jmember: sha256 $jsha, but the tarball's SHA256SUMS says '${jlisted:-nothing}'" >&2; exit 1; }
+if [ "$(jq -r ".files[\"jailer-v$fv-x86_64\"] // empty" "$work/firecracker.json")" = "" ]; then
+  echo "$0: note: mirab's $pin_url lists no jailer; it is checked through the pinned tarball and its SHA256SUMS" >&2
+fi
 
 mkdir -p "$out"
 jq -n --arg version "$version" --arg commit "$commit" --arg channel "$channel" --arg manifest "$manifest_url" \
   --arg manifest_sha256 "$(sha "$work/manifest.json")" \
   --arg kurl "$kurl" --arg ksha "$ksha" --arg kunpacked "$kunpacked" \
-  --arg pin "$pin_url" --arg fv "$fv" --arg furl "$furl" --arg fsha "$fsha" --arg member "$member" --arg msha "$msha" '{
+  --arg pin "$pin_url" --arg fv "$fv" --arg furl "$furl" --arg fsha "$fsha" --arg member "$member" --arg msha "$msha" \
+  --arg jmember "$jmember" --arg jsha "$jsha" '{
     mirab: $version, commit: $commit, channel: $channel,
     manifest: $manifest, manifest_sha256: $manifest_sha256,
     platforms: { "linux-x86_64": {
       kernel: { url: $kurl, sha256: $ksha, unpacked_sha256: $kunpacked },
-      firecracker: { version: $fv, pin: $pin, url: $furl, sha256: $fsha, member: $member, member_sha256: $msha }
+      firecracker: { version: $fv, pin: $pin, url: $furl, sha256: $fsha, member: $member, member_sha256: $msha },
+      jailer: { member: $jmember, jailer_sha256: $jsha }
     } }
   }' > "$out/mirab-vm.json"
 if [ -n "$files" ]; then
   mkdir -p "$files"
   cp "$work/vmlinux" "$files/vmlinux"
   cp "$work/$member" "$files/firecracker"
+  cp "$work/$jmember" "$files/jailer"
   chmod 644 "$files/vmlinux"
-  chmod 755 "$files/firecracker"
+  chmod 755 "$files/firecracker" "$files/jailer"
 fi
 echo "$out/mirab-vm.json: mirab $version ($channel, $commit): kernel $kunpacked, Firecracker $fv $msha"

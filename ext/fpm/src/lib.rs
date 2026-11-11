@@ -21,6 +21,8 @@ pub mod fcgi;
 #[cfg(target_os = "linux")]
 pub mod guest;
 #[cfg(target_os = "linux")]
+pub mod jail;
+#[cfg(target_os = "linux")]
 pub mod vm;
 #[cfg(target_os = "linux")]
 pub mod vsock;
@@ -36,14 +38,28 @@ pub enum Choice {
     Microvm,
 }
 
+/// Whether `auto` may pick the microVM. Not until the guest's writes to its writable folders
+/// (uploads) sync back to the host (addiscorp/securecore#72): until then a microVM keeps them in
+/// its own disk image, which nginx and backups don't see, so only an explicit `microvm` gets one.
+pub const AUTO_SELECTS_MICROVM: bool = false;
+
+/// Why `auto` is gelada on a host that could run the microVM.
+pub const AUTO_GATE: &str = "auto doesn't pick the microVM until its writable folders sync back to the host \
+(addiscorp/securecore#72); set \"microvm\" to ask for it";
+
 /// `layer1.isolation` against this host. `microvm` is `Ok` when this host can run the microVM
-/// and `Err(why)` when it can't ([`vm::available`] on Linux); it is only asked when the answer
-/// matters. Only `auto` falls back; `microvm` without one is a [`Refusal`].
+/// for this config and `Err(why)` when it can't ([`vm::available`] on Linux); it is only asked
+/// when the answer matters. Only `auto` falls back; `microvm` without one is a [`Refusal`].
 pub fn choose(layer1: &Layer1, microvm: impl FnOnce() -> Result<(), String>) -> Result<Choice, Refusal> {
+    choose_with(layer1, AUTO_SELECTS_MICROVM, microvm)
+}
+
+/// [`choose`] with the `auto` gate given, so both settings are tested.
+pub fn choose_with(layer1: &Layer1, auto_microvm: bool, microvm: impl FnOnce() -> Result<(), String>) -> Result<Choice, Refusal> {
     if !layer1.enabled {
         return Ok(Choice::Off);
     }
-    match layer1.isolation {
+    match layer1.isolation() {
         // The loader refuses `enabled: true` with `off`; this is that file, read some other way.
         Isolation::Off => Ok(Choice::Off),
         Isolation::Gelada => Ok(Choice::Gelada { fallback: None }),
@@ -52,8 +68,9 @@ pub fn choose(layer1: &Layer1, microvm: impl FnOnce() -> Result<(), String>) -> 
             Err(why) => Err(Refusal::NoMicrovm { why }),
         },
         Isolation::Auto => Ok(match microvm() {
-            Ok(()) => Choice::Microvm,
             Err(why) => Choice::Gelada { fallback: Some(why) },
+            Ok(()) if !auto_microvm => Choice::Gelada { fallback: Some(AUTO_GATE.into()) },
+            Ok(()) => Choice::Microvm,
         }),
     }
 }
@@ -64,7 +81,8 @@ impl fmt::Display for Choice {
         match self {
             Choice::Off => write!(f, "off"),
             Choice::Gelada { fallback: None } => write!(f, "gelada"),
-            Choice::Gelada { fallback: Some(why) } => write!(f, "gelada, because this host can't run the microVM ({why})"),
+            Choice::Gelada { fallback: Some(why) } if why == AUTO_GATE => write!(f, "gelada, because {why}"),
+            Choice::Gelada { fallback: Some(why) } => write!(f, "gelada, because the microVM can't run here ({why})"),
             Choice::Microvm => write!(f, "microvm"),
         }
     }
@@ -132,7 +150,7 @@ impl fmt::Display for Refusal {
             ),
             Refusal::NoMicrovm { why } => write!(
                 f,
-                "layer1.isolation is \"microvm\" but this host can't run the microVM ({why}). \
+                "layer1.isolation is \"microvm\" but the microVM can't run here ({why}). \
                  \"microvm\" never falls back; use \"auto\" to accept gelada where there is no microVM"
             ),
             Refusal::UnixSocketsInMicrovm { socket } => write!(

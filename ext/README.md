@@ -803,31 +803,55 @@ and the launcher exits 125.
 
 | value | what runs |
 |---|---|
-| `auto` (the default) | a Firecracker microVM where this host can run one, gelada otherwise, with the reason: `layer 1 isolation auto: gelada, because this host can't run the microVM (/dev/kvm: No such file or directory (os error 2))`. The only value that falls back |
+| `auto` (the default) | gelada, with the reason. **`auto` does not pick the microVM until the guest's writable folders sync back to the host (#72)**: `AUTO_SELECTS_MICROVM` in `fpm/src/lib.rs` is that gate, and a test pins it off. Once it opens, `auto` is the microVM where it can run and gelada otherwise (`layer 1 isolation auto: gelada, because the microVM can't run here (…)`), whether the host or the config is why. The only value that falls back |
 | `microvm` | the microVM, or nothing: without one the launcher exits 125 (`layer1.isolation is "microvm" but this host can't run the microVM (…). "microvm" never falls back`) |
 | `gelada` | gelada on the host kernel, as above, even where KVM exists |
 | `off` | layer 1 off, as `enabled: false` (`enabled: true` with `off` is a contradiction, and invalid) |
 
-**This host can run the microVM** when `/dev/kvm` opens read-write and answers
-`KVM_GET_API_VERSION` with 12, Firecracker, the guest kernel and the guest root image exist
-(`<vm-dir>/firecracker`, `vmlinux`, `rootfs.ext4`; `--vm-dir`, default
-`/usr/local/share/securecore/vm`, or `--firecracker`/`--kernel`/`--rootfs`), and `mke2fs` is on
-`PATH`. The installer puts mirab's kernel and Firecracker there (below). The guest root image is
-built from `docker/ext.Dockerfile`'s `guest` target by `scripts/guest-image.sh`; releases don't
-carry one yet, so on an installed host `auto` is gelada until one is there.
+**The microVM can run** when all of these hold (otherwise `auto` logs why and `microvm` exits
+125 with it):
+- the launcher is root (the jailer needs it) and the jailed user (`--vm-user`, a name or
+  `<uid>:<gid>`, default `securecore-vm`, which the installer creates) exists and isn't root;
+- `/dev/kvm` opens read-write and answers `KVM_GET_API_VERSION` with 12;
+- `<vm-dir>/firecracker`, `jailer`, `vmlinux` and `rootfs.ext4` (`--vm-dir`, default
+  `/usr/local/share/securecore/vm`) each match the sha256 in `<vm-dir>/installed.json`, the
+  installer's record. Nothing unrecorded boots. The installer records the kernel, Firecracker and
+  the jailer; no release ships a guest root image yet (it is built from `docker/ext.Dockerfile`'s
+  `guest` target by `scripts/guest-image.sh`), so on an installed host the microVM can't run;
+- the config is one the microVM can enforce (below), and every `connect[].socket` is a socket the
+  jailed user may open itself (checked by running a probe as that user);
+- with layer 3 on, the kernel has Landlock and seccomp filters (its symbols are checked; mirab's
+  kernel has neither until mirab#89, and its isolated children would fail closed);
+- cgroup v2, and `mke2fs`, `e2fsck` and `resize2fs` on `PATH`.
+
+**Firecracker never runs as root.** Its jailer (from the same Firecracker tarball) starts it as
+the jailed user with no supplementary groups, chrooted into `<state>/jail/firecracker/<id>/root`,
+which holds only this VM's kernel, disks, snapshot and sockets, in new mount, network, IPC and UTS
+namespaces, and in the cgroup `securecore/<id>` with `cpu.max` (the vCPUs) and `memory.max` (the
+guest's memory plus 256 MiB). A `connect[].socket`'s folder is bind-mounted read-only into the
+jail, so a guest's database connection reaches MariaDB with the jailed user's credentials
+(`SO_PEERCRED`): `unix_socket` authentication never makes it root. Every start empties the jail
+first, so no link from an earlier config survives. One launcher per state folder (a lock).
 
 **In the microVM** the launcher stays in the foreground (like `php-fpm -F`) and is the guest's
-only way in or out; SIGTERM, SIGINT, SIGQUIT or SIGHUP stop the VM and it exits 0. The guest has
-no network device, only vsock, and `layer1` maps onto it as follows:
+only way in or out. SIGTERM, SIGINT and SIGQUIT sync the guest's disks, stop the VM and exit 0;
+SIGUSR2 and SIGHUP reload the guest's php-fpm gracefully; SIGUSR1 is acknowledged (everything
+logs to stderr, so there is nothing to reopen). With `NOTIFY_SOCKET` set (systemd
+`Type=notify`) it sends `READY=1` once it serves. A unix `--listen` socket gets
+`--listen-owner`, `--listen-group` and `--listen-mode` (0660 by default, as php-fpm's
+`listen.mode`), set as it is made and never through a link. Every line from the guest is logged
+as `guest: …`, so the guest can't write the launcher's lines. The guest has no network device,
+only vsock, and `layer1` maps onto it as follows:
 
 | `layer1` | in the microVM |
 |---|---|
 | `network.bind` | the first port is where the launcher takes FastCGI, on `127.0.0.1` (`--listen unix:<path>` or `<host>:<port>` for another), and passes it to php-fpm over vsock |
 | `network.connect` with `socket` | the guest's `127.0.0.1:<port>` reaches that unix socket on the host, with nothing in between (Firecracker connects it; mysqlnd's connect goes onto vsock in place, #70). With the socket under `/run`, the same path works in the guest too (WordPress's `DB_HOST=localhost`) |
 | `network.connect` with `address` | the launcher connects the guest's `127.0.0.1:<port>` to that TCP `host:port` |
+| `network.connect` port 1514 | refused: it is the guest's log channel |
 | `network.connect`, neither | unreachable from the guest (logged). Outbound HTTPS and DNS are #72 |
 | `network.unixSockets` | refused: give the port the socket instead |
-| `write`, inside the app root | its own read-write disk, made once from the folder's contents and kept across starts (the host's copy isn't updated: #72) |
+| `write`, inside the app root | its own read-write disk, `--write-disk-mib` (1024) MiB, made once from the folder's contents and kept across starts; a larger value grows it in place, and the guest logs past 90 % and 98 % full, before writes fail with ENOSPC (the host's copy isn't updated: #72). A new site's disks are refused while a state folder beside it holds the disks of a root that no longer exists (a moved site: `--state-dir <that folder>` adopts them) |
 | `write`, outside it | a tmpfs in the guest (`/tmp` always is one) |
 | `deny`, outside the app root | nothing to do: the guest never has it |
 | `deny`, inside it | refused: the site disk is the whole root |
@@ -842,11 +866,20 @@ isolated children need Landlock and seccomp in the guest kernel (mirab#89 adds t
 **Snapshots.** A start restores a snapshot of a warmed-up VM when there is one for this key: the
 sha256s of Firecracker, the kernel, the root image, the site tree (every path, mode, owner, size
 and mtime, writable folders excepted) and `securecore.json`, plus the memory, vCPUs, boot
-arguments and disks. Without one, the launcher cold-boots, runs 20 front pages, snapshots, and
-restores that, so the next start is fast; old snapshots and site disks are removed. A restore
-that fails is removed and the launcher cold-boots instead. After every boot or restore the
-launcher sends the guest the clock (a restored guest has the snapshot's) and only then the
-writable disks are mounted, so no snapshot ever holds a stale view of them. `--no-snapshot`
+arguments and disks. Without one, the launcher cold-boots a VM that has no way to the database,
+warms it by compiling the site's PHP files into opcache (the guest image's `warm.php`; no request
+runs, so the production database sees nothing), snapshots it, and restores that, so the next
+start is fast; old snapshots and site disks are removed. A restore that fails is removed and the
+launcher cold-boots instead. After every boot or restore the launcher sends the guest one start
+message, which the guest takes from the host's CID only and only once per boot: the clock (a
+restored guest has the snapshot's), 64 fresh random bytes (credited to the guest kernel's pool,
+and its CRNG reseeded, so restores of one snapshot don't share a random stream), after a restore
+a graceful replacement of php-fpm's workers (forked before the snapshot; the master forks fresh
+ones and opcache stays warm), and only then the writable disks, so no snapshot ever holds a
+stale view of them. The guest kernel has no `CONFIG_VMGENID` (mirab's config), so the entropy in
+the start message is the only reseed; the residual risk is a generator inside a long-lived
+process that isn't a worker (the master, layer 3's helper), which seeds from the kernel before
+the snapshot. `--no-snapshot`
 cold-boots every time. Each site's disks, snapshot and sockets live in `--state-dir` (default
 `/var/lib/securecore/vm/<sha256 of the app root>`). `--mem` (512) and `--vcpus` (2) size the
 guest.

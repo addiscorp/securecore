@@ -50,7 +50,8 @@ pub struct Config {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 #[schemars(extend(
     "if" = { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
-    "then" = { "properties": { "isolation": { "not": { "const": "off" } } } }
+    "then" = { "properties": { "isolation": { "not": { "const": "off" } } } },
+    "else" = { "properties": { "isolation": { "const": "off" } } }
 ))]
 pub struct Layer1 {
     pub enabled: bool,
@@ -58,9 +59,11 @@ pub struct Layer1 {
     /// where this host can run one (`/dev/kvm` works and the VM files are installed) and gelada
     /// otherwise; it is the only value that falls back. `microvm` refuses to start without one.
     /// `off` is layer 1 off, as `enabled: false` is (so `enabled: true` with `off` is refused as
-    /// a contradiction).
-    #[serde(default)]
-    pub isolation: Isolation,
+    /// a contradiction, and so is `enabled: false` with any other value). Unset: `auto`
+    /// ([`Layer1::isolation`]).
+    #[serde(default, rename = "isolation", skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "auto_isolation")]
+    pub isolation_set: Option<Isolation>,
     /// Folders php-fpm may write (relative to the folder containing securecore.json, or
     /// absolute). Everything else is read-only. In a microVM, each one inside the app root is a
     /// writable disk that persists, and each one outside it is a tmpfs in the guest.
@@ -73,6 +76,17 @@ pub struct Layer1 {
     pub deny: Vec<String>,
     #[serde(default)]
     pub network: Network,
+}
+
+fn auto_isolation() -> Option<Isolation> {
+    Some(Isolation::Auto)
+}
+
+impl Layer1 {
+    /// `layer1.isolation`, `auto` when the file doesn't say.
+    pub fn isolation(&self) -> Isolation {
+        self.isolation_set.unwrap_or_default()
+    }
 }
 
 /// How layer 1 isolates php-fpm (`layer1.isolation`).
@@ -475,10 +489,19 @@ impl Config {
     /// The rules serde can't express. Each one is also in the schema (see [`Layer2`]'s
     /// `if`/`then`), so an editor flags the same files.
     fn validate(&self) -> Result<(), Problem> {
-        if self.layer1.enabled && self.layer1.isolation == Isolation::Off {
-            return Err(Problem::Invalid(
-                "layer1.enabled is true but layer1.isolation is \"off\": say one or the other".into(),
-            ));
+        match (self.layer1.enabled, self.layer1.isolation_set) {
+            (true, Some(Isolation::Off)) => {
+                return Err(Problem::Invalid(
+                    "layer1.enabled is true but layer1.isolation is \"off\": say one or the other".into(),
+                ));
+            }
+            (false, Some(i)) if i != Isolation::Off => {
+                return Err(Problem::Invalid(format!(
+                    "layer1.enabled is false but layer1.isolation is \"{}\": say one or the other",
+                    i.as_str()
+                )));
+            }
+            _ => {}
         }
         for c in &self.layer1.network.connect {
             if c.socket.is_some() && c.address.is_some() {

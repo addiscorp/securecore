@@ -81,7 +81,8 @@ fn each_isolation_value_behaves_as_decided() {
     // off: no layer 1, the host never asked.
     let off = isolation("off", false);
     assert_eq!(choose(&off, || panic!("off asks nothing")), Ok(Choice::Off));
-    assert_eq!(choose(&isolation("auto", false), || panic!("disabled asks nothing")), Ok(Choice::Off));
+    let disabled = securecore_config::Config::from_slice(layer1(r#"{"enabled":false}"#).as_bytes()).expect("valid").layer1;
+    assert_eq!(choose(&disabled, || panic!("disabled asks nothing")), Ok(Choice::Off));
     // gelada: gelada either way, the host never asked.
     assert_eq!(choose(&isolation("gelada", true), || panic!("gelada asks nothing")), Ok(Choice::Gelada { fallback: None }));
     // microvm: the microVM, or refused; never gelada.
@@ -89,14 +90,27 @@ fn each_isolation_value_behaves_as_decided() {
     let refused = choose(&isolation("microvm", true), no).expect_err("refused");
     assert_eq!(refused, Refusal::NoMicrovm { why: "/dev/kvm: No such file or directory (os error 2)".into() });
     assert!(refused.to_string().contains("never falls back"), "{refused}");
-    // auto: the microVM, or gelada with the reason. The only value that falls back.
-    assert_eq!(choose(&isolation("auto", true), yes), Ok(Choice::Microvm));
-    let fell = choose(&isolation("auto", true), no).expect("falls back");
+    // microvm on a config the VM can't express (the probe's reason): refused, never gelada.
+    let inexpressible = || Err("layer1.deny /srv/site/private is inside the app root".to_owned());
+    assert!(matches!(choose(&isolation("microvm", true), inexpressible), Err(Refusal::NoMicrovm { .. })));
+    // auto, once the gate opens: the microVM, or gelada with the reason. The only value that
+    // falls back, whether the host or the config is why.
+    let auto = isolation("auto", true);
+    assert_eq!(choose_with(&auto, true, yes), Ok(Choice::Microvm));
+    let fell = choose_with(&auto, true, no).expect("falls back");
     assert_eq!(fell, Choice::Gelada { fallback: Some("/dev/kvm: No such file or directory (os error 2)".into()) });
-    assert_eq!(fell.to_string(), "gelada, because this host can't run the microVM (/dev/kvm: No such file or directory (os error 2))");
+    assert_eq!(fell.to_string(), "gelada, because the microVM can't run here (/dev/kvm: No such file or directory (os error 2))");
+    assert_eq!(
+        choose_with(&auto, true, inexpressible),
+        Ok(Choice::Gelada { fallback: Some("layer1.deny /srv/site/private is inside the app root".into()) })
+    );
+    // auto today (#72 not landed): gelada even where the microVM could run, and it says why.
+    const { assert!(!AUTO_SELECTS_MICROVM, "auto must not pick the microVM before uploads sync back (#72)") };
+    assert_eq!(choose(&auto, yes), Ok(Choice::Gelada { fallback: Some(AUTO_GATE.into()) }));
+    assert_eq!(choose(&auto, no), Ok(Choice::Gelada { fallback: Some("/dev/kvm: No such file or directory (os error 2)".into()) }));
     // No isolation key is auto.
     let default = securecore_config::Config::from_slice(layer1(r#"{"enabled":true}"#).as_bytes()).expect("valid").layer1;
-    assert_eq!(choose(&default, yes), Ok(Choice::Microvm));
+    assert_eq!(choose_with(&default, true, yes), Ok(Choice::Microvm));
 }
 
 #[test]

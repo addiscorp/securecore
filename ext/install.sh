@@ -164,7 +164,7 @@ done
 
 # --- the release -------------------------------------------------------------------------------
 WORK=$(mktemp -d)
-trap 'rm -f "$WORK"/*; rmdir "$WORK"' EXIT
+trap 'find "$WORK" -mindepth 1 -delete; rmdir "$WORK"' EXIT
 if [ -n "$VERSION" ]; then
   fetch "$BASE/$VERSION/release.json" "$WORK/release.json" || die "There is no SecureCore release $VERSION at $BASE."
 elif [ "$CHANNEL" = canary ]; then
@@ -225,14 +225,20 @@ else
   check "$WORK/fc.tgz" "$(vm firecracker sha256)" "Firecracker $FC's tarball"
   member=$(vm firecracker member)
   mkdir -p "$WORK/fc"
-  tar -xzf "$WORK/fc.tgz" -C "$WORK/fc" "$member" || die "Firecracker $FC's tarball has no $member."
+  jmember=$(vm jailer member)
+  tar -xzf "$WORK/fc.tgz" -C "$WORK/fc" "$member" "$jmember" || die "Firecracker $FC's tarball has no $member or $jmember."
   mv "$WORK/fc/$member" "$WORK/firecracker"
-  find "$WORK/fc" -depth -type d -exec rmdir {} \;
+  mv "$WORK/fc/$jmember" "$WORK/jailer"
   check "$WORK/firecracker" "$(vm firecracker member_sha256)" "Firecracker $FC"
+  # The jailer (Firecracker runs under it, never as root): mirab's pin lists none, so it comes
+  # from the tarball checked above and must match the sha256 the release recorded for it.
+  check "$WORK/jailer" "$(vm jailer jailer_sha256)" "Firecracker $FC's jailer"
   rm -f "$WORK/vmlinux.gz" "$WORK/fc.tgz"
-  printf '{\n  "securecore": "%s",\n  "mirab": "%s",\n  "commit": "%s",\n  "manifest": "%s",\n  "kernel_sha256": "%s",\n  "firecracker": "%s",\n  "firecracker_sha256": "%s"\n}\n' \
-    "$REL" "$MIRAB" "$(vm - commit)" "$(vm - manifest)" "$(vm kernel unpacked_sha256)" "$FC" "$(vm firecracker member_sha256)" > "$WORK/installed.json"
-  step "$OK" "microVM" "mirab $MIRAB's guest kernel and Firecracker $FC, each matching mirab's sha256"
+  # No rootfs_sha256: no release ships a guest root image yet, so nothing verified is there to
+  # boot, and securecore-fpm won't start a microVM (auto is gelada, microvm refuses).
+  printf '{\n  "securecore": "%s",\n  "mirab": "%s",\n  "commit": "%s",\n  "manifest": "%s",\n  "kernel_sha256": "%s",\n  "firecracker": "%s",\n  "firecracker_sha256": "%s",\n  "jailer_sha256": "%s"\n}\n' \
+    "$REL" "$MIRAB" "$(vm - commit)" "$(vm - manifest)" "$(vm kernel unpacked_sha256)" "$FC" "$(vm firecracker member_sha256)" "$(vm jailer jailer_sha256)" > "$WORK/installed.json"
+  step "$OK" "microVM" "mirab $MIRAB's guest kernel, Firecracker $FC and its jailer, each matching its recorded sha256"
   VM=1
 fi
 
@@ -262,7 +268,16 @@ put securecore-fpm "$BIN_DIR/securecore-fpm" 755 "Launcher"
 put securecore.schema.json "$SHARE_DIR/securecore.schema.json" 644 "JSON Schema"
 if [ -n "$VM" ]; then
   put firecracker "$SHARE_DIR/vm/firecracker" 755 "Firecracker"
+  put jailer "$SHARE_DIR/vm/jailer" 755 "Jailer"
   put vmlinux "$SHARE_DIR/vm/vmlinux" 644 "Guest kernel"
+  # The unprivileged user Firecracker runs as (securecore-fpm --vm-user, default securecore-vm).
+  if id securecore-vm >/dev/null 2>&1; then
+    step "$SAME" "microVM user" "securecore-vm exists"
+  elif command -v useradd >/dev/null 2>&1 && useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group securecore-vm 2>/dev/null; then
+    step "$OK" "microVM user" "created securecore-vm (system user, no login)"
+  else
+    step "$NOTE" "microVM user" "couldn't create securecore-vm: create it, or pass securecore-fpm --vm-user <uid>:<gid>"
+  fi
   # What is installed, and from which mirab release: nobody edits a version by hand.
   put installed.json "$SHARE_DIR/vm/installed.json" 644 "microVM record"
   if [ ! -f "$SHARE_DIR/vm/rootfs.ext4" ]; then

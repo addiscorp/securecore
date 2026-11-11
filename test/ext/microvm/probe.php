@@ -18,3 +18,14 @@ echo 'read_uploads=', is_file($upload) ? trim((string) file_get_contents($upload
 echo 'write_root=', @file_put_contents("$root/sc-mvm-root.txt", 'x') !== false ? 'OK' : 'BLOCKED', "\n";
 echo 'write_plugins=', @file_put_contents("$root/wp-content/plugins/sc-mvm.txt", 'x') !== false ? 'OK' : 'BLOCKED', "\n";
 echo 'write_tmp=', @file_put_contents('/tmp/sc-mvm.txt', 'x') !== false ? 'OK' : 'BLOCKED', "\n";
+// MySQL as root with no password, over the guest's database path (127.0.0.1:3306 → vsock →
+// MariaDB's unix socket). With unix_socket auth for root@localhost this works only if the
+// connection reaches MariaDB with uid 0's credentials (Firecracker as root).
+if (isset($_GET['dbroot'])) {
+    mysqli_report(MYSQLI_REPORT_OFF);
+    $m = @mysqli_connect('127.0.0.1', 'root', '', '', 3306);
+    echo 'db_root=', $m ? 'OK' : 'REFUSED ' . str_replace("\n", ' ', (string) mysqli_connect_error()), "\n";
+}
+// Fresh randomness: the kernel's (random_bytes) and a worker's userland generator (mt_rand).
+echo 'random=', bin2hex(random_bytes(16)), "\n";
+echo 'mt_rand=', mt_rand(), "\n";

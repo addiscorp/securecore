@@ -68,13 +68,26 @@ impl Vsock {
         Ok(Vsock(fd))
     }
 
-    pub fn accept(&self) -> io::Result<Vsock> {
-        // SAFETY: accept4(2) without a peer address; a non-negative result is a new fd we own.
+    /// The next connection, and the CID it came from (the host is [`HOST_CID`]).
+    pub fn accept(&self) -> io::Result<(Vsock, u32)> {
+        let mut peer = sockaddr(0, 0);
+        let mut len = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+        // SAFETY: accept4(2) writing at most `len` bytes into `peer`; a non-negative result is
+        // a new fd we own.
         let fd = check(unsafe {
-            libc::accept4(self.0.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC)
+            libc::accept4(self.0.as_raw_fd(), (&raw mut peer).cast(), &mut len, libc::SOCK_CLOEXEC)
         })?;
         // SAFETY: fd was just returned by accept4(2).
-        Ok(Vsock(unsafe { OwnedFd::from_raw_fd(fd) }))
+        Ok((Vsock(unsafe { OwnedFd::from_raw_fd(fd) }), peer.svm_cid))
+    }
+
+    /// SO_RCVTIMEO: a read waits at most `t`.
+    pub fn set_read_timeout(&self, t: Duration) -> io::Result<()> {
+        let tv = libc::timeval { tv_sec: t.as_secs() as libc::time_t, tv_usec: t.subsec_micros() as libc::suseconds_t };
+        let len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+        // SAFETY: setsockopt(2) reading the timeval passed, on a socket we own.
+        check(unsafe { libc::setsockopt(self.0.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&raw const tv).cast(), len) })?;
+        Ok(())
     }
 }
 

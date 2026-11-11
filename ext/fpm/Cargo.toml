@@ -14,6 +14,8 @@ gelada.workspace = true
 libc.workspace = true
 # Snapshot keys: the sha256 of the VM's files and of the site tree.
 sha2.workspace = true
+# The installer's record of the VM's files (installed.json), and Firecracker's API bodies.
+serde_json.workspace = true
 
 [[bin]]
 name = "securecore-fpm"

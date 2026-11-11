@@ -214,17 +214,23 @@ fn layer1_only(body: &str) -> String {
 #[test]
 fn isolation_defaults_to_auto_and_takes_four_values() {
     let c = parse(WORDPRESS).expect("examples/wordpress.json");
-    assert_eq!(c.layer1.isolation, Isolation::Auto, "no isolation key: auto (Sami, 10 Nov)");
+    assert_eq!(c.layer1.isolation(), Isolation::Auto, "no isolation key: auto (Sami, 10 Nov)");
+    assert_eq!(c.layer1.isolation_set, None);
     for (word, want) in [("off", Isolation::Off), ("gelada", Isolation::Gelada), ("microvm", Isolation::Microvm), ("auto", Isolation::Auto)] {
         let enabled = want != Isolation::Off;
         let c = parse(&layer1_only(&format!(r#"{{"enabled":{enabled},"isolation":"{word}"}}"#))).expect(word);
-        assert_eq!(c.layer1.isolation, want);
+        assert_eq!(c.layer1.isolation(), want);
         assert_eq!(want.as_str(), word);
     }
     // off with enabled false is the same thing said twice, and valid.
     assert!(parse(&layer1_only(r#"{"enabled":false,"isolation":"off"}"#)).expect("off").is_off());
     let e = rejected(&layer1_only(r#"{"enabled":true,"isolation":"off"}"#));
     assert!(e.contains("layer1.enabled is true but layer1.isolation is \"off\""), "{e}");
+    // A layer 1 that is off with an isolation that isn't: a contradiction too.
+    for word in ["gelada", "microvm", "auto"] {
+        let e = rejected(&layer1_only(&format!(r#"{{"enabled":false,"isolation":"{word}"}}"#)));
+        assert!(e.contains(&format!("layer1.enabled is false but layer1.isolation is \"{word}\"")), "{e}");
+    }
     let e = rejected(&layer1_only(r#"{"enabled":true,"isolation":"vm"}"#));
     assert!(e.contains("unknown variant `vm`"), "{e}");
 }
@@ -272,6 +278,7 @@ fn schema_covers_the_rules_serde_enforces() {
     let layer1 = &schema["$defs"]["Layer1"];
     assert_eq!(layer1["properties"]["isolation"]["default"], "auto");
     assert_eq!(layer1["then"]["properties"]["isolation"]["not"]["const"], "off");
+    assert_eq!(layer1["else"]["properties"]["isolation"]["const"], "off");
     assert_eq!(schema["$defs"]["Connect"]["not"]["required"], serde_json::json!(["socket", "address"]));
 }
 

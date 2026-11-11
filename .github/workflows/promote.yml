@@ -78,6 +78,9 @@ jobs:
             echo "::error::${C}/release.json records ${RECORDED}, but the tag points at ${{ steps.validate.outputs.commit }}."
             exit 1
           fi
+          # A canary built with a development mirab manifest (release.yml's mirab_manifest
+          # input) never becomes stable (#71).
+          scripts/promote-check.sh "stable/${V}" || { echo "::error::${C} took its microVM files from a development mirab manifest; it can't be promoted."; exit 1; }
           # The bytes must be the ones the canary recorded: the zip, and every file in its manifest
           # (the extension's cells, launchers, mu-plugin and schema). A canary from before the
           # manifest (no "files") has only the zip.

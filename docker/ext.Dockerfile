@@ -111,6 +111,7 @@ FROM php AS guest
 COPY --from=build /out/securecore-fpm /usr/local/bin/securecore-fpm
 COPY --from=preload /out/libsc-vsock-connect.so /usr/local/lib/libsc-vsock-connect.so
 COPY ext/fpm/guest/zz-microvm.conf /usr/local/etc/php-fpm.d/zz-microvm.conf
+COPY ext/fpm/guest/warm.php /usr/local/lib/securecore/warm.php
 # The same ini files without the extension, for the extension-off latency runs (sc.ext=0).
 RUN ln -sf /usr/local/bin/securecore-fpm /sbin/securecore-init \
  && mkdir -p /usr/local/etc/php/conf.d-noext /etc/securecore \

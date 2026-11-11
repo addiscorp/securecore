@@ -27,6 +27,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -103,6 +105,12 @@ pub fn parse_cmdline(line: &str) -> Result<Boot, String> {
 pub enum Ctl {
     /// Set the clock (after a restore it is the snapshot's).
     Time { secs: i64, nanos: u32 },
+    /// Fresh randomness from the host (64 bytes, hex): credited to the kernel's pool and the
+    /// CRNG reseeded, so a restored guest doesn't replay the snapshot's random stream.
+    Entropy { hex: String },
+    /// This boot is a restore: php-fpm's workers were forked before the snapshot (and hold its
+    /// userland generator state), so they are replaced by fresh ones.
+    Refresh,
     /// Mount an ext4 disk read-write at a path.
     Mount { device: String, path: String },
     /// Mount a tmpfs at a path (a writable folder outside the app root).
@@ -110,6 +118,8 @@ pub enum Ctl {
     /// Write every dirty page to the disks: the host sends it before it stops the VM, so what
     /// php-fpm wrote to a writable folder is on the host's disk image.
     Sync,
+    /// A graceful php-fpm reload (SIGUSR2 to its master): the launcher's SIGUSR2 or SIGHUP.
+    Reload,
     Done,
 }
 
@@ -117,9 +127,12 @@ impl Ctl {
     pub fn line(&self) -> String {
         match self {
             Ctl::Time { secs, nanos } => format!("time {secs} {nanos}\n"),
+            Ctl::Entropy { hex } => format!("entropy {hex}\n"),
+            Ctl::Refresh => "refresh\n".into(),
             Ctl::Mount { device, path } => format!("mount {device} {path}\n"),
             Ctl::Tmpfs { path } => format!("tmpfs {path}\n"),
             Ctl::Sync => "sync\n".into(),
+            Ctl::Reload => "reload\n".into(),
             Ctl::Done => "done\n".into(),
         }
     }
@@ -131,12 +144,34 @@ impl Ctl {
                 secs: secs.parse().map_err(|_| format!("time: {secs}"))?,
                 nanos: nanos.parse().ok().filter(|n| *n < 1_000_000_000).ok_or_else(|| format!("time: {nanos}"))?,
             }),
+            ["entropy", hex] if hex.len() == 128 && hex.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(Ctl::Entropy { hex: (*hex).into() }),
+            ["refresh"] => Ok(Ctl::Refresh),
             ["mount", device, path] => Ok(Ctl::Mount { device: (*device).into(), path: (*path).into() }),
             ["tmpfs", path] => Ok(Ctl::Tmpfs { path: (*path).into() }),
             ["sync"] => Ok(Ctl::Sync),
+            ["reload"] => Ok(Ctl::Reload),
             ["done"] => Ok(Ctl::Done),
-            _ => Err(format!("unknown start message line {line:?}")),
+            _ => Err(format!("unknown control line {line:?}")),
         }
+    }
+
+    /// Part of the one start message a boot accepts (the rest may come any time after it).
+    pub fn starts(&self) -> bool {
+        matches!(self, Ctl::Time { .. } | Ctl::Entropy { .. } | Ctl::Refresh | Ctl::Mount { .. } | Ctl::Tmpfs { .. })
+    }
+}
+
+/// What a control connection may do, given whether this boot's start message was taken.
+/// Exactly one start message per boot (a snapshot is taken before it, so each restore takes its
+/// own); after it only `sync` and `reload`, and nothing at all before it but a start.
+pub fn allowed(lines: &[Ctl], started: bool) -> Result<(), String> {
+    let starts = lines.iter().any(Ctl::starts);
+    let others = lines.iter().any(|c| matches!(c, Ctl::Sync | Ctl::Reload));
+    match (started, starts, others) {
+        (true, true, _) => Err("this boot's start message was already taken".into()),
+        (false, false, true) => Err("nothing but the start message before the start message".into()),
+        (false, true, true) => Err("a start message carries no sync or reload".into()),
+        _ => Ok(()),
     }
 }
 
@@ -191,10 +226,95 @@ fn loopback_up() -> io::Result<()> {
     Ok(())
 }
 
-/// Applies one start message line.
+/// RNDADDENTROPY (`_IOW('R', 0x03, int[2])`) and RNDRESEEDCRNG (`_IO('R', 0x07)`).
+const RNDADDENTROPY: libc::c_ulong = 0x4008_5203;
+const RNDRESEEDCRNG: libc::c_ulong = 0x5207;
+
+/// Credits `bytes` to the kernel's pool and reseeds the CRNG from it.
+fn add_entropy(bytes: &[u8]) -> io::Result<()> {
+    // struct rand_pool_info { int entropy_count; int buf_size; __u32 buf[]; }
+    let mut info: Vec<u8> = Vec::with_capacity(8 + bytes.len());
+    info.extend_from_slice(&((bytes.len() * 8) as i32).to_ne_bytes());
+    info.extend_from_slice(&(bytes.len() as i32).to_ne_bytes());
+    info.extend_from_slice(bytes);
+    let dev = fs::OpenOptions::new().write(true).open("/dev/random")?;
+    // SAFETY: both ioctls on /dev/random; RNDADDENTROPY reads the rand_pool_info laid out above.
+    unsafe {
+        if libc::ioctl(dev.as_raw_fd(), RNDADDENTROPY, info.as_ptr()) < 0 {
+            return Err(io::Error::other(format!("RNDADDENTROPY: {}", io::Error::last_os_error())));
+        }
+        if libc::ioctl(dev.as_raw_fd(), RNDRESEEDCRNG, 0) < 0 {
+            return Err(io::Error::other(format!("RNDRESEEDCRNG: {}", io::Error::last_os_error())));
+        }
+    }
+    Ok(())
+}
+
+fn unhex(hex: &str) -> Vec<u8> {
+    (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()).collect()
+}
+
+/// php-fpm's master, once started (0 while a reload restarts it).
+static FPM_MASTER: AtomicI32 = AtomicI32::new(0);
+/// The kernel command line's settings, for a reload's fresh php-fpm.
+static BOOT: std::sync::OnceLock<Boot> = std::sync::OnceLock::new();
+/// Whether this boot took its start message.
+static STARTED: AtomicBool = AtomicBool::new(false);
+/// The writable disks' mount points, watched for space.
+static WRITABLE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// php-fpm's pool workers (`php-fpm: pool …`), children of the master: not the master, and not
+/// the extension's layer 3 helper.
+fn pool_workers(master: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    for e in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        // pid (comm) state ppid …: comm may hold spaces, so split after its closing paren.
+        let ppid = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)).and_then(|p| p.parse::<i32>().ok());
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if ppid == Some(master) && cmdline.starts_with(b"php-fpm: pool ") {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// Applies one control line.
 fn apply(ctl: &Ctl) -> io::Result<()> {
     match ctl {
         Ctl::Time { secs, nanos } => set_clock(*secs, *nanos),
+        Ctl::Entropy { hex } => add_entropy(&unhex(hex)),
+        Ctl::Refresh => {
+            // A graceful stop of each worker; the master forks fresh ones from itself (it ran no
+            // request before the snapshot), and opcache's shared memory stays warm.
+            for pid in pool_workers(FPM_MASTER.load(Ordering::SeqCst)) {
+                // SAFETY: kill(2) on a php-fpm worker of this guest.
+                unsafe { libc::kill(pid, libc::SIGQUIT) };
+            }
+            Ok(())
+        }
+        Ctl::Reload => {
+            // Not php-fpm's own SIGUSR2: that re-execs the master with its current environment,
+            // where the vault has already put placeholders in place of the secrets. A graceful
+            // stop (SIGQUIT: in-flight requests finish), then a fresh php-fpm with init's own
+            // environment, as at boot.
+            let boot = BOOT.get().ok_or_else(|| io::Error::other("no boot settings"))?;
+            let old = FPM_MASTER.swap(0, Ordering::SeqCst);
+            // SAFETY: kill(2) on php-fpm's master, which this init started.
+            unsafe { libc::kill(old, libc::SIGQUIT) };
+            let t = std::time::Instant::now();
+            while Path::new(&format!("/proc/{old}")).exists() {
+                if t.elapsed() > Duration::from_secs(30) {
+                    // SAFETY: as above; it didn't stop gracefully in 30 s.
+                    unsafe { libc::kill(old, libc::SIGKILL) };
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let pid = start_php_fpm(boot)?;
+            FPM_MASTER.store(pid as i32, Ordering::SeqCst);
+            Ok(())
+        }
         Ctl::Mount { device, path } => {
             // The snapshot may hold the device's first blocks from the kernel's partition scan
             // at boot, and the host may have written the disk since: drop them first.
@@ -205,7 +325,9 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
                 return Err(io::Error::new(e.kind(), format!("{device}: BLKFLSBUF: {e}")));
             }
             drop(dev);
-            mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV, "")
+            mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV, "")?;
+            WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).push(path.clone());
+            Ok(())
         }
         Ctl::Tmpfs { path } => mount("tmpfs", path, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777"),
         Ctl::Sync => {
@@ -217,29 +339,85 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
     }
 }
 
-/// One start message: every line applied in order, then `ok` (or the first error) to `done`.
-fn serve_ctl(conn: Vsock) {
+/// One control connection, from the host only: its lines up to `done` are read (within 10 s),
+/// checked against [`allowed`], applied in order, and answered `ok` or `error <why>`.
+fn serve_ctl(conn: Vsock, peer_cid: u32) {
     let mut out = match vsock::Half::dup(&conn) {
         Ok(out) => out,
         Err(e) => return say(&format!("ctl: {e}")),
     };
+    if peer_cid != HOST_CID {
+        say(&format!("ctl: refused a connection from CID {peer_cid}: only the host (CID {HOST_CID}) controls this guest"));
+        return;
+    }
+    let _ = conn.set_read_timeout(Duration::from_secs(10));
+    let mut lines = Vec::new();
     let mut failed: Option<String> = None;
+    let mut done = false;
     for line in BufReader::new(conn).lines() {
         let Ok(line) = line else { break };
-        let ctl = Ctl::parse(&line);
-        match ctl {
+        match Ctl::parse(&line) {
             Ok(Ctl::Done) => {
-                let reply = failed.take().map_or_else(|| "ok\n".to_owned(), |e| format!("error {e}\n"));
-                let _ = out.write_all(reply.as_bytes());
-                return;
+                done = true;
+                break;
             }
-            Ok(ctl) if failed.is_none() => {
-                if let Err(e) = apply(&ctl) {
-                    failed = Some(e.to_string());
-                }
-            }
-            Ok(_) => {}
+            Ok(ctl) => lines.push(ctl),
             Err(e) => failed = failed.or(Some(e)),
+        }
+    }
+    if !done {
+        return say("ctl: a control connection closed or timed out before `done`; nothing applied");
+    }
+    let started = STARTED.load(Ordering::SeqCst);
+    if failed.is_none() {
+        failed = allowed(&lines, started).err();
+    }
+    if failed.is_none() {
+        if lines.iter().any(Ctl::starts) {
+            STARTED.store(true, Ordering::SeqCst);
+        }
+        for ctl in &lines {
+            if let Err(e) = apply(ctl) {
+                failed = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    let reply = failed.map_or_else(|| "ok\n".to_owned(), |e| format!("error {e}\n"));
+    let _ = out.write_all(reply.as_bytes());
+}
+
+/// One line to the host's log, from this init (the host marks every guest line as the guest's).
+fn report(message: &str) {
+    if let Ok(mut c) = Vsock::connect(HOST_CID, LOG_PORT) {
+        let _ = c.write_all(format!("securecore-init: {message}\n").as_bytes());
+    }
+}
+
+/// Warns once a writable disk passes 90 % (and again past 98 %): beyond it, php-fpm's writes
+/// fail with ENOSPC. The disk's size is the launcher's `--write-disk-mib`.
+fn watch_space() {
+    let mut warned: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    loop {
+        thread::sleep(Duration::from_secs(30));
+        let paths = WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        for path in paths {
+            let Ok(c) = cstr(&path) else { continue };
+            // SAFETY: statvfs(3) fills the struct passed.
+            let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(c.as_ptr(), &mut s) } < 0 || s.f_blocks == 0 {
+                continue;
+            }
+            let used = 100 - (s.f_bavail as u64 * 100 / s.f_blocks as u64);
+            let level = if used >= 98 { 98 } else if used >= 90 { 90 } else { 0 };
+            if level > *warned.get(&path).unwrap_or(&0) {
+                let free_mib = (s.f_bavail as u64 * s.f_frsize as u64) >> 20;
+                report(&format!(
+                    "the writable disk at {path} is {used}% full ({free_mib} MiB left): writes there will fail with \
+                     ENOSPC when it fills; restart with a larger --write-disk-mib to grow it"
+                ));
+            }
+            warned.insert(path, level);
         }
     }
 }
@@ -288,7 +466,7 @@ fn listen_forwards(boot: &Boot) -> io::Result<()> {
     let fpm = Vsock::listen(FPM_PORT)?;
     thread::spawn(move || {
         loop {
-            let Ok(v) = fpm.accept() else { continue };
+            let Ok((v, _)) = fpm.accept() else { continue };
             match TcpStream::connect(("127.0.0.1", FPM_PORT as u16)) {
                 Ok(t) => {
                     let _ = t.set_nodelay(true);
@@ -321,8 +499,8 @@ fn listen_forwards(boot: &Boot) -> io::Result<()> {
     let ctl = Vsock::listen(CTL_PORT)?;
     thread::spawn(move || {
         loop {
-            if let Ok(c) = ctl.accept() {
-                serve_ctl(c);
+            if let Ok((c, cid)) = ctl.accept() {
+                serve_ctl(c, cid);
             }
         }
     });
@@ -372,6 +550,8 @@ fn boot_guest() -> io::Result<u32> {
     loopback_up()?;
     listen_forwards(&boot)?;
     let pid = start_php_fpm(&boot)?;
+    FPM_MASTER.store(pid as i32, Ordering::SeqCst);
+    thread::spawn(watch_space);
     let uptime = fs::read_to_string("/proc/uptime").unwrap_or_default();
     say(&format!(
         "php-fpm started (pid {pid}), root {}, forwarded ports {:?}, ext {}, up {}s",
@@ -380,21 +560,22 @@ fn boot_guest() -> io::Result<u32> {
         u8::from(boot.ext),
         uptime.split_whitespace().next().unwrap_or("?")
     ));
+    let _ = BOOT.set(boot);
     Ok(pid)
 }
 
 /// PID 1: boots the guest, then reaps every process until php-fpm exits. Returning ends PID 1,
 /// which panics the kernel, and `panic=1 reboot=k` stops the VM: no php-fpm, no VM.
 pub fn init() -> io::Error {
-    let fpm = match boot_guest() {
-        Ok(pid) => pid as libc::pid_t,
-        Err(e) => return e,
-    };
+    if let Err(e) = boot_guest() {
+        return e;
+    }
     loop {
         let mut status = 0;
         // SAFETY: waitpid(2) for any child, writing the status passed.
         let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
-        if pid == fpm {
+        // The current master only: a reload's old master exits on purpose.
+        if pid > 0 && pid == FPM_MASTER.load(Ordering::SeqCst) {
             return io::Error::other(format!("php-fpm exited (wait status {status})"));
         }
         if pid < 0 {
@@ -430,12 +611,30 @@ mod tests {
             Ctl::Time { secs: 1_762_800_000, nanos: 123_456_789 },
             Ctl::Mount { device: "/dev/vdc".into(), path: "/var/www/html/wp-content/uploads".into() },
             Ctl::Tmpfs { path: "/var/cache/x".into() },
+            Ctl::Entropy { hex: "ab".repeat(64) },
+            Ctl::Refresh,
             Ctl::Sync,
+            Ctl::Reload,
             Ctl::Done,
         ] {
             assert_eq!(Ctl::parse(ctl.line().trim_end()), Ok(ctl.clone()), "{ctl:?}");
         }
         assert!(Ctl::parse("time 1 1000000000").is_err(), "nanoseconds below one second");
         assert!(Ctl::parse("reboot").is_err());
+        assert!(Ctl::parse(&format!("entropy {}", "ab".repeat(8))).is_err(), "64 bytes, no fewer");
+        assert!(Ctl::parse(&format!("entropy {}", "zz".repeat(64))).is_err(), "hex only");
+        assert_eq!(unhex("00ff10"), [0, 255, 16]);
+    }
+
+    #[test]
+    fn a_boot_takes_one_start_message_then_only_sync_and_reload() {
+        let start = [Ctl::Time { secs: 1, nanos: 0 }, Ctl::Entropy { hex: "00".repeat(64) }, Ctl::Mount { device: "/dev/vdc".into(), path: "/u".into() }];
+        assert_eq!(allowed(&start, false), Ok(()), "the first start message");
+        assert!(allowed(&start, true).expect_err("a second").contains("already taken"));
+        assert!(allowed(&[Ctl::Mount { device: "/dev/vdd".into(), path: "/x".into() }], true).is_err(), "no mounts after the start");
+        assert_eq!(allowed(&[Ctl::Sync], true), Ok(()));
+        assert_eq!(allowed(&[Ctl::Reload], true), Ok(()));
+        assert!(allowed(&[Ctl::Sync], false).is_err(), "nothing before the start");
+        assert!(allowed(&[Ctl::Time { secs: 1, nanos: 0 }, Ctl::Reload], false).is_err());
     }
 }
