@@ -211,7 +211,7 @@ pub fn securecore_status() -> PhpResult<ZBox<ZendHashTable>> {
     let live = reloader.live();
     let c = &live.config;
     let mut layers = ZendHashTable::new();
-    layers.insert("layer1", c.layer1.enabled)?;
+    layers.insert("layer1", c.layer1.enabled())?;
     layers.insert("layer2", c.layer2.enabled)?;
     layers.insert("layer3", c.layer3.enabled)?;
     let mut out = ZendHashTable::new();

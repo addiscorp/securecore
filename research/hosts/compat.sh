@@ -36,7 +36,7 @@ CF7_PAGE=$(wp post list --post_type=page --name=hosts-cf7 --field=ID)
 # The recommended hosts: core may reach wordpress.org, each plugin nothing (default deny).
 cat > "$out/hosts.json" <<JSON
 {
-  "layer1": { "enabled": false },
+  "layer1": { "isolation": "off" },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "enforce",
     "core": { "hosts": ["api.wordpress.org", "downloads.wordpress.org"] },

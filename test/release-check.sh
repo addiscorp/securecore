@@ -13,7 +13,9 @@
 #      a second run changes nothing; a tampered .so is refused and changes nothing;
 #   2. config load: PHP refuses to start on a missing config (fail closed); with
 #      examples/wordpress.json the front page is 200 and securecore_status() (core) reports the
-#      file's sha256, all three layers, enforce, wordpress and caller=core;
+#      file's sha256, all three layers, enforce, wordpress and caller=core; a config an earlier
+#      release wrote (the retired layer1.enabled) is upgraded by install-ext.sh, which keeps
+#      the original, and the site serves again;
 #   3. attribution: a mu-plugin's call to securecore_status() is charged to mu-plugin:sc-smoke
 #      and refused;
 #   4. one enforce refusal: the mu-plugin can't write core's folders (but can write uploads),
@@ -53,6 +55,21 @@ sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasu
 for f in "$so" "$launcher"; do [ -f "$src/$f" ] || { echo "FAIL $src/$f is missing (scripts/ext-build.sh $php $ts $src)"; exit 1; }; done
 mkdir -p "$dir/ext"
 cp "$src/$so" "$src/$launcher" "$dir/ext/"
+# Layer 1's microVM files (#71), resolved exactly as release.yml resolves them: mirab's newest
+# stable release; exit 3 (it has no vm/ images yet, mirab#89) means a release without the
+# microVM, which the installer must then say; any other failure fails the check.
+# SECURECORE_RELEASE_MIRAB_MANIFEST=<vm/manifest.json url> is release.yml's development override
+# (e.g. a mirab canary), to check the installer's microVM step before mirab's stable has one.
+# x86_64 only (mirab pins Firecracker for it).
+vm=
+if [ "$arch" = x86_64 ]; then
+  TMPDIR=${TMPDIR:-$PWD/.tmp} scripts/mirab-vm.sh "$dir/ext" ${SECURECORE_RELEASE_MIRAB_MANIFEST:+"$SECURECORE_RELEASE_MIRAB_MANIFEST"} > "$dir/mirab.log" 2>&1; rc=$?
+  case $rc in
+    0) vm=$dir/ext/mirab-vm.json ;;
+    3) echo "mirab's stable release has no vm/ images: this release carries no microVM ($(tail -1 "$dir/mirab.log"))" ;;
+    *) echo "FAIL mirab's microVM files (see $dir/mirab.log)"; cat "$dir/mirab.log"; exit 1 ;;
+  esac
+fi
 version="$(scripts/version.sh)-canary-check"
 TMPDIR=${TMPDIR:-$PWD/.tmp} scripts/release-layout.sh "$version" "v$version" "$(git rev-parse HEAD)" canary "$dir/release" "$dir/ext" > "$dir/layout.log" \
   || { echo "FAIL release layout (see $dir/layout.log)"; exit 1; }
@@ -101,8 +118,28 @@ is "$(in_php 'php -m' | grep -cx securecore)" 1 "php -m lists securecore"
 
 # Again with the defaults the site shows (no --canary, no --wordpress), from outside the site:
 # with no latest.json it takes the newest canary, and it finds WordPress in /var/www/html.
+if [ "$arch" = x86_64 ] && [ -z "$vm" ]; then
+  has "$dir/install.log" "this release carries none" "install-ext.sh says the release carries no microVM"
+  is "$(in_php 'test -e /usr/local/share/securecore/vm/vmlinux && echo yes || echo no')" no "and installs none of it"
+fi
+if [ -n "$vm" ]; then
+  # jsonv <key>: a value from mirab-vm.json (the last one of that name: the firecracker block's
+  # come after the kernel's, so ask for the ones that are unique).
+  jsonv() { tr -d ' \n' < "$vm" | grep -o "\"$1\":\"[^\"]*\"" | tail -n 1 | cut -d'"' -f4; }
+  has "$dir/install.log" "ok microVM" "install-ext.sh installed layer 1's microVM files"
+  has "$dir/install.log" "each matching its recorded sha256" "and checked them against the recorded sha256s"
+  is "$(in_php 'sha256sum /usr/local/share/securecore/vm/vmlinux' | cut -d' ' -f1)" "$(jsonv unpacked_sha256)" "the installed guest kernel is mirab's, by its unpacked sha256"
+  is "$(in_php 'sha256sum /usr/local/share/securecore/vm/firecracker' | cut -d' ' -f1)" "$(jsonv member_sha256)" "the installed Firecracker is the one mirab pins"
+  is "$(in_php 'sha256sum /usr/local/share/securecore/vm/jailer' | cut -d' ' -f1)" "$(jsonv jailer_sha256)" "the installed jailer is the one from the same tarball"
+  is "$(in_php 'test -x /usr/local/share/securecore/vm/firecracker && test -x /usr/local/share/securecore/vm/jailer && echo yes')" yes "and both are executable"
+  is "$(in_php 'cat /usr/local/share/securecore/vm/installed.json' | tr -d ' \n' | grep -o '"jailer_sha256":"[^"]*"' | cut -d'"' -f4)" "$(jsonv jailer_sha256)" \
+    "vm/installed.json records the jailer's sha256"
+  is "$(in_php 'grep -c rootfs_sha256 /usr/local/share/securecore/vm/installed.json')" 0 "and no guest root image (none ships), so nothing boots"
+  is "$(in_php 'cat /usr/local/share/securecore/vm/installed.json' | tr -d ' \n' | grep -o '"mirab":"[^"]*"' | cut -d'"' -f4)" "$(jsonv mirab)" \
+    "vm/installed.json records the mirab release ($(jsonv mirab))"
+fi
 in_root 'cd / && sh /release/install-ext.sh --from file:///release' > "$dir/install-2.log" 2>&1; rc=$?
-if [ "$rc" = 0 ] && ! grep -qE '^ok +(Extension|Launcher|JSON Schema|mu-plugin|Config|ini) ' "$dir/install-2.log"; then
+if [ "$rc" = 0 ] && ! grep -qE '^ok +(Extension|Launcher|JSON Schema|mu-plugin|Config|ini|Firecracker|Jailer|Guest kernel|microVM record) ' "$dir/install-2.log"; then
   pass "install-ext.sh again, with the defaults: exit 0, nothing changed"
 else
   fail "install-ext.sh again, with the defaults: exit 0, nothing changed" "rc=$rc: $(tr '\n' '|' < "$dir/install-2.log")"
@@ -117,6 +154,24 @@ else
 fi
 is "$(in_php "sha256sum $extdir/securecore.so" | cut -d' ' -f1)" "$(sha "$src/$so")" "after the tampered run the installed .so is unchanged"
 in_root 'rm -rf /tmp/tampered'
+if [ -n "$vm" ]; then
+  # A release whose mirab-vm.json names another kernel sha256 (release.json agrees with it, so
+  # only mirab's sha256 check can catch the kernel): refused, and nothing changes.
+  mkdir -p "$dir/badvm-ext"
+  cp "$dir/ext/"* "$dir/badvm-ext/"
+  sed "s/$(jsonv unpacked_sha256)/$(printf '0%.0s' $(seq 64))/" "$vm" > "$dir/badvm-ext/mirab-vm.json"
+  TMPDIR=${TMPDIR:-$PWD/.tmp} scripts/release-layout.sh "$version" "v$version" "$(git rev-parse HEAD)" canary "$dir/badvm" "$dir/badvm-ext" > "$dir/layout-badvm.log" \
+    || fail "the bad-kernel release layout"
+  compose cp "$dir/badvm" php:/tmp/badvm >> "$dir/cp.log" 2>&1
+  in_root 'sh /tmp/badvm/install-ext.sh --from file:///tmp/badvm --canary --wordpress /var/www/html' > "$dir/install-badvm.log" 2>&1; rc=$?
+  if [ "$rc" != 0 ] && grep -q "unpacked guest kernel failed its sha256 check against mirab's" "$dir/install-badvm.log"; then
+    pass "a kernel that doesn't match mirab's sha256 is refused"
+  else
+    fail "a kernel that doesn't match mirab's sha256 is refused" "rc=$rc: $(tr '\n' '|' < "$dir/install-badvm.log")"
+  fi
+  is "$(in_php 'sha256sum /usr/local/share/securecore/vm/vmlinux' | cut -d' ' -f1)" "$(jsonv unpacked_sha256)" "after the refused run the installed kernel is unchanged"
+  in_root 'find /tmp/badvm -mindepth 1 -delete && rmdir /tmp/badvm'
+fi
 
 # --- 2. config load ---------------------------------------------------------------------------
 out=$(in_php 'php -d securecore.config=/etc/securecore/missing.json -r "echo \"ran\";"' 2>&1); rc=$?
@@ -150,6 +205,43 @@ is "$(field status layer2_mode)/$(field status layer2_app)" enforce/wordpress "s
 is "$(field status caller)" core "attribution: a web-root script is core"
 core plain
 is "$(field plain write-wp-includes)" OK "plain SAPI: core can write wp-includes (layer 1 is not running)"
+
+# The upgrade from an earlier release: a config that still sets the retired layer1.enabled makes
+# every PHP process refuse to start (the installer's own PHP calls included); install-ext.sh
+# upgrades it, keeping the original beside it, and the site serves again.
+sed 's|"isolation": "auto",|"enabled": true, "isolation": "auto",|' ext/examples/wordpress.json > "$dir/old-on.json"
+grep -q '"enabled": true, "isolation"' "$dir/old-on.json" || fail "the old-style (enabled: true) fixture was made"
+put_conf "$dir/old-on.json"
+in_root "chmod 644 $conf"
+out=$(in_php 'php -r "echo \"ran\";"' 2>&1)
+case $out in
+  *"layer1.enabled is retired"*) pass "an old-style config: PHP refuses to start (what an upgrade used to leave behind)" ;;
+  *) fail "an old-style config: PHP refuses to start" "$out" ;;
+esac
+in_root 'cd / && sh /release/install-ext.sh --from file:///release' > "$dir/install-migrate.log" 2>&1; rc=$?
+is "$rc" 0 "install-ext.sh over an old-style config: exit 0"
+has "$dir/install-migrate.log" "migrated $conf: layer1.enabled true removed" "install-ext.sh migrated the old-style config"
+has "$dir/install-migrate.log" "ok Loaded" "and PHP loads the extension with the migrated config"
+is "$(in_php "sha256sum $conf.before-isolation" | cut -d' ' -f1)" "$(sha "$dir/old-on.json")" "the original is kept at $conf.before-isolation, byte for byte"
+compose restart php > /dev/null 2>&1
+if wait_200 /securecore-status.php && [ "$(code /)" = 200 ]; then
+  pass "the site serves after the upgrade"
+else
+  fail "the site serves after the upgrade" "$(compose logs php 2>&1 | tail -5 | tr '\n' '|')"
+fi
+curl -s "$base/securecore-status.php" > "$dir/status-migrated"
+is "$(field status-migrated layer1)" 1 "status: layer 1 still on (enabled true → isolation auto)"
+printf '{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$dir/old-off.json"
+put_conf "$dir/old-off.json"
+in_root "chmod 644 $conf"
+in_root "/usr/local/bin/securecore-fpm --migrate-config $conf" > "$dir/migrate-off.log" 2>&1 || fail "securecore-fpm --migrate-config (enabled: false)" "$(cat "$dir/migrate-off.log")"
+is "$(in_php "php -n -r 'echo json_encode(json_decode(file_get_contents(\"$conf\"))->layer1);'")" '{"isolation":"off"}' "enabled false → isolation off"
+is "$(in_php "test -f $conf.before-isolation.1 && echo yes")" yes "a second migration keeps the first backup and adds $conf.before-isolation.1"
+in_root "rm -f $conf.before-isolation $conf.before-isolation.1"
+put_conf ext/examples/wordpress.json
+in_root "chmod 644 $conf"
+compose restart php > /dev/null 2>&1
+wait_200 /securecore-status.php || fail "php serves again with examples/wordpress.json"
 
 # --- 3-5. attribution, an enforce refusal, the vault --------------------------------------------
 t=$(now)

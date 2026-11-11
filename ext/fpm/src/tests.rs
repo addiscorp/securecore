@@ -35,14 +35,14 @@ fn the_wordpress_example_is_a_plan_the_launcher_can_enforce() {
 
 #[test]
 fn layer_one_disabled_is_no_plan() {
-    let (dir, loaded) = load_in("off",&layer1(r#"{"enabled":false,"write":["x"],"network":{"unixSockets":["/run/x.sock"],"bind":[{"port":9000}]}}"#));
+    let (dir, loaded) = load_in("off",&layer1(r#"{"isolation":"off","write":["x"],"network":{"unixSockets":["/run/x.sock"],"bind":[{"port":9000}]}}"#));
     assert_eq!(plan(&loaded), Ok(None), "disabled: nothing in layer1 is checked or applied");
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn unix_sockets_with_ports_are_refused_naming_57() {
-    let json = layer1(r#"{"enabled":true,"network":{"connect":[{"port":3306}],"unixSockets":["/run/mysqld/mysqld.sock"]}}"#);
+    let json = layer1(r#"{"isolation":"gelada","network":{"connect":[{"port":3306}],"unixSockets":["/run/mysqld/mysqld.sock"]}}"#);
     let (dir, loaded) = load_in("unix-ports", &json);
     let refusal = plan(&loaded).expect_err("refused");
     assert_eq!(refusal, Refusal::UnixSocketsWithPorts { socket: "/run/mysqld/mysqld.sock".into() });
@@ -50,7 +50,7 @@ fn unix_sockets_with_ports_are_refused_naming_57() {
     assert!(message.contains("addiscorp/securecore#57"), "{message}");
     assert!(message.contains("/run/mysqld/mysqld.sock") && message.contains("3306"), "{message}");
     // A bind port counts as a port rule too.
-    let json = layer1(r#"{"enabled":true,"network":{"bind":[{"port":9000}],"unixSockets":["db.sock"]}}"#);
+    let json = layer1(r#"{"isolation":"gelada","network":{"bind":[{"port":9000}],"unixSockets":["db.sock"]}}"#);
     let (dir2, loaded) = load_in("unix-bind", &json);
     let socket = loaded.root.join("db.sock").display().to_string();
     assert_eq!(plan(&loaded), Err(Refusal::UnixSocketsWithPorts { socket }), "the socket's path is resolved for the message");
@@ -60,11 +60,57 @@ fn unix_sockets_with_ports_are_refused_naming_57() {
 
 #[test]
 fn unix_sockets_alone_are_refused_too() {
-    let (dir, loaded) = load_in("unix-only",&layer1(r#"{"enabled":true,"network":{"unixSockets":["/run/mysqld/mysqld.sock"]}}"#));
+    let (dir, loaded) = load_in("unix-only",&layer1(r#"{"isolation":"gelada","network":{"unixSockets":["/run/mysqld/mysqld.sock"]}}"#));
     let refusal = plan(&loaded).expect_err("refused");
     assert_eq!(refusal, Refusal::UnixSocketsInPlace { socket: "/run/mysqld/mysqld.sock".into() });
     assert!(refusal.to_string().contains("restrict_self"), "{refusal}");
     let _ = fs::remove_dir_all(&dir);
+}
+
+fn isolation(json_isolation: &str) -> securecore_config::Layer1 {
+    let json = layer1(&format!(r#"{{"isolation":"{json_isolation}"}}"#));
+    securecore_config::Config::from_slice(json.as_bytes()).expect("valid").layer1
+}
+
+/// Each value against a host that can run the microVM and one that can't. The probe counts
+/// its calls: it is asked only when the answer matters.
+#[test]
+fn each_isolation_value_behaves_as_decided() {
+    let yes = || Ok(());
+    let no = || Err("/dev/kvm: No such file or directory (os error 2)".to_owned());
+    // off: no layer 1, the host never asked.
+    let off = isolation("off");
+    assert_eq!(choose(&off, || panic!("off asks nothing")), Ok(Choice::Off));
+    let disabled = securecore_config::Config::from_slice(layer1(r#"{"isolation":"off"}"#).as_bytes()).expect("valid").layer1;
+    assert_eq!(choose(&disabled, || panic!("disabled asks nothing")), Ok(Choice::Off));
+    // gelada: gelada either way, the host never asked.
+    assert_eq!(choose(&isolation("gelada"), || panic!("gelada asks nothing")), Ok(Choice::Gelada { fallback: None }));
+    // microvm: the microVM, or refused; never gelada.
+    assert_eq!(choose(&isolation("microvm"), yes), Ok(Choice::Microvm));
+    let refused = choose(&isolation("microvm"), no).expect_err("refused");
+    assert_eq!(refused, Refusal::NoMicrovm { why: "/dev/kvm: No such file or directory (os error 2)".into() });
+    assert!(refused.to_string().contains("never falls back"), "{refused}");
+    // microvm on a config the VM can't express (the probe's reason): refused, never gelada.
+    let inexpressible = || Err("layer1.deny /srv/site/private is inside the app root".to_owned());
+    assert!(matches!(choose(&isolation("microvm"), inexpressible), Err(Refusal::NoMicrovm { .. })));
+    // auto, once the gate opens: the microVM, or gelada with the reason. The only value that
+    // falls back, whether the host or the config is why.
+    let auto = isolation("auto");
+    assert_eq!(choose_with(&auto, true, yes), Ok(Choice::Microvm));
+    let fell = choose_with(&auto, true, no).expect("falls back");
+    assert_eq!(fell, Choice::Gelada { fallback: Some("/dev/kvm: No such file or directory (os error 2)".into()) });
+    assert_eq!(fell.to_string(), "gelada, because the microVM can't run here (/dev/kvm: No such file or directory (os error 2))");
+    assert_eq!(
+        choose_with(&auto, true, inexpressible),
+        Ok(Choice::Gelada { fallback: Some("layer1.deny /srv/site/private is inside the app root".into()) })
+    );
+    // auto today (#72 not landed): gelada even where the microVM could run, and it says why.
+    const { assert!(!AUTO_SELECTS_MICROVM, "auto must not pick the microVM before uploads sync back (#72)") };
+    // Gated auto asks the host nothing at all: a gelada start pays for no probe.
+    assert_eq!(choose(&auto, || panic!("gated auto must not probe")), Ok(Choice::Gelada { fallback: Some(AUTO_GATE.into()) }));
+    // No isolation key is auto.
+    let default = securecore_config::Config::from_slice(layer1(r#"{}"#).as_bytes()).expect("valid").layer1;
+    assert_eq!(choose_with(&default, true, yes), Ok(Choice::Microvm));
 }
 
 #[test]

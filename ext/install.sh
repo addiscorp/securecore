@@ -17,6 +17,11 @@
 #      securecore.so         into PHP's extension folder
 #      securecore-fpm        the layer-1 launcher, into /usr/local/bin (--bin-dir)
 #      securecore.schema.json  into /usr/local/share/securecore (--share-dir)
+#      vm/firecracker, vm/vmlinux  layer 1's microVM (#71) on x86_64, when the release carries
+#                            ext/mirab-vm.json: mirab's guest kernel and the Firecracker mirab
+#                            pins, each checked against mirab's sha256s, and vm/installed.json,
+#                            which records the mirab release they came from
+#                            (into <share-dir>/vm, where securecore-fpm looks)
 #      securecore-vault.php  the mu-plugin, into <wordpress>/wp-content/mu-plugins
 #      securecore.json       only if there is none: every layer off (an existing one is kept)
 #      securecore.ini        last: `extension=securecore.so` and `securecore.config=<file>`
@@ -24,7 +29,8 @@
 #
 # Idempotent: a file already installed with the same bytes is left alone ("unchanged"), so
 # running it again changes nothing. It never restarts a service, never runs sudo itself, and
-# never edits a securecore.json that exists.
+# never edits a securecore.json that exists, except to upgrade one an earlier release wrote
+# (securecore-fpm --migrate-config: the retired layer1.enabled), keeping the original beside it.
 set -eu
 
 BASE=https://securecore-releases.addis.gg
@@ -56,7 +62,8 @@ Options:
                       the config defaults to <dir>/securecore.json (default: the current
                       directory if it is a WordPress root, else /var/www/html if that is one)
   --config <file>     securecore.json (default: <wordpress>/securecore.json). Created with
-                      every layer off if it doesn't exist; never changed if it does
+                      every layer off if it doesn't exist; if it does, kept, and only
+                      upgraded from an earlier release's form (backup beside it)
   --php <program>     the PHP CLI of the same build as your php-fpm (default: php)
   --ini-dir <dir>     where securecore.ini goes (default: PHP's scan folder; on Debian/Ubuntu
                       packages, mods-available + phpenmod)
@@ -111,22 +118,30 @@ case $(uname -m) in
   *) die "There is no SecureCore build for $(uname -m); there are builds for x86_64 and arm64." ;;
 esac
 command -v "$PHP" >/dev/null 2>&1 || die "No PHP found ($PHP). Pass --php with the PHP CLI that matches your php-fpm."
+WORK=$(mktemp -d)
+trap 'find "$WORK" -mindepth 1 -delete; rmdir "$WORK"' EXIT
+# Every layer off: what PHP reads while the installer asks it about itself (below) and checks
+# the download. An installed SecureCore refuses to start on an invalid config, and the config
+# may be one an earlier release wrote, which is upgraded only further down.
+printf '{"layer1":{"isolation":"off"},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$WORK/off.json"
 php_eval() { "$PHP" -n -r "$1"; }
+# The PHP with its own ini (an installed SecureCore loads), but reading the every-layer-off config.
+php_ini() { "$PHP" -d "securecore.config=$WORK/off.json" -r "$1"; }
 PHP_VER=$(php_eval 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;')
 if [ "$(php_eval 'echo PHP_ZTS;')" = 1 ]; then TS=zts; TS_LABEL=ZTS; else TS=nts; TS_LABEL=NTS; fi
 PHP_LABEL="PHP $(php_eval 'echo PHP_VERSION;') $TS_LABEL $ARCH"
 # Not -n here: extension_dir and the scan folder are the build's, and php.ini may move the
 # extension folder.
-[ -n "$EXT_DIR" ] || EXT_DIR=$("$PHP" -r 'echo ini_get("extension_dir");')
+[ -n "$EXT_DIR" ] || EXT_DIR=$(php_ini 'echo ini_get("extension_dir");')
 case $EXT_DIR in /*) ;; *) die "PHP's extension_dir is '$EXT_DIR', not an absolute folder. Pass --extension-dir." ;; esac
 SO=securecore-php$PHP_VER-$TS-linux-$ARCH.so
 LAUNCHER=securecore-fpm-linux-$ARCH
-step "$OK" "PHP" "$PHP_LABEL ($("$PHP" -r 'echo PHP_BINARY;'))"
+step "$OK" "PHP" "$PHP_LABEL ($(php_ini 'echo PHP_BINARY;'))"
 
 # The ini goes where this PHP's SAPIs read it. Debian/Ubuntu packages keep one conf.d per SAPI
 # (cli, fpm, apache2) fed from mods-available by phpenmod; the official images and source
 # builds have one scan folder shared by the CLI and php-fpm.
-SCAN=$("$PHP" -r 'echo PHP_CONFIG_FILE_SCAN_DIR;')
+SCAN=$(php_ini 'echo PHP_CONFIG_FILE_SCAN_DIR;')
 ENMOD=
 if [ -z "$INI_DIR" ]; then
   mods=/etc/php/$PHP_VER/mods-available
@@ -158,8 +173,6 @@ for d in "$EXT_DIR" "$INI_DIR" "$BIN_DIR"; do
 done
 
 # --- the release -------------------------------------------------------------------------------
-WORK=$(mktemp -d)
-trap 'rm -f "$WORK"/*; rmdir "$WORK"' EXIT
 if [ -n "$VERSION" ]; then
   fetch "$BASE/$VERSION/release.json" "$WORK/release.json" || die "There is no SecureCore release $VERSION at $BASE."
 elif [ "$CHANNEL" = canary ]; then
@@ -191,8 +204,53 @@ get ext/securecore-vault.php securecore-vault.php
 get ext/securecore.schema.json securecore.schema.json
 step "$OK" "Download" "SecureCore $REL: 4 files, each matching its sha256 in release.json"
 
+# Layer 1's microVM (#71): mirab's guest kernel and the Firecracker mirab pins, as the release
+# resolved them from mirab's newest stable release (ext/mirab-vm.json, itself checked against
+# release.json). Each download is checked against the sha256s recorded there: the gzipped and
+# the unpacked kernel, the Firecracker tarball and the binary in it.
+VM=
+if [ -z "$(want ext/mirab-vm.json)" ]; then
+  step "$SKIP" "microVM" "this release carries none (mirab has no stable vm/ images yet), so layer 1's auto is gelada"
+elif [ "$ARCH" != x86_64 ]; then
+  step "$SKIP" "microVM" "mirab's Firecracker is for x86_64 only; layer 1's auto is gelada on $ARCH"
+else
+  get ext/mirab-vm.json mirab-vm.json
+  tr -d ' \t\r\n' < "$WORK/mirab-vm.json" > "$WORK/vm.flat"
+  # vm <block> <key>: a string from mirab-vm.json's linux-x86_64 <block> (kernel, firecracker),
+  # or from its top level when <block> is "-".
+  vm() {
+    if [ "$1" = - ]; then src=$(cat "$WORK/vm.flat"); else src=$(grep -o "\"$1\":{[^}]*}" "$WORK/vm.flat" | head -n 1); fi
+    printf '%s' "$src" | sed -n "s/.*\"$2\":\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
+  }
+  check() { [ "$(sha256 "$1")" = "$2" ] || die "$3 failed its sha256 check against mirab's (release.json → ext/mirab-vm.json), so nothing was installed. Run the installer again."; }
+  MIRAB=$(vm - mirab)
+  fetch "$(vm kernel url)" "$WORK/vmlinux.gz" || die "Couldn't download mirab's guest kernel ($(vm kernel url)). Run the installer again."
+  check "$WORK/vmlinux.gz" "$(vm kernel sha256)" "mirab $MIRAB's guest kernel"
+  gzip -dc "$WORK/vmlinux.gz" > "$WORK/vmlinux" || die "mirab $MIRAB's guest kernel didn't unpack."
+  check "$WORK/vmlinux" "$(vm kernel unpacked_sha256)" "mirab $MIRAB's unpacked guest kernel"
+  FC=$(vm firecracker version)
+  fetch "$(vm firecracker url)" "$WORK/fc.tgz" || die "Couldn't download Firecracker $FC ($(vm firecracker url)). Run the installer again."
+  check "$WORK/fc.tgz" "$(vm firecracker sha256)" "Firecracker $FC's tarball"
+  member=$(vm firecracker member)
+  mkdir -p "$WORK/fc"
+  jmember=$(vm jailer member)
+  tar -xzf "$WORK/fc.tgz" -C "$WORK/fc" "$member" "$jmember" || die "Firecracker $FC's tarball has no $member or $jmember."
+  mv "$WORK/fc/$member" "$WORK/firecracker"
+  mv "$WORK/fc/$jmember" "$WORK/jailer"
+  check "$WORK/firecracker" "$(vm firecracker member_sha256)" "Firecracker $FC"
+  # The jailer (Firecracker runs under it, never as root): mirab's pin lists none, so it comes
+  # from the tarball checked above and must match the sha256 the release recorded for it.
+  check "$WORK/jailer" "$(vm jailer jailer_sha256)" "Firecracker $FC's jailer"
+  rm -f "$WORK/vmlinux.gz" "$WORK/fc.tgz"
+  # No rootfs_sha256: no release ships a guest root image yet, so nothing verified is there to
+  # boot, and securecore-fpm won't start a microVM (auto is gelada, microvm refuses).
+  printf '{\n  "securecore": "%s",\n  "mirab": "%s",\n  "commit": "%s",\n  "manifest": "%s",\n  "kernel_sha256": "%s",\n  "firecracker": "%s",\n  "firecracker_sha256": "%s",\n  "jailer_sha256": "%s"\n}\n' \
+    "$REL" "$MIRAB" "$(vm - commit)" "$(vm - manifest)" "$(vm kernel unpacked_sha256)" "$FC" "$(vm firecracker member_sha256)" "$(vm jailer jailer_sha256)" > "$WORK/installed.json"
+  step "$OK" "microVM" "mirab $MIRAB's guest kernel, Firecracker $FC and its jailer, each matching its recorded sha256"
+  VM=1
+fi
+
 # The verified extension must load in this PHP before anything is installed.
-printf '{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$WORK/off.json"
 if ! out=$("$PHP" -n -d "extension=$WORK/securecore.so" -d "securecore.config=$WORK/off.json" \
     -r 'exit(extension_loaded("securecore") ? 0 : 1);' 2>&1); then
   die "The SecureCore build for $PHP_LABEL does not load in this PHP, so nothing was installed: $out"
@@ -215,6 +273,24 @@ put() {
 put securecore.so "$EXT_DIR/securecore.so" 644 "Extension"
 put securecore-fpm "$BIN_DIR/securecore-fpm" 755 "Launcher"
 put securecore.schema.json "$SHARE_DIR/securecore.schema.json" 644 "JSON Schema"
+if [ -n "$VM" ]; then
+  put firecracker "$SHARE_DIR/vm/firecracker" 755 "Firecracker"
+  put jailer "$SHARE_DIR/vm/jailer" 755 "Jailer"
+  put vmlinux "$SHARE_DIR/vm/vmlinux" 644 "Guest kernel"
+  # The unprivileged user Firecracker runs as (securecore-fpm --vm-user, default securecore-vm).
+  if id securecore-vm >/dev/null 2>&1; then
+    step "$SAME" "microVM user" "securecore-vm exists"
+  elif command -v useradd >/dev/null 2>&1 && useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group securecore-vm 2>/dev/null; then
+    step "$OK" "microVM user" "created securecore-vm (system user, no login)"
+  else
+    step "$NOTE" "microVM user" "couldn't create securecore-vm: create it, or pass securecore-fpm --vm-user <uid>:<gid>"
+  fi
+  # What is installed, and from which mirab release: nobody edits a version by hand.
+  put installed.json "$SHARE_DIR/vm/installed.json" 644 "microVM record"
+  if [ ! -f "$SHARE_DIR/vm/rootfs.ext4" ]; then
+    step "$NOTE" "microVM" "no guest root image ($SHARE_DIR/vm/rootfs.ext4) yet: until there is one, layer 1's auto is gelada"
+  fi
+fi
 if [ -n "$WP" ]; then
   mu=$WP/wp-content/mu-plugins
   put securecore-vault.php "$mu/securecore-vault.php" 644 "mu-plugin"
@@ -229,14 +305,23 @@ fi
 # The config: never overwrite one. A new one has every layer off, so loading the extension
 # changes nothing until a person turns layers on. Readable by the php-fpm workers, which reload it.
 if [ -f "$CONFIG" ]; then
-  step "$SAME" "Config" "kept $CONFIG"
+  # A file an earlier release wrote (layer1.enabled, now retired) is refused at startup, so the
+  # launcher just installed upgrades it, keeping the original beside it.
+  if out=$("$BIN_DIR/securecore-fpm" --migrate-config "$CONFIG" 2>&1); then
+    case $out in
+      unchanged*) step "$SAME" "Config" "kept $CONFIG" ;;
+      *) step "$OK" "Config" "$out" ;;
+    esac
+  else
+    step "$NOTE" "Config" "kept $CONFIG; $out"
+  fi
   NEW_CONFIG=
 else
   mkdir -p "$(dirname "$CONFIG")"
   cat > "$CONFIG.securecore-new" <<EOF
 {
   "\$schema": "file://$SHARE_DIR/securecore.schema.json",
-  "layer1": { "enabled": false },
+  "layer1": { "isolation": "off" },
   "layer2": { "enabled": false },
   "layer3": { "enabled": false }
 }
@@ -266,12 +351,14 @@ if [ -n "$ENMOD" ]; then
 fi
 
 # What PHP sees now, with the site's ini.
-if out=$("$PHP" -r 'echo extension_loaded("securecore") ? "loaded" : "not loaded";' 2>&1) && [ "$out" = loaded ]; then
+# Its answer on stdout; stderr carries the extension's startup notes (the vault's count) and,
+# on a refusal, the reason.
+if out=$("$PHP" -r 'echo extension_loaded("securecore") ? "loaded" : "not loaded";' 2>"$WORK/loaded.err") && [ "$out" = loaded ]; then
   step "$OK" "Loaded" "php -m lists securecore, config $CONFIG"
 elif [ -n "$NEW_CONFIG" ]; then
-  die "PHP doesn't load SecureCore after the install: $out"
+  die "PHP doesn't load SecureCore after the install: $out $(cat "$WORK/loaded.err")"
 else
-  step "$NOTE" "Loaded" "this PHP refuses $CONFIG here: $out"
+  step "$NOTE" "Loaded" "this PHP refuses $CONFIG here: $out $(cat "$WORK/loaded.err")"
   say "  php-fpm refuses it the same way unless its environment differs (vault env variables). Fix the file before restarting php-fpm."
 fi
 

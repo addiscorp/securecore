@@ -35,6 +35,42 @@
         "wordpress"
       ]
     },
+    "Connect": {
+      "description": "A port php-fpm may connect to, and, for a microVM, where the guest's connections to\n`127.0.0.1:<port>` arrive on the host. gelada ignores `socket` and `address`.",
+      "type": "object",
+      "properties": {
+        "address": {
+          "description": "microVM: a TCP `host:port` the launcher connects the guest's connections to, for a\nservice with no unix socket on this host. Not both `socket` and `address`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "socket": {
+          "description": "microVM: a unix socket on the host (e.g. MySQL's `/run/mysqld/mysqld.sock`). Firecracker\nconnects the guest to it directly, with no process in between (addiscorp/securecore#70).\nInside the guest the same path, when it is under `/run`, reaches it too.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "not": {
+        "required": [
+          "socket",
+          "address"
+        ]
+      },
+      "required": [
+        "port"
+      ]
+    },
     "Core": {
       "type": "object",
       "properties": {
@@ -88,8 +124,33 @@
       },
       "additionalProperties": false
     },
+    "Isolation": {
+      "description": "How layer 1 isolates php-fpm (`layer1.isolation`).",
+      "oneOf": [
+        {
+          "description": "Layer 1 off: php-fpm runs as it is.",
+          "type": "string",
+          "const": "off"
+        },
+        {
+          "description": "gelada (Landlock + seccomp) on the host kernel.",
+          "type": "string",
+          "const": "gelada"
+        },
+        {
+          "description": "A Firecracker microVM, or nothing: refused where the host can't run one.",
+          "type": "string",
+          "const": "microvm"
+        },
+        {
+          "description": "A microVM where the host can run one, gelada otherwise.",
+          "type": "string",
+          "const": "auto"
+        }
+      ]
+    },
     "Layer1": {
-      "description": "Layer 1, the outer layer: the `securecore-fpm` launcher starts php-fpm inside gelada\n(Landlock + seccomp). Knows only paths and ports, so it works for any PHP app. Read once by\nthe launcher: a change needs a php-fpm restart.",
+      "description": "Layer 1, the outer layer: the `securecore-fpm` launcher starts php-fpm inside a Firecracker\nmicroVM or inside gelada (Landlock + seccomp), as `isolation` says. Knows only paths and\nports, so it works for any PHP app. Read once by the launcher: a change needs a php-fpm\nrestart.",
       "type": "object",
       "properties": {
         "deny": {
@@ -100,8 +161,10 @@
             "type": "string"
           }
         },
-        "enabled": {
-          "type": "boolean"
+        "isolation": {
+          "description": "Layer 1's switch, and what php-fpm runs inside (addiscorp/securecore#71). `off` turns\nlayer 1 off. `auto`, the default, is gelada while the microVM is gated (until #72), then\na microVM where one can run and gelada otherwise; it is the only value that falls back.\n`gelada` is gelada. `microvm` refuses to start without one.",
+          "$ref": "#/$defs/Isolation",
+          "default": "auto"
         },
         "network": {
           "$ref": "#/$defs/Network",
@@ -112,7 +175,7 @@
           }
         },
         "write": {
-          "description": "Folders php-fpm may write (relative to the folder containing securecore.json, or\nabsolute). Everything else is read-only.",
+          "description": "Folders php-fpm may write (relative to the folder containing securecore.json, or\nabsolute). Everything else is read-only. In a microVM, each one inside the app root is a\nwritable disk that persists, and each one outside it is a tmpfs in the guest.",
           "type": "array",
           "default": [],
           "items": {
@@ -120,10 +183,7 @@
           }
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "enabled"
-      ]
+      "additionalProperties": false
     },
     "Layer2": {
       "description": "Layer 2, the extension: engine-level policy inside php-fpm, per component (plugin or\ntheme). Reloaded when the file changes.",
@@ -280,11 +340,11 @@
           }
         },
         "connect": {
-          "description": "TCP ports php-fpm may connect to (by port: the kernel can't see hostnames).",
+          "description": "TCP ports php-fpm may connect to (by port: the kernel can't see hostnames). Under gelada\nthat is any host on that port. In a microVM the guest has no network device, so a port is\nreachable only where `socket` or `address` says it goes.",
           "type": "array",
           "default": [],
           "items": {
-            "$ref": "#/$defs/Port"
+            "$ref": "#/$defs/Connect"
           }
         },
         "unixSockets": {

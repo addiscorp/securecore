@@ -145,7 +145,9 @@ cargo run -p securecore-config --bin securecore-schema > securecore.schema.json
 ```
 
 Examples: [`examples/wordpress.json`](examples/wordpress.json) (every field, the #53 example) and
-[`examples/off.json`](examples/off.json) (the minimum: three `{"enabled": false}`).
+[`examples/off.json`](examples/off.json) (the minimum: `layer1` `{"isolation": "off"}`, and
+`layer2` and `layer3` `{"enabled": false}`; layer 1's switch is `isolation`, the others' is
+`enabled`).
 
 Beyond the schema's structure, one rule is checked in code and expressed in the schema as an
 `if`/`then`: `layer2.app` is required when layer 2 is enabled. `layer2.mode` defaults to
@@ -773,7 +775,13 @@ run inside it. It logs one line to stderr first:
 securecore-fpm: layer 1 on from /var/www/html/securecore.json (sha256 2ad59919…): write /var/www/html/wp-content/uploads /var/www/html/wp-content/cache /tmp; deny /srv/backups; tcp bind 9000; tcp connect 53 3306 443; starting php-fpm
 ```
 
-With `layer1.enabled: false` it execs php-fpm as it is and says so (`layer 1 is off in …`).
+With `layer1.isolation: "off"` it execs php-fpm as it is and says so (`layer 1 is off in …`).
+`isolation` is layer 1's only switch: `layer1.enabled` is retired, and a file that still sets it
+is refused (`layer1.enabled is retired: layer1.isolation is layer 1's only switch …`).
+The installer upgrades such a file when it keeps it (`securecore-fpm --migrate-config <file>`):
+`"enabled": false` becomes `"isolation": "off"`, `"enabled": true` is removed (leaving
+`isolation` as it is, `auto` when absent), and the original is kept beside it as
+`<file>.before-isolation` (`.1`, `.2`, … if that exists), with the same owner and mode.
 A change to `layer1` applies at the next php-fpm (launcher) restart; the extension flags it as
 `restart_needed`.
 
@@ -795,6 +803,124 @@ php-fpm must listen on TCP (`listen = 9000`): with port rules no unix socket can
 
 Linux only: on macOS gelada can sandbox a program only as it starts, so `restrict_self` fails
 and the launcher exits 125.
+
+### `layer1.isolation`: gelada or a microVM (#71)
+
+`layer1.isolation` picks what php-fpm runs inside. The launcher logs the choice first
+(`securecore-fpm: layer 1 isolation auto: …`).
+
+| value | what runs |
+|---|---|
+| `auto` (the default) | gelada, with the reason. **`auto` does not pick the microVM until the guest's writable folders sync back to the host (#72)**: `AUTO_SELECTS_MICROVM` in `fpm/src/lib.rs` is that gate, and a test pins it off. Once it opens, `auto` is the microVM where it can run and gelada otherwise (`layer 1 isolation auto: gelada, because the microVM can't run here (…)`), whether the host or the config is why. The only value that falls back |
+| `microvm` | the microVM, or nothing: without one the launcher exits 125 (`layer1.isolation is "microvm" but this host can't run the microVM (…). "microvm" never falls back`) |
+| `gelada` | gelada on the host kernel, as above, even where KVM exists |
+| `off` | layer 1 off: php-fpm runs as it is. The only way to turn layer 1 off (`layer1.enabled` is retired) |
+
+**The microVM can run** when all of these hold (otherwise `auto` logs why and `microvm` exits
+125 with it):
+- the launcher is root (the jailer needs it) and the jailed user (`--vm-user`, a name or
+  `<uid>:<gid>`, default `securecore-vm`, which the installer creates) exists and isn't root;
+- `/dev/kvm` opens read-write and answers `KVM_GET_API_VERSION` with 12;
+- `<vm-dir>/firecracker`, `jailer`, `vmlinux` and `rootfs.ext4` (`--vm-dir`, default
+  `/usr/local/share/securecore/vm`) each match the sha256 in `<vm-dir>/installed.json`, the
+  installer's record. Nothing unrecorded boots. The installer records the kernel, Firecracker and
+  the jailer; no release ships a guest root image yet (it is built from `docker/ext.Dockerfile`'s
+  `guest` target by `scripts/guest-image.sh`), so on an installed host the microVM can't run;
+- the config is one the microVM can enforce (below), and every `connect[].socket` is a socket the
+  jailed user may open itself (checked by running a probe as that user);
+- with layer 3 on, the kernel has Landlock and seccomp filters (its symbols are checked; mirab's
+  kernel has neither until mirab#89, and its isolated children would fail closed);
+- cgroup v2, and `mke2fs`, `e2fsck` and `resize2fs` on `PATH`.
+
+**Firecracker never runs as root.** Its jailer (from the same Firecracker tarball) starts it as
+the jailed user with no supplementary groups, chrooted into `<state>/jail/firecracker/<id>/root`,
+which holds only this VM's kernel, disks, snapshot and sockets, in new mount, network, IPC and UTS
+namespaces, and in the cgroup `securecore/<id>` with `cpu.max` (the vCPUs) and `memory.max` (the
+guest's memory plus 256 MiB). A `connect[].socket`'s folder is bind-mounted read-only into the
+jail, so a guest's database connection reaches MariaDB with the jailed user's credentials
+(`SO_PEERCRED`): `unix_socket` authentication never makes it root. Every start empties the jail
+first, so no link from an earlier config survives. One launcher per state folder (a lock). A
+watchdog process takes the VM down when the launcher goes, however it goes (a crash, SIGKILL):
+it waits on a pipe only the launcher holds, then kills the VM's cgroup (`cgroup.kill`),
+unmounts the jail and removes the cgroup. When Firecracker exits on its own, the launcher
+clears the jail and exits non-zero. Firecracker's console goes to `<state>/console.log`, capped
+at 8 MiB (then `console.log.1`); guest log lines are cut at 8 KiB, at most 4 log connections and
+64 connections per `address` forward are served at once.
+
+**The site's files are copied as the site's pool user, never as root** (`--pool-user`, a name
+or `<uid>:<gid>`, default the app root's owner; a root-owned root needs the flag). `mke2fs -d`
+runs as that user in a private mount namespace where every writable folder is covered by an
+empty tmpfs, so the site disk holds the code and not the uploads (the writable folders are only
+mount points in it), and a file only root may read fails the build instead of reaching the
+guest. A writable folder must be a real folder in the root: `..` and a symlink anywhere along
+its path are refused. `e2fsck`/`resize2fs` on a guest-written disk run as the jailed user. The
+guest's php-fpm pool runs as the pool user's uid and gid (`sc.user`, so uploads keep the host's
+ownership), and a unix `--listen` socket's group defaults to the pool user's group.
+
+**In the microVM** the launcher stays in the foreground (like `php-fpm -F`) and is the guest's
+only way in or out. SIGTERM, SIGINT and SIGQUIT sync the guest's disks, stop the VM and exit 0;
+SIGUSR2 and SIGHUP reload the guest's php-fpm gracefully; SIGUSR1 is acknowledged (everything
+logs to stderr, so there is nothing to reopen). With `NOTIFY_SOCKET` set (systemd
+`Type=notify`) it sends `READY=1` once it serves. A unix `--listen` socket gets
+`--listen-owner`, `--listen-group` and `--listen-mode` (0660 by default, as php-fpm's
+`listen.mode`), set as it is made and never through a link. Every line from the guest is logged
+as `guest: …`, so the guest can't write the launcher's lines. The guest has no network device,
+only vsock, and `layer1` maps onto it as follows:
+
+| `layer1` | in the microVM |
+|---|---|
+| `network.bind` | the first port is where the launcher takes FastCGI, on `127.0.0.1` (`--listen unix:<path>` or `<host>:<port>` for another), and passes it to php-fpm over vsock |
+| `network.connect` with `socket` | the guest's `127.0.0.1:<port>` reaches that unix socket on the host, with nothing in between (Firecracker connects it, as the jailed user; mysqlnd's connect goes onto vsock in place, #70). Only a socket the jailed user can reach and open itself counts (its real path; every folder above it too). With the socket under `/run`, the same path works in the guest too (WordPress's `DB_HOST=localhost`) |
+| `network.connect` with `address` | the launcher connects the guest's `127.0.0.1:<port>` to that TCP `host:port` |
+| `network.connect` port 1514 | refused: it is the guest's log channel |
+| `network.connect`, neither | unreachable from the guest (logged). Outbound HTTPS and DNS are #72 |
+| `network.unixSockets` | refused: give the port the socket instead |
+| `write`, inside the app root | its own read-write disk, `--write-disk-mib` (1024) MiB, made once from the folder's contents and kept across starts; a larger value grows it in place, and the guest logs past 90 % and 98 % full, before writes fail with ENOSPC (the host's copy isn't updated: #72). A new site's disks are refused while a state folder beside it holds the disks of a root that no longer exists (a moved site: `--state-dir <that folder>` adopts them) |
+| `write`, outside it | a tmpfs in the guest (`/tmp` always is one) |
+| `deny`, outside the app root | nothing to do: the guest never has it |
+| `deny`, inside it | refused: the site disk is the whole root |
+
+The site is a read-only disk built from the app root with `mke2fs -d`, mounted at the same path
+(or `--guest-root`, the root nginx sends in `SCRIPT_FILENAME`). The guest's root is read-only
+too, so core, plugins and themes can't be written. Its PID 1 is `securecore-fpm` again, as
+`/sbin/securecore-init`: it mounts the disks, forwards vsock and starts php-fpm, whose log comes
+back to the launcher's stderr. Layers 2 and 3 run in the guest's php-fpm unchanged; layer 3's
+isolated children need Landlock and seccomp in the guest kernel (mirab#89 adds them to mirab's).
+
+**Snapshots.** A start restores a snapshot of a warmed-up VM when there is one for this key: the
+sha256s of Firecracker, the kernel, the root image, the site tree (every path, mode, owner, size
+and mtime, writable folders excepted) and `securecore.json`, plus the memory, vCPUs, boot
+arguments and disks. Without one, the launcher cold-boots a VM that has no way to the database,
+warms it by reading the site's PHP files into the guest's page cache (the guest image's
+`warm.php`; nothing is compiled or run, so the production database sees nothing, and opcache
+holds nothing compiled out of context: `opcache_compile_file` over a WordPress tree declares
+functions as it goes and caches classes whose traits aren't bound, which broke Contact Form 7),
+snapshots it, and restores that, so the next
+start is fast; old snapshots and site disks are removed. A restore that fails is removed and the
+launcher cold-boots instead. After every boot or restore the launcher sends the guest one start
+message, which the guest takes from the host's CID only and only once per boot: the clock (a
+restored guest has the snapshot's), 64 fresh random bytes (credited to the guest kernel's pool,
+and its CRNG reseeded, so restores of one snapshot don't share a random stream), after a restore
+a graceful replacement of php-fpm's workers (forked before the snapshot; the master forks fresh
+ones and opcache stays warm), and only then the writable disks, so no snapshot ever holds a
+stale view of them. The guest kernel has no `CONFIG_VMGENID` (mirab's config), so the entropy in
+the start message is the only reseed; the residual risk is a generator inside a long-lived
+process that isn't a worker (the master, layer 3's helper), which seeds from the kernel before
+the snapshot. `--no-snapshot`
+cold-boots every time. Each site's disks, snapshot and sockets live in `--state-dir` (default
+`/var/lib/securecore/vm/<sha256 of the app root>`). `--mem` (512) and `--vcpus` (2) size the
+guest.
+
+**Where the VM's files come from.** Nothing is pinned here. The release resolves mirab's newest
+stable release at build time (`scripts/mirab-vm.sh`): its `vm/manifest.json` (the kernel, with
+both sha256s) and the Firecracker mirab pins at that release's commit (mirab's
+`scripts/firecracker.json`; mirab's releases carry no Firecracker). It records them as
+`ext/mirab-vm.json` in the release, and `install-ext.sh` downloads both, checks each against
+those sha256s (the kernel gzipped and unpacked, the Firecracker tarball and its binary) and
+writes `<share-dir>/vm/installed.json`, naming the mirab release. While mirab's stable has no
+`vm/` (before mirab#89) a release carries no `mirab-vm.json` and `auto` is gelada. For
+development, `scripts/mirab-vm.sh <out> <manifest-url>` (the release workflow's `mirab_manifest`
+input) takes a canary's manifest instead.
 
 ### What php-fpm needs, and the example
 
@@ -975,7 +1101,24 @@ WordPress boot in a new zygote, on the request that brings it.
   the DB on 3306 and 443 work, ports 25 and 80, a bind of 8081, UDP and a unix socket are
   refused (and the listeners outside the sandbox receive nothing), writes outside the folders
   are refused from core and from a child program, the denied path is unreadable; unixSockets +
-  ports and an invalid file exit 125 at launch with php-fpm never starting.
+  ports and an invalid file exit 125 at launch with php-fpm never starting. In the container
+  there is no `/dev/kvm`, so this is also `auto` falling back to gelada.
+- `test/ext-microvm.sh` (a Linux host with KVM, as root; #71; also CI's `microvm` job, which
+  fails without KVM): the `layer1.isolation` values (off and gelada; auto gelada behind the #72
+  gate; auto falling back and microvm refusing on a config the VM can't express, on an
+  unverified root image and on a kernel without Landlock; in the php container without
+  `/dev/kvm`, auto falls back and microvm exits 125 without php-fpm running), then the same
+  WordPress served from a jailed Firecracker guest: Firecracker as 64000:64000 with no
+  supplementary groups, chrooted, in its own network namespace and cgroup; a host socket seeing
+  the guest's connections as that uid (`SO_PEERCRED`); the guest's kernel, loopback only, a
+  read-only site with writable uploads, layer 2 enforcing and layer 3's child running in the
+  guest, the database through MariaDB's socket; the warm-up sending MariaDB nothing; fpm.sock
+  0660; `READY=1` to `NOTIFY_SOCKET`; USR1/USR2 not stopping it; a second start message and a
+  second launcher refused; the first start making a snapshot and the next restoring it with the
+  clock resynced, fresh randomness and the uploads kept; a stale jail link gone; a site change
+  making a new snapshot, a larger `--write-disk-mib` growing the uploads disk, a broken snapshot
+  falling back to a cold boot, `--no-snapshot`, an orphaned uploads disk refused. `bench [n]` is
+  #70's latency comparison and `restore [n]` times the requests after a restore.
 - All the `test/ext-*.sh` scripts take `SECURECORE_EXT_PROJECT` and `SECURECORE_EXT_PORT` to run
   as another compose project on another port.
 - `DOCKER_CONTEXT=colima test/ext-config.sh`: WordPress on the docker stack with the extension

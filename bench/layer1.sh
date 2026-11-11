@@ -25,10 +25,11 @@ compose() {
     -f docker/compose.ext-layer1.yml -p "$project" "$@"
 }
 oha() { docker run --rm --network "${project}_default" "$OHA" --no-tui --output-format json -H "Host: 127.0.0.1:$port" "$@" http://web/; }
-# layer1 enabled (true|false), layers 2 and 3 off.
+# layer1 on (true: gelada) or off (false), layers 2 and 3 off.
 cfg() {
-  awk -v l1="$1" '/"layer1": \{/ { s = 1 } /"layer2": \{/ { s = 2 } /"layer3": \{/ { s = 3 }
-    s && /"enabled": true/ { if (s == 1) sub(/true/, l1); else sub(/true/, "false"); s = 0 } { print }' \
+  awk -v l1="$1" '{ sub(/"isolation": "auto"/, "\"isolation\": \"" (l1 == "true" ? "gelada" : "off") "\"") }
+    /"layer2": \{/ { s = 2 } /"layer3": \{/ { s = 3 }
+    s && /"enabled": true/ { sub(/true/, "false"); s = 0 } { print }' \
     ext/examples/wordpress.json > "$out/layer1-$2.json"
 }
 cfg false stock

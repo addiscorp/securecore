@@ -8,6 +8,8 @@
 #   docker build -f docker/ext.Dockerfile --target dist -o <dir> .    securecore.so + securecore-fpm
 #   docker build -f docker/ext.Dockerfile --target php .              WordPress php-fpm + the extension
 #   docker build -f docker/ext.Dockerfile --target php-layer1 .       the same, started by securecore-fpm
+#   docker build -f docker/ext.Dockerfile --target guest .            the microVM guest's root (#71;
+#                                                                      scripts/guest-image.sh makes the disk)
 #
 # The release matrix (E8) builds `dist` once per cell of scripts/ext-cells.txt, with
 # --build-arg PHP_IMAGE=<that cell's image> (scripts/ext-build.sh). The NTS cells build in the
@@ -92,3 +94,26 @@ FROM php AS php-layer1
 COPY --from=build /out/securecore-fpm /usr/local/bin/securecore-fpm
 ENTRYPOINT ["docker-ensure-installed.sh"]
 CMD ["securecore-fpm", "--config", "/var/www/html/securecore.json"]
+
+# libsc-vsock-connect.so (#70): preloaded into the guest's php-fpm, it turns a connect to
+# 127.0.0.1:<forwarded port> into a vsock connect to the host, so mysqlnd's own socket reaches
+# MySQL with no process in between.
+FROM toolchain AS preload
+COPY ext/fpm/guest/vsock-connect.c /src/vsock-connect.c
+RUN mkdir -p /out && clang -O2 -Wall -Werror -shared -fPIC -o /out/libsc-vsock-connect.so /src/vsock-connect.c -ldl
+
+# Layer 1 as a microVM (#71): the guest's root filesystem. The same php-fpm and extension as the
+# `php` target, with securecore-fpm as PID 1 (/sbin/securecore-init), the preload and the pool
+# overrides. scripts/guest-image.sh exports it to the read-only rootfs.ext4 the host boots; the
+# site and its writable folders come in on their own disks, never from here. The image carries
+# no site secrets (delivering them per site is #72).
+FROM php AS guest
+COPY --from=build /out/securecore-fpm /usr/local/bin/securecore-fpm
+COPY --from=preload /out/libsc-vsock-connect.so /usr/local/lib/libsc-vsock-connect.so
+COPY ext/fpm/guest/zz-microvm.conf /usr/local/etc/php-fpm.d/zz-microvm.conf
+COPY ext/fpm/guest/warm.php /usr/local/lib/securecore/warm.php
+# The same ini files without the extension, for the extension-off latency runs (sc.ext=0).
+RUN ln -sf /usr/local/bin/securecore-fpm /sbin/securecore-init \
+ && mkdir -p /usr/local/etc/php/conf.d-noext /etc/securecore \
+ && cp /usr/local/etc/php/conf.d/*.ini /usr/local/etc/php/conf.d-noext/ \
+ && rm /usr/local/etc/php/conf.d-noext/securecore.ini

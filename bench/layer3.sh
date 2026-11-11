@@ -44,7 +44,7 @@ trap cleanup EXIT
 cfg() { # $1 name, $2 isolate list
   cat > "$out/layer3-$1.json" <<JSON
 {
-  "layer1": { "enabled": false },
+  "layer1": { "isolation": "off" },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "enforce",
     "vault": { "from": { "wpConfig": "wp-config.php" }, "secrets": [{ "name": "DB_PASSWORD", "env": "WORDPRESS_DB_PASSWORD" }] },

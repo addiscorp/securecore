@@ -10,7 +10,7 @@ ARG BASE=sc-mvm-php
 FROM rust:1.99-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
 COPY bench/microvm/Cargo.toml bench/microvm/Cargo.lock /src/
 COPY bench/microvm/src /src/src
-COPY bench/microvm/vsock-connect.c /src/
+COPY ext/fpm/guest/vsock-connect.c /src/
 RUN cd /src && cargo build --locked --release \
  && cc -O2 -Wall -Werror -shared -fPIC -o /src/libsc-vsock-connect.so /src/vsock-connect.c -ldl
 

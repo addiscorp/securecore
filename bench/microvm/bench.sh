@@ -207,7 +207,7 @@ memory() {
 
 # host php-fpm as bench/layer1.sh's "stock" side: the extension unloaded, layer 1 off.
 host_stock() {
-  awk '/"layer1": \{/ { s = 1 } /"layer2": \{/ { s = 2 } /"layer3": \{/ { s = 3 }
+  awk '{ sub(/"isolation": "auto"/, "\"isolation\": \"off\"") } /"layer2": \{/ { s = 2 } /"layer3": \{/ { s = 3 }
     s && /"enabled": true/ { sub(/true/, "false"); s = 0 } { print }' ext/examples/wordpress.json > "$res/stock.json"
   compose exec -T php sh -c "[ -f $ini.off ] || mv $ini $ini.off"
   compose cp "$res/stock.json" "php:$conf" >/dev/null 2>&1

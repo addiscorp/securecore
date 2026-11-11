@@ -6,7 +6,9 @@
 #                                            <ext-dir> is given: every file in it (the cells'
 #                                            securecore-php<v>-<ts>-linux-<arch>.so and the
 #                                            securecore-fpm-linux-<arch> launchers, from
-#                                            scripts/ext-build.sh), plus the mu-plugin
+#                                            scripts/ext-build.sh; mirab-vm.json, what layer 1's
+#                                            microVM takes from mirab, from scripts/mirab-vm.sh,
+#                                            when the release resolved one), plus the mu-plugin
 #                                            (securecore-vault.php) and the JSON Schema
 #                                            (securecore.schema.json) from ext/
 #   <out>/<version>/release.json            version, tag, commit, channel, zip + sha256, and
@@ -35,8 +37,8 @@ if [ -n "$ext" ]; then
   mkdir -p "$out/$version/ext"
   for f in "$ext"/*; do
     case ${f##*/} in
-      securecore-php[0-9]*.[0-9]*-[nz]ts-linux-*.so|securecore-fpm-linux-*) cp "$f" "$out/$version/ext/" ;;
-      *) echo "$0: $f is not a release file (securecore-php<v>-<ts>-linux-<arch>.so or securecore-fpm-linux-<arch>)" >&2; exit 1 ;;
+      securecore-php[0-9]*.[0-9]*-[nz]ts-linux-*.so|securecore-fpm-linux-*|mirab-vm.json) cp "$f" "$out/$version/ext/" ;;
+      *) echo "$0: $f is not a release file (securecore-php<v>-<ts>-linux-<arch>.so, securecore-fpm-linux-<arch> or mirab-vm.json)" >&2; exit 1 ;;
     esac
   done
   cp "$root/ext/mu-plugin/securecore-vault.php" "$root/ext/securecore.schema.json" "$out/$version/ext/"

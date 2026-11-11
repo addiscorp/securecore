@@ -10,6 +10,7 @@
 
 pub mod dbhost;
 pub mod grant;
+pub mod migrate;
 pub mod salt;
 pub mod source;
 
@@ -42,15 +43,27 @@ pub struct Config {
     pub layer3: Layer3,
 }
 
-/// Layer 1, the outer layer: the `securecore-fpm` launcher starts php-fpm inside gelada
-/// (Landlock + seccomp). Knows only paths and ports, so it works for any PHP app. Read once by
-/// the launcher: a change needs a php-fpm restart.
+/// Layer 1, the outer layer: the `securecore-fpm` launcher starts php-fpm inside a Firecracker
+/// microVM or inside gelada (Landlock + seccomp), as `isolation` says. Knows only paths and
+/// ports, so it works for any PHP app. Read once by the launcher: a change needs a php-fpm
+/// restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Layer1 {
-    pub enabled: bool,
+    /// Retired (Sami, 10 Nov): `isolation` is layer 1's only switch. Read only to refuse a file
+    /// that still sets it, with the reason; not in the schema, so editors flag it too.
+    #[serde(default, rename = "enabled", skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub retired_enabled: Option<serde_json::Value>,
+    /// Layer 1's switch, and what php-fpm runs inside (addiscorp/securecore#71). `off` turns
+    /// layer 1 off. `auto`, the default, is gelada while the microVM is gated (until #72), then
+    /// a microVM where one can run and gelada otherwise; it is the only value that falls back.
+    /// `gelada` is gelada. `microvm` refuses to start without one.
+    #[serde(default)]
+    pub isolation: Isolation,
     /// Folders php-fpm may write (relative to the folder containing securecore.json, or
-    /// absolute). Everything else is read-only.
+    /// absolute). Everything else is read-only. In a microVM, each one inside the app root is a
+    /// writable disk that persists, and each one outside it is a tmpfs in the guest.
     #[serde(default)]
     pub write: Vec<String>,
     /// Paths php-fpm may not read at all, on top of the common secrets gelada always denies
@@ -62,6 +75,44 @@ pub struct Layer1 {
     pub network: Network,
 }
 
+impl Layer1 {
+    /// `layer1.isolation`, `auto` when the file doesn't say.
+    pub fn isolation(&self) -> Isolation {
+        self.isolation
+    }
+
+    /// Layer 1 is on: any `isolation` but `off`.
+    pub fn enabled(&self) -> bool {
+        self.isolation != Isolation::Off
+    }
+}
+
+/// How layer 1 isolates php-fpm (`layer1.isolation`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Isolation {
+    /// Layer 1 off: php-fpm runs as it is.
+    Off,
+    /// gelada (Landlock + seccomp) on the host kernel.
+    Gelada,
+    /// A Firecracker microVM, or nothing: refused where the host can't run one.
+    Microvm,
+    /// A microVM where the host can run one, gelada otherwise.
+    #[default]
+    Auto,
+}
+
+impl Isolation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Isolation::Off => "off",
+            Isolation::Gelada => "gelada",
+            Isolation::Microvm => "microvm",
+            Isolation::Auto => "auto",
+        }
+    }
+}
+
 /// The sockets php-fpm may use. Anything not listed is refused by the kernel.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -69,9 +120,11 @@ pub struct Network {
     /// TCP ports php-fpm may listen on.
     #[serde(default)]
     pub bind: Vec<Port>,
-    /// TCP ports php-fpm may connect to (by port: the kernel can't see hostnames).
+    /// TCP ports php-fpm may connect to (by port: the kernel can't see hostnames). Under gelada
+    /// that is any host on that port. In a microVM the guest has no network device, so a port is
+    /// reachable only where `socket` or `address` says it goes.
     #[serde(default)]
-    pub connect: Vec<Port>,
+    pub connect: Vec<Connect>,
     /// Unix sockets php-fpm may connect to. Not enforceable by securecore-fpm yet: on Linux
     /// gelada can't combine them with TCP ports, nor allow them in place
     /// (addiscorp/securecore#57), so a layer 1 that lists any is refused at launch.
@@ -83,6 +136,24 @@ pub struct Network {
 #[serde(deny_unknown_fields)]
 pub struct Port {
     pub port: NonZeroU16,
+}
+
+/// A port php-fpm may connect to, and, for a microVM, where the guest's connections to
+/// `127.0.0.1:<port>` arrive on the host. gelada ignores `socket` and `address`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("not" = { "required": ["socket", "address"] }))]
+pub struct Connect {
+    pub port: NonZeroU16,
+    /// microVM: a unix socket on the host (e.g. MySQL's `/run/mysqld/mysqld.sock`). Firecracker
+    /// connects the guest to it directly, with no process in between (addiscorp/securecore#70).
+    /// Inside the guest the same path, when it is under `/run`, reaches it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+    /// microVM: a TCP `host:port` the launcher connects the guest's connections to, for a
+    /// service with no unix socket on this host. Not both `socket` and `address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 /// Layer 2, the extension: engine-level policy inside php-fpm, per component (plugin or
@@ -416,6 +487,22 @@ impl Config {
     /// The rules serde can't express. Each one is also in the schema (see [`Layer2`]'s
     /// `if`/`then`), so an editor flags the same files.
     fn validate(&self) -> Result<(), Problem> {
+        if self.layer1.retired_enabled.is_some() {
+            return Err(Problem::Invalid(
+                "layer1.enabled is retired: layer1.isolation is layer 1's only switch. Remove \"enabled\" and set \
+                 \"isolation\": \"off\" to turn layer 1 off, or \"auto\" (the default), \"gelada\" or \"microvm\" \
+                 (securecore-fpm --migrate-config <file> does this, keeping a backup; the installer runs it)"
+                    .into(),
+            ));
+        }
+        for c in &self.layer1.network.connect {
+            if c.socket.is_some() && c.address.is_some() {
+                return Err(Problem::Invalid(format!(
+                    "layer1.network.connect port {} has both socket and address: give one",
+                    c.port
+                )));
+            }
+        }
         if self.layer2.enabled && self.layer2.app.is_none() {
             return Err(Problem::Invalid("layer2.enabled is true but layer2.app is missing".into()));
         }
@@ -428,7 +515,7 @@ impl Config {
 
     /// All three layers disabled: SecureCore is off. A valid configuration.
     pub fn is_off(&self) -> bool {
-        !self.layer1.enabled && !self.layer2.enabled && !self.layer3.enabled
+        !self.layer1.enabled() && !self.layer2.enabled && !self.layer3.enabled
     }
 }
 
