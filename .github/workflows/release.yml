@@ -232,8 +232,10 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p .tmp
-          TMPDIR="$PWD/.tmp" scripts/mirab-vm.sh ext-dist ${MIRAB_MANIFEST:+"$MIRAB_MANIFEST"}
-          rc=$?
+          # Steps run under bash -e: catch the exit status, or exit 3 (no vm/ in mirab stable)
+          # would fail the release here instead of shipping it without the microVM.
+          rc=0
+          TMPDIR="$PWD/.tmp" scripts/mirab-vm.sh ext-dist ${MIRAB_MANIFEST:+"$MIRAB_MANIFEST"} || rc=$?
           if [ "$rc" = 3 ]; then
             echo "::warning::mirab's newest stable release has no vm/ images yet (mirab#89): this release carries no microVM, so layer 1 is gelada"
           elif [ "$rc" != 0 ]; then

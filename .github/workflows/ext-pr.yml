@@ -87,7 +87,9 @@ jobs:
       - name: The guest kernel with Landlock and seccomp (bench/microvm/kernel.sh)
         run: |
           set -uo pipefail
-          TMPDIR="$PWD/.tmp" scripts/mirab-vm.sh .tmp/mirab; rc=$?
+          # Steps run under bash -e: catch the exit status, or exit 3 would end the step here.
+          rc=0
+          TMPDIR="$PWD/.tmp" scripts/mirab-vm.sh .tmp/mirab || rc=$?
           if [ "$rc" = 3 ]; then
             manifest="https://mirab-releases.addis.gg/$(curl -fsSL https://mirab-releases.addis.gg/canary.json | jq -r .version)/vm/manifest.json"
             echo "::warning::mirab's stable release has no vm/ yet (mirab#89): using ${manifest} for the test"
