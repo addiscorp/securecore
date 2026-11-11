@@ -496,11 +496,15 @@ fn the_writer_is_confined_to_its_folders() {
     if let Ok(dirs) = std::env::var("SC_SYNC_CONFINE_CHILD") {
         let (inside, outside) = dirs.split_once(':').expect("two dirs");
         let fd = handle(Path::new(inside));
+        // The connection, as the writer has it: made before, used after.
+        let (a, b) = UnixStream::pair().expect("pair");
         if let Err(e) = confine(&[fd.as_raw_fd()]) {
             println!("confine-failed: {e}");
             return;
         }
         let ok = |r: bool, what: &str| println!("{what}={}", if r { "yes" } else { "no" });
+        let mut got = [0u8; 4];
+        ok((&a).write_all(b"ping").is_ok() && (&b).read_exact(&mut got).is_ok() && &got == b"ping", "unix-io");
         ok(open_beneath(fd.as_raw_fd(), b"", DIR_FLAGS).and_then(|d| tmpfile(d.as_raw_fd(), &mut 0)).is_ok(), "write-inside");
         ok(fs::write(Path::new(outside).join("x"), "x").is_ok(), "write-outside");
         ok(fs::read_to_string("/etc/hostname").is_ok() || fs::read_dir("/etc").is_ok(), "read-etc");
@@ -526,7 +530,7 @@ fn the_writer_is_confined_to_its_folders() {
         eprintln!("no Landlock here ({text}): checked on the KVM host");
         return;
     }
-    for (what, want) in [("write-inside", "yes"), ("write-outside", "no"), ("read-etc", "no"), ("inet-socket", "no"), ("ptrace", "no")] {
+    for (what, want) in [("unix-io", "yes"), ("write-inside", "yes"), ("write-outside", "no"), ("read-etc", "no"), ("inet-socket", "no"), ("ptrace", "no")] {
         assert!(text.contains(&format!("{what}={want}")), "{what} should be {want}: {text}\n{}", String::from_utf8_lossy(&out.stderr));
     }
 }

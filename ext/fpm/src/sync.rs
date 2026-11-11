@@ -1761,6 +1761,12 @@ fn seccomp() -> Result<(), String> {
     let mut calls = vec![
         libc::SYS_read,
         libc::SYS_write,
+        // std's UnixStream reads and writes with recv/send.
+        libc::SYS_recvfrom,
+        libc::SYS_sendto,
+        libc::SYS_recvmsg,
+        libc::SYS_sendmsg,
+        libc::SYS_shutdown,
         libc::SYS_readv,
         libc::SYS_writev,
         libc::SYS_pread64,
@@ -1785,6 +1791,8 @@ fn seccomp() -> Result<(), String> {
         libc::SYS_mkdirat,
         libc::SYS_copy_file_range,
         libc::SYS_sendfile,
+        libc::SYS_splice,
+        libc::SYS_restart_syscall,
         libc::SYS_mmap,
         libc::SYS_munmap,
         libc::SYS_mremap,
