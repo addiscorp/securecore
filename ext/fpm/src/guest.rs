@@ -42,10 +42,15 @@ pub const LOG_PORT: u32 = 1514;
 pub const CTL_PORT: u32 = 1515;
 /// mysqlnd's connect onto vsock, preloaded into php-fpm (#70).
 pub const PRELOAD: &str = "/usr/local/lib/libsc-vsock-connect.so";
-/// `KEY=VALUE` lines php-fpm gets as its environment, when the root image has the file. The
-/// test images carry the stack's database settings here; a product image must not carry
-/// secrets (delivering them per site is addiscorp/securecore#72).
-pub const ENV_FILE: &str = "/etc/securecore/guest.env";
+/// php-fpm's environment as the host's start message delivered it (`env` lines: the vault's
+/// secrets and the site's settings, #72). Only in this process's memory: never in an image, a
+/// boot argument or the console, and empty in a snapshot (it is taken before any start
+/// message), so every restore gets it again.
+static GUEST_ENV: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// The longest value an `env` line may carry.
+pub const MAX_ENV_VALUE: usize = 16 * 1024;
+/// php-fpm's value for a delivered variable before the start message has delivered it.
+pub const NOT_DELIVERED: &str = "securecore-not-delivered-yet";
 /// The same ini folder without securecore.ini (`sc.ext=0`, the latency comparison).
 pub const NOEXT_INI: &str = "/usr/local/etc/php/conf.d-noext";
 
@@ -68,6 +73,14 @@ pub struct Boot {
     /// `sc.egress=443`: php-fpm's connections to a named host on these ports go through the
     /// host, which checks the name ([`crate::egress`]).
     pub egress: Vec<u16>,
+    /// `sc.proto=<N>`: the protocol the host booted this guest for. Unless it is this init's
+    /// own ([`crate::vm::PROTOCOL`]), the init takes no start message (so no secret).
+    pub proto: Option<u32>,
+    /// `sc.env=WORDPRESS_DB_PASSWORD,…`: the names (never the values) of the environment the
+    /// start message delivers. Until it does, php-fpm has [`NOT_DELIVERED`] for each, so it can
+    /// start at boot (the extension's vault refuses a missing variable) and the snapshot holds
+    /// no secret.
+    pub env_names: Vec<String>,
     /// `sc.ext=0`: php-fpm without the extension.
     pub ext: bool,
     /// `sc.user=<uid>:<gid>`: the host's pool user, whom php-fpm's pool runs as here, so the
@@ -89,6 +102,14 @@ pub fn parse_cmdline(line: &str) -> Result<Boot, String> {
                     boot.ports.push(p.parse().map_err(|_| format!("sc.ports: {p} is not a port"))?);
                 }
             }
+            "sc.env" => {
+                for n in value.split(',').filter(|n| !n.is_empty()) {
+                    if !env_name_ok(n) {
+                        return Err(format!("sc.env: {n:?} is not a variable name"));
+                    }
+                    boot.env_names.push(n.to_owned());
+                }
+            }
             "sc.egress" => {
                 for p in value.split(',').filter(|p| !p.is_empty()) {
                     boot.egress.push(p.parse().map_err(|_| format!("sc.egress: {p} is not a port"))?);
@@ -100,6 +121,7 @@ pub fn parse_cmdline(line: &str) -> Result<Boot, String> {
                 boot.socks.push((port, path.to_owned()));
             }
             "sc.ext" => boot.ext = value != "0",
+            "sc.proto" => boot.proto = Some(value.parse().map_err(|_| format!("sc.proto={value}: not a number"))?),
             "sc.user" => {
                 let bad = || format!("sc.user={value}: want <uid>:<gid>, not root");
                 let (u, g) = value.split_once(':').ok_or_else(bad)?;
@@ -128,6 +150,9 @@ pub enum Ctl {
     /// Fresh randomness from the host (64 bytes, hex): credited to the kernel's pool and the
     /// CRNG reseeded, so a restored guest doesn't replay the snapshot's random stream.
     Entropy { hex: String },
+    /// One variable of php-fpm's environment (its value hex-encoded): the vault's secrets and
+    /// the site's settings. A start message with any starts a fresh php-fpm that has them.
+    Env { name: String, hex: String },
     /// This boot is a restore: php-fpm's workers were forked before the snapshot (and hold its
     /// userland generator state), so they are replaced by fresh ones.
     Refresh,
@@ -140,6 +165,9 @@ pub enum Ctl {
     Sync,
     /// A graceful php-fpm reload (SIGUSR2 to its master): the launcher's SIGUSR2 or SIGHUP.
     Reload,
+    /// The handshake, alone on its connection before the start message: the host's protocol.
+    /// `ok` only when it is this init's own and the one it booted with (`sc.proto`).
+    Proto { version: u32 },
     Done,
 }
 
@@ -148,11 +176,13 @@ impl Ctl {
         match self {
             Ctl::Time { secs, nanos } => format!("time {secs} {nanos}\n"),
             Ctl::Entropy { hex } => format!("entropy {hex}\n"),
+            Ctl::Env { name, hex } => format!("env {name} {hex}\n"),
             Ctl::Refresh => "refresh\n".into(),
             Ctl::Mount { device, path } => format!("mount {device} {path}\n"),
             Ctl::Tmpfs { path } => format!("tmpfs {path}\n"),
             Ctl::Sync => "sync\n".into(),
             Ctl::Reload => "reload\n".into(),
+            Ctl::Proto { version } => format!("proto {version}\n"),
             Ctl::Done => "done\n".into(),
         }
     }
@@ -165,26 +195,42 @@ impl Ctl {
                 nanos: nanos.parse().ok().filter(|n| *n < 1_000_000_000).ok_or_else(|| format!("time: {nanos}"))?,
             }),
             ["entropy", hex] if hex.len() == 128 && hex.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(Ctl::Entropy { hex: (*hex).into() }),
+            ["env", name, hex] if env_name_ok(name) && hex.len() % 2 == 0 && hex.len() <= 2 * MAX_ENV_VALUE && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                Ok(Ctl::Env { name: (*name).into(), hex: (*hex).into() })
+            }
+            ["env", name] if env_name_ok(name) => Ok(Ctl::Env { name: (*name).into(), hex: String::new() }),
             ["refresh"] => Ok(Ctl::Refresh),
             ["mount", device, path] => Ok(Ctl::Mount { device: (*device).into(), path: (*path).into() }),
             ["tmpfs", path] => Ok(Ctl::Tmpfs { path: (*path).into() }),
             ["sync"] => Ok(Ctl::Sync),
             ["reload"] => Ok(Ctl::Reload),
+            ["proto", v] => Ok(Ctl::Proto { version: v.parse().map_err(|_| format!("proto: {v}"))? }),
             ["done"] => Ok(Ctl::Done),
+            // Never echo an env line: it carries a secret.
+            ["env", ..] => Err("a malformed env line".into()),
             _ => Err(format!("unknown control line {line:?}")),
         }
     }
 
     /// Part of the one start message a boot accepts (the rest may come any time after it).
     pub fn starts(&self) -> bool {
-        matches!(self, Ctl::Time { .. } | Ctl::Entropy { .. } | Ctl::Refresh | Ctl::Mount { .. } | Ctl::Tmpfs { .. })
+        matches!(self, Ctl::Time { .. } | Ctl::Entropy { .. } | Ctl::Env { .. } | Ctl::Refresh | Ctl::Mount { .. } | Ctl::Tmpfs { .. })
     }
+}
+
+/// An environment variable's name: a letter or `_`, then letters, digits and `_`, 1 to 128.
+pub fn env_name_ok(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty() && b.len() <= 128 && (b[0].is_ascii_alphabetic() || b[0] == b'_') && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 /// What a control connection may do, given whether this boot's start message was taken.
 /// Exactly one start message per boot (a snapshot is taken before it, so each restore takes its
 /// own); after it only `sync` and `reload`, and nothing at all before it but a start.
 pub fn allowed(lines: &[Ctl], started: bool) -> Result<(), String> {
+    if lines.iter().any(|c| matches!(c, Ctl::Proto { .. })) && lines.len() > 1 {
+        return Err("the handshake comes alone".into());
+    }
     let starts = lines.iter().any(Ctl::starts);
     let others = lines.iter().any(|c| matches!(c, Ctl::Sync | Ctl::Reload));
     match (started, starts, others) {
@@ -193,6 +239,26 @@ pub fn allowed(lines: &[Ctl], started: bool) -> Result<(), String> {
         (false, true, true) => Err("a start message carries no sync or reload".into()),
         _ => Ok(()),
     }
+}
+
+/// Whether this init may take `lines`, given the protocol it was booted for (`sc.proto`): the
+/// handshake is answered `ok` only for its own protocol, and a start message (which may carry
+/// secrets) is taken only when it was booted for it. The host sends nothing secret until the
+/// handshake's `ok` ([`crate::vm::PROTOCOL`]).
+pub fn protocol_ok(lines: &[Ctl], booted: Option<u32>) -> Result<(), String> {
+    let mine = crate::vm::PROTOCOL;
+    let booted_s = booted.map_or_else(|| "no sc.proto".to_owned(), |b| format!("sc.proto={b}"));
+    for c in lines {
+        if let Ctl::Proto { version } = c
+            && (*version != mine || booted != Some(mine))
+        {
+            return Err(format!("this guest's init speaks protocol {mine} ({booted_s}), the host {version}"));
+        }
+    }
+    if lines.iter().any(Ctl::starts) && booted != Some(mine) {
+        return Err(format!("this guest's init speaks protocol {mine} and was booted with {booted_s}: it takes no start message"));
+    }
+    Ok(())
 }
 
 fn cstr(s: &str) -> io::Result<CString> {
@@ -268,6 +334,11 @@ fn add_entropy(bytes: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Bytes as lowercase hex (the `entropy` and `env` lines' encoding).
+pub fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn unhex(hex: &str) -> Vec<u8> {
@@ -368,6 +439,13 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
     match ctl {
         Ctl::Time { secs, nanos } => set_clock(*secs, *nanos),
         Ctl::Entropy { hex } => add_entropy(&unhex(hex)),
+        Ctl::Env { name, hex } => {
+            let value = String::from_utf8(unhex(hex)).map_err(|_| io::Error::other(format!("env {name}: not UTF-8")))?;
+            let mut env = GUEST_ENV.lock().unwrap_or_else(|p| p.into_inner());
+            env.retain(|(n, _)| n != name);
+            env.push((name.clone(), value));
+            Ok(())
+        }
         Ctl::Refresh => {
             // A graceful stop of each worker; the master forks fresh ones from itself (it ran no
             // request before the snapshot), and opcache's shared memory stays warm.
@@ -420,7 +498,8 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             let drain = DRAIN.get().ok_or_else(|| io::Error::other("the folder sync never started"))?;
             drain.wait(SYNC_DRAIN).map_err(|e| io::Error::other(format!("the writable folders did not sync to the host: {e}")))
         }
-        Ctl::Done => Ok(()),
+        // Checked before anything is applied ([`protocol_ok`]).
+        Ctl::Proto { .. } | Ctl::Done => Ok(()),
     }
 }
 
@@ -457,6 +536,10 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
     if failed.is_none() {
         failed = allowed(&lines, started).err();
     }
+    // Before anything is applied: a start message only for the protocol this init booted for.
+    if failed.is_none() {
+        failed = protocol_ok(&lines, BOOT.get().and_then(|b| b.proto)).err();
+    }
     // The start message claims the boot's one start atomically (connections run concurrently).
     if failed.is_none() && lines.iter().any(Ctl::starts) && STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         failed = Some("this boot's start message was already taken".into());
@@ -468,6 +551,22 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
                 break;
             }
         }
+    }
+    // The delivered environment reaches php-fpm only through a fresh master: the one running
+    // now started at boot (before any start message, so a snapshot holds none of it).
+    if failed.is_none() && lines.iter().any(|c| matches!(c, Ctl::Env { .. })) {
+        if let Err(e) = apply(&Ctl::Reload) {
+            failed = Some(format!("starting php-fpm with the delivered environment: {e}"));
+        } else if !fpm_listening(Duration::from_secs(10)) {
+            failed = Some(format!("php-fpm with the delivered environment isn't listening on 127.0.0.1:{FPM_PORT}"));
+        }
+    }
+    // The host never shows a reply to a message that carried secrets, so the reason is logged
+    // here too (no message here ever holds a value: refused env lines are never echoed).
+    if let Some(e) = &failed
+        && lines.iter().any(|c| matches!(c, Ctl::Env { .. }))
+    {
+        report(&format!("ctl: the start message was refused: {e}"));
     }
     let reply = failed.map_or_else(|| "ok\n".to_owned(), |e| format!("error {e}\n"));
     let _ = out.write_all(reply.as_bytes());
@@ -538,13 +637,21 @@ fn say(message: &str) {
     println!("securecore-init: {message}");
 }
 
-fn env_file() -> Vec<(String, String)> {
-    let Ok(text) = fs::read_to_string(ENV_FILE) else { return Vec::new() };
-    text.lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
-        .collect()
+/// Whether php-fpm's pool accepts on loopback within `timeout` (the host serves once the start
+/// message is answered, so a fresh master must be listening by then).
+fn fpm_listening(timeout: Duration) -> bool {
+    let t = std::time::Instant::now();
+    while t.elapsed() < timeout {
+        if TcpStream::connect(("127.0.0.1", FPM_PORT as u16)).is_ok() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+fn delivered_env() -> Vec<(String, String)> {
+    GUEST_ENV.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 fn listen_forwards(boot: &Boot) -> io::Result<()> {
@@ -650,8 +757,11 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
         fs::write(conf, pool_conf(uid, gid))?;
         cmd.arg("-y").arg(conf);
     }
-    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-        .envs(env_file())
+    // Exactly this environment: nothing of init's own.
+    cmd.env_clear()
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        .envs(boot.env_names.iter().map(|n| (n.clone(), NOT_DELIVERED.to_owned())))
+        .envs(delivered_env())
         .stdin(Stdio::null())
         .stdout(Stdio::from(write.try_clone()?))
         .stderr(Stdio::from(write));
@@ -753,6 +863,8 @@ mod tests {
         assert!(parse_cmdline("sc.root=/srv sc.ports=99999").is_err());
         assert_eq!(parse_cmdline("sc.root=/srv sc.egress=443,8443").expect("parses").egress, [443, 8443]);
         assert!(parse_cmdline("sc.root=/srv sc.egress=x").is_err());
+        assert_eq!(parse_cmdline("sc.root=/srv sc.env=A_1,B").expect("parses").env_names, ["A_1", "B"]);
+        assert!(parse_cmdline("sc.root=/srv sc.env=A=b").is_err(), "names only, never a value");
     }
 
     #[test]
@@ -762,6 +874,8 @@ mod tests {
             Ctl::Mount { device: "/dev/vdc".into(), path: "/var/www/html/wp-content/uploads".into() },
             Ctl::Tmpfs { path: "/var/cache/x".into() },
             Ctl::Entropy { hex: "ab".repeat(64) },
+            Ctl::Env { name: "WORDPRESS_DB_PASSWORD".into(), hex: hex_of(b"p a$$ w\nd") },
+            Ctl::Env { name: "EMPTY".into(), hex: String::new() },
             Ctl::Refresh,
             Ctl::Sync,
             Ctl::Reload,
@@ -774,6 +888,13 @@ mod tests {
         assert!(Ctl::parse(&format!("entropy {}", "ab".repeat(8))).is_err(), "64 bytes, no fewer");
         assert!(Ctl::parse(&format!("entropy {}", "zz".repeat(64))).is_err(), "hex only");
         assert_eq!(unhex("00ff10"), [0, 255, 16]);
+        assert!(Ctl::Env { name: "X".into(), hex: String::new() }.starts(), "part of the start message");
+        for bad in ["env 1X 5ec7e7", "env X-Y 5ec7e7", "env X 5ec7e", "env X 5ec7e7zz", "env"] {
+            let e = Ctl::parse(bad).expect_err(bad);
+            assert!(!e.contains("5ec7e"), "a refused env line's value is never echoed (it may be a secret): {e}");
+        }
+        let long = format!("env X {}", "00".repeat(MAX_ENV_VALUE + 1));
+        assert!(Ctl::parse(&long).is_err(), "a value over the cap");
     }
 
     /// Two reloads at once (two USR2s close together on the host): the second waits for the
