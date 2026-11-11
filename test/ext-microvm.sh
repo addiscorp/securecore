@@ -174,6 +174,7 @@ conf() {
 peer=$dir/peer
 mkdir -p "$peer"
 chmod 755 "$peer"
+rm -f "$peer/peer.sock"
 python3 -I test/ext/microvm/peercred.py "$peer/peer.sock" > "$dir/peercred.log" 2>&1 &
 peer_pid=$!
 i=0; until [ -S "$peer/peer.sock" ]; do i=$((i + 1)); [ "$i" -lt 50 ] || die "the peer-credential listener"; sleep 0.1; done
