@@ -10,6 +10,8 @@ publish.workspace = true
 # The same types, loader and validation as the extension: one file, one parser.
 securecore-config = { path = "../config" }
 gelada.workspace = true
+# Layer 2's hostname matcher: the microVM's egress allows the hosts layer 2 lists (#72).
+securecore-attribution = { path = "../attribution" }
 # The microVM driver and the guest's init (#71): vsock, mounts, the clock, signals.
 libc.workspace = true
 # Snapshot keys: the sha256 of the VM's files and of the site tree.

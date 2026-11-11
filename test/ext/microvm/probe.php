@@ -78,6 +78,26 @@ if (isset($_GET['rm'])) {
 if (isset($_GET['chmod'])) {
     echo 'chmod=', chmod("$up/" . $_GET['chmod'], octdec($_GET['mode'])) ? 'OK' : 'FAILED', "\n";
 }
+// Egress (#72): ?curl=<url> through PHP's curl, ?stream=<url> through its https stream,
+// ?tcp=<host>:<port> a plain socket. Each prints what came back, or the error.
+if (isset($_GET['curl'])) {
+    $c = curl_init($_GET['curl']);
+    curl_setopt_array($c, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 20]);
+    $body = curl_exec($c);
+    echo 'curl_code=', curl_getinfo($c, CURLINFO_RESPONSE_CODE), "\n";
+    echo 'curl_error=', curl_error($c), "\n";
+    echo 'curl_body=', substr(str_replace("\n", ' ', (string) $body), 0, 200), "\n";
+}
+if (isset($_GET['stream'])) {
+    $body = @file_get_contents($_GET['stream'], false, stream_context_create(['http' => ['timeout' => 20]]));
+    echo 'stream_ok=', $body !== false ? 1 : 0, "\n";
+    echo 'stream_error=', $body === false ? (error_get_last()['message'] ?? '') : '', "\n";
+    echo 'stream_body=', substr(str_replace("\n", ' ', (string) $body), 0, 200), "\n";
+}
+if (isset($_GET['tcp'])) {
+    $f = @stream_socket_client('tcp://' . $_GET['tcp'], $en, $es, 5);
+    echo 'tcp=', $f ? 'CONNECTED' : "FAILED $en $es", "\n";
+}
 // Fresh randomness: the kernel's (random_bytes) and a worker's userland generator (mt_rand).
 echo 'random=', bin2hex(random_bytes(16)), "\n";
 echo 'mt_rand=', mt_rand(), "\n";

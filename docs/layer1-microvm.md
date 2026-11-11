@@ -482,7 +482,7 @@ either. The prototype therefore uses block devices:
 - **Not built:**
   - **Outbound HTTPS.** core's `api.wordpress.org` and the 443 in layer 1's connect list would
     need a host-side forward, or a CONNECT proxy, over vsock. Layer 2's hostname rules would
-    keep applying in the guest (follow-up 7).
+    keep applying in the guest (follow-up 7). Built in #72: "Egress" below.
   - **The guest's secrets.** The vault's env sources come from `/etc/securecore-guest.env` in
     the root image. These are the stack's fixed test values, but a product image must never
     carry them: they belong on a per-site config disk or a vsock handshake at boot
@@ -694,6 +694,40 @@ The sync costs a page nothing: its threads wait in `poll` until a writable folde
 
 **`auto` now picks the microVM** wherever it can run (`AUTO_SELECTS_MICROVM = true`, pinned
 on by a compile-time assert). That was the gate #75 left for this work.
+
+## Egress: named hosts through the host (#72)
+
+The guest still has no network device and no DNS. A `layer1.network.connect` port with
+neither a `socket` nor an `address` (443 in the example) is an **egress port**. On it, the
+guest reaches named hosts through the host, never an address of its own choosing
+(`ext/fpm/src/egress.rs`, and the preload `ext/fpm/guest/vsock-connect.c`):
+
+```
+guest  php-fpm (curl, PHP streams, anything that calls getaddrinfo + connect)
+         getaddrinfo("api.wordpress.org")  → 127.77.0.1: the preload answers, and keeps the name
+         connect(127.77.0.1:443)           → vsock host:1517, "api.wordpress.org 443\n", the
+                                              host's "OK\n" (or "ERR <why>\n" = ECONNREFUSED)
+host   securecore-fpm: is 443 an egress port, and is the name in layer 2's host lists? Resolve
+       it here; connect only to globally routable addresses; then a byte pipe (TLS end to end)
+```
+
+- **Only the hosts the config allows are reachable.** With layer 2 on, a name must match one of
+  layer 2's host patterns: core's, `default`'s, or any component's. The match uses layer 2's own
+  matcher (`securecore_attribution::hosts::host_allowed`: exact names, `*.` wildcards, IP
+  literals; IDNA, case and trailing dot normalised). Layer 2 then checks the caller inside the
+  guest, per component, as on the host. With layer 2 off, any name is allowed on an egress
+  port, as gelada's port rules allow any host.
+- **Never an internal address.** Whatever a name resolves to, the host connects only to globally
+  routable addresses. It refuses loopback, RFC 1918, link-local (cloud metadata), CGNAT,
+  benchmarking, unique-local, documentation and v4-mapped forms of these. An IP literal is
+  reachable only when layer 2 lists it as itself.
+- **No DNS in the guest.** The names never leave the guest as DNS queries; the host resolves them.
+  Port 53 in a connect list is just another egress port.
+- **No tap device**, no host network configuration, and nothing in the guest listens. An IP the
+  guest picks itself (`1.1.1.1:443`) is unreachable, because there is no route.
+- The handshake is blocking inside `connect()`, which then returns 0 to a non-blocking caller
+  (curl handles that). `getpeername`/`getsockname` on such a socket answer AF_INET addresses.
+- The snapshot's warm-up VM has no egress listener, like its missing database.
 
 ## Follow-up issues (not filed)
 

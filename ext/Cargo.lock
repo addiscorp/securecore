@@ -1197,6 +1197,7 @@ version = "0.1.0"
 dependencies = [
  "gelada",
  "libc",
+ "securecore-attribution",
  "securecore-config",
  "serde_json",
  "sha2",
