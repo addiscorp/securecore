@@ -22,6 +22,10 @@
 #                            pins, each checked against mirab's sha256s, and vm/installed.json,
 #                            which records the mirab release they came from
 #                            (into <share-dir>/vm, where securecore-fpm looks)
+#      vm/rootfs.ext4        the microVM's guest image (#80), when the release ships
+#                            vm/linux-x86_64/rootfs.ext4.gz: its gzip and its unpacked bytes
+#                            each checked against release.json, its sha256 recorded in
+#                            vm/installed.json (securecore-fpm boots nothing it doesn't name)
 #      securecore-vault.php  the mu-plugin, into <wordpress>/wp-content/mu-plugins
 #      securecore.json       only if there is none: every layer off (an existing one is kept)
 #      securecore.ini        last: `extension=securecore.so` and `securecore.config=<file>`
@@ -185,11 +189,13 @@ tr -d ' \t\r\n' < "$WORK/release.json" > "$WORK/release.flat"
 field() { sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$WORK/release.flat" | head -n 1; }
 REL=$(field version)
 [ -n "$REL" ] || die "$BASE did not describe a SecureCore release. Run the installer again later."
-# want <path>: the sha256 release.json gives for <path>, or nothing.
-want() {
+# wantf <path> <field>: a sha256 field (sha256, unpacked_sha256) release.json gives for <path>,
+# or nothing. want <path>: its sha256.
+wantf() {
   key=$(printf '%s' "$1" | sed 's/[.]/[.]/g')
-  grep -o "\"$key\":{[^}]*}" "$WORK/release.flat" | sed -n 's/.*"sha256":"\([0-9a-f]\{64\}\)".*/\1/p' | head -n 1
+  grep -o "\"$key\":{[^}]*}" "$WORK/release.flat" | sed -n "s/.*\"$2\":\"\\([0-9a-f]\\{64\\}\\)\".*/\\1/p" | head -n 1
 }
+want() { wantf "$1" sha256; }
 [ -n "$(want "ext/$SO")" ] || die "SecureCore $REL has no build for PHP $PHP_VER $TS_LABEL on $ARCH (ext/$SO). Builds: $(grep -o '"ext/securecore-php[^"]*"' "$WORK/release.flat" | tr -d '"' | sed 's|ext/securecore-||' | tr '\n' ' ')"
 # get <path> <file>: download <path> of the release and check it against release.json.
 get() {
@@ -242,11 +248,30 @@ else
   # from the tarball checked above and must match the sha256 the release recorded for it.
   check "$WORK/jailer" "$(vm jailer jailer_sha256)" "Firecracker $FC's jailer"
   rm -f "$WORK/vmlinux.gz" "$WORK/fc.tgz"
-  # No rootfs_sha256: no release ships a guest root image yet, so nothing verified is there to
-  # boot, and securecore-fpm won't start a microVM (auto is gelada, microvm refuses).
-  printf '{\n  "securecore": "%s",\n  "mirab": "%s",\n  "commit": "%s",\n  "manifest": "%s",\n  "kernel_sha256": "%s",\n  "firecracker": "%s",\n  "firecracker_sha256": "%s",\n  "jailer_sha256": "%s"\n}\n' \
-    "$REL" "$MIRAB" "$(vm - commit)" "$(vm - manifest)" "$(vm kernel unpacked_sha256)" "$FC" "$(vm firecracker member_sha256)" "$(vm jailer jailer_sha256)" > "$WORK/installed.json"
-  step "$OK" "microVM" "mirab $MIRAB's guest kernel, Firecracker $FC and its jailer, each matching its recorded sha256"
+  # The guest's root image (#80): SecureCore's own, built with this release, gzipped. Its gzip
+  # and its unpacked bytes are each checked against release.json. A release without one (before
+  # #80) installs the rest, and installed.json then records no rootfs_sha256, so nothing boots.
+  GUEST=
+  ROOTFS=vm/linux-x86_64/rootfs.ext4.gz
+  rootfs_rec=
+  if [ -n "$(want "$ROOTFS")" ]; then
+    unpacked=$(wantf "$ROOTFS" unpacked_sha256)
+    [ -n "$unpacked" ] || die "release.json of SecureCore $REL lists $ROOTFS with no unpacked_sha256, so nothing was installed."
+    get "$ROOTFS" rootfs.ext4.gz
+    gzip -dc "$WORK/rootfs.ext4.gz" > "$WORK/rootfs.ext4" || die "$ROOTFS didn't unpack, so nothing was installed. Run the installer again."
+    rm -f "$WORK/rootfs.ext4.gz"
+    [ "$(sha256 "$WORK/rootfs.ext4")" = "$unpacked" ] \
+      || die "$ROOTFS unpacked failed its sha256 check against release.json, so nothing was installed. Run the installer again; if it keeps failing, the download is being corrupted or tampered with."
+    rootfs_rec=$(printf ',\n  "rootfs_sha256": "%s"' "$unpacked")
+    GUEST=1
+  fi
+  printf '{\n  "securecore": "%s",\n  "mirab": "%s",\n  "commit": "%s",\n  "manifest": "%s",\n  "kernel_sha256": "%s",\n  "firecracker": "%s",\n  "firecracker_sha256": "%s",\n  "jailer_sha256": "%s"%s\n}\n' \
+    "$REL" "$MIRAB" "$(vm - commit)" "$(vm - manifest)" "$(vm kernel unpacked_sha256)" "$FC" "$(vm firecracker member_sha256)" "$(vm jailer jailer_sha256)" "$rootfs_rec" > "$WORK/installed.json"
+  if [ -n "$GUEST" ]; then
+    step "$OK" "microVM" "mirab $MIRAB's guest kernel, Firecracker $FC, its jailer and SecureCore $REL's guest image, each matching its recorded sha256"
+  else
+    step "$OK" "microVM" "mirab $MIRAB's guest kernel, Firecracker $FC and its jailer, each matching its recorded sha256"
+  fi
   VM=1
 fi
 
@@ -277,6 +302,7 @@ if [ -n "$VM" ]; then
   put firecracker "$SHARE_DIR/vm/firecracker" 755 "Firecracker"
   put jailer "$SHARE_DIR/vm/jailer" 755 "Jailer"
   put vmlinux "$SHARE_DIR/vm/vmlinux" 644 "Guest kernel"
+  if [ -n "$GUEST" ]; then put rootfs.ext4 "$SHARE_DIR/vm/rootfs.ext4" 644 "Guest image"; fi
   # The unprivileged user Firecracker runs as (securecore-fpm --vm-user, default securecore-vm).
   if id securecore-vm >/dev/null 2>&1; then
     step "$SAME" "microVM user" "securecore-vm exists"
@@ -287,8 +313,8 @@ if [ -n "$VM" ]; then
   fi
   # What is installed, and from which mirab release: nobody edits a version by hand.
   put installed.json "$SHARE_DIR/vm/installed.json" 644 "microVM record"
-  if [ ! -f "$SHARE_DIR/vm/rootfs.ext4" ]; then
-    step "$NOTE" "microVM" "no guest root image ($SHARE_DIR/vm/rootfs.ext4) yet: until there is one, layer 1's auto is gelada"
+  if [ -z "$GUEST" ]; then
+    step "$NOTE" "microVM" "SecureCore $REL ships no guest image, so nothing verified boots: layer 1's auto is gelada and microvm refuses"
   fi
 fi
 if [ -n "$WP" ]; then
