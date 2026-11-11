@@ -22,33 +22,31 @@
 #      through its own mysqli_query is still the plugin's (user_pass BLOCKED), core's is core's.
 #   6. the extension unloaded: every case RAN (the check removed altogether).
 # Exits non-zero on any failure. Writes .tmp/ext-db/. Restores examples/wordpress.json at the end.
+# On the microVM target (SC_TARGET=microvm, test/lib/target.sh) everything runs in the guest; its
+# DB_HOST is 127.0.0.1:3306 (MariaDB's socket through the launcher), so that is the probe's
+# listed host there, and 6 unloads the extension with the guest's boot argument sc.ext=0.
 #   DOCKER_CONTEXT=colima test/ext-config.sh && DOCKER_CONTEXT=colima test/ext-db.sh
 set -u
 cd "$(dirname "$0")/.." || exit 1
 project=${SECURECORE_EXT_PROJECT:-securecore-ext}
 port=${SECURECORE_EXT_PORT:-8089}
-base=http://127.0.0.1:$port
 dir=.tmp/ext-db
 mkdir -p "$dir"
 find "$dir" -mindepth 1 -delete 2>/dev/null
-html=/var/www/html
-conf=$html/securecore.json
+. test/lib/target.sh
 ini=/usr/local/etc/php/conf.d/securecore.ini
 plugin=$html/wp-content/plugins/securecore-db-probe
 fails=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
-compose() { SECURECORE_PORT=$port docker compose -f docker/compose.yml -f docker/compose.ext.yml -p "$project" "$@"; }
 wp() { compose run --rm -T cli wp "$@" 2>>"$dir/wp.err" | tr -d '\r'; }
 in_php() { compose exec -T php sh -c "$1"; }
-code() { curl -s -o /dev/null -w '%{http_code}' "$base$1"; }
-now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-wait_200() { i=0; until [ "$(code /)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 60 ] || return 1; sleep 1; done; }
-put_live() { compose exec -T php sh -c "cat > $conf.new && mv $conf.new $conf" < "$1"; }
-audit() { compose logs --no-log-prefix --since "$1" php 2>&1 | sed -n 's/.*securecore: //p' | grep '^layer2 '; }
+audit() { phplog "$1" | sed -n 's/.*securecore: //p' | grep '^layer2 '; }
 has() { if audit "$1" | grep -qF "$2"; then pass "$3"; else fail "$3" "no layer2 line matching '$2'"; fi; }
+# The DB host the probe's own connections go to (its DB_HOST).
+if on_microvm; then dbhost=127.0.0.1; else dbhost=db; fi
 
-[ "$(code /)" = 200 ] || { echo "FAIL the extension stack is not up on $base: run test/ext-config.sh first"; exit 1; }
+stack_is_up
 
 # --- fixtures: the probe, its own table, another plugin's table, the core probe ----------------
 in_php "rm -rf $plugin && mkdir -p $plugin"
@@ -64,8 +62,8 @@ cleanup() {
   in_php "rm -rf $plugin $html/sc-db-core.php $html/wp-content/db.php"
   dbq "DROP TABLE IF EXISTS wp_securecore_db_probe, wp_otherplugin_data" >/dev/null 2>&1
   [ -f "$dir/securecore.ini" ] && compose cp "$dir/securecore.ini" "php:$ini" >/dev/null 2>&1
-  compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
-  compose restart php >/dev/null 2>&1
+  put ext/examples/wordpress.json
+  php_restart >/dev/null 2>&1
   wait_200 || echo "FAIL php-fpm did not come back after cleanup"
 }
 trap cleanup EXIT
@@ -79,7 +77,7 @@ cfg() { # $1 = name, $2 = mode, $3 = the probe's grants
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "$2",
     "default": { "tables": "own", "options": "own" },
-    "components": { "securecore-db-probe": { "grants": [$3], "hosts": ["db"] } }
+    "components": { "securecore-db-probe": { "grants": [$3], "hosts": ["$dbhost"] } }
   },
   "layer3": { "enabled": false }
 }
@@ -93,8 +91,8 @@ cfg granted enforce '"posts:read", "users:read", "options:write"'
 # The vault is read at startup only: restart php-fpm once on a vault-less config, so DB_PASSWORD is
 # the real value and the probe can open its own mysqli and PDO connections (the policy is per
 # call, on every connection, not only $wpdb's).
-compose cp "$dir/enforce.json" "php:$conf" >>"$dir/cp.log" 2>&1
-compose restart php >/dev/null 2>&1
+put "$dir/enforce.json"
+php_restart >/dev/null 2>&1
 wait_200 || { echo "FAIL php-fpm did not come back on the vault-less config"; exit 1; }
 
 run() { # $1 = config: apply it, run the probe and the core probe; T = the log window start
@@ -247,17 +245,24 @@ is_ "$dropin_code" 200 "dropin: the front page is 200 with the drop-in"
 
 # --- 6. the extension unloaded: the check removed altogether --------------------------------------
 echo "# extension unloaded"
-compose cp "php:$ini" "$dir/securecore.ini" >>"$dir/cp.log" 2>&1
-grep -v '^extension=' "$dir/securecore.ini" > "$dir/no-ext.ini"
-compose cp "$dir/no-ext.ini" "php:$ini" >>"$dir/cp.log" 2>&1
-compose restart php >/dev/null 2>&1
+if on_microvm; then
+  # The guest's php.ini is on its root image: the launcher's boot argument sc.ext=0 starts its
+  # php-fpm without the extension.
+  php_restart --guest-arg sc.ext=0 >/dev/null 2>&1
+else
+  compose cp "php:$ini" "$dir/securecore.ini" >>"$dir/cp.log" 2>&1
+  grep -v '^extension=' "$dir/securecore.ini" > "$dir/no-ext.ini"
+  compose cp "$dir/no-ext.ini" "php:$ini" >>"$dir/cp.log" 2>&1
+  compose restart php >/dev/null 2>&1
+fi
 wait_200 || fail "unloaded: front page 200"
 curl -s "$base/?sc_db=run" > "$dir/out.unloaded"
 completed unloaded
 for c in $own_cases $refused_cases; do expect unloaded "$c" RAN; done
 passthrough unloaded RAN
-compose cp "$dir/securecore.ini" "php:$ini" >>"$dir/cp.log" 2>&1
+on_microvm || compose cp "$dir/securecore.ini" "php:$ini" >>"$dir/cp.log" 2>&1
 
 echo
+na_summary
 if [ "$fails" -eq 0 ]; then echo "all ext-db checks passed"; else echo "$fails check(s) failed"; fi
 [ "$fails" -eq 0 ]

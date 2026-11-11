@@ -24,16 +24,20 @@
 # Exits non-zero on any failure. Writes .tmp/ext-vault/. Restores examples/wordpress.json at the end.
 #   DOCKER_CONTEXT=colima test/ext-config.sh && DOCKER_CONTEXT=colima test/ext-vault.sh
 #   SECURECORE_EXT_PROJECT / SECURECORE_EXT_PORT pick another project / port (all ext-* tests).
+# On the microVM target (SC_TARGET=microvm, test/lib/target.sh) the probes run in the guest. A
+# vault file outside the docroot is the php container's, which the guest can't see: there the
+# salts come from the environment too (WORDPRESS_*, delivered at each start, #72), the product's
+# shape for a microVM. The fake MySQL servers (3b, 3c) listen in the stack's network, which the
+# guest never reaches (only its listed ports, through the host): those checks are n/a. The
+# extension is unloaded with the guest's boot argument sc.ext=0.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 project=${SECURECORE_EXT_PROJECT:-securecore-ext}
 port=${SECURECORE_EXT_PORT:-8089}
-base=http://127.0.0.1:$port
 dir=.tmp/ext-vault
 mkdir -p "$dir"
 find "$dir" -mindepth 1 -delete 2>/dev/null
-html=/var/www/html
-conf=$html/securecore.json
+. test/lib/target.sh
 ini=/usr/local/etc/php/conf.d/securecore.ini
 plugin=$html/wp-content/plugins/securecore-vault-probe
 muplugin=$html/wp-content/mu-plugins/securecore-vault.php
@@ -48,24 +52,19 @@ auth_secret=sc-test-auth-keysc-test-auth-salt   # wp_salt('auth') = AUTH_KEY . A
 secrets="$db_password sc-test-auth-key sc-test-secure-auth-key sc-test-logged-in-key sc-test-nonce-key sc-test-auth-salt sc-test-secure-auth-salt sc-test-logged-in-salt sc-test-nonce-salt"
 
 fails=0
-pass() { echo "ok   $1"; }
-fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
+# (n/a while NA_WHY is set: the checks that need a server the guest can't reach.)
+pass() { na_now "$1" && return; echo "ok   $1"; }
+fail() { na_now "$1" && return; echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
 # is <actual> <expected> <label>
 is() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$3" "got '$1', want '$2'"; fi; }
-compose() { SECURECORE_PORT=$port docker compose -f docker/compose.yml -f docker/compose.ext.yml -p "$project" "$@"; }
 wp() { compose run --rm -T cli wp "$@" 2>>"$dir/wp.err" | tr -d '\r'; }
 in_php() { compose exec -T php sh -c "$1"; }
-code() { curl -s -o /dev/null -w '%{http_code}' "$base$1"; }
-now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-wait_200() { i=0; until [ "$(code /)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 60 ] || return 1; sleep 1; done; }
-put_live() { compose exec -T php sh -c "cat > $conf.new && mv $conf.new $conf" < "$1"; }
-phplog() { compose logs --no-log-prefix --since "$1" php 2>&1; }
 # hmac_md5 <key>: HMAC-MD5 of "sc-vault-probe" (what the probe hashes), lowercase hex — stock PHP's
 # hash_hmac with no extension and no ini (php -n), so it needs nothing on the Docker host (openssl
 # is not on every one).
 hmac_md5() { compose exec -T php php -n -r 'echo hash_hmac("md5", "sc-vault-probe", $argv[1]);' "$1"; }
 
-[ "$(code /)" = 200 ] || { echo "FAIL the extension stack is not up on $base: run test/ext-config.sh first"; exit 1; }
+stack_is_up
 
 # --- fixtures --------------------------------------------------------------------------------
 # The vault file: a JSON object of NAME:value, outside the docroot, root-owned and readable only
@@ -129,15 +128,26 @@ cleanup() {
   wp plugin deactivate securecore-vault-probe securecore-vault-connect classic-editor wordpress-seo contact-form-7 >/dev/null 2>&1
   fakedb_stop
   in_php "rm -rf $plugin $connect_plugin $muplugin $earlymu $html/sc-vault-routine.php $html/sc-vault-core.php $html/sc-vault-connect-core.php $html/sc-lit-config.php $fakescript $fakecap $fakepid"
-  compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
+  put ext/examples/wordpress.json
   # Restore the extension ini in case a revert step changed it, then restart.
   compose cp docker/securecore.ini "php:$ini" >/dev/null 2>&1
-  compose restart php >/dev/null 2>&1
+  php_restart >/dev/null 2>&1
   wait_200 || echo "FAIL php-fpm did not come back after cleanup"
 }
 trap cleanup EXIT
 
-# The vault config for this test: DB password from the environment, salts from the vault file.
+# The vault config for this test: DB password from the environment, salts from the vault file
+# (on the microVM: from the environment, which carries the same values).
+if on_microvm; then
+  from='"wpConfig": "wp-config.php"'
+  salts=""
+  for s in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY AUTH_SALT SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT; do
+    salts="$salts, { \"name\": \"$s\", \"env\": \"WORDPRESS_$s\" }"
+  done
+else
+  from="\"vaultFile\": \"$vaultfile\""
+  salts=', "AUTH_KEY", "SECURE_AUTH_KEY", "LOGGED_IN_KEY", "NONCE_KEY", "AUTH_SALT", "SECURE_AUTH_SALT", "LOGGED_IN_SALT", "NONCE_SALT"'
+fi
 vault_cfg() { # $1 = mode
   cat > "$dir/$1.json" <<JSON
 {
@@ -145,11 +155,9 @@ vault_cfg() { # $1 = mode
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "$1",
     "vault": {
-      "from": { "vaultFile": "$vaultfile" },
+      "from": { $from },
       "secrets": [
-        { "name": "DB_PASSWORD", "env": "WORDPRESS_DB_PASSWORD" },
-        "AUTH_KEY", "SECURE_AUTH_KEY", "LOGGED_IN_KEY", "NONCE_KEY",
-        "AUTH_SALT", "SECURE_AUTH_SALT", "LOGGED_IN_SALT", "NONCE_SALT"
+        { "name": "DB_PASSWORD", "env": "WORDPRESS_DB_PASSWORD" }$salts
       ]
     },
     "core": { "hosts": ["127.0.0.1"] },
@@ -165,8 +173,8 @@ JSON
 # apply <mode>: put the config and restart php-fpm (the vault is read at MINIT).
 apply() {
   vault_cfg "$1"
-  compose cp "$dir/$1.json" "php:$conf" >/dev/null 2>&1
-  compose restart php >/dev/null 2>&1
+  put "$dir/$1.json"
+  php_restart >/dev/null 2>&1
   wait_200 || fail "$1: php-fpm serves the front page"
 }
 
@@ -231,6 +239,7 @@ for mode in enforce log; do
   fake_stop
 
   # No real secret in the bytes the foreign server received (plugin DB + salt, core DB).
+  on_microvm && NA_WHY="the fake MySQL server listens in the php container's network, and the guest reaches only its listed ports, through the host"
   cap_leak=''
   for sec in $secrets; do if grep -qF "$sec" "$dir/capture.$mode"; then cap_leak="$cap_leak $sec"; fi; done
   is "$cap_leak" "" "$mode: no real DB password or salt reached the fake server"
@@ -238,6 +247,7 @@ for mode in enforce log; do
   # failed connection.
   if grep -qF 'securecore-vault:DB_PASSWORD' "$dir/capture.$mode"; then pass "$mode: the DB placeholder (not the value) reached the foreign server"; else fail "$mode: the DB placeholder reached the foreign server" "$(tr -d '\0' < "$dir/capture.$mode" | tr '\n' ' ')"; fi
   if grep -qF 'securecore-vault:AUTH_KEY' "$dir/capture.$mode"; then pass "$mode: a salt placeholder (not the value) reached the foreign server"; else fail "$mode: a salt placeholder reached the foreign server"; fi
+  NA_WHY=
   # A plugin is refused the swap even to the real DB host: the connection fails.
   is "$(sed -n 's/^plugin_connects_real_db=//p' "$dir/connect.plugin.$mode")" failed "$mode: a plugin is refused the swap to the real DB (connection fails)"
   # Core still connects to the real DB with the placeholder (the swap is allowed).
@@ -263,9 +273,13 @@ sleep 1
 fakedb_capture > "$dir/capture.port"
 fakedb_stop
 is "$(sed -n '1s/^probe=//p' "$dir/connect.port")" connect-port "port: the probe ran"
+on_microvm && NA_WHY="the fake server listens in the db container's network; the guest reaches the database only through MariaDB's socket"
 if grep -qF 'securecore-vault:DB_PASSWORD' "$dir/capture.port"; then pass "port: the server on db:$fakedbport received the placeholder"; else fail "port: the server on db:$fakedbport received the placeholder" "capture: $(tr -d '\0' < "$dir/capture.port" | tr '\n' ' ') $(cat "$dir/fakedb.log" | tr '\n' ' ')"; fi
 if grep -qF "$db_password" "$dir/capture.port"; then fail "port: the real DB password did not reach db:$fakedbport" "it did"; else pass "port: the real DB password did not reach db:$fakedbport"; fi
-if phplog "$t" | grep -q "vault: refused DB-password swap (wrong-host) for core connecting to \"db:$fakedbport\""; then pass "port: the refusal names the host and port"; else fail "port: the refusal names the host and port" "$(phplog "$t" | grep 'vault:' | tail -1)"; fi
+NA_WHY=
+# The DB host as the probe's php-fpm names it (the guest's is its loopback).
+if on_microvm; then dbh=127.0.0.1; else dbh=db; fi
+if phplog "$t" | grep -q "vault: refused DB-password swap (wrong-host) for core connecting to \"$dbh:$fakedbport\""; then pass "port: the refusal names the host and port"; else fail "port: the refusal names the host and port" "$(phplog "$t" | grep 'vault:' | tail -1)"; fi
 # Core's own connection (DB_HOST, no port, i.e. 3306) still gets the real password.
 curl -s "$base/sc-vault-core.php" > "$dir/core.port"
 is "$(field "$dir/core.port" db_ok)" true "port: core still connects to the DB with the real value"
@@ -287,6 +301,7 @@ if (!function_exists('wp_hash')) {
 PHP
 compose cp "$dir/early-salt.php" "php:$earlymu" >>"$dir/cp.log" 2>&1
 in_php "chown www-data:www-data $earlymu"
+site_sync
 curl -s "$base/sc-vault-core.php" > "$dir/core.early"
 in_php "rm -f $earlymu"
 is "$(field "$dir/core.early" wp_salt_defined_by)" extension "early mu-plugin: wp_salt is still the extension's"
@@ -298,11 +313,15 @@ is "$(field "$dir/core.early" nonce_roundtrip)" 1 "early mu-plugin: nonces still
 t=$(now)
 apply enforce
 masked_line=$(phplog "$t" | sed -n 's/.*securecore: //p' | grep '^vault: masked' | tail -1)
+# On the microVM every salt is env-sourced: the WORDPRESS_* variables are the secrets' own
+# sources (replaced by placeholders), so no other variable holds a value for the backstop to mask.
+on_microvm && NA_WHY="the salts are env-sourced in the guest (no vault file), so no other env var holds a secret's value for the backstop to mask"
 if echo "$masked_line" | grep -q WORDPRESS_AUTH_KEY && echo "$masked_line" | grep -q WORDPRESS_NONCE_SALT; then
   pass "backstop: the salt env vars were masked by value (names logged)"
 else
   fail "backstop: the salt env vars were masked" "$masked_line"
 fi
+NA_WHY=
 leak=''
 for sec in $secrets; do if echo "$masked_line" | grep -qF "$sec"; then leak="$leak $sec"; fi; done
 is "$leak" "" "backstop: the log names only variables, never a value"
@@ -322,8 +341,8 @@ cat > "$dir/no-vault.json" <<JSON
   "layer2": { "enabled": true, "app": "wordpress", "mode": "enforce", "default": {}, "components": {} },
   "layer3": { "enabled": false } }
 JSON
-compose cp "$dir/no-vault.json" "php:$conf" >/dev/null 2>&1
-compose restart php >/dev/null 2>&1
+put "$dir/no-vault.json"
+php_restart >/dev/null 2>&1
 wait_200 || fail "no-vault: php-fpm serves the front page"
 curl -s "$base/sc-vault-core.php" > "$dir/core.no-vault"
 if grep -qF "$db_password" "$dir/core.no-vault"; then
@@ -333,12 +352,19 @@ else
 fi
 
 # (b) the extension unloaded: no masking at all.
-compose cp "php:$ini" "$dir/securecore.ini" >>"$dir/cp.log" 2>&1
-grep -v '^extension=' "$dir/securecore.ini" > "$dir/no-ext.ini"
-compose cp "$dir/no-ext.ini" "php:$ini" >/dev/null 2>&1
-compose restart php >/dev/null 2>&1
-wait_200 || fail "no-ext: php-fpm serves the front page"
-if [ "$(compose exec -T php php -m | grep -cx securecore)" = 0 ]; then pass "revert (no extension): securecore is not loaded"; else fail "revert (no extension): securecore is not loaded"; fi
+if on_microvm; then
+  # The guest's php.ini is on its root image: its boot argument sc.ext=0 leaves the extension out.
+  php_restart --guest-arg sc.ext=0 >/dev/null 2>&1
+  wait_200 || fail "no-ext: php-fpm serves the front page"
+  is "$(curl -s "$base/securecore-status.php" | grep -c '^loaded=1')" 0 "revert (no extension): securecore is not loaded in the guest's php-fpm"
+else
+  compose cp "php:$ini" "$dir/securecore.ini" >>"$dir/cp.log" 2>&1
+  grep -v '^extension=' "$dir/securecore.ini" > "$dir/no-ext.ini"
+  compose cp "$dir/no-ext.ini" "php:$ini" >/dev/null 2>&1
+  compose restart php >/dev/null 2>&1
+  wait_200 || fail "no-ext: php-fpm serves the front page"
+  if [ "$(compose exec -T php php -m | grep -cx securecore)" = 0 ]; then pass "revert (no extension): securecore is not loaded"; else fail "revert (no extension): securecore is not loaded"; fi
+fi
 curl -s "$base/sc-vault-core.php" > "$dir/core.no-ext"
 if grep -qF "$db_password" "$dir/core.no-ext" && grep -qF "sc-test-auth-key" "$dir/core.no-ext"; then
   pass "revert (no extension): the probe DOES see the test password and the salts"
@@ -346,7 +372,7 @@ else
   fail "revert (no extension): the probe sees the secrets" "getenv_db=$(field "$dir/core.no-ext" getenv_db)"
 fi
 # Restore the extension and the vault config.
-compose cp "$dir/securecore.ini" "php:$ini" >/dev/null 2>&1
+on_microvm || compose cp "$dir/securecore.ini" "php:$ini" >/dev/null 2>&1
 apply enforce
 
 # --- 5b. opcache: a wpConfig literal secret is refused at startup (fail closed) ---------------
@@ -365,13 +391,17 @@ cat > "$dir/wpc-lit.json" <<JSON
     "default": {}, "components": {} },
   "layer3": { "enabled": false } }
 JSON
-compose cp "$dir/wpc-lit.json" "php:$conf" >/dev/null 2>&1
+put "$dir/wpc-lit.json"
 since=$(now)
-compose restart php >/dev/null 2>&1
-# It must refuse to start (php-fpm exits), not serve.
-i=0; until compose ps -a --format '{{.State}}' php 2>/dev/null | grep -q exited; do i=$((i+1)); [ "$i" -lt 30 ] || break; sleep 1; done
-if compose ps -a --format '{{.State}}' php 2>/dev/null | grep -q exited; then pass "opcache: php-fpm refuses to start on a literal wpConfig secret"; else fail "opcache: php-fpm refuses to start" "$(compose ps -a --format '{{.State}}' php)"; fi
+php_restart >/dev/null 2>&1
+# It must refuse to start (php-fpm exits; on the microVM the launcher, as its guest can't serve),
+# not serve.
+if wait_exited; then pass "opcache: php-fpm refuses to start on a literal wpConfig secret"; else fail "opcache: php-fpm refuses to start" "$(php_state)"; fi
 refuse_log=$(phplog "$since" 2>&1)
+# On the microVM the guest's php-fpm refuses during the boot, before its log reaches the launcher:
+# its words are on the guest's console (the launcher's error points there).
+on_microvm && refuse_log="$refuse_log
+$(cat "$mvm_state/console.log" 2>/dev/null)"
 if echo "$refuse_log" | grep -q "SC_LIT_SECRET is a string literal" && echo "$refuse_log" | grep -q "DECLARE_CONST"; then
   pass "opcache: the log names the secret and says to move it to a vault file or the env"
 else
@@ -384,6 +414,7 @@ apply enforce
 # --- 6. compat -------------------------------------------------------------------------------
 echo "# compat (Classic Editor, Yoast SEO, Contact Form 7)"
 if wp plugin install classic-editor wordpress-seo contact-form-7 --activate >>"$dir/compat.log" 2>&1; then
+  site_sync
   # A fresh request builds the pages with the three plugins and the vault on.
   is "$(code /)" 200 "compat: front page 200 with the three plugins and the vault on"
   is "$(code /wp-login.php)" 200 "compat: login page 200 with the three plugins and the vault on"
@@ -396,5 +427,6 @@ else
 fi
 
 echo
+na_summary
 if [ "$fails" -eq 0 ]; then echo "all ext-vault checks passed"; else echo "$fails check(s) failed"; fi
 [ "$fails" -eq 0 ]
