@@ -22,6 +22,12 @@
 #      left in the jail is gone; a site change makes a new snapshot; a larger --write-disk-mib
 #      grows the uploads disk and keeps its files; a broken snapshot falls back to a cold boot;
 #      --no-snapshot cold-boots; an orphaned uploads disk of a moved site is refused;
+#   3b. the folder sync (#72): uploads of 100 KB, 10 MiB and 100 MiB reach the host's folder
+#      (timed) and nginx serves them; renames, chmods and folder removals follow; the writer runs
+#      as the pool user with no network; a link in the host's folder is replaced, never written
+#      through; an upload made while the writer is stopped survives a SIGKILL of the launcher;
+#      the writer killed mid-file leaves the old file whole and the next one resends it; a stop
+#      drains the sync;
 #   4. SIGTERM stops the VM and the launcher exits 0.
 # Exits non-zero on any failure (and at once without /dev/kvm: never a skip). Writes
 # .tmp/ext-microvm/. Leaves the stack up.
@@ -403,6 +409,9 @@ lacks "$dir/container-microvm.log" "standin-ran" "microvm without KVM: php-fpm n
 # --- 2. WordPress from the jailed guest, and 3. the snapshot -----------------------------------
 echo "# microvm: the first start makes the snapshot"
 clean_state
+# The folder sync's files from an earlier run (the uploads disk is made from this folder now).
+up=$site/wp-content/uploads
+for d in lat moved mid crash drain sc-evil sc-evil2; do if [ -e "$up/$d" ] || [ -L "$up/$d" ]; then find "$up/$d" -delete; fi; done
 # Real uploads, larger than the site's code: the site disk must not carry them.
 head -c 300M /dev/urandom > "$site/wp-content/uploads/sc-big.bin"
 chown "$pool" "$site/wp-content/uploads/sc-big.bin"
@@ -542,6 +551,7 @@ if start second "$dir/microvm.json"; then
   skew=$(( $(date +%s) - $(val second time) ))
   is "$( [ "${skew#-}" -le 2 ] && echo ok )" ok "the restored guest's clock was resynced (skew ${skew} s)"
   is "$(val second read_uploads)" "first-$$" "the upload from the first start is still there (its disk persists)"
+  is "$(cat "$site/wp-content/uploads/sc-mvm.txt" 2>/dev/null)" "first-$$" "and the host's uploads folder has it too (the folder sync, #72)"
   # Two restores of one snapshot: their randomness differs.
   differ() { if [ "$1" != "$2" ]; then echo yes; else echo "no ($1)"; fi; }
   is "$(differ "$(val second random)" "$(val first random)")" yes "random_bytes differs between two restores of one snapshot (fresh entropy)"
@@ -549,6 +559,104 @@ if start second "$dir/microvm.json"; then
   stop
 else
   fail "microvm: the second start serves"
+fi
+
+echo "# the folder sync (#72): what the guest writes to uploads reaches the host's folder"
+outside=$sockdir/sync-outside
+mkdir -p "$outside"
+find "$outside" -mindepth 1 -delete
+# The pool user could write here: only the writer's own rules keep it out.
+chown "$pool" "$outside"
+# A link the site owner put in the host's folder while the VM was stopped: not in the guest's
+# tree, so the listing removes it (never follows it).
+ln -sfn "$outside" "$up/sc-evil2"
+# eventually <tenths> <shell test>: until the test holds, or the time is up.
+eventually() { n=0; until eval "$2"; do n=$((n + 1)); [ "$n" -lt "$1" ] || return 1; sleep 0.1; done; }
+# synced <rel> <size> <sha256>: waits (60 s at most) for the host's copy, then prints the ms.
+synced() {
+  t0=$(date +%s%N)
+  eventually 600 "[ \"\$(stat -c %s \"$up/$1\" 2>/dev/null)\" = $2 ] && [ \"\$(sha256sum \"$up/$1\" | cut -d' ' -f1)\" = $3 ]" || { echo never; return 1; }
+  echo "$(( ($(date +%s%N) - t0) / 1000000 ))"
+}
+writer_pid() { ps -o pid=,args= --ppid "$PID" | awk '/--sync-writer/ { print $1 }' | head -1; }
+if start sync "$dir/microvm.json"; then
+  eventually 300 "grep -q 'sync: folder 0 reconciled' \"$dir/sync.log\"" || true
+  has "$dir/sync.log" "syncing the writable folders back to the host as uid 1234" "the launcher syncs the writable folders as the pool user"
+  has "$dir/sync.log" "sync: folder 0 reconciled" "the guest's listing reconciled the host's folder"
+  is "$( [ -L "$up/sc-evil2" ] || [ -e "$up/sc-evil2" ] && echo there || echo gone)" gone "a link planted in the host's folder is removed by the listing"
+  wpid=$(writer_pid)
+  is "$(awk '/^Uid:/ { print $2 "/" $3 }' "/proc/$wpid/status" 2>/dev/null)" 1234/1234 "the writer (pid $wpid) runs as the pool user, never root"
+  is "$(awk '/^Groups:/ { print NF - 1 }' "/proc/$wpid/status")" 0 "with no supplementary groups"
+  is "$( [ "$(readlink "/proc/$wpid/ns/net")" != "$(readlink /proc/self/ns/net)" ] && echo own)" own "and no network (a network namespace of its own)"
+  for size in 102400 10485760 104857600; do
+    probe "?put=lat/$size.bin&size=$size&seed=$size" "put-$size"
+    ms=$(synced "lat/$size.bin" "$size" "$(val "put-$size" put_sha)")
+    is "$( [ "$ms" != never ] && echo synced)" synced "a $size-byte upload reaches the host whole (${ms} ms after its request returned; PHP wrote it in $(val "put-$size" put_ms) ms)"
+  done
+  is "$(curl -s -H "Host: 127.0.0.1:$port" "http://127.0.0.1:$vport/wp-content/uploads/lat/102400.bin" | sha256sum | cut -d' ' -f1)" "$(val put-102400 put_sha)" \
+    "nginx serves the upload from the host's folder"
+  is "$(stat -c '%u:%g' "$up/lat/102400.bin")" 1234:1234 "the host's copy is the pool user's"
+  probe "?mv=lat/102400.bin&to=moved/deep/r.bin" mv
+  eventually 100 "[ -f \"$up/moved/deep/r.bin\" ] && [ ! -e \"$up/lat/102400.bin\" ]"
+  is "$(sha256sum "$up/moved/deep/r.bin" 2>/dev/null | cut -d' ' -f1)" "$(val put-102400 put_sha)" "a rename in the guest is a rename on the host"
+  probe "?chmod=lat/10485760.bin&mode=600" chmod
+  eventually 100 "[ \"\$(stat -c %a \"$up/lat/10485760.bin\")\" = 600 ]"
+  is "$(stat -c %a "$up/lat/10485760.bin")" 600 "a chmod in the guest reaches the host"
+  probe "?rm=moved" rm
+  eventually 100 "[ ! -e \"$up/moved\" ]"
+  is "$( [ -e "$up/moved" ] && echo there || echo gone)" gone "a folder removed in the guest is removed on the host, with what was in it"
+  # A link planted in the host's folder while the VM runs, where the guest then makes a folder:
+  # the writer replaces the link, and writes nothing through it.
+  ln -sfn "$outside" "$up/sc-evil"
+  probe "?put=sc-evil/x.php&size=10&seed=evil" evil
+  eventually 100 "[ -f \"$up/sc-evil/x.php\" ]"
+  is "$( [ -d "$up/sc-evil" ] && [ ! -L "$up/sc-evil" ] && echo dir)" dir "a link in the host's folder is replaced by the guest's folder"
+  is "$(find "$outside" -mindepth 1 | grep -c .)" 0 "and nothing is written where it pointed (a folder the pool user could write)"
+  # A crash before an upload synced: the writer is stopped, the upload committed in the guest,
+  # then the launcher is killed. The next start's listing sends it.
+  kill -STOP "$wpid"
+  probe "?put=crash/c.bin&size=1048576&seed=crash" crash
+  # The guest writes its disks back within about a second (its writeback interval and ext4's
+  # commit=1), whether or not the host's writer keeps up; this one is stopped.
+  sleep 3
+  is "$( [ -e "$up/crash/c.bin" ] && echo there || echo absent)" absent "an upload made while the writer is stopped hasn't reached the host"
+  fc=$(sed -n 's/.*Firecracker runs jailed as uid [0-9]* gid [0-9]* (pid \([0-9]*\)).*/\1/p' "$dir/sync.log")
+  kill -KILL "$PID"; wait "$PID" 2>/dev/null; PID=""
+  eventually 50 "! kill -0 $fc 2>/dev/null && ! kill -0 $wpid 2>/dev/null"
+  is "$(kill -0 "$wpid" 2>/dev/null && echo alive || echo gone)" gone "the writer dies with the launcher (SIGKILL)"
+  sleep 0.5
+  if start sync2 "$dir/microvm.json"; then
+    ms=$(synced crash/c.bin 1048576 "$(val crash put_sha)")
+    is "$( [ "$ms" != never ] && echo synced)" synced "after the crash, the next start's listing sends the upload (${ms} ms after serving)"
+    # The writer killed in the middle of a file: the host keeps the old one whole, and nothing
+    # partial; the launcher starts a new writer, and the listing sends the new file.
+    probe "?put=mid/m.bin&size=10485760&seed=v1" v1
+    synced mid/m.bin 10485760 "$(val v1 put_sha)" > /dev/null
+    wpid=$(writer_pid)
+    kill -STOP "$wpid"
+    probe "?put=mid/m.bin&size=209715200&seed=v2" v2
+    kill -CONT "$wpid"
+    # The moment it holds the nameless file it writes into.
+    eventually 100 "ls -l /proc/$wpid/fd 2>/dev/null | grep -q '(deleted)'"
+    kill -KILL "$wpid"
+    is "$(sha256sum "$up/mid/m.bin" | cut -d' ' -f1)" "$(val v1 put_sha)" "the writer killed mid-file: the host keeps the old file whole"
+    is "$(find "$up" -name '.sc-sync-*' | grep -c .)" 0 "and no partial or temporary file"
+    ms=$(synced mid/m.bin 209715200 "$(val v2 put_sha)")
+    is "$( [ "$ms" != never ] && echo synced)" synced "a new writer, and the listing sends the new file (${ms} ms)"
+    has "$dir/sync2.log" "the folder sync's writer ended" "the launcher says the writer ended and connects again"
+    # The test's files go, through the guest (its disk is the authority).
+    for d in lat mid crash sc-evil; do probe "?rm=$d" "rm-$d"; done
+    eventually 100 "[ ! -e \"$up/lat\" ] && [ ! -e \"$up/mid\" ] && [ ! -e \"$up/crash\" ] && [ ! -e \"$up/sc-evil\" ]" || fail "the test's files removed through the guest"
+    # A stop syncs first: an upload made just before it is on the host when the launcher exits.
+    probe "?put=drain/d.bin&size=104857600&seed=drain" drain
+    stop
+    is "$(sha256sum "$up/drain/d.bin" 2>/dev/null | cut -d' ' -f1)" "$(val drain put_sha)" "an upload made just before a stop is on the host when the launcher exits"
+    lacks "$dir/sync2.log" "did not sync" "the stop's sync drained the folder sync"
+  else
+    fail "the folder sync: the start after the crash serves"
+  fi
+else
+  fail "the folder sync: the start serves"
 fi
 
 echo "# the launcher killed (SIGKILL): the VM goes with it"

@@ -23,6 +23,8 @@ pub mod guest;
 #[cfg(target_os = "linux")]
 pub mod jail;
 #[cfg(target_os = "linux")]
+pub mod sync;
+#[cfg(target_os = "linux")]
 pub mod vm;
 #[cfg(target_os = "linux")]
 pub mod vsock;

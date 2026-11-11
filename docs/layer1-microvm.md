@@ -612,6 +612,86 @@ The product version of items 1, 2 and 4 is in `ext/fpm` (`securecore-fpm`; `ext/
   each file against those sha256s. `bench/microvm/firecracker.json` and `mirab-kernel.json`
   stay as the spike's record only.
 
+## Uploads sync back to the host (#72)
+
+A writable folder inside the app root (`wp-content/uploads`) is an ext4 disk in the guest. The
+host can't safely read that image while the guest has it mounted read-write. Until #72, nginx
+and backups therefore never saw an upload, and `auto` was gated off. Now the guest tells the
+host what changes, and the host applies it to the real folder (`ext/fpm/src/sync.rs`):
+
+```
+guest  securecore-init: inotify on every folder of each writable disk
+         │ vsock 516: the guest listens (below 1024, so only its root can); the host connects
+host   securecore-fpm ── hands the connection to ──► securecore-fpm --sync-writer
+         the site's pool user (never root: it refuses), no supplementary groups, its own empty
+         network namespace, killed with the launcher; one O_PATH handle per folder (opened
+         beneath the app root); every path opened beneath it with openat2 RESOLVE_BENEATH and
+         no symlinks
+```
+
+- **The guest's disk is the authority, the host's folder its mirror.** Each connection starts
+  with the guest's whole listing. The host removes what the guest doesn't have, makes the
+  folders it lacks, and asks for every file whose size or mtime differs. After that the guest
+  streams its changes:
+  - a file when it is closed after writing;
+  - new folders (with what is already in them);
+  - deletes (a folder with what it holds), renames (a folder's watches follow it) and modes;
+  - a hard link when it is made.
+
+  A queue overflow resends the listing.
+- **What the guest can do to the host** is what it can do to its own disk, inside the folders
+  and within caps:
+  - paths are plain and relative (`..`, `.`, empty names, more than 64 levels or 4096 bytes are
+    refused, and the connection closes);
+  - a symlink in the host's folder is never followed or written through: it is replaced by
+    what the guest has (a folder, a file), or removed by the listing;
+  - a folder's files never total more than its disk's size (`--write-disk-mib`);
+  - 256 MiB/s and 2000 operations a second, each with one second of burst;
+  - setuid, setgid and sticky bits are dropped.
+- **Crash safety.**
+  - The host writes each file into a nameless file (O_TMPFILE), fsyncs it, links it to a
+    temporary name and renames it into place, then fsyncs the folder. A writer killed in the
+    middle leaves the old file whole and nothing partial.
+  - The guest fsyncs a file before it sends it.
+  - The guest's own writeback no longer waits for the host. Dirty pages older than 1 s are
+    written every 0.5 s (the defaults are 30 s and 5 s), and the writable disks mount with
+    `commit=1`. So an upload is out of guest RAM within about a second of its request, even
+    when the host's writer is stuck. The first run without this lost an upload made while the
+    writer was stopped and Firecracker was then killed (below).
+  - A broken connection (either side crashing) is followed by a new writer and a new listing,
+    which sends whatever didn't arrive.
+- **A stop drains the sync.** The `sync` control line waits up to 8 s for every change made
+  before it to be written on the host.
+
+Measured on [xps] by `test/ext-microvm.sh` (the time from the PHP request returning, with the
+file closed in the guest, until the host's copy has the right sha256):
+
+| upload | PHP's write in the guest (two runs) | on the host after (two runs) |
+|---|---|---|
+| 100 KB | 0.7 / 2.4 ms | 9 / 26 ms |
+| 10 MiB | 67 / 123 ms | 165 / 194 ms |
+| 100 MiB | 684 / 1270 ms | 647 / 1370 ms |
+| 1 MiB made while the writer was stopped, then the launcher killed | | 23 ms after the next start serves |
+| 200 MiB, resent after the writer was killed mid-file | | 3.2 / 3.3 s (1 s reconnect delay, listing, transfer) |
+
+The second run's guest was slower at writing the file too (another agent's load on the box).
+Roughly, the host has a file 10–25 ms plus about 10 ms per MiB after PHP closes it.
+
+The listing at a start compares 6 to 13 entries (300 MiB of uploads) in under 1 ms and sends
+nothing. `mke2fs -d` keeps nanosecond mtimes, so the first start doesn't resend the folder.
+The sync costs a page nothing: its threads wait in `poll` until a writable folder changes.
+
+**Alternatives considered:**
+- **Serving `/wp-content/uploads` through the guest** (nginx → FastCGI → a static handler in the
+  guest). Backups and anything else on the host would still never see the files, and every
+  image request would pay the vsock hop.
+- **An NFS or 9p server over vsock** would make the host's folder the guest's. That puts a
+  network file system under every upload and directory scan, and a file server parsing guest
+  requests, as root, on the host. Firecracker has no virtio-fs.
+- **Reading the guest's ext4 image on the host** means root parsing an image the guest wrote,
+  which #75 rules out.
+- **Offload plugins** (object storage) work unchanged in the guest, but they aren't a default.
+
 ## Follow-up issues (not filed)
 
 1. **mirab: Landlock and seccomp in the x86_64 guest kernel.** Add `SECURITY`,

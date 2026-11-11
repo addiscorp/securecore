@@ -91,6 +91,12 @@ impl Vsock {
     }
 }
 
+impl AsRawFd for Vsock {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 impl Read for Vsock {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // SAFETY: buf is valid for buf.len() bytes, on an fd we own.

@@ -12,12 +12,15 @@
 //!   ctl   guest port 1515 ← one start message after each boot or restore (clock, fresh
 //!         randomness, the workers' refresh after a restore, then the disks); later `sync`
 //!         before a stop and `reload` on SIGUSR2/SIGHUP
+//!   sync  guest port 516 ← the writable folders' changes, applied to the host's folders by
+//!         `securecore-fpm --sync-writer` as the pool user ([`crate::sync`], #72)
 //! ```
 //!
 //! Disks: vda the guest root (`rootfs.ext4`, read-only, shared); vdb the site, built from the
 //! app root with `mke2fs -d` (read-only, rebuilt when the tree changes); vdc on one per
 //! `layer1.write` folder inside the app root (read-write, `--write-disk-mib`, kept across
-//! starts and grown when the size goes up). `write` folders outside the root are tmpfs.
+//! starts and grown when the size goes up), mirrored back into that folder on the host as the
+//! guest changes it. `write` folders outside the root are tmpfs.
 //!
 //! Only verified files boot: `<vm-dir>/installed.json` (written by the installer) must give the
 //! sha256 of Firecracker, the jailer, the kernel and the root image, and they must match.
@@ -60,7 +63,7 @@ pub const DEFAULT_STATE_DIR: &str = "/var/lib/securecore/vm";
 pub const DEFAULT_VM_USER: &str = "securecore-vm";
 /// Bumped whenever what goes into a guest changes shape (boot arguments, disks, the start
 /// message), so old snapshots are never restored into a new driver.
-const PROTOCOL: u32 = 2;
+const PROTOCOL: u32 = 3;
 /// KVM_GET_API_VERSION, and the only value every KVM since Linux 2.6.22 returns.
 const KVM_GET_API_VERSION: libc::c_ulong = 0xAE00;
 const KVM_API_VERSION: i32 = 12;
@@ -1552,6 +1555,80 @@ fn console_writer(from: impl Read, path: PathBuf, cap: u64) {
 /// `console.log`'s cap.
 const CONSOLE_CAP: u64 = 8 << 20;
 
+/// The writable folders' sync (#72, [`crate::sync`]): connects to the guest's sync port and
+/// hands the connection to a writer ([`spawn_writer`]). When the writer ends (either side
+/// crashed, or the connection broke), it connects again, and the guest starts over with its
+/// whole listing, so nothing that didn't arrive is lost. Ends with the VM.
+fn sync_folders(uds: PathBuf, root: PathBuf, rels: Vec<PathBuf>, cap: u64, pool: User) {
+    let mut quiet = false;
+    while !QUITTING.load(Ordering::SeqCst) && !FIRECRACKER_EXITED.load(Ordering::SeqCst) {
+        match spawn_writer(&uds, &root, &rels, cap, pool) {
+            Ok(mut child) => {
+                quiet = false;
+                let st = child.wait();
+                if QUITTING.load(Ordering::SeqCst) || FIRECRACKER_EXITED.load(Ordering::SeqCst) {
+                    return;
+                }
+                log(&format!("the folder sync's writer ended ({}); connecting again", st.map_or_else(|e| e.to_string(), |s| s.to_string())));
+            }
+            Err(e) if !quiet => {
+                log(&format!("the folder sync can't start ({e}); retrying every second"));
+                quiet = true;
+            }
+            Err(_) => {}
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// `securecore-fpm --sync-writer` for one connection to the guest's sync port: the connection
+/// on its stdin, a handle on each writable folder (opened beneath the app root, no link on the
+/// way) from fd 3 on, as the site's pool user with no supplementary groups, in a network
+/// namespace of its own (no network), killed if the launcher dies.
+fn spawn_writer(uds: &Path, root: &Path, rels: &[PathBuf], cap: u64, pool: User) -> Result<Child, String> {
+    use std::os::fd::OwnedFd;
+    let conn = vsock::connect_through(uds, crate::sync::SYNC_PORT, Duration::from_secs(2)).map_err(|e| format!("guest port {}: {e}", crate::sync::SYNC_PORT))?;
+    let folders: Vec<OwnedFd> = rels.iter().map(|r| jail::open_dir_beneath(root, r)).collect::<Result<_, _>>()?;
+    let raw: Vec<libc::c_int> = folders.iter().map(|f| f.as_raw_fd()).collect();
+    let mut high = vec![0 as libc::c_int; raw.len()];
+    let caps = vec![cap.to_string(); rels.len()].join(",");
+    let mut cmd = Command::new("/proc/self/exe");
+    cmd.arg0("securecore-fpm").arg("--sync-writer").arg(caps).stdin(Stdio::from(OwnedFd::from(conn))).stdout(Stdio::null());
+    // SAFETY: only syscalls between fork and exec, on values made before the fork.
+    unsafe {
+        cmd.pre_exec(move || {
+            let err = || Err(io::Error::last_os_error());
+            // Each folder to a fresh high fd first (closed at exec), then into place from fd 3:
+            // no source is overwritten before it is moved.
+            for (h, &fd) in high.iter_mut().zip(&raw) {
+                *h = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 64);
+                if *h < 0 {
+                    return err();
+                }
+            }
+            for (n, &h) in high.iter().enumerate() {
+                if libc::dup2(h, crate::sync::WRITER_FIRST_FD + n as libc::c_int) < 0 {
+                    return err();
+                }
+            }
+            if libc::unshare(libc::CLONE_NEWNET) < 0 {
+                return err();
+            }
+            if libc::setgroups(0, std::ptr::null()) < 0 || libc::setgid(pool.gid) < 0 || libc::setuid(pool.uid) < 0 {
+                return err();
+            }
+            // After the uid change, which clears it.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                return err();
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().map_err(|e| format!("the sync writer: {e}"))?;
+    drop(folders);
+    Ok(child)
+}
+
 fn serve<S: vsock::Half>(incoming: impl Iterator<Item = io::Result<S>>, uds: PathBuf) {
     for c in incoming.flatten() {
         match vsock::connect_through(&uds, FPM_PORT, Duration::from_secs(2)) {
@@ -1701,6 +1778,12 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         Started::Cold => log(&format!("microVM cold-booted; ready {t_ready:.0} ms, started {t_started:.0} ms after launch")),
     }
     log(&format!("Firecracker runs jailed as uid {} gid {} (pid {})", user.uid, user.gid, vm.pid));
+    if !plan.disks.is_empty() {
+        let rels: Vec<PathBuf> = plan.disks.iter().map(|d| d.rel(&plan.root)).collect::<Result<_, _>>()?;
+        let (uds, root, cap, pool) = (vm.vsock.clone(), plan.root.clone(), opts.write_disk_mib << 20, plan.pool);
+        log(&format!("syncing the writable folders back to the host as uid {} ({})", pool.uid, rels.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")));
+        thread::spawn(move || sync_folders(uds, root, rels, cap, pool));
+    }
     let uds = vm.vsock.clone();
     match &plan.listen {
         Listen::Unix(path) => {
