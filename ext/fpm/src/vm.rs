@@ -39,7 +39,7 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
@@ -180,11 +180,12 @@ pub struct Options {
 
 /// The site's php.ini settings as the guest gets them: `None` without `--guest-ini` or while the
 /// file is missing; refused with the reason when it sets anything else. The file is the
-/// operator's (a launcher flag names it, as with `--config`), read as the launcher, but never
-/// through a link, regular only, within [`MAX_SITE_INI`].
+/// operator's (a launcher flag names it, as with `--config`), read the way `securecore.json` is
+/// ([`crate::sitefile::read`]: no link anywhere in its path, as its folder's owner, regular
+/// only), within [`MAX_SITE_INI`].
 pub fn read_site_ini(path: Option<&Path>) -> Result<Option<String>, String> {
     let Some(path) = path else { return Ok(None) };
-    match read_regular(path, MAX_SITE_INI, None) {
+    match crate::sitefile::read(path, MAX_SITE_INI) {
         Ok(None) => Ok(None),
         Ok(Some(b)) => {
             let text = String::from_utf8(b).map_err(|_| format!("{}: not UTF-8", path.display()))?;
@@ -196,67 +197,6 @@ pub fn read_site_ini(path: Option<&Path>) -> Result<Option<String>, String> {
 
 /// The largest `--guest-ini` file read.
 pub const MAX_SITE_INI: usize = 16 * 1024;
-
-/// Reads a file the site's owner controls (`securecore.json`, the `--guest-ini` file) the way
-/// the pool user would (#90 review): this thread's filesystem uid and gid are the pool user's for
-/// the open, the last component is never followed (a link is refused), it must be a regular
-/// file, and at most `cap` bytes are read (a larger one is refused, a device never read).
-/// `Ok(None)`: it doesn't exist. No error ever quotes the file's bytes.
-pub fn read_regular(path: &Path, cap: usize, who: Option<User>) -> Result<Option<Vec<u8>>, String> {
-    // The folder is the launcher's to reach (as the site disk's copy does, its folders above the
-    // root may be closed to the pool user); the file itself is opened in it as `who`.
-    let (dir, name) = match (path.parent(), path.file_name()) {
-        (Some(d), Some(n)) if !d.as_os_str().is_empty() => (d, n),
-        _ => (Path::new("."), path.as_os_str()),
-    };
-    let d = cpath(dir)?;
-    let n = cpath(Path::new(name))?;
-    // SAFETY: open(2) with a NUL-terminated path; the fd is owned below.
-    let dfd = unsafe { libc::open(d.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-    if dfd < 0 {
-        let e = io::Error::last_os_error();
-        return if e.kind() == io::ErrorKind::NotFound { Ok(None) } else { Err(format!("{}: {e}", dir.display())) };
-    }
-    // SAFETY: dfd was just returned by open(2).
-    let dfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(dfd) };
-    // SAFETY: setfsuid(2)/setfsgid(2) change only this thread's filesystem ids, and are put
-    // back right after the open.
-    let old = who.map(|w| unsafe { (libc::setfsgid(w.gid), libc::setfsuid(w.uid)) });
-    // SAFETY: openat(2) in the folder's fd with a NUL-terminated name.
-    let fd = unsafe { libc::openat(dfd.as_raw_fd(), n.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
-    let err = io::Error::last_os_error();
-    if let Some((old_gid, old_uid)) = old {
-        // SAFETY: as above.
-        unsafe {
-            libc::setfsuid(old_uid as libc::uid_t);
-            libc::setfsgid(old_gid as libc::gid_t);
-        }
-    }
-    if fd < 0 {
-        if err.kind() == io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        if err.raw_os_error() == Some(libc::ELOOP) {
-            return Err(format!("{} is a link: refused (it is read only as itself)", path.display()));
-        }
-        return Err(format!("{}: {err}", path.display()));
-    }
-    // SAFETY: fd was just returned by open(2).
-    let f = unsafe { fs::File::from_raw_fd(fd) };
-    let m = f.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
-    if !m.file_type().is_file() {
-        return Err(format!("{} is not a regular file: refused", path.display()));
-    }
-    if m.len() > cap as u64 {
-        return Err(format!("{} is larger than {cap} bytes: refused", path.display()));
-    }
-    let mut b = Vec::new();
-    f.take(cap as u64 + 1).read_to_end(&mut b).map_err(|e| format!("{}: {e}", path.display()))?;
-    if b.len() > cap {
-        return Err(format!("{} is larger than {cap} bytes: refused", path.display()));
-    }
-    Ok(Some(b))
-}
 
 /// php-fpm's environment in the guest: each name in `--guest-env` and each vault secret's `env`,
 /// with its value from the launcher's own environment (as php-fpm on the host would have it).
@@ -1570,13 +1510,16 @@ fn refused(lines: &[Ctl], reply: &str) -> Result<(), String> {
 /// own reload interval, so an edit reaches the guest's workers about as soon as a host's.
 pub const WATCH_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// How [`live_change`]'s refusal starts.
+const VM_CANT_RUN: &str = "the microVM can't run it";
+
 /// Whether a running guest can take `new` (#90), the config it started with being `started`:
 /// `Err(why)` when the microVM can't express it (the same check a start makes, [`plan`]), so the
 /// guest keeps what it has; else what the launcher says about it. As on a host, a change to
 /// `layer1` or to the vault takes effect only at the next start (the extension in the guest
 /// reports `restart_needed`); layers 2 and 3 reload in place.
 pub fn live_change(started: &Loaded, new: &Loaded, opts: &Options) -> Result<Vec<String>, String> {
-    plan(new, opts).map_err(|e| format!("the microVM can't run it ({e})"))?;
+    plan(new, opts).map_err(|e| format!("{VM_CANT_RUN} ({e})"))?;
     let mut notes = Vec::new();
     if new.config.layer1 != started.config.layer1 {
         notes.push("layer1 differs from the one this VM started with: it applies at the next start (restart_needed)".to_owned());
@@ -1593,16 +1536,7 @@ pub fn live_change(started: &Loaded, new: &Loaded, opts: &Options) -> Result<Vec
 /// valid one is put in place in the guest, where the extension reloads it as on a host (and the
 /// host's egress takes its layer 2 hosts). A changed php.ini is delivered and php-fpm started
 /// again gracefully with it.
-#[allow(clippy::too_many_arguments)] // the watcher's whole state, handed over once at the start
-fn watch_live(
-    started: &Loaded,
-    opts: &Options,
-    uds: &Path,
-    egress: &std::sync::RwLock<crate::egress::Egress>,
-    ports: &[u16],
-    mut ini: Option<String>,
-    pool: User,
-) {
+fn watch_live(started: &Loaded, opts: &Options, uds: &Path, egress: &std::sync::RwLock<crate::egress::Egress>, ports: &[u16], mut ini: Option<String>) {
     let mut in_guest = started.sha256.clone();
     // The file's bytes last looked at (by sha256), and what was said about them: each version is
     // judged once, as the extension's Reloader does.
@@ -1610,10 +1544,12 @@ fn watch_live(
     let mut refused: Option<String> = None;
     let mut read_error: Option<String> = None;
     let mut ini_refused: Option<String> = None;
+    let mut unsure: Option<(Loaded, u8)> = None;
     loop {
         thread::sleep(WATCH_INTERVAL);
-        // Read as the pool user, never through a link, at most MAX_CONFIG bytes (#90 review).
-        let bytes = match read_regular(&started.path, crate::guest::MAX_CONFIG, Some(pool)) {
+        // The launcher's start reads it the same way (#90 review): no link anywhere in its path,
+        // as its folder's owner, regular only, at most MAX_CONFIG bytes.
+        let bytes = match crate::sitefile::read(&started.path, crate::guest::MAX_CONFIG) {
             Ok(Some(b)) => {
                 read_error = None;
                 Some(b)
@@ -1634,7 +1570,8 @@ fn watch_live(
                 match securecore_config::Config::from_slice(&b) {
                     Ok(config) => Some((Loaded { path: started.path.clone(), config, sha256: sha, root: started.root.clone() }, b)),
                     Err(problem) => {
-                        let e = securecore_config::LoadError { path: started.path.clone(), problem };
+                        // Never quoting the file (#90 review), as at the start.
+                        let e = securecore_config::LoadError { path: started.path.clone(), problem }.without_contents();
                         log(&format!("{e}; keeping the last valid config in the guest (sha256 {})", short_sha(&in_guest)));
                         None
                     }
@@ -1670,8 +1607,31 @@ fn watch_live(
                         live.path.display(),
                         short_sha(&in_guest)
                     ));
+                    // No answer from the guest (not its own refusal, not ours): it may still put
+                    // it in place late, so its answer is asked for again on the next looks.
+                    if !guest_answered(&e) && !e.starts_with(VM_CANT_RUN) {
+                        unsure = Some((live.clone(), 0));
+                    }
                     refused = Some(live.sha256.clone());
                 }
+            }
+        } else if let Some((live, tries)) = unsure.take() {
+            // N4 (#90 verification review): the guest's own answer decides a delivery whose
+            // reply was lost, on the next looks too.
+            match ask_config_sha(uds) {
+                Ok(now) if now == live.sha256 => {
+                    log(&format!(
+                        "the running guest reads {} (sha256 {}) after all (it answered late): delivered",
+                        live.path.display(),
+                        short_sha(&live.sha256)
+                    ));
+                    *egress.write().unwrap_or_else(|p| p.into_inner()) = crate::egress::Egress::new(&live, ports.to_vec());
+                    in_guest = live.sha256.clone();
+                    refused = None;
+                }
+                Ok(_) => {}
+                Err(_) if tries < 10 => unsure = Some((live, tries + 1)),
+                Err(e) => log(&format!("the guest never said which config it reads ({e}); it is taken to keep sha256 {}", short_sha(&in_guest))),
             }
         }
         if let Some(path) = &opts.guest_ini {
@@ -1688,6 +1648,12 @@ fn watch_live(
                             body.lines().count(),
                             ms(t)
                         )),
+                        // No answer at all (N4, #90 verification review): the next look delivers
+                        // them again; the guest's own refusal stands.
+                        Err(e) if !guest_answered(&e) => {
+                            log(&format!("the site's php.ini settings from {}: no answer from the guest ({e}); sending them again", path.display()));
+                            continue;
+                        }
                         Err(e) => log(&format!("the site's php.ini settings from {}: the guest refused them: {e}", path.display())),
                     }
                     ini = text;
@@ -2634,8 +2600,8 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     // An edited securecore.json and php.ini settings reach the running guest (#90).
     {
         let (loaded, opts, uds) = (loaded.clone(), opts.clone(), vm.vsock.clone());
-        let (ports, pool) = (plan.egress.clone(), plan.pool);
-        thread::spawn(move || watch_live(&loaded, &opts, &uds, egress, &ports, ini, pool));
+        let ports = plan.egress.clone();
+        thread::spawn(move || watch_live(&loaded, &opts, &uds, egress, &ports, ini));
     }
     let sig = loop {
         let sig = wait_for_signal(&set);
@@ -3361,43 +3327,12 @@ mod tests {
     /// never quotes their bytes.
     #[test]
     fn a_site_file_is_read_as_itself_regular_and_capped() {
-        let dir = scratch("regular");
-        // SAFETY: getuid/getgid only read this process's ids.
-        let me = Some(User { uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() } });
-        let file = dir.join("securecore.json");
-        fs::write(&file, "{\"secret\":\"s3cr3t\"}").expect("write");
-        assert_eq!(read_regular(&file, 1024, me), Ok(Some(b"{\"secret\":\"s3cr3t\"}".to_vec())));
-        assert_eq!(read_regular(&dir.join("missing.json"), 1024, me), Ok(None));
-        // As root (the launcher): the folder is reached as root, the file opened as the pool
-        // user, so a file the pool user can't read isn't read (another tenant's, root's own).
-        // SAFETY: geteuid only reads this process's id.
-        if unsafe { libc::geteuid() } == 0 {
-            let nobody = Some(User { uid: 65534, gid: 65534 });
-            // The site's root (open to its pool user) inside folders only root may enter.
-            let site = dir.join("site");
-            fs::create_dir_all(&site).expect("site");
-            let conf = site.join("securecore.json");
-            fs::write(&conf, "{}").expect("write");
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
-            fs::set_permissions(&site, fs::Permissions::from_mode(0o755)).expect("chmod");
-            fs::set_permissions(&conf, fs::Permissions::from_mode(0o644)).expect("chmod");
-            assert!(read_regular(&conf, 1024, nobody).expect("readable to all").is_some(), "through a folder only root may enter");
-            fs::set_permissions(&conf, fs::Permissions::from_mode(0o600)).expect("chmod");
-            assert!(read_regular(&conf, 1024, nobody).expect_err("root's alone").contains("Permission denied"));
-            assert!(read_regular(&conf, 1024, None).is_ok(), "the launcher's own reading");
-        }
-        let other = dir.join("other-tenant.json");
-        fs::write(&other, "theirs").expect("write");
-        let link = dir.join("link.json");
-        std::os::unix::fs::symlink(&other, &link).expect("link");
-        let e = read_regular(&link, 1024, me).expect_err("a link");
-        assert!(e.contains("is a link: refused"), "{e}");
-        let zero = dir.join("zero.json");
-        std::os::unix::fs::symlink("/dev/zero", &zero).expect("link");
-        assert!(read_regular(&zero, 1024, me).is_err(), "/dev/zero through a link");
-        assert!(read_regular(Path::new("/dev/zero"), 1024, me).expect_err("a device").contains("not a regular file"));
-        let e = read_regular(&file, 4, me).expect_err("over the cap");
-        assert!(e.contains("larger than 4 bytes") && !e.contains("s3cr3t"), "{e}");
+        // The reading itself is sitefile::read's (its own tests); here the --guest-ini file's.
+        let dir = fs::canonicalize(scratch("regular")).expect("dir");
+        let big = dir.join("big.ini");
+        fs::write(&big, vec![b';'; MAX_SITE_INI + 1]).expect("write");
+        assert!(read_site_ini(Some(&big)).expect_err("too big").contains("larger than"));
+        assert!(read_site_ini(Some(Path::new("/dev/zero"))).expect_err("a device").contains("not a regular file"));
         let ini = dir.join("site.ini");
         fs::write(&ini, "securecore.debug_attribution_log = ${WORDPRESS_DB_PASSWORD}\n").expect("write");
         let e = read_site_ini(Some(&ini)).expect_err("a ${} value");

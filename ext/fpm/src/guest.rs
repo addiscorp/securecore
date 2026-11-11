@@ -190,7 +190,7 @@ pub enum Ctl {
 }
 
 /// The largest `securecore.json` the host delivers (bytes).
-pub const MAX_CONFIG: usize = 128 * 1024;
+pub const MAX_CONFIG: usize = crate::sitefile::MAX_CONFIG;
 /// Where the guest keeps delivered configs and the site's ini.
 const LIVE_DIR: &str = "/run/securecore";
 /// php-fpm's extra ini folder, after the image's own: the site's settings ([`Ctl::Ini`]).
@@ -590,7 +590,9 @@ fn fd_path(fd: &OwnedFd) -> String {
 fn config_sha() -> io::Result<String> {
     use sha2::{Digest as _, Sha256};
     let boot = BOOT.get().ok_or_else(|| io::Error::other("no boot settings"))?;
-    let bytes = fs::read(format!("{}/securecore.json", boot.root))?;
+    // Never through a link, capped (#90 verification review, N5): the launcher's own reading.
+    let path = format!("{}/securecore.json", boot.root);
+    let bytes = crate::sitefile::read(Path::new(&path), MAX_CONFIG).map_err(io::Error::other)?.ok_or_else(|| io::Error::other(format!("{path}: missing")))?;
     Ok(hex_of(&Sha256::digest(&bytes)))
 }
 
