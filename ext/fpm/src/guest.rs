@@ -171,6 +171,10 @@ pub enum Ctl {
     /// The handshake, alone on its connection before the start message: the host's protocol.
     /// `ok` only when it is this init's own and the one it booted with (`sc.proto`).
     Proto { version: u32 },
+    /// This VM's log key (hex, [`crate::guestlog::KEY_LEN`] bytes): the host takes the log only
+    /// from connections that present it (#86). Alone on its connection, at any time; only the
+    /// host can reach this port, and no other process in the guest learns the key.
+    LogKey { hex: String },
     Done,
 }
 
@@ -186,6 +190,7 @@ impl Ctl {
             Ctl::Sync => "sync\n".into(),
             Ctl::Reload => "reload\n".into(),
             Ctl::Proto { version } => format!("proto {version}\n"),
+            Ctl::LogKey { hex } => format!("logkey {hex}\n"),
             Ctl::Done => "done\n".into(),
         }
     }
@@ -208,6 +213,9 @@ impl Ctl {
             ["sync"] => Ok(Ctl::Sync),
             ["reload"] => Ok(Ctl::Reload),
             ["proto", v] => Ok(Ctl::Proto { version: v.parse().map_err(|_| format!("proto: {v}"))? }),
+            ["logkey", hex] if hex.len() == 2 * crate::guestlog::KEY_LEN && hex.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(Ctl::LogKey { hex: (*hex).into() }),
+            // Never echo it: it is a secret.
+            ["logkey", ..] => Err("a malformed logkey line".into()),
             ["done"] => Ok(Ctl::Done),
             // Never echo an env line: it carries a secret.
             ["env", ..] => Err("a malformed env line".into()),
@@ -231,7 +239,7 @@ pub fn env_name_ok(name: &str) -> bool {
 /// Exactly one start message per boot (a snapshot is taken before it, so each restore takes its
 /// own); after it only `sync` and `reload`, and nothing at all before it but a start.
 pub fn allowed(lines: &[Ctl], started: bool) -> Result<(), String> {
-    if lines.iter().any(|c| matches!(c, Ctl::Proto { .. })) && lines.len() > 1 {
+    if lines.iter().any(|c| matches!(c, Ctl::Proto { .. } | Ctl::LogKey { .. })) && lines.len() > 1 {
         return Err("the handshake comes alone".into());
     }
     let starts = lines.iter().any(Ctl::starts);
@@ -501,9 +509,14 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             }
             // The host stops the VM after a sync: every log line must be in its log by then, or
             // counted there as lost (the reply is the launcher's to log).
-            LOG.drain(LOG_DRAIN).map_err(|n| io::Error::other(crate::guestlog::lost(n as u64, "not acknowledged by the host before the stop")))
+            LOG.drain(LOG_DRAIN).map_err(|n| io::Error::other(crate::guestlog::lost(n as u64, crate::guestlog::UNACKED_AT_STOP)))
         }
         // Checked before anything is applied ([`protocol_ok`]).
+        Ctl::LogKey { hex } => {
+            let key: crate::guestlog::Key = unhex(hex).try_into().map_err(|_| io::Error::other("logkey: not a key"))?;
+            LOG.set_key(key);
+            Ok(())
+        }
         Ctl::Proto { .. } | Ctl::Done => Ok(()),
     }
 }
@@ -877,7 +890,8 @@ fn boot_guest() -> io::Result<u32> {
             return Err(io::Error::new(e.kind(), format!("{link}: {e}")));
         }
     }
-    mount("tmpfs", "/tmp", "tmpfs", flags, "mode=1777")?;
+    // noexec: nothing a site writes there runs (#86 review).
+    mount("tmpfs", "/tmp", "tmpfs", flags | libc::MS_NOEXEC, "mode=1777")?;
     mount("tmpfs", "/run", "tmpfs", flags, "mode=755")?;
     // The host's log first: whatever fails from here on can be said there (#87).
     start_log();
@@ -1045,6 +1059,14 @@ mod tests {
         assert_eq!(allowed(&[Ctl::Sync], true), Ok(()));
         assert_eq!(allowed(&[Ctl::Reload], true), Ok(()));
         assert!(allowed(&[Ctl::Sync], false).is_err(), "nothing before the start");
+        // The log key (#86 review): at any time, alone, and never echoed when malformed.
+        let key = Ctl::LogKey { hex: "ab".repeat(crate::guestlog::KEY_LEN) };
+        assert_eq!(Ctl::parse(key.line().trim_end()), Ok(key.clone()));
+        assert_eq!(allowed(std::slice::from_ref(&key), false), Ok(()));
+        assert_eq!(allowed(std::slice::from_ref(&key), true), Ok(()));
+        assert!(allowed(&[key, Ctl::Sync], true).is_err(), "alone on its connection");
+        let e = Ctl::parse(&format!("logkey {}", "5ec7".repeat(8))).expect_err("short");
+        assert!(!e.contains("5ec7"), "{e}");
         assert!(allowed(&[Ctl::Time { secs: 1, nanos: 0 }, Ctl::Reload], false).is_err());
     }
 }
