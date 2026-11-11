@@ -212,7 +212,12 @@ unsafe fn check(ex: *mut zend_execute_data, hook: &Hook) -> Then {
     if !l2.enabled || l2.app.is_none() || l2.mode == Mode::Off {
         return Then::Run;
     }
-    let Some(text) = (unsafe { vault::arg(ex, hook.sql_arg) }).and_then(Zval::str).map(str::to_owned) else {
+    // Read as UTF-8 with any invalid byte replaced: a byte that is not UTF-8 is never ASCII, so
+    // the statement's structure (keywords, quotes, comments) reads as the server reads it. Taking
+    // only valid UTF-8 skipped the check for any query with one such byte in it, a comment
+    // included (#94).
+    let Some(text) = (unsafe { vault::arg(ex, hook.sql_arg) }).and_then(Zval::zend_str).map(|s| String::from_utf8_lossy(s.as_bytes()).into_owned())
+    else {
         // No SQL argument (mysqli_stmt without a query, a non-string): nothing to decide.
         return Then::Run;
     };
