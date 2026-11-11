@@ -79,8 +79,9 @@ jobs:
             exit 1
           fi
           # A canary built with a development mirab manifest (release.yml's mirab_manifest
-          # input) never becomes stable (#71).
-          scripts/promote-check.sh "stable/${V}" || { echo "::error::${C} took its microVM files from a development mirab manifest; it can't be promoted."; exit 1; }
+          # input) never becomes stable (#71), nor one whose guest image (#80) isn't the one its
+          # release.json and vm/manifest.json name, gzipped and unpacked.
+          scripts/promote-check.sh "stable/${V}" || { echo "::error::${C} can't be promoted (scripts/promote-check.sh says why above)."; exit 1; }
           # The bytes must be the ones the canary recorded: the zip, and every file in its manifest
           # (the extension's cells, launchers, mu-plugin and schema). A canary from before the
           # manifest (no "files") has only the zip.
@@ -95,9 +96,9 @@ jobs:
             '.version = $v | .tag = ("v" + $v) | .channel = "stable" | .promoted_from = $canary' \
             "stable/${V}/release.json" > release.tmp && mv release.tmp "stable/${V}/release.json"
           aws s3 sync "stable/${V}/" "s3://${R2_BUCKET_RELEASES}/${V}/" --endpoint-url="${R2_ENDPOINT}"
-          aws s3 cp "stable/${V}/release.json" "s3://${R2_BUCKET_RELEASES}/latest.json" --endpoint-url="${R2_ENDPOINT}" \
-            --content-type "application/json" --cache-control "no-cache"
-      - name: Read every file back from securecore-releases.addis.gg
+      # The stable path read back and verified BEFORE latest.json moves (APS 12: every upload is
+      # read back from the public URL before the release counts; #80).
+      - name: Read the stable release back from securecore-releases.addis.gg
         run: |
           set -euo pipefail
           V="${{ steps.validate.outputs.v }}"
@@ -108,10 +109,29 @@ jobs:
               [ "$(sum served)" = "$(sum "stable/${V}/${f}")" ] || { echo "::error::https://${host}/${V}/${f} does not match"; exit 1; }
               echo "ok https://${host}/${V}/${f}"
             done
-            curl -fsSL "https://${host}/latest.json?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -o served
-            [ "$(sum served)" = "$(sum "stable/${V}/release.json")" ] || { echo "::error::https://${host}/latest.json does not match"; exit 1; }
-            echo "ok https://${host}/latest.json"
           done
+          # The guest image (#80) and what layer 1 takes from mirab, as served at the stable path:
+          # the same check as before the copy (scripts/promote-check.sh: the image gzipped and
+          # unpacked against release.json and vm/manifest.json), on the bytes read back.
+          mkdir -p "readback/${V}"
+          curl -fsSL "https://securecore-releases.addis.gg/${V}/release.json" -o "readback/${V}/release.json"
+          for f in vm/linux-x86_64/rootfs.ext4.gz vm/manifest.json ext/mirab-vm.json; do
+            if jq -e --arg f "$f" '(.files // {})[$f]' "stable/${V}/release.json" > /dev/null; then
+              mkdir -p "readback/${V}/$(dirname "$f")"
+              curl -fsSL "https://securecore-releases.addis.gg/${V}/${f}" -o "readback/${V}/${f}"
+            fi
+          done
+          scripts/promote-check.sh "readback/${V}"
+      - name: Point latest.json at it, and read it back
+        run: |
+          set -euo pipefail
+          V="${{ steps.validate.outputs.v }}"
+          sum() { sha256sum "$1" | cut -d' ' -f1; }
+          aws s3 cp "stable/${V}/release.json" "s3://${R2_BUCKET_RELEASES}/latest.json" --endpoint-url="${R2_ENDPOINT}" \
+            --content-type "application/json" --cache-control "no-cache"
+          curl -fsSL "https://securecore-releases.addis.gg/latest.json?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -o served
+          [ "$(sum served)" = "$(sum "stable/${V}/release.json")" ] || { echo "::error::https://securecore-releases.addis.gg/latest.json does not match"; exit 1; }
+          echo "ok https://securecore-releases.addis.gg/latest.json"
       - name: Tag vX.Y.Z and make the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

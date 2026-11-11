@@ -22,6 +22,10 @@ on:
       - 'test/promote-check.sh'
       - 'scripts/mirab-vm.sh'
       - 'scripts/guest-image.sh'
+      - 'scripts/guest-build.sh'
+      - 'scripts/guest-disk.sh'
+      - 'ext/install.sh'
+      - '.github/workflows/release.yml'
       - 'scripts/promote-check.sh'
       - 'bench/microvm/**'
       - '.github/workflows/ext-pr.yml'
@@ -52,10 +56,31 @@ jobs:
           set -euo pipefail
           mkdir -p .tmp
           TMPDIR="$PWD/.tmp" scripts/ext-build.sh 8.3 nts dist
+      # The release's microVM guest image (#80), built once as release.yml's guest job builds it,
+      # so the release check installs it and boots the microVM from what the installer placed.
+      - name: The guest image (scripts/guest-build.sh)
+        run: |
+          set -euo pipefail
+          scripts/guest-build.sh dist
+          ls -l dist
       - name: Release check (test/release-check.sh)
         run: TMPDIR="$PWD/.tmp" test/release-check.sh 8.3 nts dist
       - name: Promote refuses a development mirab manifest (test/promote-check.sh)
         run: TMPDIR="$PWD/.tmp" test/promote-check.sh
+
+  # The guest image's reproducibility (#80): two builds, the second from nothing in a builder of
+  # its own, compared byte for byte; on a mismatch it lists the files that differ. It reports and
+  # never gates (continue-on-error: its red stays visible, the PR's checks don't depend on it),
+  # as in release.yml.
+  guest-reproducible:
+    name: Guest image reproducibility (reports only, never gates)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build twice and compare (scripts/guest-build.sh --check)
+        run: scripts/guest-build.sh --check .tmp/guest
 
   # Layer 1's microVM end to end (#71): WordPress served from a jailed Firecracker guest, the
   # four isolation values, the snapshot lifecycle. On ubuntu-24.04, as the cell job above runs;

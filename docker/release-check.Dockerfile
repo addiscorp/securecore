@@ -35,6 +35,9 @@ RUN set -eu; \
     printf '#!/bin/sh\nexec %s\n' "$run" > /usr/local/bin/sapi; \
     printf '#!/bin/sh\nexec %s\n' "$l1" > /usr/local/bin/sapi-layer1; \
     chmod 755 /usr/local/bin/sapi /usr/local/bin/sapi-layer1
+# And as a microVM (sapi-microvm, with docker/compose.release-check-kvm.yml): only when the
+# release ships a guest image.
+COPY --chmod=755 test/release/sapi-microvm /usr/local/bin/sapi-microvm
 # The installer, from the release, against the release (file:// is what curl fetches from the
 # bucket, byte for byte). Its output is kept for the check to read.
 COPY --from=release / /release
