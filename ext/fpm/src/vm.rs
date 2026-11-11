@@ -179,10 +179,12 @@ pub struct Options {
 }
 
 /// The site's php.ini settings as the guest gets them: `None` without `--guest-ini` or while the
-/// file is missing; refused with the reason when it sets anything else.
-pub fn read_site_ini(path: Option<&Path>, who: User) -> Result<Option<String>, String> {
+/// file is missing; refused with the reason when it sets anything else. The file is the
+/// operator's (a launcher flag names it, as with `--config`), read as the launcher, but never
+/// through a link, regular only, within [`MAX_SITE_INI`].
+pub fn read_site_ini(path: Option<&Path>) -> Result<Option<String>, String> {
     let Some(path) = path else { return Ok(None) };
-    match read_regular(path, MAX_SITE_INI, who) {
+    match read_regular(path, MAX_SITE_INI, None) {
         Ok(None) => Ok(None),
         Ok(Some(b)) => {
             let text = String::from_utf8(b).map_err(|_| format!("{}: not UTF-8", path.display()))?;
@@ -200,18 +202,35 @@ pub const MAX_SITE_INI: usize = 16 * 1024;
 /// the open, the last component is never followed (a link is refused), it must be a regular
 /// file, and at most `cap` bytes are read (a larger one is refused, a device never read).
 /// `Ok(None)`: it doesn't exist. No error ever quotes the file's bytes.
-pub fn read_regular(path: &Path, cap: usize, who: User) -> Result<Option<Vec<u8>>, String> {
-    let c = cpath(path)?;
+pub fn read_regular(path: &Path, cap: usize, who: Option<User>) -> Result<Option<Vec<u8>>, String> {
+    // The folder is the launcher's to reach (as the site disk's copy does, its folders above the
+    // root may be closed to the pool user); the file itself is opened in it as `who`.
+    let (dir, name) = match (path.parent(), path.file_name()) {
+        (Some(d), Some(n)) if !d.as_os_str().is_empty() => (d, n),
+        _ => (Path::new("."), path.as_os_str()),
+    };
+    let d = cpath(dir)?;
+    let n = cpath(Path::new(name))?;
+    // SAFETY: open(2) with a NUL-terminated path; the fd is owned below.
+    let dfd = unsafe { libc::open(d.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if dfd < 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::NotFound { Ok(None) } else { Err(format!("{}: {e}", dir.display())) };
+    }
+    // SAFETY: dfd was just returned by open(2).
+    let dfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(dfd) };
     // SAFETY: setfsuid(2)/setfsgid(2) change only this thread's filesystem ids, and are put
     // back right after the open.
-    let (old_gid, old_uid) = unsafe { (libc::setfsgid(who.gid), libc::setfsuid(who.uid)) };
-    // SAFETY: open(2) with a NUL-terminated path.
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    let old = who.map(|w| unsafe { (libc::setfsgid(w.gid), libc::setfsuid(w.uid)) });
+    // SAFETY: openat(2) in the folder's fd with a NUL-terminated name.
+    let fd = unsafe { libc::openat(dfd.as_raw_fd(), n.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
     let err = io::Error::last_os_error();
-    // SAFETY: as above.
-    unsafe {
-        libc::setfsuid(old_uid as libc::uid_t);
-        libc::setfsgid(old_gid as libc::gid_t);
+    if let Some((old_gid, old_uid)) = old {
+        // SAFETY: as above.
+        unsafe {
+            libc::setfsuid(old_uid as libc::uid_t);
+            libc::setfsgid(old_gid as libc::gid_t);
+        }
     }
     if fd < 0 {
         if err.kind() == io::ErrorKind::NotFound {
@@ -1571,7 +1590,7 @@ fn watch_live(
     loop {
         thread::sleep(WATCH_INTERVAL);
         // Read as the pool user, never through a link, at most MAX_CONFIG bytes (#90 review).
-        let bytes = match read_regular(&started.path, crate::guest::MAX_CONFIG, pool) {
+        let bytes = match read_regular(&started.path, crate::guest::MAX_CONFIG, Some(pool)) {
             Ok(Some(b)) => {
                 read_error = None;
                 Some(b)
@@ -1634,7 +1653,7 @@ fn watch_live(
         }
         if let Some(path) = &opts.guest_ini {
             // As the pool user, never through a link, capped; a refusal never quotes the file.
-            match read_site_ini(Some(path), pool) {
+            match read_site_ini(Some(path)) {
                 Ok(text) if text != ini => {
                     ini_refused = None;
                     let t = Instant::now();
@@ -2517,7 +2536,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         ),
     };
     let egress: &'static std::sync::RwLock<crate::egress::Egress> = Box::leak(Box::new(std::sync::RwLock::new(egress)));
-    let ini = read_site_ini(opts.guest_ini.as_deref(), plan.pool)?;
+    let ini = read_site_ini(opts.guest_ini.as_deref())?;
     if let (Some(path), Some(text)) = (&opts.guest_ini, &ini) {
         log(&format!("the guest's php-fpm gets the site's php.ini settings from {} ({} lines), in each start message", path.display(), text.lines().count()));
     }
@@ -3321,11 +3340,29 @@ mod tests {
     fn a_site_file_is_read_as_itself_regular_and_capped() {
         let dir = scratch("regular");
         // SAFETY: getuid/getgid only read this process's ids.
-        let me = User { uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() } };
+        let me = Some(User { uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() } });
         let file = dir.join("securecore.json");
         fs::write(&file, "{\"secret\":\"s3cr3t\"}").expect("write");
         assert_eq!(read_regular(&file, 1024, me), Ok(Some(b"{\"secret\":\"s3cr3t\"}".to_vec())));
         assert_eq!(read_regular(&dir.join("missing.json"), 1024, me), Ok(None));
+        // As root (the launcher): the folder is reached as root, the file opened as the pool
+        // user, so a file the pool user can't read isn't read (another tenant's, root's own).
+        // SAFETY: geteuid only reads this process's id.
+        if unsafe { libc::geteuid() } == 0 {
+            let nobody = Some(User { uid: 65534, gid: 65534 });
+            // The site's root (open to its pool user) inside folders only root may enter.
+            let site = dir.join("site");
+            fs::create_dir_all(&site).expect("site");
+            let conf = site.join("securecore.json");
+            fs::write(&conf, "{}").expect("write");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+            fs::set_permissions(&site, fs::Permissions::from_mode(0o755)).expect("chmod");
+            fs::set_permissions(&conf, fs::Permissions::from_mode(0o644)).expect("chmod");
+            assert!(read_regular(&conf, 1024, nobody).expect("readable to all").is_some(), "through a folder only root may enter");
+            fs::set_permissions(&conf, fs::Permissions::from_mode(0o600)).expect("chmod");
+            assert!(read_regular(&conf, 1024, nobody).expect_err("root's alone").contains("Permission denied"));
+            assert!(read_regular(&conf, 1024, None).is_ok(), "the launcher's own reading");
+        }
         let other = dir.join("other-tenant.json");
         fs::write(&other, "theirs").expect("write");
         let link = dir.join("link.json");
@@ -3340,11 +3377,12 @@ mod tests {
         assert!(e.contains("larger than 4 bytes") && !e.contains("s3cr3t"), "{e}");
         let ini = dir.join("site.ini");
         fs::write(&ini, "securecore.debug_attribution_log = ${WORDPRESS_DB_PASSWORD}\n").expect("write");
-        let e = read_site_ini(Some(&ini), me).expect_err("a ${} value");
+        let e = read_site_ini(Some(&ini)).expect_err("a ${} value");
         assert!(!e.contains("WORDPRESS_DB_PASSWORD"), "{e}");
         let ini_link = dir.join("ini-link.ini");
         std::os::unix::fs::symlink(&ini, &ini_link).expect("link");
-        assert!(read_site_ini(Some(&ini_link), me).expect_err("a link").contains("is a link"));
+        assert!(read_site_ini(Some(&ini_link)).expect_err("a link").contains("is a link"));
+        assert_eq!(read_site_ini(Some(&dir.join("absent.ini"))), Ok(None), "no file: no settings");
         let _ = fs::remove_dir_all(&dir);
     }
 
