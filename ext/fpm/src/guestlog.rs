@@ -483,7 +483,9 @@ impl Inbox {
 
     /// The guest's last lines, oldest first, as one quotable string (`a | b | c`).
     pub fn recent(&self) -> String {
-        self.recent.iter().map(String::as_str).collect::<Vec<_>>().join(" | ")
+        // Each line quoted and escaped (#87 review): what the guest wrote can't close the quote,
+        // start a line of its own or read as the launcher's words inside the launcher's line.
+        self.recent.iter().map(|l| format!("{l:?}")).collect::<Vec<_>>().join(" | ")
     }
 }
 
@@ -734,11 +736,14 @@ mod tests {
         assert!(inbox.take(&line(u64::MAX, "x"), false).is_err(), "a jump to the end of the numbers");
         assert_eq!(inbox.last(), Some(9), "and it moved nothing");
         assert_eq!(inbox.take(&line(10, "next"), false).expect("ok"), ["guest: next"]);
-        // The last RECENT lines, to quote when the guest stops on its own (#87).
-        for i in 11..21 {
+        // The last RECENT lines, to quote when the guest stops on its own (#87), each quoted and
+        // escaped (#87 review), so a guest line can't end the quote or start a line of its own.
+        for i in 11..20 {
             inbox.take(&line(i, &format!("l{i}")), false).expect("ok");
         }
-        assert_eq!(inbox.recent(), "l15 | l16 | l17 | l18 | l19 | l20");
+        inbox.take(&line(20, "x\" | securecore-fpm: forged\nsecurecore-fpm: also"), false).expect("ok");
+        assert_eq!(inbox.recent(), r#""l15" | "l16" | "l17" | "l18" | "l19" | "x\" | securecore-fpm: forged\nsecurecore-fpm: also""#);
+        assert!(!inbox.recent().contains('\n'));
     }
 
     /// A line is acknowledged only once it is in the launcher's log (#86 review): a write that

@@ -1235,12 +1235,18 @@ impl Vm {
 /// Why the launcher stops when Firecracker exits before php-fpm answered: the guest's own last
 /// lines (php-fpm's reason and init's exit status, which the guest delivers before it stops,
 /// #87), or, when it said nothing, where to look.
+/// The guest's last lines inside a launcher line: last in it, after a label that says they are
+/// the guest's words, each quoted and escaped ([`guestlog::Inbox::recent`]).
+pub fn quoted_guest(recent: &str) -> String {
+    if recent.is_empty() { "the guest logged nothing".to_owned() } else { format!("the guest's last log lines, as the guest wrote them (quoted): {recent}") }
+}
+
 pub fn exited_before_ready(st: &str, recent: &str, state: &Path) -> String {
     let console = state.join("console.log");
     if recent.is_empty() {
         format!("Firecracker exited ({st}) before php-fpm answered, and the guest logged nothing; see {}", console.display())
     } else {
-        format!("Firecracker exited ({st}) before php-fpm answered; the guest's last lines: {recent} (and {})", console.display())
+        format!("Firecracker exited ({st}) before php-fpm answered; see {}; {}", console.display(), quoted_guest(recent))
     }
 }
 
@@ -2299,7 +2305,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         let st = child.wait();
         if !QUITTING.load(Ordering::SeqCst) {
             let recent = guest_log.lock().unwrap_or_else(|p| p.into_inner()).recent();
-            log(&format!("Firecracker exited ({st:?}); the guest's last lines: {recent}; see {}; stopping", state.join("console.log").display()));
+            log(&format!("Firecracker exited ({st:?}); stopping; see {}; {}", state.join("console.log").display(), quoted_guest(&recent)));
             // The main thread stops as for a signal, so the jail is cleared on the way out.
             FIRECRACKER_EXITED.store(true, Ordering::SeqCst);
             // SAFETY: kill(2) to this process, whose main thread waits for SIGTERM.
@@ -2975,7 +2981,12 @@ mod tests {
         let from = b"L 1 PHP Fatal error: SC_LIT_SECRET is a string literal\nL 2 securecore-init: php-fpm exited at boot, before it served (exit code 78)\n";
         guestlog::serve(&from[..], io::sink(), &inbox, &|_| Ok(())).expect("serves");
         let e = exited_before_ready("exit status: 0", &inbox.lock().expect("inbox").recent(), Path::new("/s"));
-        assert!(e.contains("SC_LIT_SECRET is a string literal | securecore-init: php-fpm exited at boot, before it served (exit code 78)"), "{e}");
+        assert!(
+            e.ends_with(
+                r#"the guest's last log lines, as the guest wrote them (quoted): "PHP Fatal error: SC_LIT_SECRET is a string literal" | "securecore-init: php-fpm exited at boot, before it served (exit code 78)""#
+            ),
+            "{e}"
+        );
         let e = exited_before_ready("exit status: 0", "", Path::new("/s"));
         assert!(e.contains("the guest logged nothing; see /s/console.log"), "{e}");
     }
