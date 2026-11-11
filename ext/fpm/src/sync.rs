@@ -2175,14 +2175,26 @@ impl<R: Read, W: Write> Guest<'_, R, W> {
         Ok(())
     }
 
-    /// The folder `rel` of `disk`, made (with its parents) as needed.
+    /// Who what the host pushes belongs to here: the disk's root's owner, which is the host
+    /// folder's (`mke2fs -E root_owner`), so php-fpm's pool may change it as it may on the host.
+    fn owner(&self, disk: u8) -> io::Result<(libc::uid_t, libc::gid_t)> {
+        let st = fstat(self.root(disk))?;
+        Ok((st.st_uid, st.st_gid))
+    }
+
+    /// The folder `rel` of `disk`, made (with its parents, owned as the disk's root) as needed.
     fn guest_dir(&self, disk: u8, rel: &[u8]) -> io::Result<OwnedFd> {
+        let (uid, gid) = self.owner(disk)?;
         let mut cur = open_beneath(self.root(disk), b"", DIR_FLAGS)?;
         for n in rel.split(|b| *b == b'/').filter(|n| !n.is_empty()) {
             let c = cbytes(n)?;
             // SAFETY: mkdirat(2) of a plain name in a folder we hold (EEXIST is fine).
-            unsafe { libc::mkdirat(cur.as_raw_fd(), c.as_ptr(), 0o755) };
+            let made = unsafe { libc::mkdirat(cur.as_raw_fd(), c.as_ptr(), 0o755) } == 0;
             cur = open_beneath(cur.as_raw_fd(), n, DIR_FLAGS)?;
+            if made {
+                // SAFETY: fchown(2) on the folder just made and opened.
+                cvt(unsafe { libc::fchown(cur.as_raw_fd(), uid, gid) })?;
+            }
         }
         Ok(cur)
     }
@@ -2219,7 +2231,11 @@ impl<R: Read, W: Write> Guest<'_, R, W> {
             drop_named(&named);
             return Ok(false);
         }
+        let owner = self.owner(disk);
         let res = (|| -> io::Result<()> {
+            let (uid, gid) = owner?;
+            // SAFETY: fchown(2) on our temporary file.
+            cvt(unsafe { libc::fchown(tmp.as_raw_fd(), uid, gid) })?;
             fchmod(tmp.as_raw_fd(), mode)?;
             set_mtime(tmp.as_raw_fd(), mtime)?;
             fsync(tmp.as_raw_fd())?;

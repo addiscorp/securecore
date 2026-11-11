@@ -622,7 +622,8 @@ if start sync "$dir/microvm.json"; then
   is "$(awk '/^NoNewPrivs:/ { print $2 } /^Seccomp:/ { print $2 }' "/proc/$wpid/status" | tr '\n' /)" 1/2/ "no new privileges, and a seccomp filter"
   is "$(awk '/^Max address space/ { print $4 }' "/proc/$wpid/limits")" 1073741824 "a memory limit (RLIMIT_AS 1 GiB)"
   is "$(tr '\0' '\n' < "/proc/$wpid/environ" | grep -c .)" 0 "and an empty environment"
-  is "$(ls "/proc/$wpid/fd" | wc -l)" 5 "it holds the connection, the report pipe, stderr, the folder and its trash (the record, read, is closed)"
+  is "$(ls -l "/proc/$wpid/fd" | grep -c '\.record')" 0 "the record, read at its start, isn't held open (it is root's to write)"
+  is "$(ls -l "/proc/$wpid/fd" | grep -c "$state/trash/")" 2 "it holds each writable folder's trash (two folders)"
   for size in 102400 10485760 104857600; do
     probe "?put=lat/$size.bin&size=$size&seed=$size" "put-$size"
     ms=$(synced "lat/$size.bin" "$size" "$(val "put-$size" put_sha)")
