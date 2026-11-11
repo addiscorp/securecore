@@ -4,9 +4,13 @@
 // it; what it can't do is layer 1's (the microVM's) doing. Copied into the test site only.
 header('Content-Type: text/plain');
 $root = __DIR__;
-// A slow request (?sleep=N): keeps a php-fpm worker busy, so a graceful reload has to wait.
+// A slow request (?sleep=N): keeps a php-fpm worker busy, so a graceful reload has to wait. A busy
+// loop, not sleep(): php-fpm's stop signal would cut a sleep() short.
 if (isset($_GET['sleep'])) {
-    sleep(min(60, (int) $_GET['sleep']));
+    $until = microtime(true) + min(60, (int) $_GET['sleep']);
+    while (microtime(true) < $until) {
+        usleep(0);
+    }
 }
 echo 'kernel=', php_uname('r'), "\n";
 // The worker's effective uid, from the kernel (no posix extension needed).
