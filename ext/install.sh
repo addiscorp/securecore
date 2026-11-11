@@ -22,6 +22,10 @@
 #                            pins, each checked against mirab's sha256s, and vm/installed.json,
 #                            which records the mirab release they came from
 #                            (into <share-dir>/vm, where securecore-fpm looks)
+#      vm/rootfs.ext4        the microVM's guest image (#80), when the release ships
+#                            vm/linux-x86_64/rootfs.ext4.gz: its gzip and its unpacked bytes
+#                            each checked against release.json, its sha256 recorded in
+#                            vm/installed.json (securecore-fpm boots nothing it doesn't name)
 #      securecore-vault.php  the mu-plugin, into <wordpress>/wp-content/mu-plugins
 #      securecore.json       only if there is none: every layer off (an existing one is kept)
 #      securecore.ini        last: `extension=securecore.so` and `securecore.config=<file>`
@@ -119,7 +123,16 @@ case $(uname -m) in
 esac
 command -v "$PHP" >/dev/null 2>&1 || die "No PHP found ($PHP). Pass --php with the PHP CLI that matches your php-fpm."
 WORK=$(mktemp -d)
-trap 'find "$WORK" -mindepth 1 -delete; rmdir "$WORK"' EXIT
+# The guest image's staging folder (below), and the folders made for it, go on any exit: a refused
+# or failed install leaves nothing in <share-dir>.
+STAGE=
+MADE=
+cleanup() {
+  find "$WORK" -mindepth 1 -delete; rmdir "$WORK"
+  if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then find "$STAGE" -mindepth 1 -delete; rmdir "$STAGE"; fi
+  for d in $MADE; do rmdir "$d" 2> /dev/null || :; done
+}
+trap cleanup EXIT
 # Every layer off: what PHP reads while the installer asks it about itself (below) and checks
 # the download. An installed SecureCore refuses to start on an invalid config, and the config
 # may be one an earlier release wrote, which is upgraded only further down.
@@ -185,10 +198,17 @@ tr -d ' \t\r\n' < "$WORK/release.json" > "$WORK/release.flat"
 field() { sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$WORK/release.flat" | head -n 1; }
 REL=$(field version)
 [ -n "$REL" ] || die "$BASE did not describe a SecureCore release. Run the installer again later."
-# want <path>: the sha256 release.json gives for <path>, or nothing.
-want() {
+# wantf <path> <field>: a sha256 field (sha256, unpacked_sha256) release.json gives for <path>,
+# or nothing. want <path>: its sha256.
+wantf() {
   key=$(printf '%s' "$1" | sed 's/[.]/[.]/g')
-  grep -o "\"$key\":{[^}]*}" "$WORK/release.flat" | sed -n 's/.*"sha256":"\([0-9a-f]\{64\}\)".*/\1/p' | head -n 1
+  grep -o "\"$key\":{[^}]*}" "$WORK/release.flat" | sed -n "s/.*\"$2\":\"\\([0-9a-f]\\{64\\}\\)\".*/\\1/p" | head -n 1
+}
+want() { wantf "$1" sha256; }
+# wantn <path> <field>: a number field (bytes, unpacked_bytes) release.json gives for <path>.
+wantn() {
+  key=$(printf '%s' "$1" | sed 's/[.]/[.]/g')
+  grep -o "\"$key\":{[^}]*}" "$WORK/release.flat" | sed -n "s/.*\"$2\":\\([0-9][0-9]*\\).*/\\1/p" | head -n 1
 }
 [ -n "$(want "ext/$SO")" ] || die "SecureCore $REL has no build for PHP $PHP_VER $TS_LABEL on $ARCH (ext/$SO). Builds: $(grep -o '"ext/securecore-php[^"]*"' "$WORK/release.flat" | tr -d '"' | sed 's|ext/securecore-||' | tr '\n' ' ')"
 # get <path> <file>: download <path> of the release and check it against release.json.
@@ -209,10 +229,18 @@ step "$OK" "Download" "SecureCore $REL: 4 files, each matching its sha256 in rel
 # release.json). Each download is checked against the sha256s recorded there: the gzipped and
 # the unpacked kernel, the Firecracker tarball and the binary in it.
 VM=
+GUEST=
+ROOTFS=vm/linux-x86_64/rootfs.ext4.gz
+# The guest image is installed only beside a verified kernel and Firecracker: alone, nothing could
+# boot it, so a release that has one without the other installs neither, and says so.
 if [ -z "$(want ext/mirab-vm.json)" ]; then
-  step "$SKIP" "microVM" "this release carries none (mirab has no stable vm/ images yet), so layer 1's auto is gelada"
+  if [ -n "$(want "$ROOTFS")" ]; then
+    step "$NOTE" "microVM" "SecureCore $REL ships a guest image but no kernel or Firecracker (ext/mirab-vm.json), so neither is installed: layer 1's auto is gelada and microvm refuses"
+  else
+    step "$SKIP" "microVM" "this release carries none (mirab has no stable vm/ images yet), so layer 1's auto is gelada"
+  fi
 elif [ "$ARCH" != x86_64 ]; then
-  step "$SKIP" "microVM" "mirab's Firecracker is for x86_64 only; layer 1's auto is gelada on $ARCH"
+  step "$SKIP" "microVM" "mirab's Firecracker and SecureCore's guest image are for x86_64 only; layer 1's auto is gelada on $ARCH"
 else
   get ext/mirab-vm.json mirab-vm.json
   tr -d ' \t\r\n' < "$WORK/mirab-vm.json" > "$WORK/vm.flat"
@@ -242,11 +270,46 @@ else
   # from the tarball checked above and must match the sha256 the release recorded for it.
   check "$WORK/jailer" "$(vm jailer jailer_sha256)" "Firecracker $FC's jailer"
   rm -f "$WORK/vmlinux.gz" "$WORK/fc.tgz"
-  # No rootfs_sha256: no release ships a guest root image yet, so nothing verified is there to
-  # boot, and securecore-fpm won't start a microVM (auto is gelada, microvm refuses).
-  printf '{\n  "securecore": "%s",\n  "mirab": "%s",\n  "commit": "%s",\n  "manifest": "%s",\n  "kernel_sha256": "%s",\n  "firecracker": "%s",\n  "firecracker_sha256": "%s",\n  "jailer_sha256": "%s"\n}\n' \
-    "$REL" "$MIRAB" "$(vm - commit)" "$(vm - manifest)" "$(vm kernel unpacked_sha256)" "$FC" "$(vm firecracker member_sha256)" "$(vm jailer jailer_sha256)" > "$WORK/installed.json"
-  step "$OK" "microVM" "mirab $MIRAB's guest kernel, Firecracker $FC and its jailer, each matching its recorded sha256"
+  # The guest's root image (#80): SecureCore's own, built with this release, gzipped. Its gzip
+  # and its unpacked bytes are each checked against release.json. A release without one (before
+  # #80) installs the rest, and installed.json then records no rootfs_sha256, so nothing boots.
+  # It is downloaded and unpacked in a staging folder inside <share-dir>/vm, never the system's
+  # temporary folder (hundreds of MiB, often a small tmpfs): the same filesystem as the image's
+  # place, so installing it is a rename. The folder goes when the installer exits, whatever happens.
+  rootfs_rec=
+  if [ -n "$(want "$ROOTFS")" ]; then
+    unpacked=$(wantf "$ROOTFS" unpacked_sha256)
+    [ -n "$unpacked" ] || die "release.json of SecureCore $REL lists $ROOTFS with no unpacked_sha256, so nothing was installed."
+    gz_bytes=$(wantn "$ROOTFS" bytes)
+    unpacked_bytes=$(wantn "$ROOTFS" unpacked_bytes)
+    [ -n "$gz_bytes" ] && [ -n "$unpacked_bytes" ] || die "release.json of SecureCore $REL lists $ROOTFS without its sizes, so nothing was installed."
+    for d in "$SHARE_DIR" "$SHARE_DIR/vm"; do [ -d "$d" ] || MADE="$d $MADE"; done
+    mkdir -p "$SHARE_DIR/vm" || die "Can't create $SHARE_DIR/vm. Run the installer as root, or pass --share-dir."
+    # Room for the gzip and the image together, plus 16 MiB.
+    need_mib=$(( (gz_bytes + unpacked_bytes) / 1048576 + 16 ))
+    free_mib=$(( $(df -Pk "$SHARE_DIR/vm" | awk 'NR == 2 { print $4 }') / 1024 ))
+    [ "$free_mib" -ge "$need_mib" ] \
+      || die "$SHARE_DIR/vm has $free_mib MiB free; the microVM's guest image needs $need_mib MiB there (its gzip and the unpacked image), so nothing was installed. Free some space, or pass --share-dir."
+    STAGE=$SHARE_DIR/vm/.securecore-staging
+    mkdir -p "$STAGE"
+    chmod 700 "$STAGE"
+    fetch "$BASE/$REL/$ROOTFS" "$STAGE/rootfs.ext4.gz" || die "Couldn't download $BASE/$REL/$ROOTFS. Run the installer again."
+    [ "$(sha256 "$STAGE/rootfs.ext4.gz")" = "$(want "$ROOTFS")" ] \
+      || die "$ROOTFS failed its sha256 check against release.json, so nothing was installed. Run the installer again; if it keeps failing, the download is being corrupted or tampered with."
+    gzip -dc "$STAGE/rootfs.ext4.gz" > "$STAGE/rootfs.ext4" || die "$ROOTFS didn't unpack, so nothing was installed. Run the installer again."
+    rm -f "$STAGE/rootfs.ext4.gz"
+    [ "$(sha256 "$STAGE/rootfs.ext4")" = "$unpacked" ] \
+      || die "$ROOTFS unpacked failed its sha256 check against release.json, so nothing was installed. Run the installer again; if it keeps failing, the download is being corrupted or tampered with."
+    rootfs_rec=$(printf ',\n  "rootfs_sha256": "%s"' "$unpacked")
+    GUEST=1
+  fi
+  printf '{\n  "securecore": "%s",\n  "mirab": "%s",\n  "commit": "%s",\n  "manifest": "%s",\n  "kernel_sha256": "%s",\n  "firecracker": "%s",\n  "firecracker_sha256": "%s",\n  "jailer_sha256": "%s"%s\n}\n' \
+    "$REL" "$MIRAB" "$(vm - commit)" "$(vm - manifest)" "$(vm kernel unpacked_sha256)" "$FC" "$(vm firecracker member_sha256)" "$(vm jailer jailer_sha256)" "$rootfs_rec" > "$WORK/installed.json"
+  if [ -n "$GUEST" ]; then
+    step "$OK" "microVM" "mirab $MIRAB's guest kernel, Firecracker $FC, its jailer and SecureCore $REL's guest image, each matching its recorded sha256"
+  else
+    step "$OK" "microVM" "mirab $MIRAB's guest kernel, Firecracker $FC and its jailer, each matching its recorded sha256"
+  fi
   VM=1
 fi
 
@@ -277,6 +340,16 @@ if [ -n "$VM" ]; then
   put firecracker "$SHARE_DIR/vm/firecracker" 755 "Firecracker"
   put jailer "$SHARE_DIR/vm/jailer" 755 "Jailer"
   put vmlinux "$SHARE_DIR/vm/vmlinux" 644 "Guest kernel"
+  if [ -n "$GUEST" ]; then
+    # From the staging folder, by rename (the same filesystem): atomic, and no second copy.
+    if [ -f "$SHARE_DIR/vm/rootfs.ext4" ] && [ "$(sha256 "$SHARE_DIR/vm/rootfs.ext4")" = "$unpacked" ]; then
+      step "$SAME" "Guest image" "unchanged ($SHARE_DIR/vm/rootfs.ext4)"
+    else
+      chmod 644 "$STAGE/rootfs.ext4"
+      mv -f "$STAGE/rootfs.ext4" "$SHARE_DIR/vm/rootfs.ext4"
+      step "$OK" "Guest image" "installed $SHARE_DIR/vm/rootfs.ext4"
+    fi
+  fi
   # The unprivileged user Firecracker runs as (securecore-fpm --vm-user, default securecore-vm).
   if id securecore-vm >/dev/null 2>&1; then
     step "$SAME" "microVM user" "securecore-vm exists"
@@ -287,8 +360,8 @@ if [ -n "$VM" ]; then
   fi
   # What is installed, and from which mirab release: nobody edits a version by hand.
   put installed.json "$SHARE_DIR/vm/installed.json" 644 "microVM record"
-  if [ ! -f "$SHARE_DIR/vm/rootfs.ext4" ]; then
-    step "$NOTE" "microVM" "no guest root image ($SHARE_DIR/vm/rootfs.ext4) yet: until there is one, layer 1's auto is gelada"
+  if [ -z "$GUEST" ]; then
+    step "$NOTE" "microVM" "SecureCore $REL ships no guest image, so nothing verified boots: layer 1's auto is gelada and microvm refuses"
   fi
 fi
 if [ -n "$WP" ]; then

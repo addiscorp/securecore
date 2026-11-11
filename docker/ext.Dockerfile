@@ -21,10 +21,26 @@
 # docker/compose.ext.yml runs the WordPress stack with the `php` target;
 # docker/compose.ext-layer1.yml on top of it runs the `php-layer1` target (layer 1, E6).
 ARG PHP_IMAGE=php:8.3-fpm-bookworm@sha256:d7677e2a3c1579fbe52848cc446bc24860187c876c383a43b7d4b8e06dce537e
+# The `php` targets' (and so the microVM guest's) base, by digest: WordPress 7.1.4's php8.3-fpm
+# image, the same one docker/release-check.Dockerfile takes WordPress's files from. A release's
+# guest image is built from these bytes and no others (#80).
+ARG WORDPRESS_IMAGE=wordpress:php8.3-fpm@sha256:a6b5868cf272ee51b361c7ca31090080ee476d571416aa72832fdc640aa8527c
+# Every apt package these stages install comes from snapshot.debian.org at this moment, so a
+# rebuild installs the same versions (clang, which compiles the guest's preload; e2fsprogs, which
+# makes the guest's disk): the guest image is reproducible (#80).
+ARG DEBIAN_SNAPSHOT=20261101T000000Z
+# The guest disk's tools (mke2fs, tar, gzip): this image plus e2fsprogs from the snapshot.
+ARG GUEST_TOOLS_IMAGE=debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
-# php-config and the headers ext-php-rs's bindgen reads; clang/libclang for bindgen.
+# php-config and the headers ext-php-rs's bindgen reads; clang/libclang for bindgen, from the
+# snapshot (the image's own Debian release, its main, updates and security suites).
 FROM ${PHP_IMAGE} AS toolchain
-RUN apt-get update \
+ARG DEBIAN_SNAPSHOT
+RUN . /etc/os-release \
+ && rm -f /etc/apt/sources.list.d/debian.sources \
+ && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s %s main\ndeb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s %s-updates main\ndeb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/%s %s-security main\n' \
+      "$DEBIAN_SNAPSHOT" "$VERSION_CODENAME" "$DEBIAN_SNAPSHOT" "$VERSION_CODENAME" "$DEBIAN_SNAPSHOT" "$VERSION_CODENAME" > /etc/apt/sources.list \
+ && apt-get update \
  && apt-get install -y --no-install-recommends clang libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=rust:1.99-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c /usr/local/cargo /usr/local/cargo
@@ -74,7 +90,7 @@ COPY --from=build /out/securecore-fpm /securecore-fpm
 # the extension. One ini line points it at the config, /var/www/html/securecore.json: the site
 # root is the folder containing it. The image's entrypoint copies /usr/src/wordpress into a new
 # site volume, so a fresh stack starts with off.json there; test/ext-config.sh replaces it.
-FROM wordpress:php8.3-fpm AS php
+FROM ${WORDPRESS_IMAGE} AS php
 # PDO's MySQL driver (the image ships mysqli only): plugins that use PDO, and the database policy's
 # probe (test/ext-db.sh, E4). ext/sockets (E5): so the host tests exercise socket_connect. Both
 # are core extensions with no external libs.
@@ -113,7 +129,40 @@ COPY --from=preload /out/libsc-vsock-connect.so /usr/local/lib/libsc-vsock-conne
 COPY ext/fpm/guest/zz-microvm.conf /usr/local/etc/php-fpm.d/zz-microvm.conf
 COPY ext/fpm/guest/warm.php /usr/local/lib/securecore/warm.php
 # The same ini files without the extension, for the extension-off latency runs (sc.ext=0).
+# Then what a guest never uses goes (#80: the image ships with every release, so its size is a
+# download on every install): the compilers and build tools the php images keep for
+# docker-php-ext-install (PHPIZE_DEPS) and the C headers, PHP's sources and WordPress's (the site
+# comes on its own disk), documentation, man pages, translations, and apt's lists and caches.
+# No file keeps a setuid or setgid bit (su, mount, passwd, …): nothing in the guest needs one, and
+# the guest's root is mounted nosuid with php-fpm under no_new_privs besides (securecore-init).
+# ldconfig's aux-cache goes too: it records the libraries' inode times, the one file that made
+# two builds of this stage differ (ld.so.cache itself is what the loader reads, and stays).
+# guest-image.sh exports the flattened filesystem, so what is deleted here is not in the disk.
 RUN ln -sf /usr/local/bin/securecore-fpm /sbin/securecore-init \
  && mkdir -p /usr/local/etc/php/conf.d-noext /etc/securecore \
  && cp /usr/local/etc/php/conf.d/*.ini /usr/local/etc/php/conf.d-noext/ \
- && rm /usr/local/etc/php/conf.d-noext/securecore.ini
+ && rm /usr/local/etc/php/conf.d-noext/securecore.ini \
+ && apt-get purge -y --auto-remove autoconf dpkg-dev file g++ gcc make pkg-config re2c libc6-dev > /dev/null \
+ && for d in /usr/src /usr/include /usr/local/include /usr/local/lib/php/build /usr/local/lib/php/doc \
+      /usr/local/lib/php/test /usr/share/doc /usr/share/man /usr/share/info /usr/share/locale \
+      /usr/share/lintian /var/lib/apt/lists /var/cache/apt /var/cache/debconf /var/cache/ldconfig /var/log; do \
+      [ ! -d "$d" ] || find "$d" -mindepth 1 -delete; \
+    done \
+ && find / -xdev -perm /6000 -type f -exec chmod ug-s {} + \
+ && [ -z "$(find / -xdev -perm /6000 -type f)" ] \
+ && ! ldd /usr/local/sbin/php-fpm /usr/local/lib/php/extensions/*/*.so /usr/local/lib/php/extensions/securecore.so /usr/local/lib/libsc-vsock-connect.so | grep 'not found' \
+ && PHP_INI_SCAN_DIR=/usr/local/etc/php/conf.d-noext php -m > /tmp/m 2>&1 \
+ && ! grep -iE 'warning|unable' /tmp/m && grep -qx imagick /tmp/m && find /tmp -mindepth 1 -delete
+
+# The guest disk's tools (#80): scripts/guest-image.sh runs scripts/guest-disk.sh in this image, so
+# the export's tar, mke2fs and gzip are these pinned bytes and never the host's. mke2fs's version
+# decides the disk's bytes (1.47.0 copies each file's ctime from the unpacked tree, 1.47.1 and
+# later take SOURCE_DATE_EPOCH), so it comes from the snapshot, never from whatever the host has.
+FROM ${GUEST_TOOLS_IMAGE} AS guest-tools
+ARG DEBIAN_SNAPSHOT
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+ && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s trixie main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends e2fsprogs \
+ && find /var/lib/apt/lists -mindepth 1 -delete
+COPY --chmod=755 scripts/guest-disk.sh /usr/local/bin/guest-disk

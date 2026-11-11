@@ -6,7 +6,8 @@
 #   test/release-check.sh <php> <ts> <dir>      e.g. test/release-check.sh 8.3 nts .tmp/ext-dist
 #
 # <dir> holds the cell's built files (scripts/ext-build.sh): securecore-php<php>-<ts>-linux-<arch>.so
-# and securecore-fpm-linux-<arch>, for this Docker host's architecture. They are laid out as a
+# and securecore-fpm-linux-<arch>, for this Docker host's architecture; on x86_64, optionally the
+# release's guest image, rootfs-linux-x86_64.ext4.gz (scripts/guest-build.sh). They are laid out as a
 # release with scripts/release-layout.sh (the script the bucket's release uses), and:
 #   1. install: install-ext.sh, from that release, detects this PHP and installs the .so, the
 #      ini, the launcher, the schema and the mu-plugin; the installed .so is the release's bytes;
@@ -25,7 +26,13 @@
 #      password (the revert proof);
 #   6. layer 1: started by securecore-fpm, the SAPI runs sandboxed (NoNewPrivs, seccomp), serves
 #      200, and a core write outside layer1.write is refused — the same write that worked with
-#      the plain SAPI.
+#      the plain SAPI;
+#   7. the microVM (#80), when <dir> holds the guest image (rootfs-linux-x86_64.ext4.gz, from
+#      scripts/guest-build.sh): install-ext.sh placed it and recorded its unpacked sha256 (a
+#      changed gzip, or a release.json naming another image, is refused with nothing placed); then
+#      the php container, privileged with this host's /dev/kvm, runs the installed securecore-fpm
+#      with isolation microvm, and WordPress is served from a Firecracker guest booted from the
+#      installed files only. Needs /dev/kvm then: none is a failure, never a skip.
 # Exits non-zero on any failure. Writes .tmp/release-check/<cell>/. Takes the stack down (with
 # its volumes) at the end unless SECURECORE_RELEASE_KEEP=1.
 #   SECURECORE_RELEASE_PROJECT / SECURECORE_RELEASE_PORT: another compose project / port
@@ -55,6 +62,16 @@ sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasu
 for f in "$so" "$launcher"; do [ -f "$src/$f" ] || { echo "FAIL $src/$f is missing (scripts/ext-build.sh $php $ts $src)"; exit 1; }; done
 mkdir -p "$dir/ext"
 cp "$src/$so" "$src/$launcher" "$dir/ext/"
+# Layer 1's guest image (#80), when <dir> holds one (scripts/guest-build.sh; release.yml stages it
+# for every x86_64 cell): the release then ships it, the installer must place and record it, and
+# section 7 boots the microVM from what the installer placed, which needs this host's /dev/kvm.
+guest=
+if [ -f "$src/rootfs-linux-x86_64.ext4.gz" ]; then
+  [ "$arch" = x86_64 ] || { echo "FAIL $src holds a guest image, but the microVM is x86_64 only and this is $arch"; exit 1; }
+  cp "$src/rootfs-linux-x86_64.ext4.gz" "$dir/ext/"
+  guest_unpacked=$(gzip -dc "$src/rootfs-linux-x86_64.ext4.gz" | sha256sum | cut -d' ' -f1)
+  guest=1
+fi
 # Layer 1's microVM files (#71), resolved exactly as release.yml resolves them: mirab's newest
 # stable release; exit 3 (it has no vm/ images yet, mirab#89) means a release without the
 # microVM, which the installer must then say; any other failure fails the check.
@@ -62,13 +79,24 @@ cp "$src/$so" "$src/$launcher" "$dir/ext/"
 # (e.g. a mirab canary), to check the installer's microVM step before mirab's stable has one.
 # x86_64 only (mirab pins Firecracker for it).
 vm=
-if [ "$arch" = x86_64 ]; then
+if [ "$arch" = x86_64 ] && [ -f "$src/mirab-vm.json" ]; then
+  # The release's own resolution (release.yml's mirab job resolves mirab once and hands every cell
+  # and publish the same mirab-vm.json): used as it is.
+  cp "$src/mirab-vm.json" "$dir/ext/mirab-vm.json"
+  vm=$dir/ext/mirab-vm.json
+elif [ "$arch" = x86_64 ]; then
   TMPDIR=${TMPDIR:-$PWD/.tmp} scripts/mirab-vm.sh "$dir/ext" ${SECURECORE_RELEASE_MIRAB_MANIFEST:+"$SECURECORE_RELEASE_MIRAB_MANIFEST"} > "$dir/mirab.log" 2>&1; rc=$?
   case $rc in
     0) vm=$dir/ext/mirab-vm.json ;;
     3) echo "mirab's stable release has no vm/ images: this release carries no microVM ($(tail -1 "$dir/mirab.log"))" ;;
     *) echo "FAIL mirab's microVM files (see $dir/mirab.log)"; cat "$dir/mirab.log"; exit 1 ;;
   esac
+fi
+# A guest image is only bootable beside mirab's kernel and Firecracker: a release that would ship
+# one without mirab-vm.json fails here, never skipping the guest's checks.
+if [ -n "$guest" ] && [ -z "$vm" ]; then
+  echo "FAIL $src holds a guest image but there is no mirab-vm.json (mirab's kernel and Firecracker): a release must not ship one without the other"
+  exit 1
 fi
 version="$(scripts/version.sh)-canary-check"
 TMPDIR=${TMPDIR:-$PWD/.tmp} scripts/release-layout.sh "$version" "v$version" "$(git rev-parse HEAD)" canary "$dir/release" "$dir/ext" > "$dir/layout.log" \
@@ -134,12 +162,26 @@ if [ -n "$vm" ]; then
   is "$(in_php 'test -x /usr/local/share/securecore/vm/firecracker && test -x /usr/local/share/securecore/vm/jailer && echo yes')" yes "and both are executable"
   is "$(in_php 'cat /usr/local/share/securecore/vm/installed.json' | tr -d ' \n' | grep -o '"jailer_sha256":"[^"]*"' | cut -d'"' -f4)" "$(jsonv jailer_sha256)" \
     "vm/installed.json records the jailer's sha256"
-  is "$(in_php 'grep -c rootfs_sha256 /usr/local/share/securecore/vm/installed.json')" 0 "and no guest root image (none ships), so nothing boots"
+  if [ -n "$guest" ]; then
+    rj=$dir/release/$version/release.json
+    is "$(tr -d ' \n' < "$rj" | grep -o '"vm/linux-x86_64/rootfs.ext4.gz":{[^}]*}' | sed -n 's/.*"unpacked_sha256":"\([0-9a-f]*\)".*/\1/p')" "$guest_unpacked" \
+      "release.json records the guest image's unpacked sha256"
+    is "$(tr -d ' \n' < "$dir/release/$version/vm/manifest.json" | grep -o '"unpacked":{[^}]*}' | sed -n 's/.*"sha256":"\([0-9a-f]*\)".*/\1/p')" "$guest_unpacked" \
+      "and so does the version's vm/manifest.json"
+    has "$dir/install.log" "guest image, each matching its recorded sha256" "install-ext.sh checked the guest image too"
+    has "$dir/install.log" "ok Guest image" "install-ext.sh installed the guest image"
+    is "$(in_php 'sha256sum /usr/local/share/securecore/vm/rootfs.ext4' | cut -d' ' -f1)" "$guest_unpacked" "the installed rootfs.ext4 is the release's guest image, unpacked"
+    is "$(in_php 'cat /usr/local/share/securecore/vm/installed.json' | tr -d ' \n' | grep -o '"rootfs_sha256":"[^"]*"' | cut -d'"' -f4)" "$guest_unpacked" \
+      "vm/installed.json records its sha256, so securecore-fpm will boot it"
+  else
+    is "$(in_php 'grep -c rootfs_sha256 /usr/local/share/securecore/vm/installed.json')" 0 "and no guest root image (none ships), so nothing boots"
+    has "$dir/install.log" "ships no guest image, so nothing verified boots" "install-ext.sh says no guest image ships"
+  fi
   is "$(in_php 'cat /usr/local/share/securecore/vm/installed.json' | tr -d ' \n' | grep -o '"mirab":"[^"]*"' | cut -d'"' -f4)" "$(jsonv mirab)" \
     "vm/installed.json records the mirab release ($(jsonv mirab))"
 fi
 in_root 'cd / && sh /release/install-ext.sh --from file:///release' > "$dir/install-2.log" 2>&1; rc=$?
-if [ "$rc" = 0 ] && ! grep -qE '^ok +(Extension|Launcher|JSON Schema|mu-plugin|Config|ini|Firecracker|Jailer|Guest kernel|microVM record) ' "$dir/install-2.log"; then
+if [ "$rc" = 0 ] && ! grep -qE '^ok +(Extension|Launcher|JSON Schema|mu-plugin|Config|ini|Firecracker|Jailer|Guest kernel|Guest image|microVM record) ' "$dir/install-2.log"; then
   pass "install-ext.sh again, with the defaults: exit 0, nothing changed"
 else
   fail "install-ext.sh again, with the defaults: exit 0, nothing changed" "rc=$rc: $(tr '\n' '|' < "$dir/install-2.log")"
@@ -171,6 +213,41 @@ if [ -n "$vm" ]; then
   fi
   is "$(in_php 'sha256sum /usr/local/share/securecore/vm/vmlinux' | cut -d' ' -f1)" "$(jsonv unpacked_sha256)" "after the refused run the installed kernel is unchanged"
   in_root 'find /tmp/badvm -mindepth 1 -delete && rmdir /tmp/badvm'
+fi
+if [ -n "$guest" ]; then
+  # A guest image that isn't the release's: a changed gzip (its sha256 no longer matches), and a
+  # release.json whose unpacked sha256 is another image's (the gzip matches; only the unpacked
+  # check can catch it). Both refused before anything is placed: the installed image and record
+  # are unchanged, and no half-written file is left in the VM folder.
+  rec_before=$(in_php 'sha256sum /usr/local/share/securecore/vm/installed.json' | cut -d' ' -f1)
+  gz=$version/vm/linux-x86_64/rootfs.ext4.gz
+  in_root "cp -a /release /tmp/badgz && printf x >> /tmp/badgz/$gz"
+  in_root 'sh /tmp/badgz/install-ext.sh --from file:///tmp/badgz --canary --wordpress /var/www/html' > "$dir/install-badgz.log" 2>&1; rc=$?
+  if [ "$rc" != 0 ] && grep -q "vm/linux-x86_64/rootfs.ext4.gz failed its sha256 check against release.json, so nothing was installed" "$dir/install-badgz.log"; then
+    pass "a changed guest image gzip is refused"
+  else
+    fail "a changed guest image gzip is refused" "rc=$rc: $(tr '\n' '|' < "$dir/install-badgz.log")"
+  fi
+  in_root 'find /tmp/badgz -mindepth 1 -delete && rmdir /tmp/badgz'
+  in_root "cp -a /release /tmp/badunpacked && sed 's/$guest_unpacked/$(printf '0%.0s' $(seq 64))/' /release/$version/release.json > /tmp/badunpacked/$version/release.json && cp /tmp/badunpacked/$version/release.json /tmp/badunpacked/canary.json"
+  in_root 'sh /tmp/badunpacked/install-ext.sh --from file:///tmp/badunpacked --canary --wordpress /var/www/html' > "$dir/install-badunpacked.log" 2>&1; rc=$?
+  if [ "$rc" != 0 ] && grep -q "vm/linux-x86_64/rootfs.ext4.gz unpacked failed its sha256 check against release.json, so nothing was installed" "$dir/install-badunpacked.log"; then
+    pass "a guest image whose unpacked bytes aren't release.json's is refused"
+  else
+    fail "a guest image whose unpacked bytes aren't release.json's is refused" "rc=$rc: $(tr '\n' '|' < "$dir/install-badunpacked.log")"
+  fi
+  in_root 'find /tmp/badunpacked -mindepth 1 -delete && rmdir /tmp/badunpacked'
+  is "$(in_php 'sha256sum /usr/local/share/securecore/vm/rootfs.ext4' | cut -d' ' -f1)" "$guest_unpacked" "after the refused runs the installed guest image is unchanged"
+  is "$(in_php 'sha256sum /usr/local/share/securecore/vm/installed.json' | cut -d' ' -f1)" "$rec_before" "and so is vm/installed.json"
+  is "$(in_php 'ls -A /usr/local/share/securecore/vm | grep -c securecore-')" 0 "and nothing half-written is left in the VM folder (no .securecore-staging, no *.securecore-new)"
+  # A release with the guest image but no mirab-vm.json (no verified kernel or Firecracker):
+  # the image isn't installed, and the installer says why.
+  in_root "cp -a /release /tmp/nomirab && find /tmp/nomirab -name mirab-vm.json -delete && grep -v '\"ext/mirab-vm.json\"' /release/$version/release.json > /tmp/nomirab/$version/release.json && cp /tmp/nomirab/$version/release.json /tmp/nomirab/canary.json"
+  in_root 'sh /tmp/nomirab/install-ext.sh --from file:///tmp/nomirab --canary --wordpress /var/www/html --share-dir /tmp/nomirab-share' > "$dir/install-nomirab.log" 2>&1; rc=$?
+  is "$rc" 0 "a release with a guest image but no mirab-vm.json: the rest installs"
+  has "$dir/install-nomirab.log" "ships a guest image but no kernel or Firecracker (ext/mirab-vm.json), so neither is installed" "and the installer says the guest image isn't installed, and why"
+  is "$(in_php 'test -e /tmp/nomirab-share/vm && echo yes || echo no')" no "and nothing of the microVM is placed"
+  in_root 'find /tmp/nomirab /tmp/nomirab-share -mindepth 1 -delete; rmdir /tmp/nomirab /tmp/nomirab-share'
 fi
 
 # --- 2. config load ---------------------------------------------------------------------------
@@ -293,6 +370,83 @@ is "$(field layer1 write-wp-includes)" BLOCKED "layer 1: core can't write wp-inc
 is "$(field layer1 write-uploads)" OK "layer 1: core can write uploads"
 smoke layer1-smoke
 is "$(field layer1-smoke db_password)" "securecore-vault:DB_PASSWORD" "layer 1 + 2: the vault still holds"
+
+# --- 7. layer 1 as a microVM, from what the installer placed (#80) ------------------------------
+# The release's whole path: the php container, now privileged with this host's /dev/kvm, runs the
+# installed securecore-fpm with isolation microvm, and it boots the installed kernel and guest
+# image under the installed Firecracker and jailer, as the installed securecore-vm user, checked
+# against the installed vm/installed.json. Nothing is built or copied in for it. The database is
+# the db service (layer1.network.connect 3306 → address db:3306).
+if [ -n "$guest" ]; then
+  if [ ! -c /dev/kvm ]; then
+    fail "microVM: this host has no /dev/kvm, and a release with a guest image must boot it (never a skip)"
+  else
+    kcompose() { compose -f docker/compose.release-check-kvm.yml "$@"; }
+    sed -e 's/"isolation": "auto"/"isolation": "microvm"/' -e 's|{ "port": 3306 }|{ "port": 3306, "address": "db:3306" }|' \
+      ext/examples/wordpress.json > "$dir/microvm.json"
+    if grep -q '"isolation": "microvm"' "$dir/microvm.json" && grep -q '"address": "db:3306"' "$dir/microvm.json"; then
+      pass "the microvm config (isolation microvm, 3306 to db:3306)"
+    else
+      fail "the microvm config (isolation microvm, 3306 to db:3306)"
+    fi
+    put_conf "$dir/microvm.json"
+    compose cp test/ext/microvm/probe.php php:/var/www/html/sc-mvm-probe.php >> "$dir/cp.log" 2>&1
+    in_root "chmod 644 $conf /var/www/html/sc-mvm-probe.php"
+    host_kernel=$(uname -r)
+    t=$(now)
+    kcompose up -d php > "$dir/up-microvm.log" 2>&1 || fail "microVM: compose up (see $dir/up-microvm.log)"
+    compose restart web > /dev/null 2>&1
+    # A cold boot, the warm-up and the first snapshot come before the first request.
+    i=0
+    until [ "$(code /sc-mvm-probe.php)" = 200 ]; do
+      i=$((i + 1)); [ "$i" -lt 240 ] || break
+      sleep 1
+    done
+    phplog "$t" > "$dir/microvm.log"
+    if [ "$i" -lt 240 ]; then pass "microVM: booted from the installed files, the probe is 200 ($i s)"; else fail "microVM: booted from the installed files" "$(tail -8 "$dir/microvm.log" | tr '\n' '|')"; fi
+    has "$dir/microvm.log" "securecore-fpm: serving FastCGI" "microVM: the installed launcher serves FastCGI"
+    lacks_line() { if grep -qF -- "$2" "$1"; then fail "$3" "$(grep -F -- "$2" "$1" | head -2 | tr '\n' ' ')"; else pass "$3"; fi; }
+    lacks_line "$dir/microvm.log" "isn't verified" "microVM: every file matched vm/installed.json (no verification refusal)"
+    curl -s "$base/sc-mvm-probe.php" > "$dir/probe"
+    is "$(field probe guest_init)" 1 "microVM: PHP runs in the guest, under /sbin/securecore-init"
+    is "$(field probe netdev)" lo "microVM: the guest has loopback only"
+    if [ -n "$(field probe kernel)" ] && [ "$(field probe kernel)" != "$host_kernel" ]; then
+      pass "microVM: the guest runs its own kernel ($(field probe kernel), the host is $host_kernel)"
+    else
+      fail "microVM: the guest runs its own kernel" "guest '$(field probe kernel)', host $host_kernel"
+    fi
+    is "$(code /)" 200 "microVM: the WordPress front page is 200 from the guest (its database through db:3306)"
+    smoke microvm-smoke
+    is "$(field microvm-smoke db_password)" "securecore-vault:DB_PASSWORD" "microVM + layer 2: the vault holds in the guest"
+    is "$(field microvm-smoke write-core)" BLOCKED "microVM + layer 2: the mu-plugin can't write core's folders in the guest"
+    # No way back to root in the guest (#80): the image has no setuid or setgid file, its root
+    # is mounted nosuid, and php-fpm's workers run under no_new_privs, so su and mount (were they
+    # setuid) give a worker nothing.
+    compose cp test/release/sc-microvm-privs.php php:/var/www/html/sc-microvm-privs.php >> "$dir/cp.log" 2>&1
+    in_root 'chmod 644 /var/www/html/sc-microvm-privs.php'
+    # The site disk is rebuilt when the tree changes: a restart of the launcher picks the file up.
+    kcompose restart php > /dev/null 2>&1
+    i=0; until [ "$(code /sc-microvm-privs.php)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 240 ] || break; sleep 1; done
+    curl -s "$base/sc-microvm-privs.php" > "$dir/privs"
+    is "$(field privs setid_files)" 0 "microVM: the guest image has no setuid or setgid file"
+    is "$(field privs root_nosuid)" 1 "microVM: the guest's root is mounted nosuid"
+    is "$(field privs nonewprivs)" 1 "microVM: php-fpm's worker runs under no_new_privs"
+    is "$(field privs euid)/$(field privs su)/$(field privs mount)" "33/refused/refused" \
+      "microVM: a worker (uid 33) running su or mount stays unprivileged"
+    # The installer's free-space check (#80): a share folder too small for the image is refused,
+    # saying how much is needed, with nothing placed. (This container is privileged: a 64 MiB
+    # tmpfs stands in for a full disk.)
+    in_root 'mkdir -p /tmp/small && mount -t tmpfs -o size=64m tmpfs /tmp/small'
+    in_root "sh /release/install-ext.sh --from file:///release --canary --wordpress /var/www/html --share-dir /tmp/small/share" > "$dir/install-small.log" 2>&1; rc=$?
+    if [ "$rc" != 0 ] && grep -q "the microVM's guest image needs [0-9]* MiB there" "$dir/install-small.log"; then
+      pass "a share folder without room for the guest image is refused, saying how much it needs"
+    else
+      fail "a share folder without room for the guest image is refused, saying how much it needs" "rc=$rc: $(tr '\n' '|' < "$dir/install-small.log")"
+    fi
+    is "$(in_root 'ls -A /tmp/small | wc -l' | tr -d ' ')" 0 "and nothing is left in it"
+    in_root 'umount /tmp/small && rmdir /tmp/small'
+  fi
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then echo "all release checks passed for $cell"; else echo "$fails release check(s) failed for $cell"; fi

@@ -1,0 +1,12 @@
+# The release check's microVM boot (addiscorp/securecore#80), on top of compose.release-check.yml:
+# the php service as a stand-in server with the host's /dev/kvm, running test/release/sapi-microvm
+# (securecore-fpm and the VM's files as install-ext.sh placed them). Privileged for the jailer
+# (chroot, mount and network namespaces, device nodes, cgroups). test/release-check.sh uses it
+# when the release ships a guest image, and fails without /dev/kvm.
+services:
+  php:
+    privileged: true
+    devices:
+      - /dev/kvm:/dev/kvm
+    user: root
+    command: ["sapi-microvm"]

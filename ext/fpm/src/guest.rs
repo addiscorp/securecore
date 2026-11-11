@@ -25,6 +25,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -775,6 +776,18 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
     if !boot.ext {
         cmd.env("PHP_INI_SCAN_DIR", NOEXT_INI);
     }
+    // php-fpm and every worker under no_new_privs (#80): no exec ever gains privileges (a setuid
+    // file, file capabilities), whatever the image or a writable disk holds. The master keeps
+    // what it has (root, to switch to the pool user); a worker can't get root back.
+    // SAFETY: prctl(2) only, between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let child = cmd.spawn().map_err(|e| io::Error::new(e.kind(), format!("php-fpm: {e}")))?;
     drop(cmd);
     thread::spawn(move || pump_log(read));
@@ -783,6 +796,9 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
 
 fn boot_guest() -> io::Result<u32> {
     let flags = libc::MS_NOSUID | libc::MS_NODEV;
+    // The root image read-only, nosuid and nodev (#80): the kernel mounts it ro from the command
+    // line, which can't say nosuid; a bind remount sets the mount's flags and nothing else.
+    mount("", "/", "", libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | flags, "")?;
     mount("proc", "/proc", "proc", flags | libc::MS_NOEXEC, "")?;
     mount("sysfs", "/sys", "sysfs", flags | libc::MS_NOEXEC, "")?;
     mount("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, "")?;

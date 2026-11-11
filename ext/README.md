@@ -823,9 +823,16 @@ and the launcher exits 125.
 - `/dev/kvm` opens read-write and answers `KVM_GET_API_VERSION` with 12;
 - `<vm-dir>/firecracker`, `jailer`, `vmlinux` and `rootfs.ext4` (`--vm-dir`, default
   `/usr/local/share/securecore/vm`) each match the sha256 in `<vm-dir>/installed.json`, the
-  installer's record. Nothing unrecorded boots. The installer records the kernel, Firecracker and
-  the jailer; no release ships a guest root image yet (it is built from `docker/ext.Dockerfile`'s
-  `guest` target by `scripts/guest-image.sh`), so on an installed host the microVM can't run;
+  installer's record. Nothing unrecorded boots. The installer records the kernel, Firecracker,
+  the jailer and the guest image. Each release ships its guest image (#80) at
+  `<version>/vm/linux-x86_64/rootfs.ext4.gz`, with its sha256 gzipped and unpacked in
+  `release.json` and `vm/manifest.json`: `docker/ext.Dockerfile`'s `guest` target (its base pinned
+  by digest, apt from snapshot.debian.org; compilers, sources, docs and every setuid/setgid bit
+  removed) made into an ext4 inside the pinned `guest-tools` image by `scripts/guest-image.sh`
+  (`scripts/guest-build.sh`; `--check` builds it twice and compares, a CI report that never
+  gates). The installer checks both sha256s before it places anything, unpacking in
+  `<vm-dir>/.securecore-staging` after checking there is room. In the guest, the root is mounted
+  nosuid and php-fpm runs under no_new_privs;
 - the config is one the microVM can enforce (below), and every `connect[].socket` is a socket the
   jailed user may open itself (checked by running a probe as that user);
 - with layer 3 on, the kernel has Landlock and seccomp filters (its symbols are checked; mirab's

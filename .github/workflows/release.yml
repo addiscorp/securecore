@@ -13,7 +13,13 @@
 #   <version>/ext/securecore.schema.json                   the JSON Schema for securecore.json
 #   <version>/ext/mirab-vm.json                            layer 1's microVM from mirab (#71): the
 #                                     kernel and Firecracker URLs and sha256s, resolved from mirab's
-#                                     newest stable release at build time (absent while it has none)
+#                                     newest stable release once per release (the mirab job; no
+#                                     vm/ there fails the release, which ships a guest image)
+#   <version>/vm/linux-x86_64/rootfs.ext4.gz  layer 1's microVM guest image (#80), built once by
+#                                     the guest job (scripts/guest-build.sh); guest-reproducible
+#                                     reports, never gates, whether a rebuild matches
+#   <version>/vm/manifest.json        its sha256 and size, gzipped and unpacked (APS 12: vm/ with
+#                                     its own manifest, the shape of mirab's)
 #   <version>/release.json            version, tag, commit, channel, zip + sha256, and "files": the
 #                                     sha256 and size of every other file in <version>/ (APS 12)
 #   canary.json                       the newest canary's release.json
@@ -93,9 +99,108 @@ jobs:
             echo "cells=$(scripts/ext-cells.sh json)"
           } >> "$GITHUB_OUTPUT"
 
+  # Layer 1's microVM from mirab (#71), resolved ONCE for the whole release (#80): mirab's newest
+  # stable release, its vm/manifest.json and the Firecracker it pins (scripts/mirab-vm.sh: every
+  # file downloaded and checked by sha256 before it is recorded), or the mirab_manifest override.
+  # Every x86_64 cell's release check and publish take exactly this mirab-vm.json (its bytes, as
+  # a job output), so what the cells boot is what ships. A release ships a guest image, which is
+  # useless without a kernel and Firecracker: no vm/ in mirab's release fails the release.
+  mirab:
+    name: Resolve layer 1's microVM from mirab (scripts/mirab-vm.sh)
+    needs: [resolve]
+    runs-on: ubuntu-24.04
+    outputs:
+      vm_b64: ${{ steps.mirab.outputs.vm_b64 }}
+      vm_sha256: ${{ steps.mirab.outputs.vm_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Resolve it
+        id: mirab
+        env:
+          MIRAB_MANIFEST: ${{ github.event.inputs.mirab_manifest }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp mirab
+          TMPDIR="$PWD/.tmp" scripts/mirab-vm.sh mirab ${MIRAB_MANIFEST:+"$MIRAB_MANIFEST"} \
+            || { echo "::error::mirab's microVM files didn't resolve (exit 3: its release has no vm/ images): a release with a guest image needs them"; exit 1; }
+          cat mirab/mirab-vm.json
+          {
+            echo "vm_b64=$(base64 -w0 mirab/mirab-vm.json)"
+            echo "vm_sha256=$(sha256sum mirab/mirab-vm.json | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+  # Layer 1's microVM guest image (#80): docker/ext.Dockerfile's `guest` target (its base pinned by
+  # digest, apt from snapshot.debian.org) made into an ext4 inside the pinned guest-tools image by
+  # scripts/guest-build.sh, ONCE. Its two sha256s are this job's outputs: every x86_64 cell checks
+  # the staged bytes against them (not only against the SHA256SUMS beside them in R2), installs
+  # them with install-ext.sh and boots the microVM from what the installer placed, and publish
+  # ships the bytes that match them. Whether a rebuild gives the same bytes is guest-reproducible's
+  # question, which never gates the release. GitHub-hosted for the same reason as the cells below
+  # (Docker inside the job).
+  guest:
+    name: Guest image (layer 1's microVM)
+    needs: [resolve]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: release
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    outputs:
+      gz_sha256: ${{ steps.build.outputs.gz_sha256 }}
+      unpacked_sha256: ${{ steps.build.outputs.unpacked_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build it (scripts/guest-build.sh)
+        id: build
+        run: |
+          set -euo pipefail
+          mkdir -p guest
+          scripts/guest-build.sh guest
+          ls -l guest
+          {
+            echo "gz_sha256=$(sha256sum guest/rootfs-linux-x86_64.ext4.gz | cut -d' ' -f1)"
+            echo "unpacked_sha256=$(gzip -dc guest/rootfs-linux-x86_64.ext4.gz | sha256sum | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Stage the guest image in R2
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${R2_ENDPOINT:-}" ] || [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::error::staging needs R2_ENDPOINT, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in the release environment."
+            exit 1
+          fi
+          prefix="staging/${TAG}/${GITHUB_RUN_ID}/guest"
+          (cd guest && sha256sum -- rootfs-linux-x86_64.ext4.gz > SHA256SUMS)
+          cat guest/SHA256SUMS
+          for f in rootfs-linux-x86_64.ext4.gz SHA256SUMS; do scripts/r2.sh put "${prefix}/${f}" "guest/${f}"; done
+          mkdir -p readback
+          for f in rootfs-linux-x86_64.ext4.gz SHA256SUMS; do
+            scripts/r2.sh get "${prefix}/${f}" "readback/${f}"
+            cmp "guest/${f}" "readback/${f}" || { echo "::error::${prefix}/${f} does not read back as staged"; exit 1; }
+          done
+          echo "staged ${prefix}/"
+
+  # Reports, never gates (#80): builds the guest image twice, the second from nothing in a builder
+  # of its own (no layer, no RUN --mount cache), and fails, listing the files that differ, unless
+  # both disks have the same sha256. continue-on-error: a red job here leaves the release green,
+  # and its red is never hidden. Nothing it builds is staged or shipped.
+  guest-reproducible:
+    name: Guest image reproducibility (reports only, never gates the release)
+    needs: [resolve]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build twice and compare (scripts/guest-build.sh --check)
+        run: scripts/guest-build.sh --check guest
+
   ext:
     name: ext php${{ matrix.cell.php }}-${{ matrix.cell.ts }}-linux-${{ matrix.arch }}
-    needs: [resolve]
+    needs: [resolve, mirab, guest]
     # APS 11 puts CI on mirab VMs, but Docker inside jobs is not in mirab's phase 1 (mirab#59,
     # row 12), and this job is Docker end to end: the build runs in each PHP's official image and
     # the release check boots WordPress (php, nginx, MariaDB) in containers. So it is one of the
@@ -129,8 +234,40 @@ jobs:
           mkdir -p .tmp
           TMPDIR="$PWD/.tmp" scripts/ext-build.sh "$PHP" "$TS" dist
           ls -l dist
+      # x86_64: the staged guest image and the release's mirab-vm.json join the cell's files for
+      # the check (not its staging: publish takes the guest and mirab jobs'), so the installer
+      # places them and the check boots them. The image must be the guest job's, by the sha256s
+      # that job output, not only by the SHA256SUMS staged beside it.
+      - name: The guest image from staging, and mirab-vm.json (x86_64)
+        if: matrix.arch == 'x86_64'
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          GUEST_GZ_SHA256: ${{ needs.guest.outputs.gz_sha256 }}
+          GUEST_UNPACKED_SHA256: ${{ needs.guest.outputs.unpacked_sha256 }}
+          MIRAB_VM_B64: ${{ needs.mirab.outputs.vm_b64 }}
+          MIRAB_VM_SHA256: ${{ needs.mirab.outputs.vm_sha256 }}
+        run: |
+          set -euo pipefail
+          prefix="staging/${TAG}/${GITHUB_RUN_ID}/guest"
+          mkdir -p guest
+          scripts/r2.sh get "${prefix}/SHA256SUMS" guest/SHA256SUMS
+          scripts/r2.sh get "${prefix}/rootfs-linux-x86_64.ext4.gz" guest/rootfs-linux-x86_64.ext4.gz
+          (cd guest && sha256sum -c --strict SHA256SUMS)
+          [ "$(sha256sum guest/rootfs-linux-x86_64.ext4.gz | cut -d' ' -f1)" = "$GUEST_GZ_SHA256" ] \
+            || { echo "::error::the staged guest image is not the one the guest job built (${GUEST_GZ_SHA256})"; exit 1; }
+          [ "$(gzip -dc guest/rootfs-linux-x86_64.ext4.gz | sha256sum | cut -d' ' -f1)" = "$GUEST_UNPACKED_SHA256" ] \
+            || { echo "::error::the staged guest image does not unpack to the guest job's ${GUEST_UNPACKED_SHA256}"; exit 1; }
+          printf '%s' "$MIRAB_VM_B64" | base64 -d > guest/mirab-vm.json
+          [ "$(sha256sum guest/mirab-vm.json | cut -d' ' -f1)" = "$MIRAB_VM_SHA256" ] || { echo "::error::mirab-vm.json did not survive the job output"; exit 1; }
       - name: Release check (test/release-check.sh) — WordPress on this PHP with these bytes
-        run: TMPDIR="$PWD/.tmp" test/release-check.sh "$PHP" "$TS" dist
+        run: |
+          set -euo pipefail
+          mkdir -p check
+          cp dist/* check/
+          if [ -f guest/rootfs-linux-x86_64.ext4.gz ]; then cp guest/rootfs-linux-x86_64.ext4.gz guest/mirab-vm.json check/; fi
+          TMPDIR="$PWD/.tmp" test/release-check.sh "$PHP" "$TS" check
       - name: Stage the checked files in R2
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
@@ -157,7 +294,7 @@ jobs:
 
   publish:
     name: Build and publish to R2
-    needs: [resolve, ext]
+    needs: [resolve, mirab, guest, ext]
     # Publishing runs on GitHub-hosted runners (APS 11). The plugin zip is built here; the
     # extension's files come from the ext cells' staging, checked against each cell's SHA256SUMS.
     runs-on: ubuntu-24.04
@@ -179,7 +316,7 @@ jobs:
           curl -fsSL https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz -o "$RUNNER_TEMP/shellcheck.tar.xz"
           echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum -c -
           tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" -s sh -S info install.sh bin/securecore-worker scripts/*.sh ext/install.sh test/release-check.sh
+          "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" -s sh -S info install.sh bin/securecore-worker scripts/*.sh ext/install.sh test/release-check.sh test/release/sapi-microvm
       - name: Release keys are present
         run: |
           if [ -z "${R2_ENDPOINT:-}" ] || [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
@@ -193,6 +330,10 @@ jobs:
       - name: Take the extension's checked files from staging
         env:
           CELLS: ${{ needs.resolve.outputs.cells }}
+          GUEST_GZ_SHA256: ${{ needs.guest.outputs.gz_sha256 }}
+          GUEST_UNPACKED_SHA256: ${{ needs.guest.outputs.unpacked_sha256 }}
+          MIRAB_VM_B64: ${{ needs.mirab.outputs.vm_b64 }}
+          MIRAB_VM_SHA256: ${{ needs.mirab.outputs.vm_sha256 }}
         run: |
           set -euo pipefail
           mkdir -p staged ext-dist
@@ -221,28 +362,25 @@ jobs:
               fi
             done
           done
+          # The guest image (#80), as the guest job staged it and every x86_64 cell booted it.
+          prefix="staging/${TAG}/${GITHUB_RUN_ID}/guest"
+          mkdir -p staged/guest
+          scripts/r2.sh get "${prefix}/SHA256SUMS" staged/guest/SHA256SUMS \
+            || { echo "::error::the guest job staged nothing"; exit 1; }
+          scripts/r2.sh get "${prefix}/rootfs-linux-x86_64.ext4.gz" staged/guest/rootfs-linux-x86_64.ext4.gz
+          (cd staged/guest && sha256sum -c --strict SHA256SUMS) || { echo "::error::the staged guest image does not match its SHA256SUMS"; exit 1; }
+          # And it is the guest job's, by the sha256s that job output (#80).
+          [ "$(sha256sum staged/guest/rootfs-linux-x86_64.ext4.gz | cut -d' ' -f1)" = "$GUEST_GZ_SHA256" ] \
+            || { echo "::error::the staged guest image is not the one the guest job built (${GUEST_GZ_SHA256})"; exit 1; }
+          [ "$(gzip -dc staged/guest/rootfs-linux-x86_64.ext4.gz | sha256sum | cut -d' ' -f1)" = "$GUEST_UNPACKED_SHA256" ] \
+            || { echo "::error::the staged guest image does not unpack to the guest job's ${GUEST_UNPACKED_SHA256}"; exit 1; }
+          cp staged/guest/rootfs-linux-x86_64.ext4.gz ext-dist/
+          # Layer 1's microVM from mirab (#71): the mirab job's mirab-vm.json, the bytes every
+          # x86_64 cell's release check booted, never a second resolution.
+          printf '%s' "$MIRAB_VM_B64" | base64 -d > ext-dist/mirab-vm.json
+          [ "$(sha256sum ext-dist/mirab-vm.json | cut -d' ' -f1)" = "$MIRAB_VM_SHA256" ] || { echo "::error::mirab-vm.json did not survive the job output"; exit 1; }
+          cat ext-dist/mirab-vm.json
           ls -l ext-dist
-      # Layer 1's microVM (#71): mirab's newest stable release, its vm/manifest.json and the
-      # Firecracker it pins, resolved now and never pinned in this repo. Every file is downloaded
-      # and checked by sha256 before it is recorded. Until mirab's stable carries vm/ (mirab#89)
-      # the script exits 3 and the release ships without the microVM: layer 1's auto is gelada.
-      - name: Resolve layer 1's microVM from mirab (scripts/mirab-vm.sh)
-        env:
-          MIRAB_MANIFEST: ${{ github.event.inputs.mirab_manifest }}
-        run: |
-          set -uo pipefail
-          mkdir -p .tmp
-          # Steps run under bash -e: catch the exit status, or exit 3 (no vm/ in mirab stable)
-          # would fail the release here instead of shipping it without the microVM.
-          rc=0
-          TMPDIR="$PWD/.tmp" scripts/mirab-vm.sh ext-dist ${MIRAB_MANIFEST:+"$MIRAB_MANIFEST"} || rc=$?
-          if [ "$rc" = 3 ]; then
-            echo "::warning::mirab's newest stable release has no vm/ images yet (mirab#89): this release carries no microVM, so layer 1 is gelada"
-          elif [ "$rc" != 0 ]; then
-            exit "$rc"
-          else
-            cat ext-dist/mirab-vm.json
-          fi
       - name: Lay out the release (scripts/release-layout.sh, the same script the tests serve)
         run: |
           set -euo pipefail
@@ -278,24 +416,15 @@ jobs:
           done
       - name: Upload the versioned release
         run: aws s3 sync "release/${VERSION}/" "s3://${R2_BUCKET_RELEASES}/${VERSION}/" --endpoint-url="${R2_ENDPOINT}"
-      - name: Publish the installer and point canary.json at this release
-        run: |
-          set -euo pipefail
-          for f in install.sh install-ext.sh; do
-            aws s3 cp "release/$f" "s3://${R2_BUCKET_RELEASES}/$f" --endpoint-url="${R2_ENDPOINT}" \
-              --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
-          done
-          aws s3 cp release/canary.json "s3://${R2_BUCKET_RELEASES}/canary.json" --endpoint-url="${R2_ENDPOINT}" \
-            --content-type "application/json" --cache-control "no-cache"
-      # Every uploaded file, read back over HTTPS from both hostnames and compared byte for
-      # byte (sha256) with what was built. curl, like the installer: Cloudflare turns away
-      # Python's default user agent on these domains. The mutable files get a query string
-      # so a cached copy can't pass for the new one.
-      - name: Read every file back from securecore-releases.addis.gg
+      # Every uploaded file of <version>/, read back over HTTPS and compared byte for byte
+      # (sha256) with what was built, BEFORE canary.json or the installers point at it (APS 12:
+      # "every upload is read back from the public URL before the release counts"; #80). Until
+      # then the version folder is reachable only by its name. curl, like the installer: Cloudflare
+      # turns away Python's default user agent on these domains.
+      - name: Read the versioned release back from securecore-releases.addis.gg
         run: |
           set -euo pipefail
           sum() { sha256sum "$1" | cut -d' ' -f1; }
-          bust="?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           for host in securecore-releases.addis.gg; do
             curl -fsSL "https://${host}/${VERSION}/release.json" -o served
             [ "$(sum served)" = "$(sum "release/${VERSION}/release.json")" ] || { echo "::error::https://${host}/${VERSION}/release.json does not match"; exit 1; }
@@ -305,15 +434,42 @@ jobs:
               [ "$(sum served)" = "$want" ] || { echo "::error::https://${host}/${VERSION}/${f} does not match release.json"; exit 1; }
               echo "ok https://${host}/${VERSION}/${f} ${want}"
             done
-            for f in install.sh install-ext.sh canary.json; do
-              curl -fsSL "https://${host}/${f}${bust}" -o served
-              [ "$(sum served)" = "$(sum "release/${f}")" ] || { echo "::error::https://${host}/${f} does not match what was uploaded"; exit 1; }
-              echo "ok https://${host}/${f} $(sum served)"
-            done
           done
           # And the zip matches the sha256 the manifest promises installers.
           curl -fsSL "https://securecore-releases.addis.gg/${VERSION}/securecore.zip" -o served.zip
           [ "$(sum served.zip)" = "$(jq -r .sha256 "release/${VERSION}/release.json")" ] || { echo "::error::served zip does not match release.json"; exit 1; }
+          # The guest image (#80) as served, gzipped and unpacked, against release.json and
+          # vm/manifest.json: scripts/promote-check.sh on the bytes read back (without mirab-vm.json,
+          # whose channel check is promote's: a mirab_manifest canary publishes, never promotes).
+          mkdir -p "readback/${VERSION}/vm/linux-x86_64"
+          curl -fsSL "https://securecore-releases.addis.gg/${VERSION}/release.json" -o "readback/${VERSION}/release.json"
+          for f in vm/linux-x86_64/rootfs.ext4.gz vm/manifest.json; do
+            if jq -e --arg f "$f" '.files[$f]' "release/${VERSION}/release.json" > /dev/null; then
+              curl -fsSL "https://securecore-releases.addis.gg/${VERSION}/${f}" -o "readback/${VERSION}/${f}"
+            fi
+          done
+          scripts/promote-check.sh "readback/${VERSION}"
+      # Only now does anything point at the new version.
+      - name: Publish the installer and point canary.json at this release
+        run: |
+          set -euo pipefail
+          for f in install.sh install-ext.sh; do
+            aws s3 cp "release/$f" "s3://${R2_BUCKET_RELEASES}/$f" --endpoint-url="${R2_ENDPOINT}" \
+              --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
+          done
+          aws s3 cp release/canary.json "s3://${R2_BUCKET_RELEASES}/canary.json" --endpoint-url="${R2_ENDPOINT}" \
+            --content-type "application/json" --cache-control "no-cache"
+      # The mutable files get a query string so a cached copy can't pass for the new one.
+      - name: Read the installers and canary.json back
+        run: |
+          set -euo pipefail
+          sum() { sha256sum "$1" | cut -d' ' -f1; }
+          bust="?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          for f in install.sh install-ext.sh canary.json; do
+            curl -fsSL "https://securecore-releases.addis.gg/${f}${bust}" -o served
+            [ "$(sum served)" = "$(sum "release/${f}")" ] || { echo "::error::https://securecore-releases.addis.gg/${f} does not match what was uploaded"; exit 1; }
+            echo "ok https://securecore-releases.addis.gg/${f} $(sum served)"
+          done
       - name: GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
@@ -344,4 +500,5 @@ jobs:
             echo "- the extension: $(jq -r '.files | keys[] | select(endswith(".so"))' "release/${VERSION}/release.json" | wc -l) cells, each release-checked on WordPress before staging"
             echo "- canary.json, install.sh and install-ext.sh now point here; latest.json was not touched (promote.yml)"
             echo "- every file in release.json read back from securecore-releases.addis.gg and matched by sha256"
+            jq -r '.files["vm/linux-x86_64/rootfs.ext4.gz"] // empty | "- the microVM guest image: \(.bytes) bytes gzipped, \(.unpacked_bytes) unpacked (\(.unpacked_sha256)), booted by every x86_64 cell; reproducibility is the guest-reproducible job'"'"'s report"' "release/${VERSION}/release.json"
           } >> "$GITHUB_STEP_SUMMARY"
