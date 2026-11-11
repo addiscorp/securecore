@@ -3339,7 +3339,7 @@ mod tests {
         assert!(!e.contains("WORDPRESS_DB_PASSWORD"), "{e}");
         let ini_link = dir.join("ini-link.ini");
         std::os::unix::fs::symlink(&ini, &ini_link).expect("link");
-        assert!(read_site_ini(Some(&ini_link)).expect_err("a link").contains("is a link"));
+        assert!(read_site_ini(Some(&ini_link)).expect_err("a link").contains("a link is in its path"));
         assert_eq!(read_site_ini(Some(&dir.join("absent.ini"))), Ok(None), "no file: no settings");
         let _ = fs::remove_dir_all(&dir);
     }
