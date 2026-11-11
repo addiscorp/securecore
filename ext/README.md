@@ -796,6 +796,72 @@ php-fpm must listen on TCP (`listen = 9000`): with port rules no unix socket can
 Linux only: on macOS gelada can sandbox a program only as it starts, so `restrict_self` fails
 and the launcher exits 125.
 
+### `layer1.isolation`: gelada or a microVM (#71)
+
+`layer1.isolation` picks what php-fpm runs inside. The launcher logs the choice first
+(`securecore-fpm: layer 1 isolation auto: …`).
+
+| value | what runs |
+|---|---|
+| `auto` (the default) | a Firecracker microVM where this host can run one, gelada otherwise, with the reason: `layer 1 isolation auto: gelada, because this host can't run the microVM (/dev/kvm: No such file or directory (os error 2))`. The only value that falls back |
+| `microvm` | the microVM, or nothing: without one the launcher exits 125 (`layer1.isolation is "microvm" but this host can't run the microVM (…). "microvm" never falls back`) |
+| `gelada` | gelada on the host kernel, as above, even where KVM exists |
+| `off` | layer 1 off, as `enabled: false` (`enabled: true` with `off` is a contradiction, and invalid) |
+
+**This host can run the microVM** when `/dev/kvm` opens read-write and answers
+`KVM_GET_API_VERSION` with 12, Firecracker, the guest kernel and the guest root image exist
+(`<vm-dir>/firecracker`, `vmlinux`, `rootfs.ext4`; `--vm-dir`, default
+`/usr/local/share/securecore/vm`, or `--firecracker`/`--kernel`/`--rootfs`), and `mke2fs` is on
+`PATH`. The installer puts mirab's kernel and Firecracker there (below). The guest root image is
+built from `docker/ext.Dockerfile`'s `guest` target by `scripts/guest-image.sh`; releases don't
+carry one yet, so on an installed host `auto` is gelada until one is there.
+
+**In the microVM** the launcher stays in the foreground (like `php-fpm -F`) and is the guest's
+only way in or out; SIGTERM, SIGINT, SIGQUIT or SIGHUP stop the VM and it exits 0. The guest has
+no network device, only vsock, and `layer1` maps onto it as follows:
+
+| `layer1` | in the microVM |
+|---|---|
+| `network.bind` | the first port is where the launcher takes FastCGI, on `127.0.0.1` (`--listen unix:<path>` or `<host>:<port>` for another), and passes it to php-fpm over vsock |
+| `network.connect` with `socket` | the guest's `127.0.0.1:<port>` reaches that unix socket on the host, with nothing in between (Firecracker connects it; mysqlnd's connect goes onto vsock in place, #70). With the socket under `/run`, the same path works in the guest too (WordPress's `DB_HOST=localhost`) |
+| `network.connect` with `address` | the launcher connects the guest's `127.0.0.1:<port>` to that TCP `host:port` |
+| `network.connect`, neither | unreachable from the guest (logged). Outbound HTTPS and DNS are #72 |
+| `network.unixSockets` | refused: give the port the socket instead |
+| `write`, inside the app root | its own read-write disk, made once from the folder's contents and kept across starts (the host's copy isn't updated: #72) |
+| `write`, outside it | a tmpfs in the guest (`/tmp` always is one) |
+| `deny`, outside the app root | nothing to do: the guest never has it |
+| `deny`, inside it | refused: the site disk is the whole root |
+
+The site is a read-only disk built from the app root with `mke2fs -d`, mounted at the same path
+(or `--guest-root`, the root nginx sends in `SCRIPT_FILENAME`). The guest's root is read-only
+too, so core, plugins and themes can't be written. Its PID 1 is `securecore-fpm` again, as
+`/sbin/securecore-init`: it mounts the disks, forwards vsock and starts php-fpm, whose log comes
+back to the launcher's stderr. Layers 2 and 3 run in the guest's php-fpm unchanged; layer 3's
+isolated children need Landlock and seccomp in the guest kernel (mirab#89 adds them to mirab's).
+
+**Snapshots.** A start restores a snapshot of a warmed-up VM when there is one for this key: the
+sha256s of Firecracker, the kernel, the root image, the site tree (every path, mode, owner, size
+and mtime, writable folders excepted) and `securecore.json`, plus the memory, vCPUs, boot
+arguments and disks. Without one, the launcher cold-boots, runs 20 front pages, snapshots, and
+restores that, so the next start is fast; old snapshots and site disks are removed. A restore
+that fails is removed and the launcher cold-boots instead. After every boot or restore the
+launcher sends the guest the clock (a restored guest has the snapshot's) and only then the
+writable disks are mounted, so no snapshot ever holds a stale view of them. `--no-snapshot`
+cold-boots every time. Each site's disks, snapshot and sockets live in `--state-dir` (default
+`/var/lib/securecore/vm/<sha256 of the app root>`). `--mem` (512) and `--vcpus` (2) size the
+guest.
+
+**Where the VM's files come from.** Nothing is pinned here. The release resolves mirab's newest
+stable release at build time (`scripts/mirab-vm.sh`): its `vm/manifest.json` (the kernel, with
+both sha256s) and the Firecracker mirab pins at that release's commit (mirab's
+`scripts/firecracker.json`; mirab's releases carry no Firecracker). It records them as
+`ext/mirab-vm.json` in the release, and `install-ext.sh` downloads both, checks each against
+those sha256s (the kernel gzipped and unpacked, the Firecracker tarball and its binary) and
+writes `<share-dir>/vm/installed.json`, naming the mirab release. While mirab's stable has no
+`vm/` (before mirab#89) a release carries no `mirab-vm.json` and `auto` is gelada. For
+development, `scripts/mirab-vm.sh <out> <manifest-url>` (the release workflow's `mirab_manifest`
+input) takes a canary's manifest instead.
+
 ### What php-fpm needs, and the example
 
 Everything php-fpm may do is in the file; the launcher adds nothing. `examples/wordpress.json`'s
@@ -975,7 +1041,17 @@ WordPress boot in a new zygote, on the request that brings it.
   the DB on 3306 and 443 work, ports 25 and 80, a bind of 8081, UDP and a unix socket are
   refused (and the listeners outside the sandbox receive nothing), writes outside the folders
   are refused from core and from a child program, the denied path is unreadable; unixSockets +
-  ports and an invalid file exit 125 at launch with php-fpm never starting.
+  ports and an invalid file exit 125 at launch with php-fpm never starting. In the container
+  there is no `/dev/kvm`, so this is also `auto` falling back to gelada.
+- `test/ext-microvm.sh` (a Linux host with KVM, as root; #71): the four `layer1.isolation`
+  values (off and gelada on the host; auto and microvm boot the microVM there; in the php
+  container without `/dev/kvm`, auto falls back to gelada and microvm exits 125 without php-fpm
+  running), then the same WordPress served from a Firecracker guest: the guest's kernel,
+  loopback only, a read-only site with writable uploads, layer 2 enforcing and layer 3's child
+  running in the guest, the database through MariaDB's socket; the first start making a
+  snapshot and the next restoring it with the clock resynced and the uploads kept; a site change
+  making a new snapshot, a broken one falling back to a cold boot, `--no-snapshot`. `bench [n]`
+  is #70's latency comparison and `restore [n]` times the requests after a restore.
 - All the `test/ext-*.sh` scripts take `SECURECORE_EXT_PROJECT` and `SECURECORE_EXT_PORT` to run
   as another compose project on another port.
 - `DOCKER_CONTEXT=colima test/ext-config.sh`: WordPress on the docker stack with the extension

@@ -1,0 +1,22 @@
+# Layer 1 as a microVM (addiscorp/securecore#71): the layer-1 stack plus what the host-side
+# securecore-fpm needs to serve the same site from a Firecracker guest. On top of compose.yml,
+# compose.ext.yml and compose.ext-layer1.yml; test/ext-microvm.sh drives it.
+#   SC_MVM_MYSQLD  a host folder that becomes MariaDB's /run/mysqld, so its unix socket is on
+#                  the host and the guest's port 3306 can be pointed straight at it (the
+#                  product shape: the socket's folder is mounted, never reached via /proc)
+#   SC_MVM_RUN     the host folder holding securecore-fpm's --listen socket (fpm.sock)
+#   SC_MVM_PORT    the port of the nginx that sends PHP to the microVM
+services:
+  db:
+    volumes:
+      - ${SC_MVM_MYSQLD:?}:/run/mysqld
+
+  # nginx for the microVM: the same image and static files as `web`, PHP to fpm.sock.
+  mvmweb:
+    build: { context: .., dockerfile: docker/web.Dockerfile }
+    ports:
+      - "127.0.0.1:${SC_MVM_PORT:-8096}:80"
+    volumes:
+      - wp:/var/www/html:ro
+      - ${SC_MVM_RUN:?}:/run/mvm
+      - ../bench/microvm/nginx.conf:/etc/nginx/conf.d/default.conf:ro

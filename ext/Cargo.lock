@@ -1196,7 +1196,9 @@ name = "securecore-fpm"
 version = "0.1.0"
 dependencies = [
  "gelada",
+ "libc",
  "securecore-config",
+ "sha2",
 ]
 
 [[package]]

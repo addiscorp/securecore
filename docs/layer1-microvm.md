@@ -587,6 +587,26 @@ invalid config never runs unprotected. gelada is protected, but weaker. See "Nee
    Going lower means fewer round trips (a persistent connection saves the 0.45 ms connect, for
    example), not a faster transport.
 
+## What #71 built from this
+
+The product version of items 1, 2 and 4 is in `ext/fpm` (`securecore-fpm`; `ext/README.md`,
+"`layer1.isolation`"), tested by `test/ext-microvm.sh`:
+
+- `layer1.isolation` is `off`, `gelada`, `microvm` or `auto` (the default). Only `auto` falls
+  back; `microvm` refuses. `layer1.network.connect[].socket` / `address` say where a guest port
+  goes on the host.
+- The driver (`vm.rs`), the vsock bridges (`vsock.rs`) and the guest's PID 1 (`guest.rs`, the
+  same binary as `/sbin/securecore-init`) replace `bench/microvm/src/main.rs` and `init.sh`: no
+  socat, no shell in the guest's start. The preload moved to `ext/fpm/guest/`, the guest root to
+  `docker/ext.Dockerfile`'s `guest` target and `scripts/guest-image.sh`.
+- Snapshots are keyed by the sha256s of Firecracker, the kernel, the root image, the site tree and
+  the config, plus the machine; the writable disks are mounted only after a restore, after the
+  clock is set; a stop syncs them first.
+- Nothing is pinned: `scripts/mirab-vm.sh` resolves mirab's newest stable release, its
+  `vm/manifest.json` and the Firecracker mirab pins at that commit, and `install-ext.sh` checks
+  each file against those sha256s. `bench/microvm/firecracker.json` and `mirab-kernel.json`
+  stay as the spike's record only.
+
 ## Follow-up issues (not filed)
 
 1. **mirab: Landlock and seccomp in the x86_64 guest kernel.** Add `SECURITY`,

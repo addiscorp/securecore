@@ -11,6 +11,9 @@
 #   <version>/ext/securecore-fpm-linux-<arch>              the layer-1 launcher, one per architecture
 #   <version>/ext/securecore-vault.php                     the mu-plugin
 #   <version>/ext/securecore.schema.json                   the JSON Schema for securecore.json
+#   <version>/ext/mirab-vm.json                            layer 1's microVM from mirab (#71): the
+#                                     kernel and Firecracker URLs and sha256s, resolved from mirab's
+#                                     newest stable release at build time (absent while it has none)
 #   <version>/release.json            version, tag, commit, channel, zip + sha256, and "files": the
 #                                     sha256 and size of every other file in <version>/ (APS 12)
 #   canary.json                       the newest canary's release.json
@@ -31,7 +34,15 @@
 name: Release (canary)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mirab_manifest:
+        description: >-
+          Development only: a mirab vm/manifest.json to take layer 1's microVM kernel and
+          Firecracker from instead of mirab's newest stable release, e.g.
+          https://mirab-releases.addis.gg/<version>/vm/manifest.json (a canary). Empty: stable.
+        required: false
+        default: ''
   push:
     tags:
       - 'v*-canary-*'
@@ -211,6 +222,25 @@ jobs:
             done
           done
           ls -l ext-dist
+      # Layer 1's microVM (#71): mirab's newest stable release, its vm/manifest.json and the
+      # Firecracker it pins, resolved now and never pinned in this repo. Every file is downloaded
+      # and checked by sha256 before it is recorded. Until mirab's stable carries vm/ (mirab#89)
+      # the script exits 3 and the release ships without the microVM: layer 1's auto is gelada.
+      - name: Resolve layer 1's microVM from mirab (scripts/mirab-vm.sh)
+        env:
+          MIRAB_MANIFEST: ${{ github.event.inputs.mirab_manifest }}
+        run: |
+          set -uo pipefail
+          mkdir -p .tmp
+          TMPDIR="$PWD/.tmp" scripts/mirab-vm.sh ext-dist ${MIRAB_MANIFEST:+"$MIRAB_MANIFEST"}
+          rc=$?
+          if [ "$rc" = 3 ]; then
+            echo "::warning::mirab's newest stable release has no vm/ images yet (mirab#89): this release carries no microVM, so layer 1 is gelada"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          else
+            cat ext-dist/mirab-vm.json
+          fi
       - name: Lay out the release (scripts/release-layout.sh, the same script the tests serve)
         run: |
           set -euo pipefail

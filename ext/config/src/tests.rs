@@ -207,6 +207,42 @@ fn port_zero_and_bad_scope_are_rejected() {
     rejected(&with_layer2(r#","default":{"files":"own"}"#));
 }
 
+fn layer1_only(body: &str) -> String {
+    format!(r#"{{"layer1":{body},"layer2":{{"enabled":false}},"layer3":{{"enabled":false}}}}"#)
+}
+
+#[test]
+fn isolation_defaults_to_auto_and_takes_four_values() {
+    let c = parse(WORDPRESS).expect("examples/wordpress.json");
+    assert_eq!(c.layer1.isolation, Isolation::Auto, "no isolation key: auto (Sami, 10 Nov)");
+    for (word, want) in [("off", Isolation::Off), ("gelada", Isolation::Gelada), ("microvm", Isolation::Microvm), ("auto", Isolation::Auto)] {
+        let enabled = want != Isolation::Off;
+        let c = parse(&layer1_only(&format!(r#"{{"enabled":{enabled},"isolation":"{word}"}}"#))).expect(word);
+        assert_eq!(c.layer1.isolation, want);
+        assert_eq!(want.as_str(), word);
+    }
+    // off with enabled false is the same thing said twice, and valid.
+    assert!(parse(&layer1_only(r#"{"enabled":false,"isolation":"off"}"#)).expect("off").is_off());
+    let e = rejected(&layer1_only(r#"{"enabled":true,"isolation":"off"}"#));
+    assert!(e.contains("layer1.enabled is true but layer1.isolation is \"off\""), "{e}");
+    let e = rejected(&layer1_only(r#"{"enabled":true,"isolation":"vm"}"#));
+    assert!(e.contains("unknown variant `vm`"), "{e}");
+}
+
+#[test]
+fn connect_takes_a_socket_or_an_address_not_both() {
+    let c = parse(&layer1_only(
+        r#"{"enabled":true,"network":{"connect":[{"port":3306,"socket":"/run/mysqld/mysqld.sock"},{"port":6379,"address":"10.0.0.5:6379"},{"port":443}]}}"#,
+    ))
+    .expect("valid");
+    let connect = &c.layer1.network.connect;
+    assert_eq!(connect[0].socket.as_deref(), Some("/run/mysqld/mysqld.sock"));
+    assert_eq!(connect[1].address.as_deref(), Some("10.0.0.5:6379"));
+    assert_eq!((connect[2].socket.as_deref(), connect[2].address.as_deref()), (None, None));
+    let e = rejected(&layer1_only(r#"{"enabled":true,"network":{"connect":[{"port":3306,"socket":"/s","address":"h:1"}]}}"#));
+    assert!(e.contains("port 3306 has both socket and address"), "{e}");
+}
+
 /// One source of truth: the committed schema is exactly what the types generate. To update:
 /// `cargo run -p securecore-config --bin securecore-schema > securecore.schema.json` in ext/.
 #[test]
@@ -227,6 +263,16 @@ fn schema_covers_the_rules_serde_enforces() {
     assert_eq!(layer2["additionalProperties"], false);
     assert_eq!(layer2["then"]["required"], serde_json::json!(["app"]));
     assert_eq!(schema["$defs"]["Mode"]["enum"], serde_json::json!(["enforce", "log", "off"]));
+    let isolation = &schema["$defs"]["Isolation"];
+    let words: Vec<&str> = isolation["oneOf"].as_array().map_or_else(
+        || isolation["enum"].as_array().expect("enum").iter().filter_map(|v| v.as_str()).collect(),
+        |one| one.iter().filter_map(|v| v["const"].as_str()).collect(),
+    );
+    assert_eq!(words, ["off", "gelada", "microvm", "auto"]);
+    let layer1 = &schema["$defs"]["Layer1"];
+    assert_eq!(layer1["properties"]["isolation"]["default"], "auto");
+    assert_eq!(layer1["then"]["properties"]["isolation"]["not"]["const"], "off");
+    assert_eq!(schema["$defs"]["Connect"]["not"]["required"], serde_json::json!(["socket", "address"]));
 }
 
 /// A fresh directory under TMPDIR (the clone's .tmp when run per AGENTS.md).

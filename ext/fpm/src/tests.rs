@@ -67,6 +67,38 @@ fn unix_sockets_alone_are_refused_too() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn isolation(json_isolation: &str, enabled: bool) -> securecore_config::Layer1 {
+    let json = layer1(&format!(r#"{{"enabled":{enabled},"isolation":"{json_isolation}"}}"#));
+    securecore_config::Config::from_slice(json.as_bytes()).expect("valid").layer1
+}
+
+/// Each value against a host that can run the microVM and one that can't. The probe counts
+/// its calls: it is asked only when the answer matters.
+#[test]
+fn each_isolation_value_behaves_as_decided() {
+    let yes = || Ok(());
+    let no = || Err("/dev/kvm: No such file or directory (os error 2)".to_owned());
+    // off: no layer 1, the host never asked.
+    let off = isolation("off", false);
+    assert_eq!(choose(&off, || panic!("off asks nothing")), Ok(Choice::Off));
+    assert_eq!(choose(&isolation("auto", false), || panic!("disabled asks nothing")), Ok(Choice::Off));
+    // gelada: gelada either way, the host never asked.
+    assert_eq!(choose(&isolation("gelada", true), || panic!("gelada asks nothing")), Ok(Choice::Gelada { fallback: None }));
+    // microvm: the microVM, or refused; never gelada.
+    assert_eq!(choose(&isolation("microvm", true), yes), Ok(Choice::Microvm));
+    let refused = choose(&isolation("microvm", true), no).expect_err("refused");
+    assert_eq!(refused, Refusal::NoMicrovm { why: "/dev/kvm: No such file or directory (os error 2)".into() });
+    assert!(refused.to_string().contains("never falls back"), "{refused}");
+    // auto: the microVM, or gelada with the reason. The only value that falls back.
+    assert_eq!(choose(&isolation("auto", true), yes), Ok(Choice::Microvm));
+    let fell = choose(&isolation("auto", true), no).expect("falls back");
+    assert_eq!(fell, Choice::Gelada { fallback: Some("/dev/kvm: No such file or directory (os error 2)".into()) });
+    assert_eq!(fell.to_string(), "gelada, because this host can't run the microVM (/dev/kvm: No such file or directory (os error 2))");
+    // No isolation key is auto.
+    let default = securecore_config::Config::from_slice(layer1(r#"{"enabled":true}"#).as_bytes()).expect("valid").layer1;
+    assert_eq!(choose(&default, yes), Ok(Choice::Microvm));
+}
+
 #[test]
 fn the_sandbox_carries_the_plan() {
     let plan = Plan {

@@ -53,6 +53,19 @@ sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasu
 for f in "$so" "$launcher"; do [ -f "$src/$f" ] || { echo "FAIL $src/$f is missing (scripts/ext-build.sh $php $ts $src)"; exit 1; }; done
 mkdir -p "$dir/ext"
 cp "$src/$so" "$src/$launcher" "$dir/ext/"
+# Layer 1's microVM files (#71), resolved as the release resolves them: mirab's newest stable
+# release, or, while that has no vm/ images (mirab#89), mirab's newest canary, so the
+# installer's microVM step is checked either way. x86_64 only (mirab pins Firecracker for it).
+vm=
+if [ "$arch" = x86_64 ]; then
+  TMPDIR=${TMPDIR:-$PWD/.tmp} scripts/mirab-vm.sh "$dir/ext" > "$dir/mirab.log" 2>&1; rc=$?
+  if [ "$rc" = 3 ]; then
+    canary=$(curl -fsSL https://mirab-releases.addis.gg/canary.json | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p')
+    TMPDIR=${TMPDIR:-$PWD/.tmp} scripts/mirab-vm.sh "$dir/ext" "https://mirab-releases.addis.gg/$canary/vm/manifest.json" >> "$dir/mirab.log" 2>&1; rc=$?
+  fi
+  [ "$rc" = 0 ] || { echo "FAIL mirab's microVM files (see $dir/mirab.log)"; cat "$dir/mirab.log"; exit 1; }
+  vm=$dir/ext/mirab-vm.json
+fi
 version="$(scripts/version.sh)-canary-check"
 TMPDIR=${TMPDIR:-$PWD/.tmp} scripts/release-layout.sh "$version" "v$version" "$(git rev-parse HEAD)" canary "$dir/release" "$dir/ext" > "$dir/layout.log" \
   || { echo "FAIL release layout (see $dir/layout.log)"; exit 1; }
@@ -101,8 +114,20 @@ is "$(in_php 'php -m' | grep -cx securecore)" 1 "php -m lists securecore"
 
 # Again with the defaults the site shows (no --canary, no --wordpress), from outside the site:
 # with no latest.json it takes the newest canary, and it finds WordPress in /var/www/html.
+if [ -n "$vm" ]; then
+  # jsonv <key>: a value from mirab-vm.json (the last one of that name: the firecracker block's
+  # come after the kernel's, so ask for the ones that are unique).
+  jsonv() { tr -d ' \n' < "$vm" | grep -o "\"$1\":\"[^\"]*\"" | tail -n 1 | cut -d'"' -f4; }
+  has "$dir/install.log" "ok microVM" "install-ext.sh installed layer 1's microVM files"
+  has "$dir/install.log" "each matching mirab's sha256" "and checked them against mirab's sha256s"
+  is "$(in_php 'sha256sum /usr/local/share/securecore/vm/vmlinux' | cut -d' ' -f1)" "$(jsonv unpacked_sha256)" "the installed guest kernel is mirab's, by its unpacked sha256"
+  is "$(in_php 'sha256sum /usr/local/share/securecore/vm/firecracker' | cut -d' ' -f1)" "$(jsonv member_sha256)" "the installed Firecracker is the one mirab pins"
+  is "$(in_php 'test -x /usr/local/share/securecore/vm/firecracker && echo yes')" yes "and it is executable"
+  is "$(in_php 'cat /usr/local/share/securecore/vm/installed.json' | tr -d ' \n' | grep -o '"mirab":"[^"]*"' | cut -d'"' -f4)" "$(jsonv mirab)" \
+    "vm/installed.json records the mirab release ($(jsonv mirab))"
+fi
 in_root 'cd / && sh /release/install-ext.sh --from file:///release' > "$dir/install-2.log" 2>&1; rc=$?
-if [ "$rc" = 0 ] && ! grep -qE '^ok +(Extension|Launcher|JSON Schema|mu-plugin|Config|ini) ' "$dir/install-2.log"; then
+if [ "$rc" = 0 ] && ! grep -qE '^ok +(Extension|Launcher|JSON Schema|mu-plugin|Config|ini|Firecracker|Guest kernel|microVM record) ' "$dir/install-2.log"; then
   pass "install-ext.sh again, with the defaults: exit 0, nothing changed"
 else
   fail "install-ext.sh again, with the defaults: exit 0, nothing changed" "rc=$rc: $(tr '\n' '|' < "$dir/install-2.log")"
@@ -117,6 +142,24 @@ else
 fi
 is "$(in_php "sha256sum $extdir/securecore.so" | cut -d' ' -f1)" "$(sha "$src/$so")" "after the tampered run the installed .so is unchanged"
 in_root 'rm -rf /tmp/tampered'
+if [ -n "$vm" ]; then
+  # A release whose mirab-vm.json names another kernel sha256 (release.json agrees with it, so
+  # only mirab's sha256 check can catch the kernel): refused, and nothing changes.
+  mkdir -p "$dir/badvm-ext"
+  cp "$dir/ext/"* "$dir/badvm-ext/"
+  sed "s/$(jsonv unpacked_sha256)/$(printf '0%.0s' $(seq 64))/" "$vm" > "$dir/badvm-ext/mirab-vm.json"
+  TMPDIR=${TMPDIR:-$PWD/.tmp} scripts/release-layout.sh "$version" "v$version" "$(git rev-parse HEAD)" canary "$dir/badvm" "$dir/badvm-ext" > "$dir/layout-badvm.log" \
+    || fail "the bad-kernel release layout"
+  compose cp "$dir/badvm" php:/tmp/badvm >> "$dir/cp.log" 2>&1
+  in_root 'sh /tmp/badvm/install-ext.sh --from file:///tmp/badvm --canary --wordpress /var/www/html' > "$dir/install-badvm.log" 2>&1; rc=$?
+  if [ "$rc" != 0 ] && grep -q "unpacked guest kernel failed its sha256 check against mirab's" "$dir/install-badvm.log"; then
+    pass "a kernel that doesn't match mirab's sha256 is refused"
+  else
+    fail "a kernel that doesn't match mirab's sha256 is refused" "rc=$rc: $(tr '\n' '|' < "$dir/install-badvm.log")"
+  fi
+  is "$(in_php 'sha256sum /usr/local/share/securecore/vm/vmlinux' | cut -d' ' -f1)" "$(jsonv unpacked_sha256)" "after the refused run the installed kernel is unchanged"
+  in_root 'find /tmp/badvm -mindepth 1 -delete && rmdir /tmp/badvm'
+fi
 
 # --- 2. config load ---------------------------------------------------------------------------
 out=$(in_php 'php -d securecore.config=/etc/securecore/missing.json -r "echo \"ran\";"' 2>&1); rc=$?

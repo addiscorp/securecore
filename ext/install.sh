@@ -17,6 +17,11 @@
 #      securecore.so         into PHP's extension folder
 #      securecore-fpm        the layer-1 launcher, into /usr/local/bin (--bin-dir)
 #      securecore.schema.json  into /usr/local/share/securecore (--share-dir)
+#      vm/firecracker, vm/vmlinux  layer 1's microVM (#71) on x86_64, when the release carries
+#                            ext/mirab-vm.json: mirab's guest kernel and the Firecracker mirab
+#                            pins, each checked against mirab's sha256s, and vm/installed.json,
+#                            which records the mirab release they came from
+#                            (into <share-dir>/vm, where securecore-fpm looks)
 #      securecore-vault.php  the mu-plugin, into <wordpress>/wp-content/mu-plugins
 #      securecore.json       only if there is none: every layer off (an existing one is kept)
 #      securecore.ini        last: `extension=securecore.so` and `securecore.config=<file>`
@@ -191,6 +196,46 @@ get ext/securecore-vault.php securecore-vault.php
 get ext/securecore.schema.json securecore.schema.json
 step "$OK" "Download" "SecureCore $REL: 4 files, each matching its sha256 in release.json"
 
+# Layer 1's microVM (#71): mirab's guest kernel and the Firecracker mirab pins, as the release
+# resolved them from mirab's newest stable release (ext/mirab-vm.json, itself checked against
+# release.json). Each download is checked against the sha256s recorded there: the gzipped and
+# the unpacked kernel, the Firecracker tarball and the binary in it.
+VM=
+if [ -z "$(want ext/mirab-vm.json)" ]; then
+  step "$SKIP" "microVM" "this release carries none (mirab has no stable vm/ images yet), so layer 1's auto is gelada"
+elif [ "$ARCH" != x86_64 ]; then
+  step "$SKIP" "microVM" "mirab's Firecracker is for x86_64 only; layer 1's auto is gelada on $ARCH"
+else
+  get ext/mirab-vm.json mirab-vm.json
+  tr -d ' \t\r\n' < "$WORK/mirab-vm.json" > "$WORK/vm.flat"
+  # vm <block> <key>: a string from mirab-vm.json's linux-x86_64 <block> (kernel, firecracker),
+  # or from its top level when <block> is "-".
+  vm() {
+    if [ "$1" = - ]; then src=$(cat "$WORK/vm.flat"); else src=$(grep -o "\"$1\":{[^}]*}" "$WORK/vm.flat" | head -n 1); fi
+    printf '%s' "$src" | sed -n "s/.*\"$2\":\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
+  }
+  check() { [ "$(sha256 "$1")" = "$2" ] || die "$3 failed its sha256 check against mirab's (release.json → ext/mirab-vm.json), so nothing was installed. Run the installer again."; }
+  MIRAB=$(vm - mirab)
+  fetch "$(vm kernel url)" "$WORK/vmlinux.gz" || die "Couldn't download mirab's guest kernel ($(vm kernel url)). Run the installer again."
+  check "$WORK/vmlinux.gz" "$(vm kernel sha256)" "mirab $MIRAB's guest kernel"
+  gzip -dc "$WORK/vmlinux.gz" > "$WORK/vmlinux" || die "mirab $MIRAB's guest kernel didn't unpack."
+  check "$WORK/vmlinux" "$(vm kernel unpacked_sha256)" "mirab $MIRAB's unpacked guest kernel"
+  FC=$(vm firecracker version)
+  fetch "$(vm firecracker url)" "$WORK/fc.tgz" || die "Couldn't download Firecracker $FC ($(vm firecracker url)). Run the installer again."
+  check "$WORK/fc.tgz" "$(vm firecracker sha256)" "Firecracker $FC's tarball"
+  member=$(vm firecracker member)
+  mkdir -p "$WORK/fc"
+  tar -xzf "$WORK/fc.tgz" -C "$WORK/fc" "$member" || die "Firecracker $FC's tarball has no $member."
+  mv "$WORK/fc/$member" "$WORK/firecracker"
+  find "$WORK/fc" -depth -type d -exec rmdir {} \;
+  check "$WORK/firecracker" "$(vm firecracker member_sha256)" "Firecracker $FC"
+  rm -f "$WORK/vmlinux.gz" "$WORK/fc.tgz"
+  printf '{\n  "securecore": "%s",\n  "mirab": "%s",\n  "commit": "%s",\n  "manifest": "%s",\n  "kernel_sha256": "%s",\n  "firecracker": "%s",\n  "firecracker_sha256": "%s"\n}\n' \
+    "$REL" "$MIRAB" "$(vm - commit)" "$(vm - manifest)" "$(vm kernel unpacked_sha256)" "$FC" "$(vm firecracker member_sha256)" > "$WORK/installed.json"
+  step "$OK" "microVM" "mirab $MIRAB's guest kernel and Firecracker $FC, each matching mirab's sha256"
+  VM=1
+fi
+
 # The verified extension must load in this PHP before anything is installed.
 printf '{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$WORK/off.json"
 if ! out=$("$PHP" -n -d "extension=$WORK/securecore.so" -d "securecore.config=$WORK/off.json" \
@@ -215,6 +260,15 @@ put() {
 put securecore.so "$EXT_DIR/securecore.so" 644 "Extension"
 put securecore-fpm "$BIN_DIR/securecore-fpm" 755 "Launcher"
 put securecore.schema.json "$SHARE_DIR/securecore.schema.json" 644 "JSON Schema"
+if [ -n "$VM" ]; then
+  put firecracker "$SHARE_DIR/vm/firecracker" 755 "Firecracker"
+  put vmlinux "$SHARE_DIR/vm/vmlinux" 644 "Guest kernel"
+  # What is installed, and from which mirab release: nobody edits a version by hand.
+  put installed.json "$SHARE_DIR/vm/installed.json" 644 "microVM record"
+  if [ ! -f "$SHARE_DIR/vm/rootfs.ext4" ]; then
+    step "$NOTE" "microVM" "no guest root image ($SHARE_DIR/vm/rootfs.ext4) yet: until there is one, layer 1's auto is gelada"
+  fi
+fi
 if [ -n "$WP" ]; then
   mu=$WP/wp-content/mu-plugins
   put securecore-vault.php "$mu/securecore-vault.php" 644 "mu-plugin"

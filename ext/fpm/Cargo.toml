@@ -10,6 +10,10 @@ publish.workspace = true
 # The same types, loader and validation as the extension: one file, one parser.
 securecore-config = { path = "../config" }
 gelada.workspace = true
+# The microVM driver and the guest's init (#71): vsock, mounts, the clock, signals.
+libc.workspace = true
+# Snapshot keys: the sha256 of the VM's files and of the site tree.
+sha2.workspace = true
 
 [[bin]]
 name = "securecore-fpm"
