@@ -280,8 +280,16 @@ pub const RELOAD_GRACE: Duration = Duration::from_secs(20);
 pub const RELOAD_TIMEOUT: Duration = Duration::from_secs(40);
 /// The host's wait for a `sync` (and the guest's for a control connection's lines).
 pub const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
-/// The writable disks' mount points, watched for space.
+/// The writable disks' mount points, in the start message's order: watched for space, and
+/// synced to the host (their index is the sync's disk number).
 static WRITABLE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The folder sync's progress, which a `sync` line waits on.
+static DRAIN: std::sync::OnceLock<crate::sync::Drain> = std::sync::OnceLock::new();
+/// How long a `sync` line waits for the writable folders to reach the host (the host waits
+/// [`SYNC_TIMEOUT`] for the whole line).
+const SYNC_DRAIN: Duration = Duration::from_secs(8);
+/// A writable disk's ext4 options: its journal commits every second (see `boot_guest`).
+pub const WRITABLE_MOUNT_DATA: &str = "commit=1";
 
 /// php-fpm's pool workers (`php-fpm: pool …`), children of the master: not the master, and not
 /// the extension's layer 3 helper.
@@ -381,15 +389,28 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
                 return Err(io::Error::new(e.kind(), format!("{device}: BLKFLSBUF: {e}")));
             }
             drop(dev);
-            mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV, "")?;
+            mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV, WRITABLE_MOUNT_DATA)?;
             WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).push(path.clone());
+            // Every file closed after writing is made durable at once, whatever the host's sync
+            // is doing (it may be stuck behind a host that doesn't answer).
+            let mount_path = path.clone();
+            thread::spawn(move || {
+                if let Err(e) = crate::sync::keep_durable(&mount_path) {
+                    report(&format!("sync: making {mount_path} durable on close stopped: {e}"));
+                }
+            });
             Ok(())
         }
         Ctl::Tmpfs { path } => mount("tmpfs", path, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777"),
         Ctl::Sync => {
             // SAFETY: sync(2) takes nothing and can't fail.
             unsafe { libc::sync() };
-            Ok(())
+            // And every change to a writable folder is on the host's copy of it (#72).
+            if WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
+                return Ok(());
+            }
+            let drain = DRAIN.get().ok_or_else(|| io::Error::other("the folder sync never started"))?;
+            drain.wait(SYNC_DRAIN).map_err(|e| io::Error::other(format!("the writable folders did not sync to the host: {e}")))
         }
         Ctl::Done => Ok(()),
     }
@@ -553,6 +574,33 @@ fn listen_forwards(boot: &Boot) -> io::Result<()> {
             }
         });
     }
+    // The writable folders' sync (#72): the host connects once the start message mounted them.
+    // Bound here, before php-fpm starts, and below 1024: no other process can take the port.
+    let sync = Vsock::listen(crate::sync::SYNC_PORT)?;
+    if DRAIN.get().is_none() {
+        let _ = DRAIN.set(crate::sync::Drain::new()?);
+    }
+    let drain: &'static crate::sync::Drain = DRAIN.get().ok_or_else(|| io::Error::other("the folder sync's state"))?;
+    thread::spawn(move || {
+        loop {
+            let Ok((conn, cid)) = sync.accept() else { continue };
+            if cid != HOST_CID {
+                say(&format!("sync: refused a connection from CID {cid}"));
+                continue;
+            }
+            let mounts = WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if mounts.is_empty() {
+                continue;
+            }
+            let (Ok(r), Ok(w)) = (vsock::Half::dup(&conn), vsock::Half::dup(&conn)) else { continue };
+            let hangup = conn.as_raw_fd();
+            let r = BufReader::with_capacity(64 << 10, r);
+            if let Err(e) = crate::sync::serve_guest(&mounts, r, w, hangup, drain, &|m| report(&format!("sync: {m}"))) {
+                report(&format!("sync: the connection to the host ended: {e}"));
+            }
+            drop(conn);
+        }
+    });
     let ctl = Vsock::listen(CTL_PORT)?;
     thread::spawn(move || {
         loop {
@@ -625,6 +673,14 @@ fn boot_guest() -> io::Result<u32> {
     }
     mount("/dev/vdb", &boot.root, "ext4", libc::MS_RDONLY | flags, "noload")?;
     loopback_up()?;
+    // The folder sync watches every folder of the writable disks (8192 by default here).
+    let _ = fs::write("/proc/sys/fs/inotify/max_user_watches", "65536");
+    // A write to a writable disk is on the host's image (out of guest RAM, so a killed
+    // Firecracker can't lose it) within about a second, whether or not the host's sync keeps up:
+    // dirty pages older than 1 s are written every 0.5 s, and ext4 commits every second
+    // (`commit=1` on the mount). The defaults are 30 s and 5 s.
+    fs::write("/proc/sys/vm/dirty_expire_centisecs", "100")?;
+    fs::write("/proc/sys/vm/dirty_writeback_centisecs", "50")?;
     listen_forwards(&boot)?;
     let pid = start_php_fpm(&boot)?;
     FPM_MASTER.store(pid as i32, Ordering::SeqCst);

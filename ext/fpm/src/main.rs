@@ -254,6 +254,11 @@ fn main() -> ExitCode {
     if argv.first().map(PathBuf::from).is_some_and(|p| p.file_name().is_some_and(|n| n == "securecore-init")) {
         return guest_init();
     }
+    #[cfg(target_os = "linux")]
+    if argv.get(1).is_some_and(|a| a == "--sync-writer") {
+        // The microVM's folder sync (#72): started by the launcher itself, never by hand.
+        return ExitCode::from(securecore_fpm::sync::writer_main(argv.get(2).and_then(|c| c.to_str()).unwrap_or("")));
+    }
     if argv.get(1).is_some_and(|a| a == "--migrate-config") {
         return match argv.get(2..) {
             Some([file]) => migrate_config(std::path::Path::new(file)),

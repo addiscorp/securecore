@@ -34,6 +34,55 @@ if (isset($_GET['peer'])) {
     $f = @stream_socket_client('tcp://127.0.0.1:4444', $en, $es, 3);
     echo 'peer=', $f ? trim((string) fgets($f)) : "FAILED $en $es", "\n";
 }
+// The folder sync (#72): changes to uploads, as WordPress makes them. Paths are relative to
+// uploads; the test checks the host's copy.
+$up = "$root/wp-content/uploads";
+if (isset($_GET['put'])) {
+    // ?put=<rel>&size=<bytes>[&seed=<s>]: a file of pseudo-random bytes; its sha256 is printed.
+    $size = (int) ($_GET['size'] ?? 0);
+    $block = hash('sha512', (string) ($_GET['seed'] ?? 'x'), true);
+    $block = str_repeat($block, 1024);
+    $path = "$up/" . $_GET['put'];
+    @mkdir(dirname($path), 0755, true);
+    $t = microtime(true);
+    $f = fopen($path, 'wb');
+    $ctx = hash_init('sha256');
+    for ($left = $size; $left > 0; $left -= strlen($chunk)) {
+        $chunk = substr($block, 0, min($left, strlen($block)));
+        fwrite($f, $chunk);
+        hash_update($ctx, $chunk);
+    }
+    fclose($f);
+    echo 'put_sha=', hash_final($ctx), "\n";
+    echo 'put_ms=', round((microtime(true) - $t) * 1000, 1), "\n";
+}
+if (isset($_GET['mv'])) {
+    @mkdir(dirname("$up/" . $_GET['to']), 0755, true);
+    echo 'mv=', rename("$up/" . $_GET['mv'], "$up/" . $_GET['to']) ? 'OK' : 'FAILED', "\n";
+}
+if (isset($_GET['rm'])) {
+    // A file, or a folder with everything in it.
+    $rm = function ($p) use (&$rm) {
+        if (is_dir($p) && !is_link($p)) {
+            foreach (scandir($p) as $n) {
+                if ($n !== '.' && $n !== '..') {
+                    $rm("$p/$n");
+                }
+            }
+            return rmdir($p);
+        }
+        return unlink($p);
+    };
+    echo 'rm=', $rm("$up/" . $_GET['rm']) ? 'OK' : 'FAILED', "\n";
+}
+if (isset($_GET['sha'])) {
+    // ?sha=<rel>: the guest's copy, as the host pushed it (or empty).
+    $p = "$up/" . $_GET['sha'];
+    echo 'sha=', is_file($p) ? hash_file('sha256', $p) : '', "\n";
+}
+if (isset($_GET['chmod'])) {
+    echo 'chmod=', chmod("$up/" . $_GET['chmod'], octdec($_GET['mode'])) ? 'OK' : 'FAILED', "\n";
+}
 // Fresh randomness: the kernel's (random_bytes) and a worker's userland generator (mt_rand).
 echo 'random=', bin2hex(random_bytes(16)), "\n";
 echo 'mt_rand=', mt_rand(), "\n";

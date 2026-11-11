@@ -8,7 +8,7 @@
 #   1. the values: off runs php-fpm as it is; gelada sandboxes it in place; auto is gelada even
 #      on this KVM host (until #72) and says why; auto with a config the VM can't express falls
 #      back with that reason and microvm refuses it; microvm refuses a root image nothing
-#      verified, and mirab's kernel (no Landlock) when layer 3 is on; in the php container (no
+#      verified, and a kernel without Landlock when layer 3 is on; in the php container (no
 #      /dev/kvm) auto falls back and microvm exits 125 without php-fpm ever running;
 #   2. a real WordPress front page from the guest (its kernel, loopback only, securecore-init as
 #      PID 1), with layer 2 enforcing and layer 3's child running there, the database through
@@ -22,6 +22,15 @@
 #      left in the jail is gone; a site change makes a new snapshot; a larger --write-disk-mib
 #      grows the uploads disk and keeps its files; a broken snapshot falls back to a cold boot;
 #      --no-snapshot cold-boots; an orphaned uploads disk of a moved site is refused;
+#   3b. the folder sync (#72): uploads of 100 KB, 10 MiB and 100 MiB reach the host's folder
+#      (timed) and nginx serves them; renames, chmods and folder removals follow, removals into
+#      the root-only trash; the writer runs as the pool user with no network, no new privileges,
+#      seccomp, a memory limit and an empty environment; a link in the host's folder is kept,
+#      never written through or removed; a file the owner edits on the host wins over the
+#      guest's write, and reaches the guest at the next start with the files the owner added
+#      while it was stopped (timed); an upload made while the writer is stopped survives a
+#      SIGKILL of the launcher; the writer killed mid-file leaves the old file whole and the
+#      next one resends it; a stop drains the sync;
 #   4. SIGTERM stops the VM and the launcher exits 0.
 # Exits non-zero on any failure (and at once without /dev/kvm: never a skip). Writes
 # .tmp/ext-microvm/. Leaves the stack up.
@@ -32,7 +41,7 @@
 # Needs: the guest kernel (KERNEL=, default .tmp/mvm/vmlinux-sc from bench/microvm/kernel.sh:
 # mirab's kernel plus Landlock and seccomp, until mirab#89 ships them); a host securecore-fpm
 # (SECURECORE_FPM=, default .target/release/securecore-fpm); docker, mke2fs, e2fsck, resize2fs,
-# curl, jq, socat. mirab's files come from scripts/mirab-vm.sh: stable, or MIRAB_MANIFEST=<url>,
+# curl, jq, python3 (test/sock.py stands in for socat). mirab's files come from scripts/mirab-vm.sh: stable, or MIRAB_MANIFEST=<url>,
 # or mirab's newest canary while stable has no vm/.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -50,6 +59,7 @@ run=$dir/run
 sockdir=/run/$project
 mysqld=$sockdir/mysqld
 fpm=${SECURECORE_FPM:-$PWD/.target/release/securecore-fpm}
+sockpy="$PWD/test/sock.py"
 kernel=${KERNEL:-$PWD/.tmp/mvm/vmlinux-sc}
 OHA=ghcr.io/hatoo/oha@sha256:3ec3dbf549ea197793482d47a6324797411406bbf438c2fe8b91f244ec641a2f # oha 1.16.0
 html=/var/www/html
@@ -82,7 +92,7 @@ val() { sed -n "s/^$2=//p" "$dir/probe.$1"; }
 [ -c /dev/kvm ] || die "this host has no /dev/kvm: the microVM tests need KVM (they never skip)"
 [ -x "$fpm" ] || die "no host securecore-fpm at $fpm (cd ext && cargo build --release -p securecore-fpm)"
 [ "$kernel" = "$vm/vmlinux" ] || [ -s "$kernel" ] || die "no guest kernel at $kernel (bench/microvm/kernel.sh; KERNEL=$vm/vmlinux for mirab's)"
-for t in socat mke2fs e2fsck resize2fs jq; do command -v "$t" >/dev/null 2>&1 || die "$t isn't on PATH"; done
+for t in python3 mke2fs e2fsck resize2fs jq; do command -v "$t" >/dev/null 2>&1 || die "$t isn't on PATH"; done
 chown 999:999 "$mysqld"
 echo "starting the stack (project $project, ports $port and $vport)"
 compose build php mvmweb > "$dir/build.log" 2>&1 || die "docker build (see $dir/build.log)"
@@ -155,7 +165,10 @@ record() {
     "$(sum "$1/firecracker")" "$(sum "$1/jailer")" "$(sum "$1/vmlinux")" "$r" > "$1/installed.json"
 }
 record "$vm"
-# Variants for the refusals: nothing verified for the rootfs; mirab's kernel (no Landlock).
+# Variants for the refusals: nothing verified for the rootfs; a kernel without Landlock and
+# seccomp filters. (mirab's own kernel had neither until mirab 0.2.1; the kernel here is the
+# kernel's bytes with both symbols renamed, recorded like any other, so it is refused by the
+# check and never booted.)
 for v in vm-norootfs vm-mirabkernel; do
   mkdir -p "$dir/$v"
   find "$dir/$v" -mindepth 1 -delete
@@ -163,7 +176,7 @@ for v in vm-norootfs vm-mirabkernel; do
 done
 record "$dir/vm-norootfs" no-rootfs
 rm -f "$dir/vm-mirabkernel/vmlinux"
-cp "$dir/vmlinux-mirab" "$dir/vm-mirabkernel/vmlinux"
+LC_ALL=C sed -e 's/landlock_merge_ruleset/landlock_merge_rulesex/g' -e 's/__seccomp_filter/__seccomp_filtex/g' "$vm/vmlinux" > "$dir/vm-mirabkernel/vmlinux"
 record "$dir/vm-mirabkernel"
 # The jailed user, and nginx's group (the alpine image's nginx is 101:101) for fpm.sock.
 vmuser=${SC_VM_USER:-64000:64000}
@@ -337,7 +350,7 @@ mkdir -p "$sockdir/locked/inner"
 chmod 700 "$sockdir/locked"
 chmod 755 "$sockdir/locked/inner"
 rm -f "$sockdir/locked/inner/db.sock"
-socat UNIX-LISTEN:"$sockdir/locked/inner/db.sock",fork,mode=777 /dev/null > /dev/null 2>&1 &
+python3 "$sockpy" listen "$sockdir/locked/inner/db.sock" > /dev/null 2>&1 &
 locked_pid=$!
 i=0; until [ -S "$sockdir/locked/inner/db.sock" ]; do i=$((i + 1)); [ "$i" -lt 50 ] || die "the locked socket"; sleep 0.1; done
 sed "s|{ \"port\": 4444|{ \"port\": 5555, \"socket\": \"$sockdir/locked/inner/db.sock\" }, { \"port\": 4444|" "$dir/microvm.json" > "$dir/microvm-locked.json"
@@ -372,7 +385,7 @@ for v in deny norootfs mirabkernel link dotdot locked; do
 done
 has "$dir/value-microvm-deny.log" "is inside the app root" "microvm with a denied path in the root: says why"
 has "$dir/value-microvm-norootfs.log" "the guest root image isn't verified" "microvm without a verified root image: says why"
-has "$dir/value-microvm-mirabkernel.log" "has no Landlock and seccomp filters" "microvm with layer 3 on mirab's kernel: says why"
+has "$dir/value-microvm-mirabkernel.log" "has no Landlock and seccomp filters" "microvm with layer 3 on a kernel without Landlock: says why"
 has "$dir/value-microvm-link.log" "wp-content/sc-evil is a symlink" "a writable folder that is a link (to a root-only folder) is refused, never read"
 has "$dir/value-microvm-dotdot.log" "holds \"..\"" "a writable folder with \"..\" is refused, never read"
 has "$dir/value-microvm-locked.log" "may not connect to $sockdir/locked/inner/db.sock (Permission denied" \
@@ -403,6 +416,9 @@ lacks "$dir/container-microvm.log" "standin-ran" "microvm without KVM: php-fpm n
 # --- 2. WordPress from the jailed guest, and 3. the snapshot -----------------------------------
 echo "# microvm: the first start makes the snapshot"
 clean_state
+# The folder sync's files from an earlier run (the uploads disk is made from this folder now).
+up=$site/wp-content/uploads
+for d in lat moved mid crash drain sc-evil sc-evil2 host-made wins; do if [ -e "$up/$d" ] || [ -L "$up/$d" ]; then find "$up/$d" -delete; fi; done
 # Real uploads, larger than the site's code: the site disk must not carry them.
 head -c 300M /dev/urandom > "$site/wp-content/uploads/sc-big.bin"
 chown "$pool" "$site/wp-content/uploads/sc-big.bin"
@@ -410,7 +426,7 @@ chown "$pool" "$site/wp-content/uploads/sc-big.bin"
 qa=$(questions); qb=$(questions); qbase=$((qb - qa))
 q0=$(questions)
 rm -f "$dir/notify.sock" "$dir/notify.msg"
-socat -u "UNIX-RECV:$dir/notify.sock" "OPEN:$dir/notify.msg,creat" &
+python3 "$sockpy" recv "$dir/notify.sock" "$dir/notify.msg" &
 notify_pid=$!
 sleep 0.3
 export NOTIFY_SOCKET="$dir/notify.sock"
@@ -472,7 +488,7 @@ if [ "$started" = 1 ]; then
   # (From inside the jail: its full path is longer than a unix socket address holds. The lines go
   # after Firecracker's OK: it drops what follows the CONNECT line in the same write, #70.)
   { printf 'CONNECT 1515\n'; sleep 1; printf 'time 1 0\nentropy %s\ndone\n' "$(printf '00%.0s' $(seq 64))"; sleep 3; } \
-    | (cd "$(jail_root)" && socat -t 5 - UNIX-CONNECT:v.sock) > "$dir/second-start.out" 2>&1
+    | (cd "$(jail_root)" && python3 "$sockpy" connect v.sock) > "$dir/second-start.out" 2>&1
   has "$dir/second-start.out" "error this boot's start message was already taken" "the guest refuses a second start message"
   # A second launcher on the same state folder.
   "$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" --listen "unix:$run/other.sock" > "$dir/second-launcher.log" 2>&1
@@ -542,6 +558,7 @@ if start second "$dir/microvm.json"; then
   skew=$(( $(date +%s) - $(val second time) ))
   is "$( [ "${skew#-}" -le 2 ] && echo ok )" ok "the restored guest's clock was resynced (skew ${skew} s)"
   is "$(val second read_uploads)" "first-$$" "the upload from the first start is still there (its disk persists)"
+  is "$(cat "$site/wp-content/uploads/sc-mvm.txt" 2>/dev/null)" "first-$$" "and the host's uploads folder has it too (the folder sync, #72)"
   # Two restores of one snapshot: their randomness differs.
   differ() { if [ "$1" != "$2" ]; then echo yes; else echo "no ($1)"; fi; }
   is "$(differ "$(val second random)" "$(val first random)")" yes "random_bytes differs between two restores of one snapshot (fresh entropy)"
@@ -549,6 +566,157 @@ if start second "$dir/microvm.json"; then
   stop
 else
   fail "microvm: the second start serves"
+fi
+
+echo "# the folder sync (#72): what the guest writes to uploads reaches the host's folder"
+outside=$sockdir/sync-outside
+mkdir -p "$outside"
+find "$outside" -mindepth 1 -delete
+# The pool user could write here: only the writer's own rules keep it out.
+chown "$pool" "$outside"
+# A link the site owner put in the host's folder while the VM was stopped: the host's, so the
+# listing keeps it (never follows, removes or pushes it).
+ln -sfn "$outside" "$up/sc-evil2"
+# eventually <tenths> <shell test>: until the test holds, or the time is up.
+eventually() { n=0; until eval "$2"; do n=$((n + 1)); [ "$n" -lt "$1" ] || return 1; sleep 0.1; done; }
+# synced <rel> <size> <sha256>: waits (60 s at most) for the host's copy, then prints the ms.
+synced() {
+  t0=$(date +%s%N)
+  eventually 600 "[ \"\$(stat -c %s \"$up/$1\" 2>/dev/null)\" = $2 ] && [ \"\$(sha256sum \"$up/$1\" | cut -d' ' -f1)\" = $3 ]" || { echo never; return 1; }
+  echo "$(( ($(date +%s%N) - t0) / 1000000 ))"
+}
+writer_pid() { ps -o pid=,args= --ppid "$PID" | awk '/--sync-writer/ { print $1 }' | head -1; }
+if start sync "$dir/microvm.json"; then
+  eventually 300 "grep -q 'sync: folder 0 reconciled' \"$dir/sync.log\"" || true
+  has "$dir/sync.log" "syncing the writable folders with the host's as uid 1234" "the launcher syncs the writable folders as the pool user"
+  has "$dir/sync.log" "sync: folder 0 reconciled" "the guest's listing reconciled the host's folder"
+  is "$( [ -L "$up/sc-evil2" ] && echo link)" link "a link planted in the host's folder is the host's: kept"
+  has "$dir/sync.log" "not synced, never removed: a symlink on the host" "and logged once as never synced"
+  wpid=$(writer_pid)
+  is "$(awk '/^Uid:/ { print $2 "/" $3 }' "/proc/$wpid/status" 2>/dev/null)" 1234/1234 "the writer (pid $wpid) runs as the pool user, never root"
+  is "$(awk '/^Groups:/ { print NF - 1 }' "/proc/$wpid/status")" 0 "with no supplementary groups"
+  is "$( [ "$(readlink "/proc/$wpid/ns/net")" != "$(readlink /proc/self/ns/net)" ] && echo own)" own "and no network (a network namespace of its own)"
+  is "$(awk '/^NoNewPrivs:/ { print $2 } /^Seccomp:/ { print $2 }' "/proc/$wpid/status" | tr '\n' /)" 1/2/ "no new privileges, and a seccomp filter"
+  is "$(awk '/^Max address space/ { print $4 }' "/proc/$wpid/limits")" 1073741824 "a memory limit (RLIMIT_AS 1 GiB)"
+  is "$(tr '\0' '\n' < "/proc/$wpid/environ" | grep -c .)" 0 "and an empty environment"
+  is "$(ls -l "/proc/$wpid/fd" | grep -c '\.record')" 0 "the record, read at its start, isn't held open (it is root's to write)"
+  is "$(ls -l "/proc/$wpid/fd" | grep -c "$state/trash/")" 2 "it holds each writable folder's trash (two folders)"
+  for size in 102400 10485760 104857600; do
+    probe "?put=lat/$size.bin&size=$size&seed=$size" "put-$size"
+    ms=$(synced "lat/$size.bin" "$size" "$(val "put-$size" put_sha)")
+    is "$( [ "$ms" != never ] && echo synced)" synced "a $size-byte upload reaches the host whole (${ms} ms after its request returned; PHP wrote it in $(val "put-$size" put_ms) ms)"
+  done
+  is "$(curl -s -H "Host: 127.0.0.1:$port" "http://127.0.0.1:$vport/wp-content/uploads/lat/102400.bin" | sha256sum | cut -d' ' -f1)" "$(val put-102400 put_sha)" \
+    "nginx serves the upload from the host's folder"
+  is "$(stat -c '%u:%g' "$up/lat/102400.bin")" 1234:1234 "the host's copy is the pool user's"
+  probe "?mv=lat/102400.bin&to=moved/deep/r.bin" mv
+  eventually 100 "[ -f \"$up/moved/deep/r.bin\" ] && [ ! -e \"$up/lat/102400.bin\" ]"
+  is "$(sha256sum "$up/moved/deep/r.bin" 2>/dev/null | cut -d' ' -f1)" "$(val put-102400 put_sha)" "a rename in the guest is a rename on the host"
+  probe "?chmod=lat/10485760.bin&mode=600" chmod
+  eventually 100 "[ \"\$(stat -c %a \"$up/lat/10485760.bin\")\" = 600 ]"
+  is "$(stat -c %a "$up/lat/10485760.bin")" 600 "a chmod in the guest reaches the host"
+  probe "?rm=moved" rm
+  eventually 100 "[ ! -e \"$up/moved\" ]"
+  is "$( [ -e "$up/moved" ] && echo there || echo gone)" gone "a folder removed in the guest is removed on the host, with what was in it"
+  trashed=$(find "$state/trash" -path '*/moved/deep/r.bin' | head -1)
+  is "$(sha256sum "$trashed" 2>/dev/null | cut -d' ' -f1)" "$(val put-102400 put_sha)" "into the trash (${trashed#"$state"/}), never unlinked"
+  is "$(stat -c '%U %a' "$state/trash" "$(dirname "$(dirname "$(dirname "$(dirname "$trashed")")")")" | tr '\n' ' ')" "root 700 root 700 " \
+    "the trash and its day are root's, 0700, outside the web root"
+  # A link planted in the host's folder while the VM runs, where the guest then makes a folder:
+  # the host's link wins; nothing is written through it, and it stays.
+  ln -sfn "$outside" "$up/sc-evil"
+  probe "?put=sc-evil/x.php&size=10&seed=evil" evil
+  eventually 100 "grep -q 'sc-evil.*is not a folder on the host' \"$dir/sync.log\"" || true
+  is "$( [ -L "$up/sc-evil" ] && echo link)" link "a link in the host's folder is never replaced"
+  has "$dir/sync.log" '"sc-evil" is not a folder on the host' "the writer says so"
+  is "$(find "$outside" -mindepth 1 | grep -c .)" 0 "and nothing is written where it pointed (a folder the pool user could write)"
+  # A file the site owner edits on the host wins over the guest's next write to it.
+  probe "?put=wins/w.txt&size=1000&seed=w1" w1
+  synced wins/w.txt 1000 "$(val w1 put_sha)" > /dev/null
+  printf 'the owner edited this on the host\n' > "$up/wins/w.txt"
+  owner_sha=$(sha256sum "$up/wins/w.txt" | cut -d' ' -f1)
+  probe "?put=wins/w.txt&size=2000&seed=w2" w2
+  eventually 100 "grep -q 'wins/w.txt.*changed on the host' \"$dir/sync.log\"" || true
+  is "$(sha256sum "$up/wins/w.txt" | cut -d' ' -f1)" "$owner_sha" "a file the owner changed on the host is never overwritten by the guest"
+  has "$dir/sync.log" "the host's copy wins" "the writer says the host's copy wins"
+  # A crash before an upload synced: the writer is stopped, the upload committed in the guest,
+  # then the launcher is killed. The next start's listing sends it.
+  kill -STOP "$wpid"
+  probe "?put=crash/c.bin&size=1048576&seed=crash" crash
+  # The guest writes its disks back within about a second (its writeback interval and ext4's
+  # commit=1), whether or not the host's writer keeps up; this one is stopped.
+  sleep 3
+  is "$( [ -e "$up/crash/c.bin" ] && echo there || echo absent)" absent "an upload made while the writer is stopped hasn't reached the host"
+  fc=$(sed -n 's/.*Firecracker runs jailed as uid [0-9]* gid [0-9]* (pid \([0-9]*\)).*/\1/p' "$dir/sync.log")
+  kill -KILL "$PID"; wait "$PID" 2>/dev/null; PID=""
+  eventually 50 "! kill -0 $fc 2>/dev/null && ! kill -0 $wpid 2>/dev/null"
+  is "$(kill -0 "$wpid" 2>/dev/null && echo alive || echo gone)" gone "the writer dies with the launcher (SIGKILL)"
+  sleep 0.5
+  # Files the site owner adds on the host while the VM is stopped (an SFTP upload, a restore):
+  # pushed into the guest's disk at the next start. 50 files of 1 MiB and one of 100 MiB.
+  mkdir -p "$up/host-made"
+  for n in $(seq 1 50); do head -c 1M /dev/urandom > "$up/host-made/f$n.bin"; done
+  head -c 100M /dev/urandom > "$up/host-made/big.bin"
+  chown -R "$pool" "$up/host-made"
+  host_sha=$(sha256sum "$up/host-made/big.bin" | cut -d' ' -f1)
+  ino0=$(stat -c %i "$up/host-made/f1.bin" "$up/host-made/big.bin" | tr '\n' ' ')
+  if start sync2 "$dir/microvm.json"; then
+    ms=$(synced crash/c.bin 1048576 "$(val crash put_sha)")
+    is "$( [ "$ms" != never ] && echo synced)" synced "after the crash, the next start's listing sends the upload (${ms} ms after serving)"
+    if [ "$ms" = never ]; then
+      probe "?sha=crash/c.bin" crash-guest
+      echo "  the guest's copy: $(val crash-guest sha); the host's: $(stat -c %s "$up/crash/c.bin" 2>&1); want $(val crash put_sha)"
+      grep -E 'crash|refused|sync:' "$dir/sync2.log" | tail -8 | sed 's/^/  | /'
+    fi
+    eventually 300 "grep -q 'folder 0 reconciled' \"$dir/sync2.log\"" || true
+    pushed=$(grep -m1 'folder 0 reconciled' "$dir/sync2.log")
+    echo "  import at the start: ${pushed#*sync: }"
+    is "$(echo "$pushed" | sed -n 's/.* \([0-9]*\) pushed to the guest.*/\1/p')" 53 "the host's new files (51) and folder, and the owner's edit, are pushed into the guest at the start"
+    probe "?sha=host-made/big.bin" pushed
+    is "$(val pushed sha)" "$host_sha" "the guest has the host's file, whole"
+    probe "?sha=wins/w.txt" wins
+    is "$(val wins sha)" "$owner_sha" "and the owner's edit, which won"
+    # A push that came back as a change would replace the host's file (a new inode).
+    sleep 2
+    is "$(stat -c %i "$up/host-made/f1.bin" "$up/host-made/big.bin" | tr '\n' ' ')" "$ino0" "nothing pushed comes back to the host as a change"
+    # The writer killed in the middle of a file: the host keeps the old one whole, and nothing
+    # partial; the launcher starts a new writer, and the listing sends the new file.
+    probe "?put=mid/m.bin&size=10485760&seed=v1" v1
+    synced mid/m.bin 10485760 "$(val v1 put_sha)" > /dev/null
+    wpid=$(writer_pid)
+    kill -STOP "$wpid"
+    probe "?put=mid/m.bin&size=209715200&seed=v2" v2
+    kill -CONT "$wpid"
+    # The moment it holds the nameless file it writes into: the kill lands mid-file, or the test
+    # proves nothing.
+    if eventually 100 "ls -l /proc/$wpid/fd 2>/dev/null | grep -q '(deleted)'"; then
+      pass "the writer holds its nameless temporary file mid-transfer"
+    else
+      fail "the writer holds its nameless temporary file mid-transfer" "never seen in /proc/$wpid/fd"
+    fi
+    kill -KILL "$wpid"
+    is "$(sha256sum "$up/mid/m.bin" | cut -d' ' -f1)" "$(val v1 put_sha)" "the writer killed mid-file: the host keeps the old file whole"
+    is "$(find "$up" -name '.sc-sync-*' | grep -c .)" 0 "and no partial or temporary file"
+    ms=$(synced mid/m.bin 209715200 "$(val v2 put_sha)")
+    is "$( [ "$ms" != never ] && echo synced)" synced "a new writer, and the listing sends the new file (${ms} ms)"
+    has "$dir/sync2.log" "the folder sync's writer ended" "the launcher says the writer ended and connects again"
+    # The test's files go, through the guest (the sync wrote or took them all, so they are the
+    # guest's to remove); the links are the host's, removed here.
+    for d in lat mid crash host-made wins; do probe "?rm=$d" "rm-$d"; done
+    probe "?rm=sc-evil" rm-sc-evil
+    eventually 100 "[ ! -e \"$up/lat\" ] && [ ! -e \"$up/mid\" ] && [ ! -e \"$up/crash\" ] && [ ! -e \"$up/host-made\" ] && [ ! -e \"$up/wins\" ]" \
+      || fail "the test's files removed through the guest" "$(ls "$up" | tr '\n' ' ')"
+    rm -f "$up/sc-evil" "$up/sc-evil2"
+    # A stop syncs first: an upload made just before it is on the host when the launcher exits.
+    probe "?put=drain/d.bin&size=104857600&seed=drain" drain
+    stop
+    is "$(sha256sum "$up/drain/d.bin" 2>/dev/null | cut -d' ' -f1)" "$(val drain put_sha)" "an upload made just before a stop is on the host when the launcher exits"
+    lacks "$dir/sync2.log" "did not sync" "the stop's sync drained the folder sync"
+  else
+    fail "the folder sync: the start after the crash serves"
+  fi
+else
+  fail "the folder sync: the start serves"
 fi
 
 echo "# the launcher killed (SIGKILL): the VM goes with it"
