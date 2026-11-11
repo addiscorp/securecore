@@ -310,7 +310,7 @@ contains huge SC-L3DB-AFTER-HUGE "result cap: the rest of the page is there"
 want huge huge BLOCKED "result cap"
 want huge error dbResultBytes "result cap"
 peak=$(verdict huge peak)
-if [ -n "$peak" ] && [ "$peak" -lt 120000000 ]; then pass "result cap: the worker's peak memory stayed at $peak bytes"; else fail "result cap: the worker's peak memory stayed under 120 MB" "'$peak'"; fi
+if [ -n "$peak" ] && [ "$peak" -lt 40000000 ]; then pass "result cap: the worker's peak memory stayed at $peak bytes, under the 40 MiB result"; else fail "result cap: the worker's peak memory stayed under the 40 MiB result" "'$peak'"; fi
 # The error the child sees names neither the database nor its user.
 get err "/?page_id=$d_err"
 e=$(verdict err err)

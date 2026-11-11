@@ -33,69 +33,86 @@
         global $wpdb;
         if ($error === '' || str_starts_with($error, 'securecore: ')) return $error;
         $error = (string) preg_replace("/'[^']*'@'[^']*'/", "'<user>'@'<host>'", $error);
-        $facts = [
-            defined('DB_NAME') ? (string) DB_NAME : (string) ($wpdb->dbname ?? ''),
-            defined('DB_USER') ? (string) DB_USER : (string) ($wpdb->dbuser ?? ''),
-            defined('DB_HOST') ? (string) DB_HOST : (string) ($wpdb->dbhost ?? ''),
-        ];
-        foreach (array_unique(array_filter($facts, static fn ($f) => strlen($f) >= 2)) as $f) {
-            $error = str_ireplace([$f . '.', $f], ['', '<db>'], $error);
+        $db = defined('DB_NAME') ? (string) DB_NAME : (string) ($wpdb->dbname ?? '');
+        if ($db !== '') {
+            // Where the server names it: 'db.table', `db`.table, 'db'.
+            $error = str_replace(["'$db.", "`$db`.", "'$db'", "`$db`"], ["'", '', "'<db>'", '`<db>`'], $error);
         }
         return $errno > 0 ? "[$errno] $error" : $error;
     };
-    // One query from the child, on this worker's connection: what $wpdb saw, PHP-serialized.
-    // The rows are copied only up to $limit bytes (layer3.limits.dbResultBytes): past it the
-    // answer is a refusal, and the worker's copies are freed, so a result far over the cap never
-    // costs more than the one $wpdb buffered.
+    // One query from the child, on this worker's connection, PHP-serialized as wpdb::query()
+    // would leave it. It runs as $wpdb's own query does (the worker's `query` filters, then
+    // mysqli_query() on $wpdb's connection, which layer 2 checks with the same route and text),
+    // but unbuffered (MYSQLI_USE_RESULT): rows are read one at a time and copied only up to
+    // $limit bytes (layer3.limits.dbResultBytes). Past it the rest is drained unread and the
+    // answer is a refusal, so a result far over the cap never sits in the worker's memory.
     $run = static function (int $limit) use ($slug, $clean): string {
         global $wpdb;
         $sql = \securecore_layer3_db_begin($slug);
         if (!is_string($sql)) {
             return serialize(['ret' => false, 'error' => 'securecore: layer3 had no query to run']);
         }
+        $sql = (string) apply_filters('query', $sql);
+        $dbh = $wpdb->dbh ?? null;
+        if (!$dbh instanceof \mysqli && $wpdb->check_connection(false)) $dbh = $wpdb->dbh ?? null;
+        if ($sql === '' || !$dbh instanceof \mysqli) {
+            return serialize(['ret' => false, 'error' => $sql === '' ? '' : 'securecore: layer3: the worker has no database connection']);
+        }
         $ret = false;
-        $cols = [];
+        $error = '';
         $errno = 0;
-        try {
-            $ret = $wpdb->query($sql);
-            $error = (string) $wpdb->last_error;
-            $dbh = $wpdb->dbh ?? null;
-            if ($error !== '' && $dbh instanceof \mysqli) $errno = (int) mysqli_errno($dbh);
-            if ($ret !== false && ($wpdb->result ?? null) instanceof \mysqli_result) {
-                $cols = (array) $wpdb->get_col_info('name');
-            }
-        } catch (\Throwable $e) {
-            $ret = false;
-            $error = 'securecore: ' . get_class($e);
-        }
         $keys = [];
+        $cols = [];
         $rows = [];
-        $bytes = 0;
-        foreach (is_array($wpdb->last_result) ? $wpdb->last_result : [] as $row) {
-            $v = is_object($row) ? get_object_vars($row) : [];
-            if ($keys === []) $keys = array_keys($v);
-            // What serialize() writes for each value, near enough (its text and ~16 bytes).
-            foreach ($v as $x) $bytes += strlen((string) $x) + 16;
-            if ($limit > 0 && $bytes > $limit) {
-                unset($rows, $v);
-                $wpdb->flush();
-                error_log("securecore: layer3 plugin:$slug database answer refused: over the dbResultBytes cap of $limit");
-                return serialize(['ret' => false, 'error' => "securecore: layer3 refused this answer (over the dbResultBytes cap of $limit)"]);
-            }
-            $rows[] = array_values($v);
+        $a = [];
+        try {
+            $res = mysqli_query($dbh, $sql, MYSQLI_USE_RESULT);
+        } catch (\Throwable $e) {
+            $res = false;
         }
-        $a = [
-            'ret' => is_int($ret) || is_bool($ret) ? $ret : false,
+        if ($res === false) {
+            $errno = (int) mysqli_errno($dbh);
+            $error = (string) mysqli_error($dbh);
+        } elseif ($res instanceof \mysqli_result) {
+            $cols = array_map(static fn ($f) => $f->name, mysqli_fetch_fields($res) ?: []);
+            $bytes = 0;
+            while (($row = mysqli_fetch_assoc($res)) !== null && $row !== false) {
+                if ($keys === []) $keys = array_keys($row);
+                // What serialize() writes for each value, near enough (its text and ~16 bytes).
+                foreach ($row as $x) $bytes += strlen((string) $x) + 16;
+                if ($limit > 0 && $bytes > $limit) {
+                    $rows = [];
+                    mysqli_free_result($res);
+                    error_log("securecore: layer3 plugin:$slug database answer refused: over the dbResultBytes cap of $limit");
+                    return serialize(['ret' => false, 'error' => "securecore: layer3 refused this answer (over the dbResultBytes cap of $limit)"]);
+                }
+                $rows[] = array_values($row);
+            }
+            if (mysqli_errno($dbh)) {
+                $errno = (int) mysqli_errno($dbh);
+                $error = (string) mysqli_error($dbh);
+            }
+            mysqli_free_result($res);
+            $ret = $error === '' ? count($rows) : false;
+        } elseif (preg_match('/^\s*(create|alter|truncate|drop)\s/i', $sql)) {
+            $ret = true;
+        } elseif (preg_match('/^\s*(insert|delete|update|replace)\s/i', $sql)) {
+            // As wpdb::query() sets them: rows_affected for a write, insert_id for an INSERT/REPLACE.
+            $ret = (int) mysqli_affected_rows($dbh);
+            $a['affected'] = $ret;
+            if (preg_match('/^\s*(insert|replace)\s/i', $sql)) $a['insert_id'] = (int) mysqli_insert_id($dbh);
+        } else {
+            $ret = 0;
+        }
+        if ($error !== '' && preg_match('/^\s*(insert|replace)\s/i', $sql)) $a['insert_id'] = 0;
+        $a += [
+            'ret' => $ret,
             'error' => $clean($error, $errno),
             'keys' => $keys,
             'rows' => $rows,
             'cols' => $cols,
             'num_rows' => count($rows),
         ];
-        // As wpdb::query() sets them: rows_affected for a write, insert_id for an INSERT/REPLACE.
-        if (preg_match('/^\s*(insert|delete|update|replace)\s/i', $sql)) $a['affected'] = (int) $wpdb->rows_affected;
-        if (preg_match('/^\s*(insert|replace)\s/i', $sql)) $a['insert_id'] = (int) $wpdb->insert_id;
-        if ($rows !== []) $wpdb->flush();
         return serialize($a);
     };
     // The statement time cap: the time left before the call's deadline, set before a query

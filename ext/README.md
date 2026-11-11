@@ -1072,7 +1072,11 @@ the php-fpm worker, which runs each query on its own connection, under layer 2:
 2. **In the worker,** the extension reads the frame and decides first what only layer 3 decides
    (`gateway::admit`): the request's query cap, the text's size (16 MiB) and UTF-8, and no change to
    the statement time cap. Then the stand-in takes the text (`securecore_layer3_db_begin`) and
-   runs it with `$wpdb->query()` on the real connection. While it does, the stand-in's own frames
+   runs it as `$wpdb->query()` does: the worker's `query` filters, then `mysqli_query()` on
+   `$wpdb`'s own connection (the route and text layer 2 sees for the plugin's `$wpdb->query()`
+   unisolated), but unbuffered, so the rows are read one at a time (below; `$wpdb`'s own state,
+   `num_queries` and `SAVEQUERIES` don't see these queries, and a `db.php` drop-in's own routing
+   is not used). While it does, the stand-in's own frames
    (compiled under the name `securecore-layer3:<slug>`, which only the extension uses) are
    `plugin:<slug>`, so **layer 2's own caller rule** (`attribution::db_caller`, then `db::check`)
    charges the query to the plugin exactly as it charges that plugin's `$wpdb->query()` in the
@@ -1091,7 +1095,7 @@ isolated plugin, where the same `get_option()` in the worker is core's.
 | cap | where | what happens |
 |---|---|---|
 | `limits.dbQueries` (default 1000) | the worker, per request and plugin (its load and its calls) | each query past it fails (`last_error`: `over the dbQueries cap`); one line per request |
-| `limits.dbResultBytes` (default 4 MiB, at most 16 MiB) | the worker, per answer | the stand-in counts the bytes as it copies the rows and stops past the cap: the answer fails (the query ran) and the worker's copies are freed, with a line. The one copy `$wpdb` buffered (mysqli's) is the worker's own `memory_limit`'s to bound; the serialized answer is checked again on the way out |
+| `limits.dbResultBytes` (default 4 MiB, at most 16 MiB) | the worker, per answer | the result is read unbuffered (`MYSQLI_USE_RESULT`) and the stand-in counts the bytes as it copies each row: past the cap the rest is drained unread and the answer fails (the query ran), with a line, so a result far over the cap never sits in the worker's memory. The serialized answer is checked again on the way out |
 | `limits.timeoutMs` | the worker, per call, queries included | the time left before the call's deadline caps each statement on the server (`SET SESSION max_statement_time` on MariaDB; `max_execution_time` on MySQL, which covers SELECTs only, #99), re-set before a query whenever the last setting is over 50 ms old (so no statement runs more than 50 ms past the deadline there), and the session's own value restored after; past the deadline the child is killed as for any call. A plugin's query naming either variable is refused |
 
 **Transactions.** The plugin's statements run on the worker's connection, as unisolated. After
