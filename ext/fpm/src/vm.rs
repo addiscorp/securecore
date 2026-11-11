@@ -518,6 +518,12 @@ pub fn available(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     fs::create_dir_all(&plan.state).map_err(|e| format!("{}: {e}", plan.state.display()))?;
     fs::set_permissions(&plan.state, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
     verify(&opts.assets, &plan.state)?;
+    // Every writable folder must fit its disk (sized from it, [`disk_mib`]) and the sync.
+    for d in &plan.disks {
+        let (used, entries) = folder_usage(&plan, d)?;
+        let new = !plan.state.join(format!("{}.ext4", d.id)).is_file();
+        fits(&d.host, used, entries, if new { Some(free_bytes(&plan.state)?) } else { None })?;
+    }
     if loaded.config.layer3.enabled {
         kernel_supports_layer3(&opts.assets.kernel)?;
     }
@@ -740,11 +746,87 @@ fn site_disk(plan: &Plan, sha: &str, bytes: u64, entries: u64, user: User) -> Re
     Ok(path)
 }
 
-/// A writable folder's disk, `mib` MiB: made once from the folder's contents, then kept (the
-/// guest's writes live there; syncing them back is addiscorp/securecore#72), and grown in place
-/// (`e2fsck` + `resize2fs`, offline: it isn't mounted before the guest's start message) when
-/// `mib` is more than it has. Owned by the jailed user, private.
-fn write_disk(plan: &Plan, disk: &WriteDisk, mib: u64, user: User) -> Result<PathBuf, String> {
+/// What a writable folder on the host holds now: the bytes its files take on disk (each inode
+/// once) and its files and folders. Metadata only, walked through the folder opened beneath the
+/// app root: no link is followed, and another mount inside it isn't walked.
+pub fn folder_usage(plan: &Plan, disk: &WriteDisk) -> Result<(u64, u64), String> {
+    let held = jail::open_dir_beneath(&plan.root, &disk.rel(&plan.root)?)?;
+    let via = PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+    let dev = fs::metadata(&via).map_err(|e| format!("{}: {e}", disk.host.display()))?.dev();
+    let (mut bytes, mut entries) = (0u64, 0u64);
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![via];
+    while let Some(dir) = stack.pop() {
+        let Ok(list) = fs::read_dir(&dir) else { continue };
+        for e in list.flatten() {
+            let Ok(m) = e.metadata() else { continue };
+            if m.dev() != dev {
+                continue;
+            }
+            if m.is_dir() {
+                entries += 1;
+                stack.push(e.path());
+            } else if m.is_file() {
+                entries += 1;
+                if m.nlink() <= 1 || seen.insert(m.ino()) {
+                    bytes += m.blocks() * 512;
+                }
+            }
+            if entries > crate::sync::MAX_ENTRIES as u64 {
+                return Ok((bytes, entries));
+            }
+        }
+    }
+    Ok((bytes, entries))
+}
+
+/// A writable disk's size in MiB for a folder taking `used` bytes: twice that and at least
+/// 1 GiB, rounded up to a power of two (so the snapshot's key changes only when it doubles), and
+/// never less than `--write-disk-mib`.
+pub fn disk_mib(flag: u64, used: u64) -> u64 {
+    (2 * used).div_ceil(1 << 20).max(1024).next_power_of_two().max(flag)
+}
+
+/// Whether a writable folder (`used` bytes, `entries` files and folders) can go onto its disk:
+/// the sync handles at most [`crate::sync::MAX_ENTRIES`] entries, and a new disk's copy needs
+/// `used` plus 64 MiB free where the state folder is (`free`; `None`: the disk exists already).
+pub fn fits(host: &Path, used: u64, entries: u64, free: Option<u64>) -> Result<(), String> {
+    let max = crate::sync::MAX_ENTRIES as u64;
+    if entries > max {
+        return Err(format!("{} holds more than {max} files and folders, more than the folder sync keeps in step", host.display()));
+    }
+    if let Some(free) = free
+        && used + (64 << 20) > free
+    {
+        return Err(format!(
+            "{} takes {} MiB, and the state folder's filesystem has {} MiB free for its writable disk",
+            host.display(),
+            used >> 20,
+            free >> 20
+        ));
+    }
+    Ok(())
+}
+
+/// Bytes free for root's use on the filesystem holding `path`.
+fn free_bytes(path: &Path) -> Result<u64, String> {
+    let c = cpath(path)?;
+    // SAFETY: statvfs(2) fills the zeroed struct passed.
+    unsafe {
+        let mut s: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut s) < 0 {
+            return Err(format!("{}: {}", path.display(), io::Error::last_os_error()));
+        }
+        Ok(s.f_bfree as u64 * s.f_frsize as u64)
+    }
+}
+
+/// A writable folder's disk, `mib` MiB ([`disk_mib`]): made once from the folder's contents,
+/// then kept (the guest's writes live there, and sync with the host's folder, [`crate::sync`]),
+/// and grown in place (`e2fsck` + `resize2fs`, offline: it isn't mounted before the guest's
+/// start message) when `mib` is more than it has. Owned by the jailed user, private. Its path and
+/// its size in bytes.
+fn write_disk(plan: &Plan, disk: &WriteDisk, mib: u64, user: User) -> Result<(PathBuf, u64), String> {
     let path = plan.state.join(format!("{}.ext4", disk.id));
     let want = mib << 20;
     if !path.is_file() {
@@ -789,7 +871,7 @@ fn write_disk(plan: &Plan, disk: &WriteDisk, mib: u64, user: User) -> Result<Pat
             log(&format!("grew the writable disk {} for {} from {} to {mib} MiB", path.display(), disk.guest, have >> 20));
         } else if have > want {
             log(&format!(
-                "the writable disk {} is {} MiB, more than --write-disk-mib {mib}: disks only grow; keeping it",
+                "the writable disk {} is {} MiB, more than the {mib} MiB it needs now: disks only grow; keeping it",
                 path.display(),
                 have >> 20
             ));
@@ -797,7 +879,9 @@ fn write_disk(plan: &Plan, disk: &WriteDisk, mib: u64, user: User) -> Result<Pat
     }
     std::os::unix::fs::chown(&path, Some(user.uid), Some(user.gid)).map_err(|e| e.to_string())?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-    Ok(path)
+    // The cap the sync holds the host folder to: the disk as it is (it may be bigger than asked).
+    let size = fs::metadata(&path).map_err(|e| e.to_string())?.len().max(want);
+    Ok((path, size))
 }
 
 /// `<state>/site.json` names the app root a state folder belongs to. A folder of another root
@@ -1559,12 +1643,16 @@ const CONSOLE_CAP: u64 = 8 << 20;
 /// hands the connection to a writer ([`spawn_writer`]). When the writer ends (either side
 /// crashed, or the connection broke), it connects again, and the guest starts over with its
 /// whole listing, so nothing that didn't arrive is lost. Ends with the VM.
-fn sync_folders(uds: PathBuf, root: PathBuf, rels: Vec<PathBuf>, cap: u64, pool: User) {
+fn sync_folders(uds: PathBuf, root: PathBuf, state: PathBuf, folders: Vec<SyncFolder>, pool: User) {
     let mut quiet = false;
     while !QUITTING.load(Ordering::SeqCst) && !FIRECRACKER_EXITED.load(Ordering::SeqCst) {
-        match spawn_writer(&uds, &root, &rels, cap, pool) {
+        match spawn_writer(&uds, &root, &state, &folders, pool) {
             Ok(mut child) => {
                 quiet = false;
+                // The writer's reports, appended to each folder's record until it ends.
+                if let Some(out) = child.stdout.take() {
+                    keep_records(out, &state, &folders);
+                }
                 let st = child.wait();
                 if QUITTING.load(Ordering::SeqCst) || FIRECRACKER_EXITED.load(Ordering::SeqCst) {
                     return;
@@ -1581,25 +1669,178 @@ fn sync_folders(uds: PathBuf, root: PathBuf, rels: Vec<PathBuf>, cap: u64, pool:
     }
 }
 
+/// One writable folder the sync keeps in step: its path in the app root, its disk's id (its
+/// record and trash are named by it) and its cap (the disk's size).
+#[derive(Debug, Clone)]
+pub struct SyncFolder {
+    pub rel: PathBuf,
+    pub id: String,
+    pub cap: u64,
+}
+
+/// `<state>/sync-<id>.record`: the folder's record ([`crate::sync::Record`]), root's only.
+fn record_path(state: &Path, id: &str) -> PathBuf {
+    state.join(format!("sync-{id}.record"))
+}
+
+/// The folder's record, compacted (written through a temporary name), and opened read-only for
+/// the writer. A record that isn't a plain file of root's is refused.
+fn open_record(state: &Path, id: &str) -> Result<fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = record_path(state, id);
+    let text = match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path) {
+        Ok(f) => {
+            let m = f.metadata().map_err(|e| e.to_string())?;
+            if !m.is_file() || m.uid() != 0 {
+                return Err(format!("{}: not a file of root's; refusing it", path.display()));
+            }
+            let mut s = String::new();
+            (&f).take(256 << 20).read_to_string(&mut s).map_err(|e| format!("{}: {e}", path.display()))?;
+            s
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let tmp = path.with_extension("record.new");
+    let _ = fs::remove_file(&tmp);
+    {
+        let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        f.write_all(crate::sync::Record::parse(&text).text().as_bytes()).and_then(|()| f.sync_all()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    }
+    fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Appends the writer's reports (`<disk> <record line>`) to each folder's record, until the
+/// writer closes its end. A line that isn't one is dropped and logged once.
+fn keep_records(out: impl Read, state: &Path, folders: &[SyncFolder]) {
+    let mut files: Vec<Option<fs::File>> = folders.iter().map(|f| OpenOptions::new().append(true).open(record_path(state, &f.id)).ok()).collect();
+    let mut warned = false;
+    for line in BufReader::new(out.take(u64::MAX)).split(b'\n') {
+        let Ok(line) = line else { break };
+        let parsed = std::str::from_utf8(&line).ok().and_then(|l| l.split_once(' ')).and_then(|(d, rest)| Some((d.parse::<usize>().ok()?, rest)));
+        let ok = parsed.filter(|(d, rest)| *d < files.len() && rest.len() < 3 * crate::sync::MAX_PATH && crate::sync::Record::default().apply(rest));
+        match ok {
+            Some((d, rest)) => {
+                if let Some(f) = files[d].as_mut() {
+                    let _ = f.write_all(format!("{rest}\n").as_bytes());
+                }
+            }
+            None if !warned => {
+                log("the folder sync's writer reported a line that isn't a record change; dropped");
+                warned = true;
+            }
+            None => {}
+        }
+    }
+    for f in files.iter().flatten() {
+        let _ = f.sync_all();
+    }
+}
+
+/// A day as `YYYY-MM-DD` (UTC), from days since 1970-01-01 (the civil calendar).
+pub fn date_of(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The days since 1970-01-01 of a `YYYY-MM-DD` [`date_of`] made, or `None`.
+pub fn days_of(date: &str) -> Option<i64> {
+    let mut it = date.split('-');
+    let (y, m, d): (i64, i64, i64) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+    if it.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    (date_of(days) == date).then_some(days)
+}
+
+/// Today's trash folder for one writable folder, `<state>/trash/<date>/<id>` (the first two
+/// root's, 0700; the last the pool user's, which only the writer reaches, through its handle),
+/// and the date folders older than [`crate::sync::TRASH_DAYS`] removed.
+fn trash_dir(state: &Path, id: &str, pool: User) -> Result<std::os::fd::OwnedFd, String> {
+    let trash = state.join("trash");
+    let today = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) / 86_400;
+    let made = |p: &Path| -> Result<(), String> {
+        match fs::create_dir(p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        }
+        let m = fs::symlink_metadata(p).map_err(|e| e.to_string())?;
+        if !m.is_dir() || m.uid() != 0 {
+            return Err(format!("{}: not a folder of root's", p.display()));
+        }
+        fs::set_permissions(p, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())
+    };
+    made(&trash)?;
+    for e in fs::read_dir(&trash).map_err(|e| e.to_string())?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if days_of(&name).is_some_and(|d| today - d > crate::sync::TRASH_DAYS) {
+            // std's remove_dir_all never follows a link it finds inside.
+            if let Err(err) = fs::remove_dir_all(e.path()) {
+                log(&format!("the trash folder {}: {err}", e.path().display()));
+            }
+        }
+    }
+    let day = trash.join(date_of(today));
+    made(&day)?;
+    let mine = day.join(id);
+    match fs::create_dir(&mine) {
+        Ok(()) => {
+            std::os::unix::fs::chown(&mine, Some(pool.uid), Some(pool.gid)).map_err(|e| e.to_string())?;
+            fs::set_permissions(&mine, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("{}: {e}", mine.display())),
+    }
+    jail::open_dir_beneath(&day, Path::new(id))
+}
+
 /// `securecore-fpm --sync-writer` for one connection to the guest's sync port: the connection
-/// on its stdin, a handle on each writable folder (opened beneath the app root, no link on the
-/// way) from fd 3 on, as the site's pool user with no supplementary groups, in a network
-/// namespace of its own (no network), killed if the launcher dies.
-fn spawn_writer(uds: &Path, root: &Path, rels: &[PathBuf], cap: u64, pool: User) -> Result<Child, String> {
+/// on its stdin, its reports on its stdout, and per writable folder, from fd 3 on, a handle on
+/// the folder (opened beneath the app root, no link on the way), its trash folder and its record
+/// (read-only). As the site's pool user with no supplementary groups, an empty environment, no
+/// new privileges, a network namespace of its own (no network) and [`WRITER_MEMORY`] of address
+/// space; killed if the launcher dies. It confines itself further (Landlock, seccomp) before it
+/// reads from the guest ([`crate::sync::confine`]).
+fn spawn_writer(uds: &Path, root: &Path, state: &Path, folders: &[SyncFolder], pool: User) -> Result<Child, String> {
+    use crate::sync::{WRITER_FDS_PER_FOLDER, WRITER_FIRST_FD, WRITER_MEMORY};
     use std::os::fd::OwnedFd;
+    let mut held: Vec<OwnedFd> = Vec::new();
+    for f in folders {
+        held.push(jail::open_dir_beneath(root, &f.rel)?);
+        held.push(trash_dir(state, &f.id, pool)?);
+        held.push(OwnedFd::from(open_record(state, &f.id)?));
+    }
     let conn = vsock::connect_through(uds, crate::sync::SYNC_PORT, Duration::from_secs(2)).map_err(|e| format!("guest port {}: {e}", crate::sync::SYNC_PORT))?;
-    let folders: Vec<OwnedFd> = rels.iter().map(|r| jail::open_dir_beneath(root, r)).collect::<Result<_, _>>()?;
-    let raw: Vec<libc::c_int> = folders.iter().map(|f| f.as_raw_fd()).collect();
+    let raw: Vec<libc::c_int> = held.iter().map(|f| f.as_raw_fd()).collect();
     let mut high = vec![0 as libc::c_int; raw.len()];
-    let caps = vec![cap.to_string(); rels.len()].join(",");
+    let caps = folders.iter().map(|f| f.cap.to_string()).collect::<Vec<_>>().join(",");
     let mut cmd = Command::new("/proc/self/exe");
-    cmd.arg0("securecore-fpm").arg("--sync-writer").arg(caps).stdin(Stdio::from(OwnedFd::from(conn))).stdout(Stdio::null());
+    // Nothing of the launcher's environment (which may hold the site's secrets).
+    cmd.env_clear().arg0("securecore-fpm").arg("--sync-writer").arg(caps).stdin(Stdio::from(OwnedFd::from(conn))).stdout(Stdio::piped());
+    debug_assert_eq!(WRITER_FDS_PER_FOLDER, 3);
     // SAFETY: only syscalls between fork and exec, on values made before the fork.
     unsafe {
         cmd.pre_exec(move || {
             let err = || Err(io::Error::last_os_error());
-            // Each folder to a fresh high fd first (closed at exec), then into place from fd 3:
-            // no source is overwritten before it is moved.
+            // Each fd to a fresh high one first (closed at exec), then into place from fd 3: no
+            // source is overwritten before it is moved.
             for (h, &fd) in high.iter_mut().zip(&raw) {
                 *h = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 64);
                 if *h < 0 {
@@ -1607,25 +1848,29 @@ fn spawn_writer(uds: &Path, root: &Path, rels: &[PathBuf], cap: u64, pool: User)
                 }
             }
             for (n, &h) in high.iter().enumerate() {
-                if libc::dup2(h, crate::sync::WRITER_FIRST_FD + n as libc::c_int) < 0 {
+                if libc::dup2(h, WRITER_FIRST_FD + n as libc::c_int) < 0 {
                     return err();
                 }
             }
             if libc::unshare(libc::CLONE_NEWNET) < 0 {
                 return err();
             }
+            let mem = libc::rlimit { rlim_cur: WRITER_MEMORY, rlim_max: WRITER_MEMORY };
+            if libc::setrlimit(libc::RLIMIT_AS, &mem) < 0 {
+                return err();
+            }
             if libc::setgroups(0, std::ptr::null()) < 0 || libc::setgid(pool.gid) < 0 || libc::setuid(pool.uid) < 0 {
                 return err();
             }
             // After the uid change, which clears it.
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
                 return err();
             }
             Ok(())
         });
     }
     let child = cmd.spawn().map_err(|e| format!("the sync writer: {e}"))?;
-    drop(folders);
+    drop(held);
     Ok(child)
 }
 
@@ -1735,8 +1980,14 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     let site = sha_of(&format!("tree {tree}\nconfig {}\n", loaded.sha256));
     let site_path = site_disk(&plan, &site, bytes, entries, user)?;
     let mut disks = Vec::new();
+    let mut sync = Vec::new();
+    let mut sizes = Vec::new();
     for d in &plan.disks {
-        disks.push((d.id.clone(), write_disk(&plan, d, opts.write_disk_mib, user)?));
+        let (used, _) = folder_usage(&plan, d)?;
+        let (path, bytes) = write_disk(&plan, d, disk_mib(opts.write_disk_mib, used), user)?;
+        disks.push((d.id.clone(), path));
+        sync.push(SyncFolder { rel: d.rel(&plan.root)?, id: d.id.clone(), cap: bytes });
+        sizes.push((bytes >> 20).to_string());
     }
     let args = boot_args(&plan, opts);
     let key = Key {
@@ -1748,7 +1999,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
             opts.mem_mib,
             opts.vcpus,
             disks.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(","),
-            opts.write_disk_mib
+            sizes.join(",")
         ),
     };
     let m = Machine { site: site_path, disks, args, key: key.sha256(), user, sockets };
@@ -1778,11 +2029,14 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         Started::Cold => log(&format!("microVM cold-booted; ready {t_ready:.0} ms, started {t_started:.0} ms after launch")),
     }
     log(&format!("Firecracker runs jailed as uid {} gid {} (pid {})", user.uid, user.gid, vm.pid));
-    if !plan.disks.is_empty() {
-        let rels: Vec<PathBuf> = plan.disks.iter().map(|d| d.rel(&plan.root)).collect::<Result<_, _>>()?;
-        let (uds, root, cap, pool) = (vm.vsock.clone(), plan.root.clone(), opts.write_disk_mib << 20, plan.pool);
-        log(&format!("syncing the writable folders back to the host as uid {} ({})", pool.uid, rels.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")));
-        thread::spawn(move || sync_folders(uds, root, rels, cap, pool));
+    if !sync.is_empty() {
+        let (uds, root, state, pool) = (vm.vsock.clone(), plan.root.clone(), plan.state.clone(), plan.pool);
+        log(&format!(
+            "syncing the writable folders with the host's as uid {} ({})",
+            pool.uid,
+            sync.iter().map(|f| format!("{} ({} MiB)", f.rel.display(), f.cap >> 20)).collect::<Vec<_>>().join(", ")
+        ));
+        thread::spawn(move || sync_folders(uds, root, state, sync, pool));
     }
     let uds = vm.vsock.clone();
     match &plan.listen {
@@ -2215,6 +2469,39 @@ mod tests {
         drop(a);
         assert!(S.take().is_some(), "a freed slot is taken again");
         drop(b);
+    }
+
+    /// A writable disk is sized from its folder: twice what it holds, at least 1 GiB, in powers of
+    /// two, never below the flag. A folder too big for the sync, or for the state folder's
+    /// filesystem, is refused by `available` (so `auto` falls back with the reason).
+    #[test]
+    fn a_writable_disk_is_sized_from_its_folder_and_must_fit() {
+        assert_eq!(disk_mib(1024, 0), 1024);
+        assert_eq!(disk_mib(1024, 300 << 20), 1024, "300 MiB of uploads: 1 GiB");
+        assert_eq!(disk_mib(1024, 600 << 20), 2048, "600 MiB: 2 GiB, not a refusal");
+        assert_eq!(disk_mib(1024, 5 << 30), 16384, "5 GiB: 16 GiB");
+        assert_eq!(disk_mib(4096, 10 << 20), 4096, "the flag is a floor");
+        assert_eq!(disk_mib(64, 0), 1024, "and never below 1 GiB");
+        let p = Path::new("/srv/site/wp-content/uploads");
+        fits(p, 300 << 20, 1000, None).expect("an existing disk");
+        fits(p, 300 << 20, 1000, Some(1 << 30)).expect("room for the copy");
+        let e = fits(p, 300 << 20, 1000, Some(200 << 20)).expect_err("no room for the copy");
+        assert!(e.contains("MiB free"), "{e}");
+        let e = fits(p, 0, crate::sync::MAX_ENTRIES as u64 + 1, None).expect_err("too many entries");
+        assert!(e.contains("files and folders"), "{e}");
+    }
+
+    #[test]
+    fn trash_folders_are_named_by_their_day() {
+        assert_eq!(date_of(0), "1970-01-01");
+        assert_eq!(date_of(20_403), "2025-11-11");
+        assert_eq!(date_of(11_016), "2000-02-29");
+        for d in [0, 11_016, 20_403, 20_404, 47_482] {
+            assert_eq!(days_of(&date_of(d)), Some(d));
+        }
+        for bad in ["2026-13-01", "2026-02-30", "x", "2026-1-1-1", "../2026-01-01"] {
+            assert_eq!(days_of(bad), None, "{bad}");
+        }
     }
 
     #[test]

@@ -17,6 +17,11 @@ sha2.workspace = true
 # The installer's record of the VM's files (installed.json), and Firecracker's API bodies.
 serde_json.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The folder sync's writer (#72): Landlock to its folders, a seccomp allowlist.
+landlock.workspace = true
+seccompiler.workspace = true
+
 [[bin]]
 name = "securecore-fpm"
 path = "src/main.rs"

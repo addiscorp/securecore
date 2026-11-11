@@ -75,6 +75,11 @@ if (isset($_GET['rm'])) {
     };
     echo 'rm=', $rm("$up/" . $_GET['rm']) ? 'OK' : 'FAILED', "\n";
 }
+if (isset($_GET['sha'])) {
+    // ?sha=<rel>: the guest's copy, as the host pushed it (or empty).
+    $p = "$up/" . $_GET['sha'];
+    echo 'sha=', is_file($p) ? hash_file('sha256', $p) : '', "\n";
+}
 if (isset($_GET['chmod'])) {
     echo 'chmod=', chmod("$up/" . $_GET['chmod'], octdec($_GET['mode'])) ? 'OK' : 'FAILED', "\n";
 }
