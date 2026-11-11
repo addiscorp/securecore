@@ -686,6 +686,11 @@ if start sync "$dir/microvm.json"; then
   if start sync2 "$dir/microvm.json"; then
     ms=$(synced crash/c.bin 1048576 "$(val crash put_sha)")
     is "$( [ "$ms" != never ] && echo synced)" synced "after the crash, the next start's listing sends the upload (${ms} ms after serving)"
+    if [ "$ms" = never ]; then
+      probe "?sha=crash/c.bin" crash-guest
+      echo "  the guest's copy: $(val crash-guest sha); the host's: $(stat -c %s "$up/crash/c.bin" 2>&1); want $(val crash put_sha)"
+      grep -E 'crash|refused|sync:' "$dir/sync2.log" | tail -8 | sed 's/^/  | /'
+    fi
     eventually 300 "grep -q 'folder 0 reconciled' \"$dir/sync2.log\"" || true
     pushed=$(grep -m1 'folder 0 reconciled' "$dir/sync2.log")
     echo "  import at the start: ${pushed#*sync: }"
@@ -757,8 +762,10 @@ if start egress "$dir/microvm.json"; then
   is "$(val hold tcp)" CONNECTED "a plain socket in the guest reaches api.wordpress.org:443 by name"
   is "$(echo "$owners" | grep -c 'uid:1234 ')" 1 "the host connects it as the pool user (1234; owners of :443 connections: ${owners:-none})"
   has "$dir/egress.log" "egress connects only to public addresses that aren't this host's, as the pool user" "the launcher says so"
+  # With the extension on, layer 2 refuses an unlisted IP first (no errno): the route itself is
+  # checked below, with the extension off.
   probe "?tcp=1.1.1.1:443" ip
-  is "$(val ip tcp | cut -c1-6)" FAILED "an IP the guest picks itself is unreachable (no network device): $(val ip tcp)"
+  is "$(val ip tcp | cut -c1-6)" FAILED "an IP the guest picks itself, unlisted, is refused in the guest (got '$(val ip tcp)')"
   probe "?curl=https://example.com/" other
   is "$(val other curl_code)" 0 "a host layer 2 doesn't list is refused in the guest ($(val other curl_error | cut -c1-120))"
   stop
@@ -767,6 +774,9 @@ else
 fi
 # Without the extension (nothing in the guest checks names), the host still does.
 if start egress-noext "$dir/microvm.json" --guest-arg sc.ext=0 --no-snapshot; then
+  # Nothing in the guest refuses it now: only the missing route does (ENETUNREACH, 101).
+  probe "?tcp=1.1.1.1:443" noext-ip
+  is "$(val noext-ip tcp | cut -d' ' -f1-2)" "FAILED 101" "an IP the guest picks itself is unreachable: no network device, no route (got '$(val noext-ip tcp)')"
   probe "?curl=https://example.com/" noext
   is "$(val noext curl_code)" 0 "with no extension in the guest, a host no config lists is still refused"
   has "$dir/egress-noext.log" "egress refused: example.com:443: example.com is in none of layer 2's host lists" "by the host, which says why"
