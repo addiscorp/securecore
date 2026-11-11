@@ -468,7 +468,21 @@ mod tests {
         let child = crate::vm::spawn_egress_helper(&via, host, &[local], crate::jail::User { uid: 65534, gid: 65534 }).expect("helper");
         // SAFETY: our fd, no longer needed here.
         unsafe { libc::close(fd) };
-        let (c, peer) = l.accept().expect("accept");
+        // At most 10 s: a helper that never connects fails the test, never hangs it.
+        l.set_nonblocking(true).expect("nonblocking");
+        let t = std::time::Instant::now();
+        let (c, peer) = loop {
+            match l.accept() {
+                Ok(x) => break x,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && t.elapsed() < Duration::from_secs(10) => thread::sleep(Duration::from_millis(20)),
+                Err(e) => {
+                    drop(guest);
+                    let out = child.wait_with_output().expect("wait");
+                    panic!("the helper never connected ({e}): {} {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+                }
+            }
+        };
+        c.set_nonblocking(false).expect("blocking");
         assert_eq!(read_answer(&mut guest).expect("answer"), "OK\n");
         // The connecting socket's owner, from /proc/net/tcp (local address = the peer's).
         let hexport = format!("{:04X}", peer.port());
