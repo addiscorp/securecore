@@ -6,6 +6,10 @@
 !bench/worker-breakdown.php
 !bench/microvm/init.sh
 !bench/microvm/zz-microvm.conf
+!bench/microvm/Cargo.toml
+!bench/microvm/Cargo.lock
+!bench/microvm/src/
+!bench/microvm/vsock-connect.c
 !test/plugin/
 !docker/
 !ext/

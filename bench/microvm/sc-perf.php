@@ -23,4 +23,27 @@ for ($i = 0; $i < 2000000; $i++) {
     $x += $i % 7;
 }
 $cpu = (hrtime(true) - $t) / 1e6;
-printf("connect_ms=%.3f query_ms=%.4f cpu_ms=%.2f\n", $connect, $q, $cpu);
+// #70: the other things a WordPress page does a lot of. 100k microtime() calls (the clock: a
+// vDSO read, or a syscall or VM exit), 20k uncached stat()s of the site's PHP files, and
+// building and walking 1M-element arrays (memory, TLB).
+$t = hrtime(true);
+for ($i = 0; $i < 100000; $i++) {
+    microtime(true);
+}
+$clock = (hrtime(true) - $t) / 1e6;
+$files = glob(__DIR__ . '/wp-includes/*.php');
+$t = hrtime(true);
+for ($i = 0; $i < 20000; $i++) {
+    clearstatcache();
+    stat($files[$i % count($files)]);
+}
+$stat = (hrtime(true) - $t) / 1e6;
+$t = hrtime(true);
+$a = range(1, 1000000);
+$s = 0;
+foreach (array_reverse($a) as $v) {
+    $s += $v;
+}
+unset($a);
+$mem = (hrtime(true) - $t) / 1e6;
+printf("connect_ms=%.3f query_ms=%.4f cpu_ms=%.2f clock_ms=%.2f stat_ms=%.2f mem_ms=%.2f\n", $connect, $q, $cpu, $clock, $stat, $mem);

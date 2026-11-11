@@ -12,8 +12,20 @@
 #   bench/microvm/bench.sh ext             the extension in the guest: status, the vault probe,
 #                                          layer 3's isolated plugin, vs the host stack
 #   bench/microvm/bench.sh fallback        detect / launch with and without /dev/kvm
+#   bench/microvm/bench.sh dbpath [n]      #70: sc-perf.php (connect, query, CPU) for every
+#                                          database path candidate, n samples each
+#   bench/microvm/bench.sh breakdown       #70: empty / 70 KB / front-page p50 and time inside
+#                                          PHP, host php-fpm vs the microVM
 # KERNEL=<vmlinux> picks the guest kernel (default .tmp/mvm/vmlinux, mirab's). Results:
 # .tmp/bench/mvm/. Exits non-zero on any failure.
+# The database path (#70) for every command, by environment:
+#   MVM_DB=vsock|fwd|socat|tap   the guest side (init.sh's sc.db; default vsock)
+#   MVM_FPM=fwd|socat            the guest's FastCGI forwarder (default fwd)
+#   MVM_HOST=unix|tcp|splice     the host side: unix (default) points Firecracker's v.sock_3306
+#                                straight at MariaDB's unix socket; tcp is the driver's TCP hop
+#                                (the spike's); splice is that hop with splice(2)
+#   MVM_DB=tap needs no MVM_HOST: a tap device on the stack's bridge, removed on exit.
+# The spike's path is MVM_DB=socat MVM_FPM=socat MVM_HOST=tcp.
 set -eu
 cd "$(dirname "$0")/../.."
 what=${1:-}
@@ -46,14 +58,43 @@ web_up() {
     -v "$PWD/bench/microvm/nginx.conf:/etc/nginx/conf.d/default.conf:ro" "$project-web" >/dev/null
 }
 
+tap=sc70tap0
+tap_down() { ip link show "$tap" >/dev/null 2>&1 && ip link del "$tap"; return 0; }
+# The driver's options for the database path (MVM_DB, MVM_FPM, MVM_HOST above).
+db_opts() {
+  d=${MVM_DB:-vsock} h=${MVM_HOST:-unix}
+  set -- --arg "sc.db=$d" --arg "sc.fpm=${MVM_FPM:-fwd}"
+  if [ "$d" = tap ]; then
+    # The guest on the stack's own bridge, at the subnet's .250, reaching the db container's IP.
+    netid=$(docker network inspect -f '{{.Id}}' "${project}_default")
+    subnet=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "${project}_default")
+    tap_down
+    ip tuntap add dev "$tap" mode tap
+    ip link set "$tap" master "br-$(echo "$netid" | cut -c1-12)"
+    ip link set "$tap" up
+    set -- "$@" --tap "$tap" --arg "sc.net=${subnet%.*/*}.250/${subnet#*/}" --arg "sc.dbhost=$(dbip):3306"
+  else
+    case $h in
+      # MariaDB's socket, reached through its container's root; a product mounts the socket's
+      # folder instead.
+      unix) set -- "$@" --forward "3306=unix:/proc/$(docker inspect -f '{{.State.Pid}}' "$(compose ps -q db)")/root/run/mysqld/mysqld.sock" ;;
+      tcp) set -- "$@" --forward "3306=$(dbip):3306" ;;
+      splice) set -- "$@" --forward "3306=$(dbip):3306" --splice 1 ;;
+      *) die "MVM_HOST=$h" ;;
+    esac
+  fi
+  printf '%s\n' "$@"
+}
 # vm_start <name> [boot options]: starts the driver, waits for its ready line and for the first
 # front page (200) through nginx. Sets DRV (driver pid), FCPID, and PAGE_MS (driver start → 200).
 vm_start() {
   name=$1; shift
+  opts=$(db_opts) || die "db_opts"
   t0=$(now_ns)
+  # shellcheck disable=SC2086 # one option per word; no path in them has a space
   "$bin" boot --dir "$run" --firecracker "$mvm/firecracker" --kernel "$kernel" \
     --rootfs "$mvm/rootfs.ext4" --site "$mvm/site.ext4" --uploads "$mvm/uploads.ext4" \
-    --forward "3306=$(dbip):3306" "$@" > "$res/$name.out" 2> "$res/$name.err" &
+    $opts "$@" > "$res/$name.out" 2> "$res/$name.err" &
   DRV=$!
   until grep -q '"ready"' "$res/$name.out" 2>/dev/null; do
     kill -0 "$DRV" 2>/dev/null || die "$name: driver exited: $(cat "$res/$name.err")"
@@ -67,7 +108,24 @@ vm_start() {
   PAGE_MS=$(( ($(now_ns) - t0) / 1000000 ))
   FCPID=$(grep -o '"firecracker_pid":[0-9]*' "$res/$name.out" | cut -d: -f2)
 }
-vm_stop() { "$bin" ctl --dir "$run" quit >/dev/null; wait "$DRV" || die "driver exited non-zero"; }
+vm_stop() {
+  "$bin" ctl --dir "$run" quit >/dev/null; wait "$DRV" || die "driver exited non-zero"
+  DRV=""
+  [ "${MVM_DB:-}" != tap ] || tap_down
+}
+# On any exit, a VM still running (a failed step) is stopped, with its driver: a leftover VM
+# skews every later measurement (#70: one left over with idle=poll took two of the four cores).
+DRV=""
+cleanup() {
+  if [ -n "$DRV" ]; then
+    "$bin" ctl --dir "$run" quit >/dev/null 2>&1 || true
+    fc=$(grep -o '"firecracker_pid":[0-9]*' "$res/$name.out" 2>/dev/null | cut -d: -f2)
+    [ -z "$fc" ] || kill "$fc" 2>/dev/null || true
+    kill "$DRV" 2>/dev/null || true
+  fi
+  tap_down
+}
+trap cleanup EXIT
 field() { grep -o "\"$1\":[0-9.]*" "$2" | cut -d: -f2; }
 
 boot() {
@@ -232,6 +290,69 @@ perf() {
   host_restore
 }
 
+# #70: sc-perf.php's connect, per-query and CPU times for each database path, n samples each,
+# extension off on both sides (as perf).
+perf_line() {
+  for _ in $(seq "$n"); do curl -s -H "Host: 127.0.0.1:$port" "http://127.0.0.1:$1/sc-perf.php"; done > "$res/dbpath-$2.txt"
+  grep -c '^connect_ms=' "$res/dbpath-$2.txt" | grep -qx "$n" || die "$2: sc-perf.php: $(head -c 300 "$res/dbpath-$2.txt")"
+  m() { sed -n "s/.*$1=\([0-9.]*\).*/\1/p" "$res/dbpath-$2.txt" | median; }
+  printf '%-34s connect_ms=%s query_ms=%s cpu_ms=%s clock_ms=%s stat_ms=%s mem_ms=%s (median of %s)\n' "$2" \
+    "$(m connect_ms "$2")" "$(m query_ms "$2")" "$(m cpu_ms "$2")" "$(m clock_ms "$2")" "$(m stat_ms "$2")" "$(m mem_ms "$2")" "$n"
+}
+dbpath() {
+  host_stock
+  compose restart php >/dev/null 2>&1
+  w=0; until [ "$(code "$port" /)" = 200 ]; do w=$((w + 1)); [ "$w" -lt 300 ] || die "host php-fpm did not come back"; sleep 0.2; done
+  web_up
+  perf_line "$port" "host php-fpm (TCP to the db container)"
+  # How many statements one front page sends (MariaDB's Questions counter, minus the reading).
+  # shellcheck disable=SC2016 # expanded by the db container's shell
+  qs() { compose exec -T db sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N -e "SHOW GLOBAL STATUS LIKE '\''Questions'\''"' | awk '{ print $2 }'; }
+  q0=$(qs); code "$port" / >/dev/null; q1=$(qs)
+  echo "one front page (host php-fpm, extension off): $((q1 - q0 - 1)) statements to MySQL"
+  # db/fpm/host[/extra boot options, comma-separated]. The last two rows are diagnostics, not
+  # candidates: idle=poll (the guest's vCPUs never halt: what waking a halted vCPU costs, at
+  # one host core per vCPU) and one vCPU.
+  for c in socat/socat/tcp fwd/fwd/tcp fwd/fwd/splice fwd/fwd/unix vsock/fwd/tcp vsock/fwd/splice \
+    vsock/fwd/unix tap/fwd/- vsock/fwd/unix/--arg,idle=poll vsock/fwd/unix/--vcpus,1; do
+    MVM_DB=$(echo "$c" | cut -d/ -f1) MVM_FPM=$(echo "$c" | cut -d/ -f2) MVM_HOST=$(echo "$c" | cut -d/ -f3)
+    extra=$(echo "$c" | cut -s -d/ -f4 | tr , ' ')
+    export MVM_DB MVM_FPM MVM_HOST
+    # shellcheck disable=SC2086 # extra is a list of options
+    vm_start "dbpath-$MVM_DB-$MVM_HOST" --arg sc.ext=0 $extra
+    perf_line "$vport" "microVM db=$MVM_DB host=$MVM_HOST${extra:+ $extra}"
+    vm_stop
+  done
+  unset MVM_DB MVM_FPM MVM_HOST
+  host_restore
+}
+
+# #70: where a front page's time goes, host php-fpm against the microVM (extension off on both,
+# the default database path): oha p50 of an empty PHP response, of 70,725 bytes (the front
+# page's size) with no WordPress, and of the front page; and the median time inside PHP for
+# the front page (sc-front.php's X-SC-PHP-MS, n=21).
+php_ms() {
+  for _ in $(seq 21); do
+    curl -s -o /dev/null -D - -H "Host: 127.0.0.1:$port" "http://127.0.0.1:$1/sc-front.php" | tr -d '\r' | sed -n 's/^X-SC-PHP-MS: //p'
+  done | median
+}
+breakdown_side() {
+  printf '%-14s empty %.2f ms   70 KB %.2f ms   front page %.2f ms   inside PHP %s ms\n' "$1" \
+    "$(p50 "http://$2/sc-front.php?big=0" "bd-$1-empty")" "$(p50 "http://$2/sc-front.php?big=70725" "bd-$1-big")" \
+    "$(p50 "http://$2/" "bd-$1-front")" "$(php_ms "$3")"
+}
+breakdown() {
+  web_up
+  host_stock
+  compose restart php >/dev/null 2>&1
+  w=0; until [ "$(code "$port" /)" = 200 ]; do w=$((w + 1)); [ "$w" -lt 300 ] || die "host php-fpm did not come back"; sleep 0.2; done
+  breakdown_side "host php-fpm" web "$port"
+  vm_start breakdown --arg sc.ext=0
+  breakdown_side microVM mvmweb "$vport"
+  vm_stop
+  host_restore
+}
+
 fallback() {
   # The driver as the php image's Debian would build it (the NixOS build's loader is Nix's).
   RUST=rust:1.99-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c
@@ -276,5 +397,7 @@ case $what in
   ext) shift 2 2>/dev/null || shift; ext "$@" ;;
   fallback) fallback ;;
   perf) perf ;;
-  *) echo "usage: bench/microvm/bench.sh boot|snapshot|memory|latency|ext|fallback [n]" >&2; exit 2 ;;
+  dbpath) dbpath ;;
+  breakdown) breakdown "$@" ;;
+  *) echo "usage: bench/microvm/bench.sh boot|snapshot|memory|latency|ext|fallback|perf|dbpath|breakdown [n]" >&2; exit 2 ;;
 esac

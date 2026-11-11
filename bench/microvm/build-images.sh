@@ -22,6 +22,7 @@ docker cp test/ext/securecore-status.php "$php:/var/www/html/sc-status.php"
 docker cp test/ext/vault/routine.php "$php:/var/www/html/sc-vault-routine.php"
 docker cp test/ext/vault/core.php "$php:/var/www/html/sc-vault-core.php"
 docker cp bench/microvm/sc-perf.php "$php:/var/www/html/sc-perf.php"
+docker cp bench/microvm/sc-front.php "$php:/var/www/html/sc-front.php"
 
 # ext4 image of a directory: sized to its contents + 30% + 64 MiB, built as root so owners stay.
 pack() {

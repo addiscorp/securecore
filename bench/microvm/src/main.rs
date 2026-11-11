@@ -5,8 +5,9 @@
 //! way in or out: the guest has no network device, only vsock.
 //!
 //!   in   D/fpm.sock (a unix socket nginx's fastcgi_pass points at) → vsock port 9000 → php-fpm
-//!   out  guest port P on vsock → D/v.sock_P → the host TCP address `--forward P=ADDR` names
-//!        (MySQL on 3306; nothing else is reachable from the guest)
+//!   out  guest port P on vsock → D/v.sock_P → what `--forward P=…` names: MySQL's unix
+//!        socket directly, or a TCP address through the driver (MySQL on 3306; nothing else
+//!        is reachable from the guest)
 //!   log  guest port 1514 → D/guest.log (php-fpm's stderr, the extension's audit lines)
 //!
 //!   securecore-microvm detect [--firecracker F --kernel K --rootfs R]
@@ -21,6 +22,12 @@
 //!   securecore-microvm ctl --dir D quit|snapshot SNAPDIR
 //!       snapshot pauses the VM, writes SNAPDIR/vm.snap + vm.mem, prints the timings, and stops
 //!       the VM
+//!   securecore-microvm guest-forward [--tcp-to-vsock ADDR=PORT]... [--vsock-to-tcp PORT=ADDR]...
+//!       inside the guest, in place of socat: forwards without a fork per connection (#70)
+//!
+//! `--forward P=unix:PATH` makes D/v.sock_P a symlink to MySQL's unix socket, so Firecracker
+//! connects the guest straight to MySQL with no driver hop (#70); `--forward P=HOST:PORT` keeps
+//! the driver's TCP hop (`--splice 1` copies it with splice(2)).
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -45,6 +52,118 @@ const KVM_API_VERSION: i32 = 12;
 unsafe extern "C" {
     fn ioctl(fd: i32, request: std::ffi::c_ulong, ...) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
+    fn socket(domain: i32, ty: i32, proto: i32) -> i32;
+    #[link_name = "bind"]
+    fn bind_vm(fd: i32, addr: *const SockaddrVm, len: u32) -> i32;
+    fn listen(fd: i32, backlog: i32) -> i32;
+    fn accept4(fd: i32, addr: *mut u8, len: *mut u32, flags: i32) -> i32;
+    fn connect(fd: i32, addr: *const SockaddrVm, len: u32) -> i32;
+    fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+    fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+    fn shutdown(fd: i32, how: i32) -> i32;
+    fn pipe2(fds: *mut i32, flags: i32) -> i32;
+    fn splice(fd_in: i32, off_in: *mut i64, fd_out: i32, off_out: *mut i64, len: usize, flags: u32) -> isize;
+}
+
+const AF_VSOCK: i32 = 40;
+const SOCK_STREAM: i32 = 1;
+const SOCK_CLOEXEC: i32 = 0o2000000;
+const SHUT_WR: i32 = 1;
+const SHUT_RDWR: i32 = 2;
+const SPLICE_F_MOVE: u32 = 1;
+/// VMADDR_CID_ANY, for a guest-side vsock listener.
+const CID_ANY: u32 = u32::MAX;
+
+/// struct sockaddr_vm (linux/vm_sockets.h).
+#[repr(C)]
+struct SockaddrVm {
+    family: u16,
+    reserved1: u16,
+    port: u32,
+    cid: u32,
+    flags: u8,
+    zero: [u8; 3],
+}
+
+impl SockaddrVm {
+    fn new(cid: u32, port: u32) -> SockaddrVm {
+        SockaddrVm { family: AF_VSOCK as u16, reserved1: 0, port, cid, flags: 0, zero: [0; 3] }
+    }
+}
+
+/// An AF_VSOCK stream socket (std has none).
+struct Vsock(std::os::fd::OwnedFd);
+
+impl Vsock {
+    fn socket() -> io::Result<std::os::fd::OwnedFd> {
+        // SAFETY: socket(2) with constant arguments; a non-negative result is a new fd we own.
+        let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd was just returned by socket(2) and nothing else owns it.
+        Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+    }
+    fn connect(cid: u32, port: u32) -> io::Result<Vsock> {
+        let fd = Vsock::socket()?;
+        let a = SockaddrVm::new(cid, port);
+        // SAFETY: a valid sockaddr_vm of the size passed, on a socket we own.
+        if unsafe { connect(fd.as_raw_fd(), &a, std::mem::size_of::<SockaddrVm>() as u32) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Vsock(fd))
+    }
+    fn listen(port: u32) -> io::Result<Vsock> {
+        let fd = Vsock::socket()?;
+        let a = SockaddrVm::new(CID_ANY, port);
+        // SAFETY: as in connect; listen(2) on the bound socket.
+        if unsafe { bind_vm(fd.as_raw_fd(), &a, std::mem::size_of::<SockaddrVm>() as u32) } < 0
+            || unsafe { listen(fd.as_raw_fd(), 128) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Vsock(fd))
+    }
+    fn accept(&self) -> io::Result<Vsock> {
+        // SAFETY: accept4(2) without a peer address; a non-negative result is a new fd we own.
+        let fd = unsafe { accept4(self.0.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), SOCK_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd was just returned by accept4(2).
+        Ok(Vsock(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }))
+    }
+}
+
+impl Read for Vsock {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: buf is valid for buf.len() bytes.
+        let n = unsafe { read(self.0.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+        if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+    }
+}
+impl Write for Vsock {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // SAFETY: buf is valid for buf.len() bytes.
+        let n = unsafe { write(self.0.as_raw_fd(), buf.as_ptr(), buf.len()) };
+        if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+impl Half for Vsock {
+    fn dup(&self) -> io::Result<Self> {
+        Ok(Vsock(self.0.try_clone()?))
+    }
+    fn shut_write(&self) {
+        // SAFETY: shutdown(2) on an fd we own.
+        unsafe { shutdown(self.0.as_raw_fd(), SHUT_WR) };
+    }
+    fn shut_both(&self) {
+        // SAFETY: shutdown(2) on an fd we own.
+        unsafe { shutdown(self.0.as_raw_fd(), SHUT_RDWR) };
+    }
 }
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
@@ -89,7 +208,8 @@ fn main() {
         Some("launch") => Args::parse(&argv[2..]).and_then(|a| launch(&a)),
         Some("boot") => Args::parse(&argv[2..]).and_then(|a| boot(&a)),
         Some("ctl") => ctl(&argv[2..]),
-        _ => Err("usage: securecore-microvm detect|launch|boot|ctl (see the source header)".into()),
+        Some("guest-forward") => Args::parse(&argv[2..]).and_then(|a| guest_forward(&a)),
+        _ => Err("usage: securecore-microvm detect|launch|boot|ctl|guest-forward (see the source header)".into()),
     };
     if let Err(e) = r {
         eprintln!("securecore-microvm: {e}");
@@ -196,7 +316,10 @@ fn api(sock: &Path, method: &str, path: &str, body: &str) -> Result<(), String> 
 fn vsock_connect(uds: &Path, port: u32) -> io::Result<UnixStream> {
     let mut s = UnixStream::connect(uds)?;
     s.set_read_timeout(Some(Duration::from_secs(2)))?;
-    writeln!(s, "CONNECT {port}")?;
+    // One write: Firecracker reads the handshake line without blocking, and a line split over
+    // several writes (writeln! formats in pieces) is dropped with "error adding local-init
+    // connection: WouldBlock" (#70: the console showed it, and nginx got a 502).
+    s.write_all(format!("CONNECT {port}\n").as_bytes())?;
     // Byte by byte, so nothing after the handshake line is read here.
     let mut line = Vec::new();
     let mut b = [0u8; 1];
@@ -269,6 +392,7 @@ fn fcgi_ping(uds: &Path) -> io::Result<()> {
 trait Half: Read + Write + Send + Sized + 'static {
     fn dup(&self) -> io::Result<Self>;
     fn shut_write(&self);
+    fn shut_both(&self);
 }
 impl Half for UnixStream {
     fn dup(&self) -> io::Result<Self> {
@@ -277,6 +401,9 @@ impl Half for UnixStream {
     fn shut_write(&self) {
         let _ = self.shutdown(std::net::Shutdown::Write);
     }
+    fn shut_both(&self) {
+        let _ = self.shutdown(std::net::Shutdown::Both);
+    }
 }
 impl Half for TcpStream {
     fn dup(&self) -> io::Result<Self> {
@@ -284,6 +411,9 @@ impl Half for TcpStream {
     }
     fn shut_write(&self) {
         let _ = self.shutdown(std::net::Shutdown::Write);
+    }
+    fn shut_both(&self) {
+        let _ = self.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -300,6 +430,125 @@ fn join<A: Half, B: Half>(a: A, b: B) -> io::Result<()> {
         let _ = io::copy(&mut b, &mut a2);
         a2.shut_write();
     });
+    Ok(())
+}
+
+/// `join` for the guest's forwarder: the first direction to end shuts both connections down
+/// completely, as socat -t 0 does. Firecracker doesn't pass a guest's half-close (vsock
+/// SHUTDOWN with only SEND) on to the host's socket, so a forwarder that only half-closed would
+/// leave nginx waiting for php-fpm's close, and the host's MySQL connection open (measured: every
+/// FastCGI request hung after its headers).
+fn join_closing<A: Half, B: Half>(a: A, b: B) -> io::Result<()> {
+    let (a2, b2) = (a.dup()?, b.dup()?);
+    let (a3, b3) = (a.dup()?, b.dup()?);
+    let (a4, b4) = (a.dup()?, b.dup()?);
+    thread::spawn(move || {
+        let (mut a, mut b2) = (a, b2);
+        let _ = io::copy(&mut a, &mut b2);
+        a3.shut_both();
+        b3.shut_both();
+    });
+    thread::spawn(move || {
+        let (mut b, mut a2) = (b, a2);
+        let _ = io::copy(&mut b, &mut a2);
+        a4.shut_both();
+        b4.shut_both();
+    });
+    Ok(())
+}
+
+/// Moves bytes from one fd to another through a pipe with splice(2), so they never enter this
+/// process's memory, until `from` reaches end of file.
+fn splice_all(from: i32, to: i32) -> io::Result<()> {
+    let mut p = [0i32; 2];
+    // SAFETY: pipe2(2) fills the two-element array.
+    if unsafe { pipe2(p.as_mut_ptr(), SOCK_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both fds were just returned by pipe2(2) and are owned (and closed) here.
+    let (r, w): (std::os::fd::OwnedFd, std::os::fd::OwnedFd) =
+        unsafe { (std::os::fd::FromRawFd::from_raw_fd(p[0]), std::os::fd::FromRawFd::from_raw_fd(p[1])) };
+    loop {
+        // SAFETY: splice(2) between fds this call keeps open, no offsets.
+        let n = unsafe { splice(from, std::ptr::null_mut(), w.as_raw_fd(), std::ptr::null_mut(), 1 << 20, SPLICE_F_MOVE) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let mut left = n as usize;
+        while left > 0 {
+            // SAFETY: as above.
+            let m = unsafe { splice(r.as_raw_fd(), std::ptr::null_mut(), to, std::ptr::null_mut(), left, SPLICE_F_MOVE) };
+            if m <= 0 {
+                return Err(io::Error::last_os_error());
+            }
+            left -= m as usize;
+        }
+    }
+}
+
+/// `join`, with splice(2) instead of read/write copies (`--splice 1`, host side).
+fn join_splice<A: Half + AsRawFd, B: Half + AsRawFd>(a: A, b: B) -> io::Result<()> {
+    let (a2, b2) = (a.dup()?, b.dup()?);
+    thread::spawn(move || {
+        let _ = splice_all(a.as_raw_fd(), b2.as_raw_fd());
+        b2.shut_write();
+    });
+    thread::spawn(move || {
+        let _ = splice_all(b.as_raw_fd(), a2.as_raw_fd());
+        a2.shut_write();
+    });
+    Ok(())
+}
+
+/// The guest's forwarder (#70), in place of socat: one long-lived process, a thread pair per
+/// connection, no fork or exec per connection.
+///   --tcp-to-vsock 127.0.0.1:3306=3306   guest loopback TCP → vsock to the host (CID 2)
+///   --vsock-to-tcp 9000=127.0.0.1:9000   vsock from the host → guest loopback TCP
+fn guest_forward(a: &Args) -> Result<(), String> {
+    let mut handles = Vec::new();
+    for f in a.all("tcp-to-vsock") {
+        let (addr, port) = f.split_once('=').ok_or_else(|| format!("--tcp-to-vsock {f}: want ADDR=PORT"))?;
+        let port: u32 = port.parse().map_err(|_| format!("--tcp-to-vsock {f}: bad port"))?;
+        let l = std::net::TcpListener::bind(addr).map_err(|e| format!("{addr}: {e}"))?;
+        handles.push(thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let _ = c.set_nodelay(true);
+                match Vsock::connect(2, port) {
+                    Ok(v) => {
+                        let _ = join_closing(c, v);
+                    }
+                    Err(e) => eprintln!("guest-forward: vsock 2:{port}: {e}"),
+                }
+            }
+        }));
+    }
+    for f in a.all("vsock-to-tcp") {
+        let (port, addr) = f.split_once('=').ok_or_else(|| format!("--vsock-to-tcp {f}: want PORT=ADDR"))?;
+        let port: u32 = port.parse().map_err(|_| format!("--vsock-to-tcp {f}: bad port"))?;
+        let l = Vsock::listen(port).map_err(|e| format!("vsock listen {port}: {e}"))?;
+        let addr = addr.to_string();
+        handles.push(thread::spawn(move || {
+            loop {
+                let Ok(v) = l.accept() else { continue };
+                match TcpStream::connect(&addr) {
+                    Ok(t) => {
+                        let _ = t.set_nodelay(true);
+                        let _ = join_closing(v, t);
+                    }
+                    Err(e) => eprintln!("guest-forward: {addr}: {e}"),
+                }
+            }
+        }));
+    }
+    if handles.is_empty() {
+        return Err("guest-forward: nothing to forward".into());
+    }
+    for h in handles {
+        let _ = h.join();
+    }
     Ok(())
 }
 
@@ -320,18 +569,30 @@ fn boot(a: &Args) -> Result<(), String> {
     for f in [&api_sock, &vsock] {
         let _ = fs::remove_file(f);
     }
-    // Guest → host: one listener per forwarded port, up before the guest can dial it.
+    // Guest → host: one entry per forwarded port, in place before the guest can dial it.
+    // Firecracker connects a guest's vsock connection to port P to the unix socket D/v.sock_P.
+    //   P=unix:PATH  D/v.sock_P is a symlink to PATH (MySQL's own unix socket), so Firecracker
+    //                connects straight to it: no driver thread, no TCP (#70)
+    //   P=HOST:PORT  the driver listens on D/v.sock_P and connects each connection to HOST:PORT
+    //                over TCP, copying with read/write, or with splice(2) under --splice 1
+    let use_splice = a.get("splice") == Some("1");
     for f in a.all("forward") {
         let (port, addr) = f.split_once('=').ok_or_else(|| format!("--forward {f}: want PORT=ADDR"))?;
         let port: u32 = port.parse().map_err(|_| format!("--forward {f}: bad port"))?;
-        let l = bind(&dir.join(format!("v.sock_{port}")))?;
+        let at = dir.join(format!("v.sock_{port}"));
+        if let Some(target) = addr.strip_prefix("unix:") {
+            let _ = fs::remove_file(&at);
+            std::os::unix::fs::symlink(target, &at).map_err(|e| format!("{}: {e}", at.display()))?;
+            continue;
+        }
+        let l = bind(&at)?;
         let addr = addr.to_string();
         thread::spawn(move || {
             for c in l.incoming().flatten() {
                 match TcpStream::connect(&addr) {
                     Ok(t) => {
                         let _ = t.set_nodelay(true);
-                        let _ = join(c, t);
+                        let _ = if use_splice { join_splice(c, t) } else { join(c, t) };
                     }
                     Err(e) => eprintln!("securecore-microvm: forward {port} → {addr}: {e}"),
                 }
@@ -534,6 +795,15 @@ fn configure(a: &Args, api_sock: &Path, vsock: &Path) -> Result<(), String> {
         "/vsock",
         &format!(r#"{{"guest_cid":3,"uds_path":{}}}"#, json_str(&vsock.to_string_lossy())),
     )?;
+    // --tap NAME: a network device, for #70's comparison only (the design has none).
+    if let Some(tap) = a.get("tap") {
+        api(
+            api_sock,
+            "PUT",
+            "/network-interfaces/eth0",
+            &format!(r#"{{"iface_id":"eth0","host_dev_name":{},"guest_mac":"06:00:ac:10:00:02"}}"#, json_str(tap)),
+        )?;
+    }
     api(api_sock, "PUT", "/actions", r#"{"action_type":"InstanceStart"}"#)
 }
 

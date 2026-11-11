@@ -29,20 +29,27 @@ securecore-microvm (host, Rust, std only)    ── Firecracker API, vsock bridg
   │ CONNECT 9000 on Firecracker's vsock socket
   ▼
 microVM: no network device, lo only
-  socat vsock:9000 → 127.0.0.1:9000 → php-fpm + securecore.so (layers 2 and 3)
-  socat 127.0.0.1:3306 → vsock host:3306 ──► driver ──► MySQL (the only way out)
+  guest-forward vsock:9000 → 127.0.0.1:9000 → php-fpm + securecore.so (layers 2 and 3)
+  mysqlnd's connect to 127.0.0.1:3306 = a vsock connect to host:3306 (libsc-vsock-connect.so)
+     ──► Firecracker ──► <dir>/v.sock_3306 = MySQL's own unix socket (the only way out)
   php-fpm's log → vsock host:1514 ──► driver ──► <dir>/guest.log
   vda root (ro, shared) · vdb site (ro) · vdc uploads (rw) · tmpfs /tmp, /run, wp-content/cache
 ```
 
+That is the database path after #70 (section 3). The spike's was socat in the guest, then the
+driver's thread, then TCP to MySQL; `bench.sh` still runs it with `MVM_DB=socat MVM_FPM=socat
+MVM_HOST=tcp`.
+
 | file | what |
 |---|---|
-| `bench/microvm/src/main.rs` | `securecore-microvm`. Its commands: `detect` (can this host run the VM?); `launch` (the VM, or exec `securecore-fpm` as the fallback); `boot` (cold or `--restore`); `ctl quit` and `ctl snapshot` |
+| `bench/microvm/src/main.rs` | `securecore-microvm`. Its commands: `detect` (can this host run the VM?); `launch` (the VM, or exec `securecore-fpm` as the fallback); `boot` (cold or `--restore`); `ctl quit` and `ctl snapshot`; `guest-forward` (inside the guest, socat's replacement) |
+| `bench/microvm/vsock-connect.c` | `libsc-vsock-connect.so`, preloaded into the guest's php-fpm: a connect to 127.0.0.1:3306 becomes a vsock connect to the host (#70) |
+| `bench/microvm/sc-perf.php`, `sc-front.php` | time a page's parts inside PHP: MySQL connect and round trip, CPU, clock, stat, memory; the front page's own time |
 | `bench/microvm/firecracker.json` | mirab's `scripts/firecracker.json`, verbatim |
 | `bench/microvm/mirab-kernel.json` | the pin for mirab's published kernel: version, URL, both sha256 values |
 | `bench/microvm/fetch.sh` | fetches Firecracker (tarball and binary checked against the pin, as mirab's `firecracker-install.ts` does) and mirab's `vmlinux` (gzip and unpacked sha256, re-checked against mirab's live manifest) |
 | `bench/microvm/kernel.sh`, `kernel-securecore.config` | mirab's kernel recipe plus five lines (Landlock and seccomp), giving `vmlinux-sc` |
-| `bench/microvm/guest.Dockerfile`, `init.sh`, `zz-microvm.conf` | the guest's root: the `php-layer1` image plus socat, a PID 1 and the pool overrides |
+| `bench/microvm/guest.Dockerfile`, `init.sh`, `zz-microvm.conf` | the guest's root: the `php-layer1` image plus the forwarder, the preload, a PID 1 and the pool overrides (socat stays for the comparison runs and the log pipe) |
 | `bench/microvm/build-images.sh` | `rootfs.ext4`, `site.ext4` and `uploads.ext4`, built from the stack |
 | `bench/microvm/bench.sh` | every measurement below (`boot`, `snapshot`, `memory`, `latency`, `perf`, `ext`, `fallback`, `smoke`) |
 
@@ -174,18 +181,9 @@ restored from snapshot, idle after the first page: firecracker RSS 96044 kB, PSS
 
 **What the prototype uses: vsock, with no network device in the guest.** nginx's
 `fastcgi_pass` points at a unix socket the driver owns. The driver opens `CONNECT 9000` on
-Firecracker's vsock socket for each connection, and socat in the guest connects that to
-php-fpm on loopback. The guest never gets an IP address, so there is nothing to route, filter
-or masquerade.
-
-**Tap networking was not built.** A tap device would need:
-
-- a bridge, tap devices and nftables rules on the host;
-- mirab's `vm network setup` model, which NixOS would have to declare;
-- egress filtering to stand in for layer 1's port rules.
-
-vsock avoids all of that and makes the allowlist the driver's forward list (Q5). A tap path is
-worth measuring only if the database overhead below can't be closed over vsock (follow-up 8).
+Firecracker's vsock socket for each connection, and `guest-forward` in the guest connects that
+to php-fpm on loopback. The guest never gets an IP address, so there is nothing to route,
+filter or masquerade.
 
 **Front-page p50, with the method of `bench/layer1.sh`:**
 
@@ -193,35 +191,223 @@ worth measuring only if the database overhead below can't be closed over vsock (
 - The extension is off on both sides, so the only difference is where php-fpm runs.
 - "host php-fpm" is the stack's php container with layer 1 off (`bench/layer1.sh`'s "stock").
 
+### The spike's path: +15 ms
+
+The spike (#68) measured this; #70 re-ran it on the same box on 10 Nov, with the same method
+and result:
+
 ```
-$ bench/microvm/bench.sh latency 5
-round 1: host php-fpm 65.94 ms   microVM 81.14 ms
-round 2: host php-fpm 65.87 ms   microVM 80.75 ms
-round 3: host php-fpm 66.10 ms   microVM 80.92 ms
-round 4: host php-fpm 65.79 ms   microVM 81.09 ms
-round 5: host php-fpm 66.03 ms   microVM 80.74 ms
+$ bench/microvm/bench.sh latency 5                                 # #68
 median p50: host php-fpm 65.94 ms, microVM 80.92 ms, delta +14.98 ms
-$ bench/layer1.sh 5          # for reference, today's gelada layer 1 on the same box
+$ MVM_DB=socat MVM_FPM=socat MVM_HOST=tcp bench/microvm/bench.sh latency 5   # #70, the same path
+round 1: host php-fpm 66.00 ms   microVM 80.88 ms
+round 2: host php-fpm 66.31 ms   microVM 81.47 ms
+round 3: host php-fpm 65.93 ms   microVM 81.13 ms
+round 4: host php-fpm 66.06 ms   microVM 81.25 ms
+round 5: host php-fpm 66.00 ms   microVM 80.93 ms
+median p50: host php-fpm 66.00 ms, microVM 81.13 ms, delta +15.12 ms
+$ bench/layer1.sh 5          # for reference, gelada layer 1 on the same box (#68)
 median p50: stock 65.82 ms, layer1 66.04 ms, delta +0.22 ms
 ```
 
-**The microVM adds about 15 ms (+23 %) to the front page; gelada adds 0.2 ms.** That is over
-the 2 ms budget #53 sets for layer 2. `sc-perf.php` times the cost inside PHP, so nginx,
-FastCGI and the bridge are not in its numbers:
+That path was socat (one fork per connection) in the guest, then vsock, then the driver's
+thread, then TCP to the db container.
+
+**The spike's diagnosis was half right.** It assumed about 100 queries a page. A front page
+actually sends **34 statements** (MariaDB's `Questions` counter, `bench.sh dbpath`), so the
+0.15 ms extra a `SELECT 1` costs explains about 5 ms, not 15. Even so, the database path turned
+out to be most of the gap (8.5 ms, below), because WordPress's real queries carry larger
+results through every hop and each page pays a socat fork.
+
+### The candidates (#70)
+
+`sc-perf.php` times the cost inside PHP, so nginx, FastCGI and the bridge are not in its
+numbers: connect is one `mysqli` connect, and query is a `SELECT 1` round trip averaged over 200.
+Every row is the median of 7 page loads on one VM, with the extension off. Rows run in sequence
+on the same box, with nothing else of ours running:
 
 ```
-$ bench/microvm/bench.sh perf
-host php-fpm: connect_ms=0.611 query_ms=0.0500 cpu_ms=39.15    (5 runs; median shown)
-microVM:      connect_ms=1.237 query_ms=0.2069 cpu_ms=41.29
+$ bench/microvm/bench.sh dbpath 7
+host php-fpm (TCP to the db container) connect_ms=0.712 query_ms=0.0524 cpu_ms=41.54 clock_ms=3.77 stat_ms=53.22 mem_ms=33.29
+one front page (host php-fpm, extension off): 34 statements to MySQL
+microVM db=socat host=tcp          connect_ms=1.282 query_ms=0.2298 cpu_ms=41.86 clock_ms=3.74 stat_ms=23.48 mem_ms=24.79
+microVM db=fwd host=tcp            connect_ms=0.876 query_ms=0.2239 cpu_ms=41.26 clock_ms=3.74 stat_ms=23.56 mem_ms=26.17
+microVM db=fwd host=splice         connect_ms=1.008 query_ms=0.2123 cpu_ms=41.13 clock_ms=3.76 stat_ms=23.86 mem_ms=23.99
+microVM db=fwd host=unix           connect_ms=0.606 query_ms=0.1649 cpu_ms=40.21 clock_ms=3.74 stat_ms=23.61 mem_ms=24.18
+microVM db=vsock host=tcp          connect_ms=0.757 query_ms=0.1811 cpu_ms=41.25 clock_ms=3.75 stat_ms=23.52 mem_ms=23.96
+microVM db=vsock host=splice       connect_ms=0.742 query_ms=0.1656 cpu_ms=41.19 clock_ms=3.74 stat_ms=23.26 mem_ms=24.93
+microVM db=vsock host=unix         connect_ms=0.451 query_ms=0.1136 cpu_ms=40.03 clock_ms=3.75 stat_ms=23.40 mem_ms=23.86
+microVM db=tap host=-              connect_ms=0.651 query_ms=0.1261 cpu_ms=41.66 clock_ms=3.75 stat_ms=23.67 mem_ms=25.98
+microVM db=vsock host=unix --arg idle=poll connect_ms=0.425 query_ms=0.1172 cpu_ms=40.88 …
+microVM db=vsock host=unix --vcpus 1 connect_ms=0.521 query_ms=0.1342 cpu_ms=41.22 …
 ```
 
-- **CPU costs the same** (a 2M-step PHP loop: 39–46 ms on both sides).
-- **Each MySQL round trip costs 0.05 ms on the host and 0.20 ms in the VM.** The VM's path has
-  four userspace copies: guest socat, vsock, the driver's thread, then TCP to the db container.
-- At +0.15 ms a query, about 100 queries per page (WordPress plus Yoast) account for the whole
-  gap. The database path is what to optimise (follow-up 8), not the VM.
+| candidate | guest side (`sc.db`) | host side (`MVM_HOST`) | query | connect |
+|---|---|---|---|---|
+| the spike | socat, a fork per connection | the driver's thread, TCP | 0.230 ms | 1.28 ms |
+| in-guest forwarder, no fork | `guest-forward` | the driver, TCP | 0.224 | 0.88 |
+| splice on the host | `guest-forward` | the driver, `splice(2)` | 0.212 | 1.01 |
+| direct hop to MySQL's unix socket | `guest-forward` | `v.sock_3306` → `mysqld.sock` | 0.165 | 0.61 |
+| no forwarder in the guest | mysqlnd on vsock (preload) | the driver, TCP | 0.181 | 0.76 |
+| the same, with splice | mysqlnd on vsock | `splice(2)` | 0.166 | 0.74 |
+| **both hops gone** | **mysqlnd on vsock** | **`mysqld.sock` directly** | **0.114** | **0.45** |
+| tap, for comparison | a virtio-net device, TCP to the db's IP | the host bridge | 0.126 | 0.65 |
+| host php-fpm | | TCP to the db container | 0.052 | 0.71 |
 
-**Two fixes the measurements forced**, both in `init.sh`:
+What each candidate is:
+
+- **An in-guest forwarder without forks** (`securecore-microvm guest-forward`). It is one
+  long-lived Rust process, with a thread pair per connection. Per query it is no faster than
+  socat: the hop is the cost, not the fork. It only saves socat's fork at connect (0.4 ms).
+- **Splice on the host** (`--splice 1`). It saves at most 0.015 ms a query. MySQL's packets
+  are small, so copying them was never the cost; waking the driver's threads is.
+- **A direct hop to MySQL's unix socket** (`--forward 3306=unix:<mysqld.sock>`). For a
+  guest-initiated connection to port P, Firecracker connects to the unix socket
+  `<uds_path>_P`. The driver makes that path a symlink to MariaDB's own socket, so Firecracker
+  connects the guest straight to MySQL: no driver thread and no TCP. This saves 0.06 ms a query
+  with either guest side. The bench reaches the db container's socket through
+  `/proc/<mariadbd>/root/run/mysqld/mysqld.sock`; a product mounts the socket's folder instead.
+- **No forwarder in the guest** (`libsc-vsock-connect.so`, `vsock-connect.c`). It is preloaded
+  into php-fpm, and turns mysqlnd's `connect()` to `127.0.0.1:3306` into an `AF_VSOCK` connect
+  to the host on the same port. It does this in place, on the same fd, keeping its
+  `O_NONBLOCK`, so mysqlnd's non-blocking connect, poll and `SO_ERROR` work unchanged. Only the
+  listed ports (`SC_VSOCK_PORTS=3306`) and only loopback are affected; every other `connect()`
+  is untouched. Combined with the direct hop, PHP's socket goes guest kernel → Firecracker →
+  `mysqld.sock`, and nothing else is on the path.
+- **tap**, for comparison only (`MVM_DB=tap`): a virtio-net device on the stack's docker bridge,
+  with WordPress connecting to the db container's IP. At 0.126 ms it is slower than the best
+  vsock path, and it costs the guest a network device. For layer 2 that means:
+  - the guest can reach every address the bridge can unless the host filters it, so
+    `layer1.network.connect` stops being deny-by-default by construction and becomes nftables
+    rules the launcher must install and keep right;
+  - DNS, UDP and every other port become reachable unless they are filtered too;
+  - layer 2's SQL rules and the vault still hold (they are in the extension), but nothing
+    below them stops a bypass of the extension (an isolated child, or a PHP RCE) from opening
+    any socket the bridge routes.
+
+  vsock keeps the forward list as the only way out. Tap is not worth that.
+- **Diagnostics, not candidates:** `idle=poll` (the guest's vCPUs never halt) and one vCPU
+  change nothing (0.117 and 0.134 ms). Waking a halted vCPU is not the remaining cost; KVM's
+  200 µs `halt_poll_ns` already covers it. What is left, 0.06 ms a query over the host, is
+  Firecracker's vsock device (two event-loop wakeups per round trip) and the guest's virtio
+  queues.
+- **The guest isn't slower at anything else a page does.** It matches or beats the host
+  container at a 100k-call `microtime()` loop (3.7 ms both; the guest clocksource is `tsc`, so
+  calls stay in the vDSO), 20k uncached `stat()`s (23 ms against 53 ms through overlayfs) and
+  1M-element arrays (24 against 33 ms).
+
+### The chosen path: +5 ms
+
+The pick is **mysqlnd on vsock plus the direct hop to `mysqld.sock`**, with `guest-forward`
+replacing socat for FastCGI (port 9000). It is now the default of `init.sh` and `bench.sh`:
+
+```
+$ bench/microvm/bench.sh latency 5                                 # 10 Nov, quiet box
+round 1: host php-fpm 65.83 ms   microVM 71.32 ms
+round 2: host php-fpm 66.26 ms   microVM 72.47 ms
+round 3: host php-fpm 65.85 ms   microVM 70.95 ms
+round 4: host php-fpm 66.19 ms   microVM 71.16 ms
+round 5: host php-fpm 66.02 ms   microVM 72.33 ms
+median p50: host php-fpm 66.02 ms, microVM 71.32 ms, delta +5.30 ms
+$ bench/microvm/bench.sh latency 5                                 # again, 9 minutes later
+round 1: host php-fpm 116.68 ms   microVM 117.58 ms               # (another agent's load)
+round 2: host php-fpm 79.96 ms   microVM 71.65 ms
+round 3: host php-fpm 65.92 ms   microVM 70.94 ms
+round 4: host php-fpm 66.04 ms   microVM 70.86 ms
+round 5: host php-fpm 66.10 ms   microVM 70.61 ms
+median p50: host php-fpm 66.10 ms, microVM 70.94 ms, delta +4.84 ms
+```
+
+**The front page goes from +15.1 ms to about +5 ms (+5.30 and +4.84 in two runs; +8 %
+instead of +23 %).** Every VM-side round in both runs is between 70.6 and 72.5 ms. The target
+was under +5 ms: one run meets it, the other misses by 0.3 ms.
+
+Where the 10 ms went, with each half measured alone:
+
+```
+$ MVM_FPM=socat bench/microvm/bench.sh latency 5                   # new DB path, socat for FastCGI
+median p50: host php-fpm 65.90 ms, microVM 72.57 ms, delta +6.67 ms
+$ MVM_DB=socat MVM_HOST=tcp bench/microvm/bench.sh latency 5       # spike DB path, guest-forward for FastCGI
+median p50: host php-fpm 66.16 ms, microVM 80.08 ms, delta +13.92 ms
+```
+
+- **The database path: 8.5 ms** (+15.1 → +6.7).
+- **guest-forward instead of socat for FastCGI: 1.2 ms** (+15.1 → +13.9). That is socat's
+  fork and exec on every request, since nginx opens a connection per request.
+
+What remains of the +5 ms (`bench.sh breakdown`):
+
+```
+$ bench/microvm/bench.sh breakdown
+host php-fpm   empty 1.03 ms   70 KB 2.07 ms   front page 67.88 ms   inside PHP 64.29 ms
+microVM        empty 1.07 ms   70 KB 1.42 ms   front page 71.12 ms   inside PHP 70.01 ms
+```
+
+- **The FastCGI bridge costs nothing measurable now.** An empty PHP response and a 70,725-byte
+  one (the front page's size, no WordPress) take the same time through the VM as on the host.
+- **The rest is inside PHP:** about 2 ms is the 34 statements at 0.06 ms over the host each,
+  and the remainder (about 3 ms, within this box's run-to-run noise of ±1 ms) shows up in none
+  of the microbenchmarks above.
+- **Going further means making fewer round trips**, or a faster virtio-vsock (vhost-vsock in
+  the kernel, which Firecracker doesn't offer). A persistent connection would save the
+  0.45 ms connect, for example. Further shaving of the transport has run out: the best
+  transport is 0.06 ms over the host, and tap, `idle=poll` and one vCPU don't beat it.
+
+### Layer 2 and the vault on the new path
+
+`bench.sh ext` with `vmlinux-sc`, on the default path (mysqlnd on vsock) and with gelada inside
+the guest (`sc.layer1=1`, where the path is `guest-forward`, below):
+
+```
+$ KERNEL=.tmp/mvm/vmlinux-sc bench/microvm/bench.sh ext
+microVM, kernel vmlinux-sc, boot arguments: (none):
+loaded=1 layer2_mode=enforce reload_error= layer1=1 layer2=1 layer3=1
+  vault: db_ok=true; DB password visible to PHP anywhere in the probe output: no
+  vault probe scalars: getenv_db='securecore-vault:DB_PASSWORD' const_db='securecore-vault:DB_PASSWORD' wpdb_dbpassword='securecore-vault:DB_PASSWORD'
+  front page 70725 bytes; Contact Form 7 (isolated by layer 3) assets in it: 0
+      3 securecore: layer3 plugin:contact-form-7 database refused (not yet available to an isolated plugin): SELECT option_value FROM wp_options WHERE option_name = 'wpcf7' LIMIT 1
+NOTICE: PHP message: securecore: layer2 enforce plugin:wordpress-seo mysqli_query table select wp_yoast_indexable
+$ KERNEL=.tmp/mvm/vmlinux-sc bench/microvm/bench.sh ext 1 --arg sc.layer1=1
+loaded=1 layer2_mode=enforce reload_error= layer1=1 layer2=1 layer3=1
+  vault: db_ok=true; DB password visible to PHP anywhere in the probe output: no
+  vault probe scalars: getenv_db='securecore-vault:DB_PASSWORD' const_db='securecore-vault:DB_PASSWORD' wpdb_dbpassword='securecore-vault:DB_PASSWORD'
+  front page 70725 bytes; Contact Form 7 (isolated by layer 3) assets in it: 0
+securecore-fpm: layer 1 on from /var/www/html/securecore.json (sha256 5ae649c5…): write /var/www/html/wp-content/uploads /var/www/html/wp-content/cache /tmp; deny /srv/backups
+securecore-init: ext=1 layer1=1 db=fwd fpm=fwd clocksource=tsc up 0.30s
+NOTICE: PHP message: securecore: layer2 enforce plugin:wordpress-seo mysqli_query table select wp_yoast_indexable
+```
+
+The results are the same as on the host stack and in the spike:
+
+- layer 2 enforces (Yoast's refused `select`);
+- the vault holds (the DB works, and the password appears nowhere);
+- layer 3 isolates Contact Form 7, and its child's DB calls are refused.
+
+The preload changes only which socket family carries the bytes. The vault's substitution and
+layer 2's SQL checks run in the extension, above mysqlnd, so they see the same calls.
+
+**gelada inside the guest refuses vsock, as it should.** gelada's seccomp filter (0.3.0,
+`linux.rs`) denies `socket()` for every family but `AF_UNIX`, `AF_NETLINK`, `AF_INET` and
+`AF_INET6` when the network is on, `AF_VSOCK` included. So under `sc.layer1=1`, init uses
+`guest-forward` for the database instead (`db=fwd`: 0.165 ms a query with the direct hop). That
+keeps the inner wall intact rather than punching a vsock hole in it.
+
+**Three bugs the work found**, fixed in this prototype:
+
+- **Firecracker drops a guest's half-close.** A vsock `SHUTDOWN` carrying only SEND never
+  reaches the host's socket. A forwarder that only half-closed (as `join` does on the host) left
+  every FastCGI request hanging after its headers: nginx waits for php-fpm's close. It would
+  also have left each MySQL connection open on the host. `guest-forward` shuts both sockets down
+  completely when either direction ends, as `socat -t 0` does.
+- **The driver's `CONNECT` line went out in pieces.** `writeln!` formats the line in several
+  `write()`s, and Firecracker reads the handshake without blocking. A split line was dropped
+  ("error adding local-init connection: WouldBlock" in the console) and nginx returned a 502:
+  often enough that a 120-request latency round failed. It is now one write.
+- **A failed bench step left its VM running.** One such VM, booted with `idle=poll`, used two of
+  the four cores and skewed every later number until it was found. `bench.sh` now stops any VM
+  on exit.
+
+**Two fixes the spike's measurements forced**, both in `init.sh`:
 
 - **socat's default `-t 0.5`.** After php-fpm closes, socat waits 0.5 s before closing the vsock
   side, and nginx (no FastCGI keepalive) waits for that close. A PHP page with no WordPress took
@@ -264,9 +450,15 @@ either. The prototype therefore uses block devices:
 
 ## 5. Database, with layer 2's rules still applying
 
-- **The way out is the driver's forward list.** The guest reaches MySQL at `127.0.0.1:3306`;
-  socat carries that to vsock host port 3306, and the driver connects it to the configured
-  address (`--forward 3306=<db>:3306`). Nothing else is reachable. Without a network device
+- **The way out is the driver's forward list.** The guest reaches MySQL at `127.0.0.1:3306`.
+  mysqlnd's connect becomes a vsock connect to host port 3306 (section 3, #70), and that reaches
+  whatever the driver put at `<dir>/v.sock_3306`:
+  - MySQL's own unix socket (`--forward 3306=unix:<path>`, the default);
+  - or a driver thread to a TCP address (`--forward 3306=<db>:3306`), for a database that has no
+    socket on this host.
+
+  A port with no entry has no socket, so Firecracker refuses the connection. Nothing else is
+  reachable. Without a network device
   there is no DNS, UDP or other port to deny: `layer1.network.connect` becomes the forward list
   in the product (follow-up 3), deny-by-default by construction.
 - **Layer 2 runs inside the guest, in the extension, unchanged.** It is SQL-level, so the
@@ -365,8 +557,20 @@ invalid config never runs unprotected. gelada is protected, but weaker. See "Nee
    - vsock only, no tap devices and no root-owned network setup;
    - the guest's log over vsock.
 
-   The guest's socat and shell PID 1 should become a small static Rust init that does the
-   forwarding itself. That saves a userspace hop per query (follow-up 8).
+   **The database path is #70's** (section 3), and #71 builds the product version of it:
+   - **Host:** `network.connect` entries for MySQL point Firecracker's `v.sock_<port>` at the
+     database's unix socket when it is on this host. The launcher mounts or symlinks the socket's
+     folder, never through `/proc/<pid>/root` as the bench does. A remote database falls back
+     to the driver's TCP thread (splice isn't worth it: 0.015 ms).
+   - **Guest, php-fpm:** mysqlnd's socket goes onto vsock directly. The preload is the
+     prototype. The product can keep it as a tiny audited library in the root image, or move
+     the same in-place swap into the extension, which already sits in every php-fpm. Either way
+     it is restricted to loopback and the listed ports.
+   - **Guest, everything else:** `guest-forward` (or the static Rust init that replaces
+     `init.sh`) carries FastCGI on 9000. It also carries the database when gelada runs inside
+     the guest, since gelada's seccomp refuses `AF_VSOCK`. It closes both sockets fully on either
+     side's end, because Firecracker drops half-closes.
+   - **Driver:** the vsock `CONNECT` line goes out in one write.
 3. **Kernel.** Upstream the five Landlock/seccomp lines into mirab's `kernel-x86_64.config`,
    then pin mirab's published `vmlinux` by sha256 as `mirab-kernel.json` does. That gives one
    kernel for both projects, with no fork. Until mirab promotes a release with `vm/` images,
@@ -375,10 +579,13 @@ invalid config never runs unprotected. gelada is protected, but weaker. See "Nee
    boot, warm up, snapshot. Restore it on start (6–16 ms to load, about 14–100 ms to php-fpm,
    about 0.3 s to the first page). Keep cold boot (0.4 s to php-fpm) as the path when no
    snapshot exists.
-5. **Ship the microVM as opt-in (`auto`) only after the database path is within budget.**
-   Today the microVM costs +15 ms p50 against gelada's +0.2 ms, and the gap is MySQL round
-   trips, not virtualisation. Until it is closed, gelada stays the default and the microVM is
-   the high-isolation choice for operators who accept the cost.
+5. **The cost after #70: about +5 ms p50** (+5.30 and +4.84 against +15.1, section 3). Sami
+   made the microVM layer 1's default on 10 Nov. The +5 ms is now
+   - about 2 ms of MySQL round trips (34 a page at 0.06 ms over the host);
+   - about 3 ms inside PHP that no microbenchmark here attributes.
+
+   Going lower means fewer round trips (a persistent connection saves the 0.45 ms connect, for
+   example), not a faster transport.
 
 ## Follow-up issues (not filed)
 
@@ -403,9 +610,8 @@ invalid config never runs unprotected. gelada is protected, but weaker. See "Nee
    disk, never baked into an image, and prove they never reach the console or `/proc/cmdline`.
 7. **Egress for core hosts (443).** A host-side forward or CONNECT proxy over vsock, with
    layer 2's hostname rules applying in the guest. DNS too, if it's needed at all.
-8. **The database path over vsock.** Go from 0.20 ms to under 0.1 ms per query: an in-guest
-   forwarder with no socat fork, splice on the host, or a direct vsock-to-unix-socket hop to
-   MySQL. Measure tap networking for comparison. The target is under +5 ms on the front page.
+8. **The database path over vsock.** Done in #70 (section 3): 0.230 → 0.114 ms a query, +15.1 →
+   about +5 ms a front page. The product version is #71.
 9. **Snapshot lifecycle.** Decide when a snapshot is rebuilt (image, site or config sha256),
    resync the guest clock after a restore, and find out why the first page after a restore
    takes 0.3 s rather than 80 ms.
@@ -427,5 +633,8 @@ invalid config never runs unprotected. gelada is protected, but weaker. See "Nee
 
   Separately: pin a mirab canary now, or wait for a promoted release that carries `vm/`
   images.
-- **Whether +15 ms p50 is acceptable for an opt-in high-isolation mode** before follow-up 8
-  closes the gap.
+- **Whether about +5 ms p50 (one run +4.84, one +5.30) meets "under +5 ms" for the default.**
+  If it doesn't, the next lever is fewer database round trips, not the transport. That is
+  section 3's finding: the best vsock path is 0.06 ms a query over the host, and tap,
+  `idle=poll` and one vCPU don't do better. (#68 asked whether +15 ms was acceptable for an
+  opt-in mode; the default decision of 10 Nov replaced that question.)
