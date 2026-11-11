@@ -58,24 +58,130 @@ pub fn user(spec: &str) -> Result<User, String> {
     Ok(u)
 }
 
-/// Whether `user` can connect to the unix socket at `path` (its real path: the launcher
-/// bind-mounts this path's folder) itself: a real connect, as `user` with no supplementary
-/// groups, so every folder above it counts as well as the socket's own permissions. Forks, so
-/// it runs before the launcher starts any thread.
-pub fn can_connect_as(user: User, path: &Path) -> Result<(), String> {
-    let m = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+/// openat2(2): `path` under `dir` with `flags` and the `resolve` rules (`RESOLVE_*`). Raw, with no
+/// allocation, so it may run between fork and exec. The fd, or -1 with errno set.
+pub fn openat2_raw(dir: libc::c_int, path: &std::ffi::CStr, flags: libc::c_int, resolve: u64) -> libc::c_int {
+    // SAFETY: open_how is plain data (all zeroes is valid); openat2(2) reads `how` (its size
+    // passed) and the NUL-terminated path.
+    unsafe {
+        let mut how: libc::open_how = std::mem::zeroed();
+        how.flags = (flags | libc::O_CLOEXEC) as u64;
+        how.resolve = resolve;
+        libc::syscall(libc::SYS_openat2, dir, path.as_ptr(), &raw const how, std::mem::size_of::<libc::open_how>()) as libc::c_int
+    }
+}
+
+/// `/proc/self/fd/<fd>` as a NUL-terminated path in `buf`, written without allocating (so it
+/// may run between fork and exec).
+pub fn proc_fd_path(fd: libc::c_int, buf: &mut [u8; 32]) -> *const libc::c_char {
+    let prefix = b"/proc/self/fd/";
+    buf[..prefix.len()].copy_from_slice(prefix);
+    let mut at = prefix.len();
+    let mut digits = [0u8; 10];
+    let (mut n, mut len) = (fd.max(0) as u32, 0);
+    loop {
+        digits[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for d in digits[..len].iter().rev() {
+        buf[at] = *d;
+        at += 1;
+    }
+    buf[at] = 0;
+    buf.as_ptr().cast()
+}
+
+/// No symlink anywhere on the way (the last component included), and no magic link.
+pub const NO_LINKS: u64 = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+/// [`NO_LINKS`], and never out of the starting folder (no `..` above it, no absolute path).
+pub const BENEATH: u64 = NO_LINKS | libc::RESOLVE_BENEATH;
+
+/// An `O_PATH` handle on the folder `rel` inside `root`: `root` opened with no symlink on its
+/// own path (it is a resolved path), then `rel` walked beneath it with no symlink and no `..`
+/// out. What is opened is the folder that is there now, so a link put in its place or above it
+/// after a check by path is refused (ELOOP), never followed.
+pub fn open_dir_beneath(root: &Path, rel: &Path) -> Result<std::os::fd::OwnedFd, String> {
+    use std::os::fd::FromRawFd as _;
+    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+    // The open's error, saying so when a link is why: ELOOP for one on the way, ENOTDIR for the
+    // last component being one (O_NOFOLLOW opens the link itself, which is no folder).
+    let refused = |path: &Path| {
+        let e = io::Error::last_os_error();
+        let link = e.raw_os_error() == Some(libc::ELOOP)
+            || (e.raw_os_error() == Some(libc::ENOTDIR) && fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()));
+        let why = if link { " (a symlink is on the way: only real folders are followed)" } else { "" };
+        format!("{}: {e}{why}", path.display())
+    };
+    let r = cstr(root).map_err(|e| e.to_string())?;
+    let fd = openat2_raw(libc::AT_FDCWD, &r, flags, NO_LINKS);
+    if fd < 0 {
+        return Err(refused(root));
+    }
+    // SAFETY: fd was just returned by openat2(2) and is owned here.
+    let root_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let rel_c = if rel.as_os_str().is_empty() { CString::from(c".") } else { cstr(rel).map_err(|e| e.to_string())? };
+    let fd = openat2_raw(std::os::fd::AsRawFd::as_raw_fd(&root_fd), &rel_c, flags, BENEATH);
+    if fd < 0 {
+        return Err(refused(&root.join(rel)));
+    }
+    // SAFETY: as above.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// A `connect[].socket`'s folder, held open from the moment it is checked: the check
+/// ([`can_connect_as`]) and the bind mount ([`Jail::bind_dir`]) both go through this handle, so
+/// they see the same folder whatever happens to the path in between.
+#[derive(Debug)]
+pub struct SocketDir {
+    /// The socket's path (resolved: no symlink in it), for messages.
+    pub path: PathBuf,
+    /// The socket's name in its folder.
+    pub name: std::ffi::OsString,
+    /// `O_PATH|O_NOFOLLOW` on the folder, opened with no symlink anywhere on its path.
+    pub dir: std::os::fd::OwnedFd,
+}
+
+impl SocketDir {
+    /// Opens the folder of the socket at `path`, which must be a resolved, absolute path.
+    pub fn open(path: &Path) -> Result<SocketDir, String> {
+        let dir = path.parent().filter(|d| d.is_absolute()).ok_or_else(|| format!("{}: not an absolute socket path", path.display()))?;
+        let name = path.file_name().ok_or_else(|| format!("{}: no file name", path.display()))?.to_owned();
+        let dir = open_dir_beneath(dir, Path::new("")).map_err(|e| format!("the socket's folder {e}"))?;
+        Ok(SocketDir { path: path.to_owned(), name, dir })
+    }
+
+    /// `/proc/self/fd/<n>`: the held folder, as a path the kernel resolves to it.
+    pub fn proc_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&self.dir)))
+    }
+}
+
+/// Whether `user` can connect to the socket in `sock`'s held folder itself: a real connect, as
+/// `user` with no supplementary groups. The child, as `user`, opens the socket's folder by its
+/// path with no symlink on the way, so every folder above it counts; that must be the very
+/// folder `sock` holds (device and inode); and it connects through that handle. Forks, so it
+/// runs before the launcher starts any thread.
+pub fn can_connect_as(user: User, sock: &SocketDir) -> Result<(), String> {
+    let path = &sock.path;
+    let held = sock.proc_path().join(&sock.name);
+    let m = fs::symlink_metadata(&held).map_err(|e| format!("{}: {e}", path.display()))?;
     if !std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()) {
         return Err(format!("{} is not a unix socket", path.display()));
     }
-    let via = path.to_str().ok_or_else(|| format!("{}: not UTF-8", path.display()))?.to_owned();
-    // SAFETY: an all-zero sockaddr_un is valid; the path is copied in below, NUL-terminated.
+    let dir_meta = fs::metadata(sock.proc_path()).map_err(|e| e.to_string())?;
+    let (dev, ino) = (dir_meta.dev(), dir_meta.ino());
+    let dir_path = cstr(path.parent().unwrap_or(Path::new("/"))).map_err(|e| e.to_string())?;
+    let name = CString::new(sock.name.as_encoded_bytes()).map_err(|_| format!("{}: holds a NUL", path.display()))?;
+    // SAFETY: an all-zero sockaddr_un is valid; the child fills its path.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    if via.len() >= addr.sun_path.len() {
-        return Err(format!("{}: the path is too long for a unix socket", path.display()));
-    }
-    for (d, s) in addr.sun_path.iter_mut().zip(via.as_bytes()) {
-        *d = *s as libc::c_char;
+    // "/proc/self/fd/<n>/<name>": the longest fd is 10 digits.
+    if 14 + 10 + 1 + name.as_bytes().len() >= addr.sun_path.len() {
+        return Err(format!("{}: the socket's name is too long", path.display()));
     }
     // SAFETY: fork(2) in a process with one thread (checked by the caller's timing: the probe
     // runs before any thread starts). The child makes plain syscalls only and _exits.
@@ -84,10 +190,33 @@ pub fn can_connect_as(user: User, path: &Path) -> Result<(), String> {
         return Err(format!("fork: {}", io::Error::last_os_error()));
     }
     if pid == 0 {
-        // SAFETY: the child: drop to the user, try the connect, exit with the errno (0: it worked).
+        // SAFETY: the child: drop to the user, open the folder as it, compare, connect through
+        // it, and exit with the errno (0: it worked; 101: another folder than the one held).
         unsafe {
             if libc::setgroups(0, std::ptr::null()) < 0 || libc::setgid(user.gid) < 0 || libc::setuid(user.uid) < 0 {
                 libc::_exit(100);
+            }
+            let fd = openat2_raw(libc::AT_FDCWD, &dir_path, libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW, NO_LINKS);
+            if fd < 0 {
+                libc::_exit(*libc::__errno_location() & 0x7f);
+            }
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut st) < 0 || st.st_dev != dev || st.st_ino != ino {
+                libc::_exit(101);
+            }
+            // sun_path = "/proc/self/fd/<fd>/<name>", written without allocating.
+            let mut buf = [0u8; 32];
+            proc_fd_path(fd, &mut buf);
+            let mut at = 0;
+            for &b in buf.iter().take_while(|b| **b != 0) {
+                addr.sun_path[at] = b as libc::c_char;
+                at += 1;
+            }
+            addr.sun_path[at] = b'/' as libc::c_char;
+            at += 1;
+            for &b in name.as_bytes() {
+                addr.sun_path[at] = b as libc::c_char;
+                at += 1;
             }
             let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
             let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
@@ -102,6 +231,10 @@ pub fn can_connect_as(user: User, path: &Path) -> Result<(), String> {
     match code {
         0 => Ok(()),
         100 => Err(format!("probing {}: could not switch to uid {}", path.display(), user.uid)),
+        101 => Err(format!(
+            "{}: its folder changed while it was checked (the path now leads to another folder); refusing it",
+            path.display()
+        )),
         errno => Err(format!(
             "the microVM's user (uid {}) may not connect to {} ({}); only sockets it can open itself are \
              reachable from the guest",
@@ -318,16 +451,19 @@ impl Jail {
         Ok(d)
     }
 
-    /// Bind-mounts the host folder `src` read-only (nosuid, nodev, noexec) at `name` in the jail.
-    pub fn bind_dir(&self, src: &Path, name: &str) -> Result<(), String> {
+    /// Bind-mounts the socket's held folder (`src`, through its handle: the folder that was
+    /// checked, whatever its path leads to now) read-only (nosuid, nodev, noexec) at `name` in
+    /// the jail.
+    pub fn bind_dir(&self, src: &SocketDir, name: &str) -> Result<(), String> {
         let dst = self.host(name);
         fs::create_dir_all(&dst).map_err(|e| format!("{}: {e}", dst.display()))?;
-        let (s, d) = (cstr(src).map_err(|e| e.to_string())?, cstr(&dst).map_err(|e| e.to_string())?);
+        let (s, d) = (cstr(&src.proc_path()).map_err(|e| e.to_string())?, cstr(&dst).map_err(|e| e.to_string())?);
         let none = std::ptr::null();
+        let shown = src.path.parent().unwrap_or(Path::new("/")).display();
         // SAFETY: mount(2) with NUL-terminated paths; a bind, then its read-only remount.
         unsafe {
             if libc::mount(s.as_ptr(), d.as_ptr(), none, libc::MS_BIND, none.cast()) < 0 {
-                return Err(format!("bind-mounting {} into the jail: {}", src.display(), io::Error::last_os_error()));
+                return Err(format!("bind-mounting {shown} into the jail: {}", io::Error::last_os_error()));
             }
             let flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
             if libc::mount(none, d.as_ptr(), none, flags, none.cast()) < 0 {
@@ -431,8 +567,9 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _l = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let nobody = User { uid: 65534, gid: 65534 };
+        let probe = |p: &Path| can_connect_as(nobody, &SocketDir::open(p)?);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod");
-        let e = can_connect_as(nobody, &path).expect_err("a root-only socket");
+        let e = probe(&path).expect_err("a root-only socket");
         assert!(e.contains("may not connect") && e.contains("Permission denied"), "{e}");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).expect("chmod");
         // Every folder above counts, not only the socket's own: a 0777 socket in a 0755 folder
@@ -445,16 +582,78 @@ mod tests {
         let _l2 = std::os::unix::net::UnixListener::bind(&deep).expect("bind");
         fs::set_permissions(&deep, fs::Permissions::from_mode(0o777)).expect("chmod");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
-        let e = can_connect_as(nobody, &deep).expect_err("a socket below a root-only folder");
+        let e = probe(&deep).expect_err("a socket below a root-only folder");
         assert!(e.contains("Permission denied"), "{e}");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
         let searchable = dir.ancestors().skip(1).all(|a| fs::metadata(a).is_ok_and(|m| m.permissions().mode() & 0o001 != 0));
         if searchable {
-            can_connect_as(nobody, &path).expect("a socket anyone may reach and open");
+            probe(&path).expect("a socket anyone may reach and open");
+            // The folder checked is the folder held: its path swapped for another folder (with
+            // a socket anyone may open) after it was opened is refused, never checked instead.
+            let held = SocketDir::open(&deep).expect("open");
+            fs::rename(&inner, dir.join("inner-old")).expect("move the folder away");
+            fs::create_dir_all(&inner).expect("another folder in its place");
+            fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).expect("chmod");
+            let _l3 = std::os::unix::net::UnixListener::bind(&deep).expect("bind");
+            fs::set_permissions(&deep, fs::Permissions::from_mode(0o777)).expect("chmod");
+            let e = can_connect_as(nobody, &held).expect_err("the path leads elsewhere now");
+            assert!(e.contains("its folder changed"), "{e}");
         } else {
             eprintln!("{} has a folder above it others can't search: the allowed case is checked in the Docker gate", dir.display());
         }
-        assert!(can_connect_as(nobody, &dir).expect_err("a folder").contains("not a unix socket"));
+        assert!(probe(&dir).expect_err("a folder").contains("not a unix socket"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_socket_folder_is_opened_with_no_link_on_the_way() {
+        let dir = std::env::temp_dir().join(format!("securecore-jail-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("real")).expect("dirs");
+        let dir = fs::canonicalize(&dir).expect("canonical");
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).expect("link");
+        SocketDir::open(&dir.join("real/db.sock")).expect("a real folder");
+        let e = SocketDir::open(&dir.join("link/db.sock")).expect_err("a link to the folder");
+        assert!(e.contains("symlink is on the way"), "{e}");
+        let e = open_dir_beneath(&dir, Path::new("link")).expect_err("a link beneath");
+        assert!(e.contains("symlink is on the way"), "{e}");
+        assert!(open_dir_beneath(&dir, Path::new("../")).is_err(), "never out of the root");
+        open_dir_beneath(&dir, Path::new("real")).expect("a real folder beneath");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Root with CAP_SYS_ADMIN (a mount): the bind mount is of the folder held, not of what its
+    /// path leads to by then.
+    #[test]
+    fn the_bind_mount_is_of_the_folder_that_was_checked() {
+        let caps = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("CapEff:").map(|v| v.trim().to_owned())))
+            .and_then(|v| u64::from_str_radix(&v, 16).ok())
+            .unwrap_or(0);
+        // SAFETY: geteuid(2) can't fail.
+        if unsafe { libc::geteuid() } != 0 || caps & (1 << 21) == 0 {
+            eprintln!("not root with CAP_SYS_ADMIN: checked on the KVM host and in test/ext-microvm.sh");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("securecore-jail-bind-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("run")).expect("dirs");
+        let dir = fs::canonicalize(&dir).expect("canonical");
+        fs::write(dir.join("run/checked"), "").expect("marker");
+        let held = SocketDir::open(&dir.join("run/db.sock")).expect("open");
+        fs::rename(dir.join("run"), dir.join("run-old")).expect("move away");
+        fs::create_dir_all(dir.join("run")).expect("another");
+        fs::write(dir.join("run/swapped"), "").expect("marker");
+        let j = Jail::new(&dir.join("state"), "sc-bindtest", User { uid: 65534, gid: 65534 });
+        fs::create_dir_all(&j.root).expect("jail root");
+        j.bind_dir(&held, "/sock-1").expect("bind");
+        let seen = j.host("/sock-1");
+        let (checked, swapped) = (seen.join("checked").exists(), seen.join("swapped").exists());
+        let c = cstr(&seen).expect("cstr");
+        // SAFETY: umount2(2) of the bind just made.
+        unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+        assert!(checked && !swapped, "the jail sees the checked folder: checked={checked} swapped={swapped}");
         let _ = fs::remove_dir_all(&dir);
     }
 

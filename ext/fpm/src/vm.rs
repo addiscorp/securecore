@@ -170,6 +170,13 @@ pub struct WriteDisk {
     pub id: String,
 }
 
+impl WriteDisk {
+    /// The folder relative to the app root, which it is always inside ([`plan`]).
+    fn rel(&self, root: &Path) -> Result<PathBuf, String> {
+        self.host.strip_prefix(root).map(Path::to_path_buf).map_err(|_| format!("{} is not in the app root", self.host.display()))
+    }
+}
+
 /// What the VM is, for one config: everything here is decided before anything boots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -511,10 +518,22 @@ pub fn available(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     if loaded.config.layer3.enabled {
         kernel_supports_layer3(&opts.assets.kernel)?;
     }
-    for (_, socket) in &plan.sockets {
-        jail::can_connect_as(user, socket)?;
-    }
+    open_sockets(&plan, user)?;
     Jail::cgroup_parent()
+}
+
+/// Each `connect[].socket`'s folder, opened with no symlink on its (resolved) path and held:
+/// the jailed user's connect is checked through the handle ([`jail::can_connect_as`]), and
+/// [`wire`] bind-mounts the same handle, so the two can't see different folders. Forks for each
+/// check, so it runs before any thread starts.
+fn open_sockets(plan: &Plan, user: User) -> Result<Vec<(u16, jail::SocketDir)>, String> {
+    let mut out = Vec::new();
+    for (port, socket) in &plan.sockets {
+        let held = jail::SocketDir::open(socket)?;
+        jail::can_connect_as(user, &held)?;
+        out.push((*port, held));
+    }
+    Ok(out)
 }
 
 /// What a snapshot is valid for. Two starts with the same key boot the same bytes the same way.
@@ -558,6 +577,16 @@ fn run_tool(cmd: &mut Command, what: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// e2fsck's verdict, by its exit code (e2fsck(8)): 0 clean and 1 errors corrected are fine
+/// to grow; anything else (2 reboot needed, 4 errors left, 8 an operational error, a signal…)
+/// is refused.
+fn fsck_result(status: std::process::ExitStatus, stderr: &[u8]) -> Result<(), String> {
+    match status.code() {
+        Some(0 | 1) => Ok(()),
+        _ => Err(format!("e2fsck: {status} {}", String::from_utf8_lossy(stderr).trim())),
+    }
+}
+
 fn cpath(p: &Path) -> Result<std::ffi::CString, String> {
     std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).map_err(|_| format!("{}: holds a NUL", p.display()))
 }
@@ -568,22 +597,41 @@ fn cpath(p: &Path) -> Result<std::ffi::CString, String> {
 const SOURCE_FD: libc::c_int = 200;
 const OUTPUT_FD: libc::c_int = 201;
 
+/// A folder to copy: `rel` inside the app root `root` (a resolved path). Every folder is
+/// opened by walking from a handle on `root` ([`jail::open_dir_beneath`]'s rules: no symlink,
+/// no `..` out), never reopened by path.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    root: &'a Path,
+    rel: &'a Path,
+}
+
+/// The folder `rel` names (empty: the root itself), for openat2 from the root's handle.
+fn rel_cstr(rel: &Path) -> Result<std::ffi::CString, String> {
+    if rel.as_os_str().is_empty() { Ok(c".".to_owned()) } else { cpath(rel) }
+}
+
 /// Runs `cmd` as `who`, with no supplementary groups. With `source`, first (still root, in a
-/// private mount namespace of its own) every folder in `masks` is covered by an empty read-only
-/// tmpfs, and `source` is opened (after the masks, so they apply) as fd [`SOURCE_FD`]: the
-/// command reads the tree through it, as `who`, so it sees only what `who` may read, never the
-/// masked folders, and needs no search right on the folders above `source`.
-fn as_user(cmd: &mut Command, who: User, source: Option<&Path>, masks: &[PathBuf], output: Option<&fs::File>) -> Result<(), String> {
-    let source = source.map(cpath).transpose()?;
+/// private mount namespace of its own) the app root is opened with no symlink on its path, every
+/// folder in `masks` (relative to it) is opened beneath it and covered by an empty read-only
+/// tmpfs mounted onto that handle (`/proc/self/fd/<n>`), and the source folder is opened beneath
+/// it (after the masks, so they apply) as fd [`SOURCE_FD`]: the command reads the tree through
+/// it, as `who`, so it sees only what `who` may read, never the masked folders, and needs no
+/// search right on the folders above the source. A symlink put anywhere on the way after the
+/// plan's checks fails the open (ELOOP), so the command never runs.
+fn as_user(cmd: &mut Command, who: User, source: Option<Source<'_>>, masks: &[PathBuf], output: Option<&fs::File>) -> Result<(), String> {
+    let source = source.map(|s| Ok::<_, String>((cpath(s.root)?, rel_cstr(s.rel)?))).transpose()?;
     let output = output.map(|f| f.as_raw_fd());
-    let masks: Vec<std::ffi::CString> = masks.iter().map(|m| cpath(m)).collect::<Result<_, _>>()?;
+    let masks: Vec<std::ffi::CString> = masks.iter().map(|m| rel_cstr(m)).collect::<Result<_, _>>()?;
     let (tmpfs, none) = (c"tmpfs", c"none");
     let data = c"mode=0755,size=4k";
-    // SAFETY: only syscalls between fork and exec, on strings made before the fork.
+    let dir_flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+    // SAFETY: only syscalls between fork and exec, on strings made before the fork (the fd
+    // paths are written into a stack buffer).
     unsafe {
         cmd.pre_exec(move || {
             let err = || Err(io::Error::last_os_error());
-            if let Some(src) = &source {
+            if let Some((root, rel)) = &source {
                 if !masks.is_empty() {
                     if libc::unshare(libc::CLONE_NEWNS) < 0 {
                         return err();
@@ -591,14 +639,26 @@ fn as_user(cmd: &mut Command, who: User, source: Option<&Path>, masks: &[PathBuf
                     if libc::mount(none.as_ptr(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) < 0 {
                         return err();
                     }
-                    for m in &masks {
-                        let flags = libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
-                        if libc::mount(tmpfs.as_ptr(), m.as_ptr(), tmpfs.as_ptr(), flags, data.as_ptr().cast()) < 0 {
-                            return err();
-                        }
-                    }
                 }
-                let fd = libc::open(src.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+                // Opened in this mount namespace, so the masks mounted through it apply to it.
+                let root_fd = jail::openat2_raw(libc::AT_FDCWD, root, dir_flags, jail::NO_LINKS);
+                if root_fd < 0 {
+                    return err();
+                }
+                for m in &masks {
+                    let fd = jail::openat2_raw(root_fd, m, dir_flags, jail::BENEATH);
+                    if fd < 0 {
+                        return err();
+                    }
+                    let mut at = [0u8; 32];
+                    let target = jail::proc_fd_path(fd, &mut at);
+                    let flags = libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+                    if libc::mount(tmpfs.as_ptr(), target, tmpfs.as_ptr(), flags, data.as_ptr().cast()) < 0 {
+                        return err();
+                    }
+                    libc::close(fd);
+                }
+                let fd = jail::openat2_raw(root_fd, rel, dir_flags, jail::BENEATH);
                 if fd < 0 || libc::dup2(fd, SOURCE_FD) < 0 {
                     return err();
                 }
@@ -618,9 +678,17 @@ fn as_user(cmd: &mut Command, who: User, source: Option<&Path>, masks: &[PathBuf
 }
 
 /// `mke2fs -d <from>` into `<to>` (through a temporary name), `mb` MiB, the copy made as
-/// `who` (the site's pool user, [`as_user`]) with `masks` left out, and the image's root owned
-/// like `<from>`.
-fn mke2fs(who: User, from: &Path, masks: &[PathBuf], to: &Path, mb: u64, inodes: u64, journal: bool) -> Result<(), String> {
+/// `who` (the site's pool user, [`as_user`]) with `masks` (relative to the app root) left out,
+/// and the image's root owned like `<from>`. `from` and every mask are opened beneath the app
+/// root first, here, to refuse a link on the way with the reason; the copy opens them again the
+/// same way in its own process, so a link put there in between fails it too.
+fn mke2fs(who: User, from: Source<'_>, masks: &[PathBuf], to: &Path, mb: u64, inodes: u64, journal: bool) -> Result<(), String> {
+    let shown = from.root.join(from.rel);
+    let src = jail::open_dir_beneath(from.root, from.rel)?;
+    for m in masks {
+        jail::open_dir_beneath(from.root, m).map_err(|e| format!("a writable folder left out of the copy: {e}"))?;
+    }
+    let m = fs::File::from(src).metadata().map_err(|e| format!("{}: {e}", shown.display()))?;
     let tmp = to.with_extension("ext4.new");
     let _ = fs::remove_file(&tmp);
     // Made and opened here, owned by `who`, and handed to mke2fs (as `who`) as an fd.
@@ -630,10 +698,6 @@ fn mke2fs(who: User, from: &Path, masks: &[PathBuf], to: &Path, mb: u64, inodes:
         std::os::unix::fs::fchown(&f, Some(who.uid), Some(who.gid)).map_err(|e| e.to_string())?;
         f
     };
-    let m = fs::symlink_metadata(from).map_err(|e| format!("{}: {e}", from.display()))?;
-    if !m.is_dir() {
-        return Err(format!("{} is not a folder", from.display()));
-    }
     let mut cmd = Command::new("mke2fs");
     cmd.args(["-q", "-F", "-t", "ext4", "-b", "4096", "-m", "0"]).arg("-N").arg(inodes.to_string());
     if !journal {
@@ -642,7 +706,7 @@ fn mke2fs(who: User, from: &Path, masks: &[PathBuf], to: &Path, mb: u64, inodes:
     cmd.arg("-E").arg(format!("root_owner={}:{}", m.uid(), m.gid())).arg("-d").arg(format!("/proc/self/fd/{SOURCE_FD}"));
     cmd.arg(format!("/proc/self/fd/{OUTPUT_FD}")).arg(format!("{mb}M"));
     as_user(&mut cmd, who, Some(from), masks, Some(&out))?;
-    if let Err(e) = run_tool(&mut cmd, &format!("mke2fs {} (copying {} as uid {})", to.display(), from.display(), who.uid)) {
+    if let Err(e) = run_tool(&mut cmd, &format!("mke2fs {} (copying {} as uid {})", to.display(), shown.display(), who.uid)) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
@@ -658,8 +722,8 @@ fn site_disk(plan: &Plan, sha: &str, bytes: u64, entries: u64, user: User) -> Re
         let t = Instant::now();
         // What the tree uses on disk, plus a third for ext4's own blocks and directories, plus 64 MiB.
         let mb = bytes * 4 / 3 / (1 << 20) + 64;
-        let masks: Vec<PathBuf> = plan.disks.iter().map(|d| d.host.clone()).collect();
-        mke2fs(plan.pool, &plan.root, &masks, &path, mb, entries * 2 + 1024, false)?;
+        let masks: Vec<PathBuf> = plan.disks.iter().map(|d| d.rel(&plan.root)).collect::<Result<_, _>>()?;
+        mke2fs(plan.pool, Source { root: &plan.root, rel: Path::new("") }, &masks, &path, mb, entries * 2 + 1024, false)?;
         log(&format!("built the site disk {} ({mb} MiB, {entries} entries) in {:.0} ms", path.display(), ms(t)));
         for e in fs::read_dir(&plan.state).map_err(|e| e.to_string())?.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -681,7 +745,12 @@ fn write_disk(plan: &Plan, disk: &WriteDisk, mib: u64, user: User) -> Result<Pat
     let path = plan.state.join(format!("{}.ext4", disk.id));
     let want = mib << 20;
     if !path.is_file() {
-        let (_, bytes, entries) = site_sha256(&disk.host, &BTreeSet::new()).map_err(|e| format!("{}: {e}", disk.host.display()))?;
+        let rel = disk.rel(&plan.root)?;
+        // Measured through the folder opened beneath the root, as the copy reads it.
+        let held = jail::open_dir_beneath(&plan.root, &rel)?;
+        let via = PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+        let (_, bytes, entries) = site_sha256(&via, &BTreeSet::new()).map_err(|e| format!("{}: {e}", disk.host.display()))?;
+        drop(held);
         if bytes + (64 << 20) > want {
             return Err(format!(
                 "{} holds {} MiB, which doesn't fit a {mib} MiB writable disk: raise --write-disk-mib",
@@ -689,7 +758,7 @@ fn write_disk(plan: &Plan, disk: &WriteDisk, mib: u64, user: User) -> Result<Pat
                 bytes >> 20
             ));
         }
-        mke2fs(plan.pool, &disk.host, &[], &path, mib, (entries * 2 + 4096).max(16384), true)?;
+        mke2fs(plan.pool, Source { root: &plan.root, rel: &rel }, &[], &path, mib, (entries * 2 + 4096).max(16384), true)?;
         log(&format!("made the writable disk {} for {} ({mib} MiB)", path.display(), disk.guest));
     } else {
         let have = fs::metadata(&path).map_err(|e| e.to_string())?.len();
@@ -707,7 +776,8 @@ fn write_disk(plan: &Plan, disk: &WriteDisk, mib: u64, user: User) -> Result<Pat
             let mut fsck = Command::new("e2fsck");
             fsck.args(["-f", "-y", &via]);
             as_user(&mut fsck, user, None, &[], Some(&img))?;
-            run_tool(&mut fsck, "e2fsck").or_else(|e| if e.contains("exit status: 1") { Ok(()) } else { Err(e) })?;
+            let out = fsck.stdin(Stdio::null()).output().map_err(|e| format!("e2fsck: {e}"))?;
+            fsck_result(out.status, &out.stderr)?;
             img.set_len(want).map_err(|e| e.to_string())?;
             let mut resize = Command::new("resize2fs");
             resize.arg(&via);
@@ -899,6 +969,8 @@ struct Machine {
     args: String,
     key: String,
     user: User,
+    /// The `connect[].socket` folders, checked and held ([`open_sockets`]).
+    sockets: Vec<(u16, jail::SocketDir)>,
 }
 
 /// What a jail holds for one spawn: the host ends of the guest's ports come with it.
@@ -939,7 +1011,7 @@ impl Vm {
             j.user_dir(IN_SNAP_NEW)?;
         }
         let (root, short) = short_dir(&j.root)?;
-        wire(plan, j, &short, m.user, wiring)?;
+        wire(plan, m, j, &short, wiring)?;
         let mut cmd = j.command(&opts.assets.jailer, &opts.assets.firecracker, opts.vcpus, opts.mem_mib, &["--api-sock", IN_API]);
         // stdout and stderr together, through a pipe, into a capped console.log.
         let (rd, wr) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
@@ -1142,12 +1214,30 @@ fn tell_guest(uds: &Path, lines: &[Ctl], timeout: Duration) -> Result<(), String
     let message: String = lines.iter().map(Ctl::line).collect();
     s.write_all(message.as_bytes()).map_err(|e| format!("the guest's control port: {e}"))?;
     s.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
-    let mut reply = String::new();
-    BufReader::new(s).read_line(&mut reply).map_err(|e| format!("the guest's control port: {e}"))?;
+    let reply = read_reply(s)?;
     match reply.trim_end() {
         "ok" => Ok(()),
         other => Err(format!("the guest refused {:?}: {other}", lines.iter().map(|c| c.line().trim_end().split(' ').next().unwrap_or("").to_owned()).collect::<Vec<_>>())),
     }
+}
+
+/// The longest reply the guest's control port may give (`ok`, or `error <why>`), newline
+/// included.
+pub const MAX_REPLY: u64 = 4096;
+
+/// The guest's one-line reply, read through a [`MAX_REPLY`] cap: a guest that sends more
+/// without a newline (or closes before one) is refused, never buffered without bound.
+pub fn read_reply(from: impl Read) -> Result<String, String> {
+    let mut reply = String::new();
+    BufReader::new(from.take(MAX_REPLY)).read_line(&mut reply).map_err(|e| format!("the guest's control port: {e}"))?;
+    if !reply.ends_with('\n') {
+        return Err(if reply.len() as u64 >= MAX_REPLY {
+            format!("the guest's control port: a reply longer than {MAX_REPLY} bytes; refused")
+        } else {
+            "the guest's control port: closed before a whole reply".to_owned()
+        });
+    }
+    Ok(reply)
 }
 
 /// How the VM came up, for the log.
@@ -1245,16 +1335,15 @@ fn bind_unix(path: &Path, mode: SocketMode) -> Result<UnixListener, String> {
 /// The host ends of the guest's ports, in the jail: each `connect[].socket` as a link into its
 /// folder bind-mounted read-only, each `address` as a listener here, and the log listener. The
 /// jail was emptied first, so nothing from an earlier config is left.
-fn wire(plan: &Plan, j: &Jail, short: &Path, user: User, wiring: Wiring) -> Result<(), String> {
+fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Result<(), String> {
+    let user = m.user;
     let owned = SocketMode { owner: Some(user.uid), group: Some(user.gid), mode: 0o600 };
     if wiring == Wiring::Full {
-        for (port, socket) in &plan.sockets {
-            let dir = socket.parent().ok_or_else(|| format!("{}: no folder", socket.display()))?;
-            let name = socket.file_name().ok_or_else(|| format!("{}: no file name", socket.display()))?;
+        for (port, held) in &m.sockets {
             let mount = format!("/sock-{port}");
-            j.bind_dir(dir, &mount)?;
+            j.bind_dir(held, &mount)?;
             let link = j.host(&format!("/v.sock_{port}"));
-            std::os::unix::fs::symlink(Path::new(&mount[1..]).join(name), &link).map_err(|e| format!("{}: {e}", link.display()))?;
+            std::os::unix::fs::symlink(Path::new(&mount[1..]).join(&held.name), &link).map_err(|e| format!("{}: {e}", link.display()))?;
         }
         for (port, address) in &plan.addresses {
             let l = bind_unix(&short.join(format!("v.sock_{port}")), owned)?;
@@ -1368,6 +1457,44 @@ pub struct SlotGuard(&'static Slots);
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         self.0.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Requests for one thing that runs one at a time (the guest's reload): a request while none
+/// is queued queues one; requests while one is queued join it. The worker takes them with
+/// [`Coalesce::next`], so requests made while a run is under way make exactly one more run.
+pub struct Coalesce {
+    pending: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl Coalesce {
+    pub const fn new() -> Coalesce {
+        Coalesce { pending: std::sync::Mutex::new(false), cv: std::sync::Condvar::new() }
+    }
+
+    /// Queues a run. `false`: one was already queued, and this request joins it.
+    pub fn request(&self) -> bool {
+        let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let new = !*p;
+        *p = true;
+        self.cv.notify_one();
+        new
+    }
+
+    /// Waits for a queued run and takes it.
+    pub fn next(&self) {
+        let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        while !*p {
+            p = self.cv.wait(p).unwrap_or_else(|e| e.into_inner());
+        }
+        *p = false;
+    }
+}
+
+impl Default for Coalesce {
+    fn default() -> Coalesce {
+        Coalesce::new()
     }
 }
 
@@ -1506,6 +1633,8 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     fs::create_dir_all(&plan.state).map_err(|e| format!("{}: {e}", plan.state.display()))?;
     fs::set_permissions(&plan.state, fs::Permissions::from_mode(0o700)).map_err(|e| format!("{}: {e}", plan.state.display()))?;
     let _lock = lock_state(&plan.state)?;
+    // Checked again here, not only in `available`: what is checked is what is bind-mounted.
+    let sockets = open_sockets(&plan, user)?;
     // Before any thread: whatever ends this process, the VM ends with it.
     let jail = Jail::new(&plan.state, &plan.id, user);
     let mounts: Vec<PathBuf> = plan.sockets.iter().map(|(p, _)| jail.root.join(format!("sock-{p}"))).collect();
@@ -1545,7 +1674,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
             opts.write_disk_mib
         ),
     };
-    let m = Machine { site: site_path, disks, args, key: key.sha256(), user };
+    let m = Machine { site: site_path, disks, args, key: key.sha256(), user, sockets };
     let (mut vm, mut how) = start(&plan, opts, &m)?;
     let t_ready = ms(t0);
     let restored = matches!(how, Started::Restored { .. });
@@ -1603,18 +1732,28 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
             unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
         }
     });
+    // Reloads in a thread of their own: a stop signal during a reload is handled at once, and its
+    // sync reaches the guest on its own connection, never behind the reload. One reload at a
+    // time: the signals that arrive while one runs make exactly one more after it.
+    static RELOADS: Coalesce = Coalesce::new();
+    let uds = vm.vsock.clone();
+    thread::spawn(move || {
+        loop {
+            RELOADS.next();
+            match tell_guest(&uds, &[Ctl::Reload, Ctl::Done], crate::guest::RELOAD_TIMEOUT) {
+                Ok(()) => log("reloaded the guest's php-fpm gracefully"),
+                Err(e) => log(&format!("the guest's php-fpm reload failed: {e}")),
+            }
+        }
+    });
     let sig = loop {
         let sig = wait_for_signal(&set);
         match sig {
             libc::SIGUSR1 => log("SIGUSR1: nothing to reopen (the launcher and the guest log to stderr)"),
-            // In its own thread: a stop signal during a reload is handled at once, and its sync
-            // reaches the guest on its own connection, never behind the reload.
             libc::SIGUSR2 | libc::SIGHUP => {
-                let uds = vm.vsock.clone();
-                thread::spawn(move || match tell_guest(&uds, &[Ctl::Reload, Ctl::Done], crate::guest::RELOAD_TIMEOUT) {
-                    Ok(()) => log(&format!("signal {sig}: reloaded the guest's php-fpm gracefully")),
-                    Err(e) => log(&format!("signal {sig}: the guest's php-fpm reload failed: {e}")),
-                });
+                if !RELOADS.request() {
+                    log(&format!("signal {sig}: a reload is already queued; this one joins it"));
+                }
             }
             _ => break sig,
         }
@@ -1912,8 +2051,9 @@ mod tests {
         fs::write(dir.join("wp-content/uploads/big.bin"), vec![7u8; 1 << 20]).expect("upload");
         let nobody = User { uid: 65534, gid: 65534 };
         let img = dir.with_extension("ext4");
-        let uploads = dir.join("wp-content/uploads");
-        mke2fs(nobody, &dir, std::slice::from_ref(&uploads), &img, 64, 1024, false).expect("the site, as nobody");
+        let uploads = PathBuf::from("wp-content/uploads");
+        let site = Source { root: &dir, rel: Path::new("") };
+        mke2fs(nobody, site, std::slice::from_ref(&uploads), &img, 64, 1024, false).expect("the site, as nobody");
         let ls = |p: &str| {
             let out = Command::new("debugfs").arg("-R").arg(format!("ls -l {p}")).arg(&img).output().expect("debugfs");
             String::from_utf8_lossy(&out.stdout).into_owned()
@@ -1924,10 +2064,56 @@ mod tests {
         fs::write(dir.join("root-only.txt"), "secret").expect("write");
         fs::set_permissions(dir.join("root-only.txt"), fs::Permissions::from_mode(0o600)).expect("chmod");
         let _ = fs::remove_file(&img);
-        let e = mke2fs(nobody, &dir, &[uploads], &img, 64, 1024, false).expect_err("a root-only file");
+        let e = mke2fs(nobody, site, std::slice::from_ref(&uploads), &img, 64, 1024, false).expect_err("a root-only file");
         assert!(e.contains("as uid 65534"), "{e}");
         let _ = fs::remove_file(&img);
+        fs::remove_file(dir.join("root-only.txt")).expect("rm");
+        // A link put above the mask after every check by path: the mask is opened beneath the
+        // root in the copy's own process, so the copy fails there (ELOOP), nothing copied.
+        let outside = dir.with_extension("mask-outside");
+        fs::create_dir_all(outside.join("uploads")).expect("outside");
+        fs::rename(dir.join("wp-content"), dir.join("wp-content-old")).expect("move");
+        std::os::unix::fs::symlink(&outside, dir.join("wp-content")).expect("link");
+        let mut cmd = Command::new("true");
+        as_user(&mut cmd, nobody, Some(site), std::slice::from_ref(&uploads), None).expect("prepared");
+        let e = cmd.status().expect_err("the mask's open fails in the child");
+        assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}");
+        let _ = fs::remove_file(&img);
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// The write folders are checked by path when the plan is made; a symlinked parent put in
+    /// after that (here: wp-content swapped for a link to a tree outside the root) is refused
+    /// when the disks are built, never followed.
+    #[test]
+    fn a_link_put_in_after_the_plan_is_refused_when_the_disks_are_built() {
+        let dir = scratch("race");
+        let l = loaded(&dir, r#"{"isolation":"microvm","write":["wp-content/uploads"],"network":{"bind":[{"port":9000}]}}"#);
+        let mut o = opts();
+        o.state = Some(dir.with_extension("race-state"));
+        let p = plan(&l, &o).expect("plan: a real folder");
+        let outside = dir.with_extension("race-outside");
+        fs::create_dir_all(outside.join("uploads")).expect("outside");
+        fs::write(outside.join("uploads/secret.txt"), "not the site's").expect("write");
+        fs::rename(dir.join("wp-content"), dir.join("wp-content-old")).expect("move");
+        std::os::unix::fs::symlink(&outside, dir.join("wp-content")).expect("link");
+        let nobody = User { uid: 65534, gid: 65534 };
+        let e = write_disk(&p, &p.disks[0], 1024, nobody).expect_err("the writable disk's folder");
+        assert!(e.contains("symlink is on the way"), "{e}");
+        let e = site_disk(&p, &"0".repeat(64), 0, 0, nobody).expect_err("the site disk's mask");
+        assert!(e.contains("symlink is on the way"), "{e}");
+        // Root only (a uid switch): the copy's own process opens the folder beneath the root
+        // again, so a link put in after the launcher's own check fails it there too.
+        // SAFETY: geteuid(2) can't fail.
+        if unsafe { libc::geteuid() } == 0 {
+            let mut cmd = Command::new("true");
+            as_user(&mut cmd, nobody, Some(Source { root: &p.root, rel: Path::new("wp-content/uploads") }), &[], None).expect("prepared");
+            let e = cmd.status().expect_err("the source's open fails in the child");
+            assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -1946,6 +2132,65 @@ mod tests {
         drop(a);
         assert!(S.take().is_some(), "a freed slot is taken again");
         drop(b);
+    }
+
+    #[test]
+    fn e2fsck_passes_only_on_exit_0_or_1() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let exit = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        fsck_result(exit(0), b"").expect("clean");
+        fsck_result(exit(1), b"").expect("errors corrected");
+        // 12 (4 errors left + 8 operational) reads "exit status: 12", which holds "exit status: 1".
+        for code in [2, 4, 8, 12, 16, 128] {
+            assert!(fsck_result(exit(code), b"").is_err(), "exit {code}");
+        }
+        let killed = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        assert!(fsck_result(killed, b"").is_err(), "killed by a signal");
+    }
+
+    #[test]
+    fn the_guests_reply_is_capped() {
+        assert_eq!(read_reply(&b"ok\n"[..]), Ok("ok\n".to_owned()));
+        let long = format!("error {}\n", "y".repeat(MAX_REPLY as usize));
+        assert!(read_reply(long.as_bytes()).expect_err("too long").contains("longer than"));
+        assert!(read_reply(&b"ok"[..]).expect_err("cut").contains("closed before"), "no newline: not a reply");
+        // A guest streaming without a newline: refused at the cap, not read to the end.
+        let e = read_reply(io::repeat(b'x')).expect_err("endless");
+        assert!(e.contains("longer than 4096 bytes"), "{e}");
+    }
+
+    /// Five reload signals while a reload runs: one more reload after it, never two at once.
+    #[test]
+    fn reload_signals_during_a_reload_make_exactly_one_more() {
+        use std::sync::atomic::AtomicUsize;
+        static Q: Coalesce = Coalesce::new();
+        static STARTED: AtomicUsize = AtomicUsize::new(0);
+        static FINISHED: AtomicUsize = AtomicUsize::new(0);
+        static RUNNING: AtomicBool = AtomicBool::new(false);
+        thread::spawn(|| {
+            loop {
+                Q.next();
+                assert!(!RUNNING.swap(true, Ordering::SeqCst), "two runs at once");
+                STARTED.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(200));
+                RUNNING.store(false, Ordering::SeqCst);
+                FINISHED.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let until = |what: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !what() {
+                assert!(t.elapsed() < Duration::from_secs(5), "timed out");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert!(Q.request(), "the first request queues a run");
+        until(&|| STARTED.load(Ordering::SeqCst) == 1);
+        let queued: Vec<bool> = (0..5).map(|_| Q.request()).collect();
+        assert_eq!(queued, [true, false, false, false, false], "one more run queued; the rest join it");
+        until(&|| FINISHED.load(Ordering::SeqCst) == 2);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(STARTED.load(Ordering::SeqCst), 2, "six requests, two runs");
     }
 
     #[test]

@@ -300,6 +300,53 @@ fn pool_workers(master: i32) -> Vec<i32> {
     out
 }
 
+/// kill(2), never on a pid ≤ 0: 0 is init's own process group and -1 every process in the
+/// guest, which a master pid read mid-reload (0) must never turn into.
+pub fn signal(pid: i32, sig: libc::c_int) -> io::Result<()> {
+    if pid <= 0 {
+        return Err(io::Error::other(format!("refusing to send signal {sig} to pid {pid}")));
+    }
+    // SAFETY: kill(2) on one positive pid.
+    if unsafe { libc::kill(pid, sig) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// php-fpm's master `pid` stopped gracefully (SIGQUIT: in-flight requests finish), or killed
+/// after [`RELOAD_GRACE`]. Init's wait loop reaps it.
+fn stop_gracefully(pid: i32) {
+    if signal(pid, libc::SIGQUIT).is_err() {
+        return;
+    }
+    let t = std::time::Instant::now();
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        if t.elapsed() > RELOAD_GRACE {
+            let _ = signal(pid, libc::SIGKILL);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// One reload at a time: two control connections can each carry a `reload` (two signals close
+/// together on the host), and the second must stop the master the first started, never read
+/// the 0 that stands for "being replaced".
+static RELOADING: Mutex<()> = Mutex::new(());
+
+/// Replaces the master recorded in `master`: `stop` the old one (when there is one: a reload
+/// whose start failed leaves none), `start` a fresh one and record it. Serialised by
+/// [`RELOADING`].
+pub fn reload(master: &AtomicI32, stop: impl FnOnce(i32), start: impl FnOnce() -> io::Result<i32>) -> io::Result<()> {
+    let _one = RELOADING.lock().unwrap_or_else(|p| p.into_inner());
+    let old = master.swap(0, Ordering::SeqCst);
+    if old > 0 {
+        stop(old);
+    }
+    let pid = start()?;
+    master.store(pid, Ordering::SeqCst);
+    Ok(())
+}
+
 /// Applies one control line.
 fn apply(ctl: &Ctl) -> io::Result<()> {
     match ctl {
@@ -308,9 +355,11 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
         Ctl::Refresh => {
             // A graceful stop of each worker; the master forks fresh ones from itself (it ran no
             // request before the snapshot), and opcache's shared memory stays warm.
-            for pid in pool_workers(FPM_MASTER.load(Ordering::SeqCst)) {
-                // SAFETY: kill(2) on a php-fpm worker of this guest.
-                unsafe { libc::kill(pid, libc::SIGQUIT) };
+            let master = FPM_MASTER.load(Ordering::SeqCst);
+            if master > 0 {
+                for pid in pool_workers(master) {
+                    let _ = signal(pid, libc::SIGQUIT);
+                }
             }
             Ok(())
         }
@@ -320,20 +369,7 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             // stop (SIGQUIT: in-flight requests finish), then a fresh php-fpm with init's own
             // environment, as at boot.
             let boot = BOOT.get().ok_or_else(|| io::Error::other("no boot settings"))?;
-            let old = FPM_MASTER.swap(0, Ordering::SeqCst);
-            // SAFETY: kill(2) on php-fpm's master, which this init started.
-            unsafe { libc::kill(old, libc::SIGQUIT) };
-            let t = std::time::Instant::now();
-            while Path::new(&format!("/proc/{old}")).exists() {
-                if t.elapsed() > RELOAD_GRACE {
-                    // SAFETY: as above; it didn't stop gracefully in time.
-                    unsafe { libc::kill(old, libc::SIGKILL) };
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            let pid = start_php_fpm(boot)?;
-            FPM_MASTER.store(pid as i32, Ordering::SeqCst);
-            Ok(())
+            reload(&FPM_MASTER, stop_gracefully, || start_php_fpm(boot).map(|pid| pid as i32))
         }
         Ctl::Mount { device, path } => {
             // The snapshot may hold the device's first blocks from the kernel's partition scan
@@ -669,6 +705,41 @@ mod tests {
         assert!(Ctl::parse(&format!("entropy {}", "ab".repeat(8))).is_err(), "64 bytes, no fewer");
         assert!(Ctl::parse(&format!("entropy {}", "zz".repeat(64))).is_err(), "hex only");
         assert_eq!(unhex("00ff10"), [0, 255, 16]);
+    }
+
+    /// Two reloads at once (two USR2s close together on the host): the second waits for the
+    /// first, then stops the master the first started; neither ever sees the 0 in between.
+    #[test]
+    fn reloads_run_one_at_a_time_and_never_signal_pid_0() {
+        static MASTER: AtomicI32 = AtomicI32::new(100);
+        static NEXT: AtomicI32 = AtomicI32::new(101);
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let stopped = Mutex::new(Vec::new());
+        thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    reload(
+                        &MASTER,
+                        |old| {
+                            assert!(!BUSY.swap(true, Ordering::SeqCst), "two reloads overlapped");
+                            stopped.lock().expect("lock").push(old);
+                            thread::sleep(Duration::from_millis(50));
+                        },
+                        || {
+                            thread::sleep(Duration::from_millis(50));
+                            BUSY.store(false, Ordering::SeqCst);
+                            Ok(NEXT.fetch_add(1, Ordering::SeqCst))
+                        },
+                    )
+                    .expect("reload");
+                });
+            }
+        });
+        assert_eq!(*stopped.lock().expect("lock"), [100, 101], "each reload stopped the master before it");
+        assert_eq!(MASTER.load(Ordering::SeqCst), 102);
+        // kill(0, …) is init's process group and kill(-1, …) every process: never.
+        assert!(signal(0, 0).is_err() && signal(-1, 0).is_err());
+        signal(std::process::id() as i32, 0).expect("a real pid");
     }
 
     #[test]

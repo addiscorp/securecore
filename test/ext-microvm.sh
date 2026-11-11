@@ -485,6 +485,24 @@ if [ "$started" = 1 ]; then
   has "$dir/first.log" "SIGUSR1: nothing to reopen" "SIGUSR1 is acknowledged"
   has "$dir/first.log" "reloaded the guest's php-fpm gracefully" "SIGUSR2 reloads the guest's php-fpm"
   is "$(vcode /)" 200 "the front page after the reload: 200"
+  # Two reloads close together: the second USR2 arrives while the first reload waits for a 5 s
+  # request in flight. One reload at a time, on both sides: the second runs after the first
+  # (never on the 0 the guest records while a master is replaced), and php-fpm keeps serving.
+  reloads() { grep -c "reloaded the guest's php-fpm gracefully" "$dir/first.log"; }
+  before=$(reloads)
+  vget "/sc-mvm-probe.php?sleep=5" > "$dir/during-reloads.out" &
+  slow=$!
+  sleep 1
+  kill -USR2 "$PID"
+  sleep 0.5
+  kill -USR2 "$PID"
+  i=0
+  while [ "$(reloads)" -lt $((before + 2)) ] && [ "$i" -lt 120 ]; do i=$((i + 1)); sleep 0.5; done
+  wait "$slow"
+  is "$(reloads)" $((before + 2)) "two USR2s close together: two reloads, one after the other"
+  lacks "$dir/first.log" "reload failed" "neither reload failed"
+  is "$(kill -0 "$PID" 2>/dev/null && echo running)" running "the launcher (and its VM) still runs after both"
+  is "$(vcode /)" 200 "the front page after two reloads close together: 200"
   is "$(stat -c '%a %u %g' "$(find "$state" -maxdepth 2 -path '*/snap-*/vm.mem' | head -1)")" "640 0 64000" \
     "the snapshot is root's, read-only to the VM's group"
   # A slow reload (a 15 s request in flight, which php-fpm's graceful stop waits for), and a stop
