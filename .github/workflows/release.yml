@@ -58,6 +58,10 @@ permissions:
 
 env:
   R2_BUCKET_RELEASES: securecore-releases
+  # aws-cli 2.23+ adds CRC checksums R2 doesn't accept on multipart uploads ("InvalidPart" on
+  # CompleteMultipartUpload for the 106 MiB guest image); only send/verify them when required.
+  AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+  AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
 
 jobs:
   resolve:
@@ -407,10 +411,10 @@ jobs:
         run: |
           set -euo pipefail
           bust="?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          curl -fsSL "https://securecore-releases.addis.gg/php.json${bust}" -o served-php.json
+          curl -fsSL --retry 5 --retry-all-errors "https://securecore-releases.addis.gg/php.json${bust}" -o served-php.json
           cmp served-php.json mirror/php.json || { echo "::error::https://securecore-releases.addis.gg/php.json does not match"; exit 1; }
           jq -r '.builds[][][] | "\(.path) \(.sha256)"' mirror/php.json | while read -r path want; do
-            got="$(curl -fsSL "https://securecore-releases.addis.gg/${path}" | sha256sum | cut -d' ' -f1)"
+            got="$(curl -fsSL --retry 5 --retry-all-errors "https://securecore-releases.addis.gg/${path}" | sha256sum | cut -d' ' -f1)"
             [ "$got" = "$want" ] || { echo "::error::${path} served from R2 does not match php.json"; exit 1; }
             echo "ok ${path} ${got}"
           done
@@ -426,26 +430,26 @@ jobs:
           set -euo pipefail
           sum() { sha256sum "$1" | cut -d' ' -f1; }
           for host in securecore-releases.addis.gg; do
-            curl -fsSL "https://${host}/${VERSION}/release.json" -o served
+            curl -fsSL --retry 5 --retry-all-errors "https://${host}/${VERSION}/release.json" -o served
             [ "$(sum served)" = "$(sum "release/${VERSION}/release.json")" ] || { echo "::error::https://${host}/${VERSION}/release.json does not match"; exit 1; }
             # Every file the manifest names, by the sha256 it promises installers.
             jq -r '.files | to_entries[] | "\(.key) \(.value.sha256)"' "release/${VERSION}/release.json" | while read -r f want; do
-              curl -fsSL "https://${host}/${VERSION}/${f}" -o served
+              curl -fsSL --retry 5 --retry-all-errors "https://${host}/${VERSION}/${f}" -o served
               [ "$(sum served)" = "$want" ] || { echo "::error::https://${host}/${VERSION}/${f} does not match release.json"; exit 1; }
               echo "ok https://${host}/${VERSION}/${f} ${want}"
             done
           done
           # And the zip matches the sha256 the manifest promises installers.
-          curl -fsSL "https://securecore-releases.addis.gg/${VERSION}/securecore.zip" -o served.zip
+          curl -fsSL --retry 5 --retry-all-errors "https://securecore-releases.addis.gg/${VERSION}/securecore.zip" -o served.zip
           [ "$(sum served.zip)" = "$(jq -r .sha256 "release/${VERSION}/release.json")" ] || { echo "::error::served zip does not match release.json"; exit 1; }
           # The guest image (#80) as served, gzipped and unpacked, against release.json and
           # vm/manifest.json: scripts/promote-check.sh on the bytes read back (without mirab-vm.json,
           # whose channel check is promote's: a mirab_manifest canary publishes, never promotes).
           mkdir -p "readback/${VERSION}/vm/linux-x86_64"
-          curl -fsSL "https://securecore-releases.addis.gg/${VERSION}/release.json" -o "readback/${VERSION}/release.json"
+          curl -fsSL --retry 5 --retry-all-errors "https://securecore-releases.addis.gg/${VERSION}/release.json" -o "readback/${VERSION}/release.json"
           for f in vm/linux-x86_64/rootfs.ext4.gz vm/manifest.json; do
             if jq -e --arg f "$f" '.files[$f]' "release/${VERSION}/release.json" > /dev/null; then
-              curl -fsSL "https://securecore-releases.addis.gg/${VERSION}/${f}" -o "readback/${VERSION}/${f}"
+              curl -fsSL --retry 5 --retry-all-errors "https://securecore-releases.addis.gg/${VERSION}/${f}" -o "readback/${VERSION}/${f}"
             fi
           done
           scripts/promote-check.sh "readback/${VERSION}"
@@ -466,7 +470,7 @@ jobs:
           sum() { sha256sum "$1" | cut -d' ' -f1; }
           bust="?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           for f in install.sh install-ext.sh canary.json; do
-            curl -fsSL "https://securecore-releases.addis.gg/${f}${bust}" -o served
+            curl -fsSL --retry 5 --retry-all-errors "https://securecore-releases.addis.gg/${f}${bust}" -o served
             [ "$(sum served)" = "$(sum "release/${f}")" ] || { echo "::error::https://securecore-releases.addis.gg/${f} does not match what was uploaded"; exit 1; }
             echo "ok https://securecore-releases.addis.gg/${f} $(sum served)"
           done
