@@ -750,6 +750,11 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
         } else if !fpm_listening(Duration::from_secs(10)) {
             failed = Some(format!("php-fpm with the delivered environment isn't listening on 127.0.0.1:{FPM_PORT}"));
         }
+    } else if failed.is_none() && lines.contains(&Ctl::Reload) && !fpm_listening(Duration::from_secs(10)) {
+        // A reload is done once the fresh php-fpm takes requests, not once it is started: the
+        // host says "reloaded" on this answer, and sends requests on (found by #86's stress on
+        // GitHub's runners, where requests right after a reload met no listener).
+        failed = Some(format!("the reloaded php-fpm isn't listening on 127.0.0.1:{FPM_PORT}"));
     }
     // The host never shows a reply to a message that carried secrets, so the reason is logged
     // here too (no message here ever holds a value: refused env lines are never echoed).
