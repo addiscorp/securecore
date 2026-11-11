@@ -1480,7 +1480,7 @@ impl<R: Read, W: Write> Guest<'_, R, W> {
                         Reply::Need { .. } => self.put_tree(disk, &rel)?,
                         Reply::Ok if is_dir => {
                             let prefix = format!("{from}/");
-                            for (_, (d, p)) in self.wds.iter_mut() {
+                            for (d, p) in self.wds.values_mut() {
                                 if *d == disk && (*p == from || p.starts_with(&prefix)) {
                                     let moved = format!("{rel}{}", &p[from.len()..]);
                                     *p = moved;
