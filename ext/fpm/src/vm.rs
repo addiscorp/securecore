@@ -1085,6 +1085,15 @@ struct Vm {
     jail: Jail,
     /// The key only its init's log connections present ([`guestlog`]).
     log_key: guestlog::Key,
+    /// Its log port's server: what it hasn't said yet is said when the VM goes ([`Drop`]).
+    log_server: &'static guestlog::LogServer,
+}
+
+/// A VM's log key, and the old one a restored snapshot's init still holds for a moment.
+#[derive(Clone, Copy)]
+struct LogKeys {
+    key: guestlog::Key,
+    stale: Option<guestlog::Key>,
 }
 
 /// An `O_PATH` handle on `dir` and the short path prefix that reaches into it.
@@ -1101,6 +1110,8 @@ fn short_dir(dir: &Path) -> Result<(fs::File, PathBuf), String> {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        // The last second's refusals on its log port (#86 verification review).
+        self.log_server.flush();
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
@@ -1141,14 +1152,16 @@ enum Wiring {
 impl Vm {
     /// A fresh jail with this machine's files (and `snap`'s, to restore it), then the jailer.
     /// A spawn that fails leaves no jail behind (nothing stays mounted).
-    fn spawn(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>, key: guestlog::Key) -> Result<Vm, String> {
+    /// `keys`: this VM's log key, and a restored snapshot's old one, which is refused quietly.
+    fn spawn(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>, keys: LogKeys) -> Result<Vm, String> {
         let j = Jail::new(&plan.state, &plan.id, m.user);
-        Vm::spawn_in(&j, plan, opts, m, wiring, snap, key).inspect_err(|_| {
+        Vm::spawn_in(&j, plan, opts, m, wiring, snap, keys).inspect_err(|_| {
             let _ = j.clear();
         })
     }
 
-    fn spawn_in(j: &Jail, plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>, key: guestlog::Key) -> Result<Vm, String> {
+    fn spawn_in(j: &Jail, plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>, keys: LogKeys) -> Result<Vm, String> {
+        let key = keys.key;
         j.prepare()?;
         j.place(&opts.assets.kernel, IN_KERNEL)?;
         j.place(&opts.assets.rootfs, IN_ROOTFS)?;
@@ -1167,7 +1180,7 @@ impl Vm {
             j.user_dir(IN_SNAP_NEW)?;
         }
         let (root, short) = short_dir(&j.root)?;
-        wire(plan, m, j, &short, wiring, key)?;
+        let log_server = wire(plan, m, j, &short, wiring, keys)?;
         let mut cmd = j.command(&opts.assets.jailer, &opts.assets.firecracker, opts.vcpus, opts.mem_mib, &["--api-sock", IN_API]);
         // stdout and stderr together, through a pipe, into a capped console.log.
         let (rd, wr) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
@@ -1180,7 +1193,7 @@ impl Vm {
         let pid = child.id() as i32;
         let _ = fs::write(j.base.join("firecracker.pid"), pid.to_string());
         let inside = |p: &str| short.join(p.trim_start_matches('/'));
-        let mut vm = Vm { child: Some(child), pid, api: inside(IN_API), vsock: inside(IN_VSOCK), _root: root, jail: j.clone(), log_key: key };
+        let mut vm = Vm { child: Some(child), pid, api: inside(IN_API), vsock: inside(IN_VSOCK), _root: root, jail: j.clone(), log_key: key, log_server };
         let t = Instant::now();
         while UnixStream::connect(&vm.api).is_err() {
             if let Some(st) = vm.exited() {
@@ -1256,7 +1269,7 @@ fn give_log_key(vm: &Vm) {
 }
 
 fn cold_boot(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring) -> Result<Vm, String> {
-    let vm = Vm::spawn(plan, opts, m, wiring, None, random_key()?)?;
+    let vm = Vm::spawn(plan, opts, m, wiring, None, LogKeys { key: random_key()?, stale: None })?;
     vm.api("PUT", "/machine-config", &format!(r#"{{"vcpu_count":{},"mem_size_mib":{},"smt":false}}"#, opts.vcpus, opts.mem_mib))?;
     let args = format!("{} sc.time={}", m.args, now().0);
     vm.api("PUT", "/boot-source", &format!(r#"{{"kernel_image_path":{},"boot_args":{}}}"#, json_str(IN_KERNEL), json_str(&args)))?;
@@ -1288,8 +1301,16 @@ fn snap_key(snap: &Path) -> Result<guestlog::Key, String> {
     b.try_into().map_err(|_| format!("{}: not a log key", path.display()))
 }
 
+/// A restore's log keys: a fresh one of its own, and the snapshot's as the stale one.
+fn restore_keys(snap: &Path) -> Result<LogKeys, String> {
+    Ok(LogKeys { key: random_key()?, stale: Some(snap_key(snap)?) })
+}
+
+/// A restore: a fresh log key of its own, given to the restored init at once (#86 verification
+/// review, K2). The snapshot's key, which every restore of it starts with, is only ever refused
+/// (quietly): whoever learned it in one restored guest has nothing in the next.
 fn restore(plan: &Plan, opts: &Options, m: &Machine, snap: &Path) -> Result<Vm, String> {
-    let vm = Vm::spawn(plan, opts, m, Wiring::Full, Some(snap), snap_key(snap)?)?;
+    let vm = Vm::spawn(plan, opts, m, Wiring::Full, Some(snap), restore_keys(snap)?)?;
     vm.api(
         "PUT",
         "/snapshot/load",
@@ -1299,6 +1320,7 @@ fn restore(plan: &Plan, opts: &Options, m: &Machine, snap: &Path) -> Result<Vm, 
             json_str(&format!("{IN_SNAP}/vm.mem"))
         ),
     )?;
+    give_log_key(&vm);
     Ok(vm)
 }
 
@@ -1632,7 +1654,7 @@ fn bind_unix(path: &Path, mode: SocketMode) -> Result<UnixListener, String> {
 /// The host ends of the guest's ports, in the jail: each `connect[].socket` as a link into its
 /// folder bind-mounted read-only, each `address` as a listener here, and the log listener. The
 /// jail was emptied first, so nothing from an earlier config is left.
-fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, key: guestlog::Key) -> Result<(), String> {
+fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, keys: LogKeys) -> Result<&'static guestlog::LogServer, String> {
     let user = m.user;
     let owned = SocketMode { owner: Some(user.uid), group: Some(user.gid), mode: 0o600 };
     if wiring == Wiring::Full {
@@ -1701,13 +1723,13 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, key: g
     let l = bind_unix(&short.join(format!("v.sock_{LOG_PORT}")), owned)?;
     // Each write whole: a guest line never interleaves with another thread's.
     let emit = Box::new(|s: &str| io::stderr().lock().write_all(s.as_bytes()));
-    let server: &'static guestlog::LogServer = Box::leak(Box::new(guestlog::LogServer::new(key, emit)));
+    let server: &'static guestlog::LogServer = Box::leak(Box::new(guestlog::LogServer::new(keys.key, keys.stale, emit)));
     thread::spawn(move || {
         for c in l.incoming().flatten() {
             thread::spawn(move || server.take(c));
         }
     });
-    Ok(())
+    Ok(server)
 }
 
 /// A fixed number of slots: a connection takes one or is turned away.
@@ -2980,6 +3002,20 @@ mod tests {
         );
         let disk = refused(&lines, "error the writable folders did not sync to the host: timed out").expect_err("refused");
         assert!(stop_sync_failed(&disk).starts_with("the guest did not sync its disks before the stop: "), "{}", stop_sync_failed(&disk));
+    }
+
+    /// K2: every restore of a snapshot takes the log with a key of its own, never the snapshot's,
+    /// which it only knows as the one to refuse.
+    #[test]
+    fn each_restore_gets_a_log_key_of_its_own() {
+        let dir = scratch("keys");
+        fs::write(dir.join(SNAP_LOG_KEY), [4u8; guestlog::KEY_LEN]).expect("write");
+        let (a, b) = (restore_keys(&dir).expect("keys"), restore_keys(&dir).expect("keys"));
+        assert_eq!(a.stale, Some([4u8; guestlog::KEY_LEN]), "the snapshot's key is the stale one");
+        assert!(a.key != [4u8; guestlog::KEY_LEN] && b.key != a.key, "each restore's own, fresh");
+        fs::write(dir.join(SNAP_LOG_KEY), b"short").expect("write");
+        assert!(restore_keys(&dir).is_err(), "a broken key file fails the restore (it cold-boots)");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

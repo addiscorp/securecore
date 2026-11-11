@@ -627,10 +627,36 @@ fn root_of(path: &Path) -> PathBuf {
 
 /// Reads, parses and validates the file at `path`.
 pub fn load(path: &Path) -> Result<Loaded, LoadError> {
-    let err = |problem| LoadError { path: path.to_owned(), problem };
-    let bytes = fs::read(path).map_err(|e| err(Problem::Read(e)))?;
-    let config = Config::from_slice(&bytes).map_err(err)?;
-    Ok(Loaded { path: path.to_owned(), config, sha256: sha256_hex(&bytes), root: root_of(path) })
+    let bytes = fs::read(path).map_err(|e| LoadError { path: path.to_owned(), problem: Problem::Read(e) })?;
+    load_bytes(path, &bytes)
+}
+
+/// Parses and validates `bytes`, read from `path` by the caller (the launcher reads the file its
+/// own careful way, addiscorp/securecore#90 review).
+pub fn load_bytes(path: &Path, bytes: &[u8]) -> Result<Loaded, LoadError> {
+    let config = Config::from_slice(bytes).map_err(|problem| LoadError { path: path.to_owned(), problem })?;
+    Ok(Loaded { path: path.to_owned(), config, sha256: sha256_hex(bytes), root: root_of(path) })
+}
+
+impl LoadError {
+    /// The message without anything of the file's bytes in it: a JSON or schema error says
+    /// where (line and column) and what kind, never the token it met (serde's messages quote
+    /// it, and a file in the wrong place could hold anything). The rules the types can't
+    /// express ([`Problem::Invalid`]) are this crate's own words.
+    pub fn without_contents(&self) -> String {
+        match &self.problem {
+            Problem::Parse(e) => {
+                let kind = match e.classify() {
+                    serde_json::error::Category::Syntax => "not valid JSON",
+                    serde_json::error::Category::Eof => "the file ends too early",
+                    serde_json::error::Category::Data => "a key or value securecore.schema.json doesn't take",
+                    serde_json::error::Category::Io => "it could not be read",
+                };
+                format!("{}: invalid at line {} column {}: {kind}", self.path.display(), e.line(), e.column())
+            }
+            _ => self.to_string(),
+        }
+    }
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {

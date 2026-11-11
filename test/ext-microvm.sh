@@ -164,6 +164,9 @@ vmuser=${SC_VM_USER:-64000:64000}
 
 # The site's files the VM sees: the probe, the status page, writable folders owned by www-data.
 cp test/ext/microvm/probe.php "$site/sc-mvm-probe.php"
+# An executable script on the site disk: the guest mounts it noexec, so it never runs (#86 review).
+printf '#!/bin/sh\necho ran\n' > "$site/sc-mvm-exec.sh"
+chmod 755 "$site/sc-mvm-exec.sh"
 cp test/ext/securecore-status.php "$site/sc-status.php"
 mkdir -p "$site/wp-content/uploads" "$site/wp-content/cache"
 chown 33:33 "$site/wp-content/plugins" "$site"
@@ -524,6 +527,8 @@ if [ "$started" = 1 ]; then
   # nothing (the same script runs through /bin/sh, so it is /tmp's noexec that stops it).
   is "$(val first child_env)/$(val first child_sees)" "/." "neither PHP nor a program it starts sees LD_PRELOAD or SC_VSOCK_PORTS"
   is "$(val first tmp_exec)/$(val first sh_exec)" "BLOCKED/ran" "/tmp is noexec in the guest"
+  is "$(val first uploads_exec)" BLOCKED "an uploads disk is noexec in the guest"
+  is "$(val first site_exec)/$(val first site_sh_exec)" "BLOCKED/ran" "the site disk is noexec in the guest (its script runs only through /bin/sh)"
   is "$(val first write_uploads)" OK "uploads are writable (their own disk)"
   is "$(val first write_root)/$(val first write_plugins)" BLOCKED/BLOCKED "the site itself is read-only"
   is "$(val first write_tmp)" OK "/tmp is writable (tmpfs)"
@@ -952,7 +957,7 @@ has "$dir/moved.log" "holds the writable disks (uploads) of the site that was at
 has "$dir/moved.log" "--state-dir $moved/old" "and how to keep it"
 find "$moved" -mindepth 1 -delete
 
-for f in sc-mvm-probe.php sc-status.php sc-mvm-changed.txt wp-content/uploads/sc-big.bin; do rm -f "$site/$f"; done
+for f in sc-mvm-probe.php sc-mvm-exec.sh sc-status.php sc-mvm-changed.txt wp-content/uploads/sc-big.bin; do rm -f "$site/$f"; done
 cp ext/examples/wordpress.json "$site/securecore.json"
 echo
 if [ "$fails" -eq 0 ]; then echo "all ext-microvm checks passed"; else echo "$fails check(s) failed"; fi

@@ -486,7 +486,8 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
                 return Err(io::Error::new(e.kind(), format!("{device}: BLKFLSBUF: {e}")));
             }
             drop(dev);
-            mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV, WRITABLE_MOUNT_DATA)?;
+            // noexec (#86 verification review): nothing written to a writable folder runs.
+            mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, WRITABLE_MOUNT_DATA)?;
             WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).push(path.clone());
             // Every file closed after writing is made durable at once, whatever the host's sync
             // is doing (it may be stuck behind a host that doesn't answer).
@@ -498,7 +499,7 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             });
             Ok(())
         }
-        Ctl::Tmpfs { path } => mount("tmpfs", path, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777"),
+        Ctl::Tmpfs { path } => mount("tmpfs", path, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, "mode=1777"),
         Ctl::Sync => {
             // SAFETY: sync(2) takes nothing and can't fail.
             unsafe { libc::sync() };
@@ -607,7 +608,9 @@ fn start_log() {
 
 /// One line to the host's log, from this init (the host marks every guest line as the guest's).
 fn report(message: &str) {
-    LOG.line(format!("securecore-init: {message}").as_bytes());
+    // Its own kind of frame: the launcher logs it as `guest-init: `, which php-fpm's lines can't
+    // be (#86 verification review).
+    LOG.init_line(message.as_bytes());
 }
 
 /// Warns once a writable disk passes 90 % (and again past 98 %): beyond it, php-fpm's writes
@@ -827,7 +830,8 @@ fn boot_guest() -> io::Result<u32> {
     if let Some(t) = boot.time {
         set_clock(t, 0)?;
     }
-    mount("/dev/vdb", &boot.root, "ext4", libc::MS_RDONLY | flags, "noload")?;
+    // noexec too: php-fpm reads the site's PHP, nothing on the site disk ever runs as a program.
+    mount("/dev/vdb", &boot.root, "ext4", libc::MS_RDONLY | flags | libc::MS_NOEXEC, "noload")?;
     loopback_up()?;
     // The folder sync watches every folder of the writable disks (8192 by default here).
     let _ = fs::write("/proc/sys/fs/inotify/max_user_watches", "65536");
