@@ -1199,6 +1199,7 @@ dependencies = [
  "landlock",
  "libc",
  "seccompiler",
+ "securecore-attribution",
  "securecore-config",
  "serde_json",
  "sha2",

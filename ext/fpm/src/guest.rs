@@ -65,6 +65,9 @@ pub struct Boot {
     /// `sc.sock=3306:/run/mysqld/mysqld.sock` (repeatable): a unix socket in the guest that
     /// reaches host port 3306's forward.
     pub socks: Vec<(u16, String)>,
+    /// `sc.egress=443`: php-fpm's connections to a named host on these ports go through the
+    /// host, which checks the name ([`crate::egress`]).
+    pub egress: Vec<u16>,
     /// `sc.ext=0`: php-fpm without the extension.
     pub ext: bool,
     /// `sc.user=<uid>:<gid>`: the host's pool user, whom php-fpm's pool runs as here, so the
@@ -84,6 +87,11 @@ pub fn parse_cmdline(line: &str) -> Result<Boot, String> {
             "sc.ports" => {
                 for p in value.split(',').filter(|p| !p.is_empty()) {
                     boot.ports.push(p.parse().map_err(|_| format!("sc.ports: {p} is not a port"))?);
+                }
+            }
+            "sc.egress" => {
+                for p in value.split(',').filter(|p| !p.is_empty()) {
+                    boot.egress.push(p.parse().map_err(|_| format!("sc.egress: {p} is not a port"))?);
                 }
             }
             "sc.sock" => {
@@ -647,9 +655,12 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(write.try_clone()?))
         .stderr(Stdio::from(write));
-    if !boot.ports.is_empty() {
-        let ports: Vec<String> = boot.ports.iter().map(u16::to_string).collect();
-        cmd.env("LD_PRELOAD", PRELOAD).env("SC_VSOCK_PORTS", ports.join(","));
+    if !boot.ports.is_empty() || !boot.egress.is_empty() {
+        let list = |p: &[u16]| p.iter().map(u16::to_string).collect::<Vec<_>>().join(",");
+        cmd.env("LD_PRELOAD", PRELOAD).env("SC_VSOCK_PORTS", list(&boot.ports));
+        if !boot.egress.is_empty() {
+            cmd.env("SC_EGRESS_PORTS", list(&boot.egress)).env("SC_EGRESS_HOST_PORT", crate::egress::EGRESS_PORT.to_string());
+        }
     }
     if !boot.ext {
         cmd.env("PHP_INI_SCAN_DIR", NOEXT_INI);
@@ -740,6 +751,8 @@ mod tests {
         let conf = pool_conf(1234, 1235);
         assert!(conf.starts_with("[global]\ninclude=/usr/local/etc/php-fpm.conf\n") && conf.ends_with("[www]\nuser = 1234\ngroup = 1235\n"), "{conf}");
         assert!(parse_cmdline("sc.root=/srv sc.ports=99999").is_err());
+        assert_eq!(parse_cmdline("sc.root=/srv sc.egress=443,8443").expect("parses").egress, [443, 8443]);
+        assert!(parse_cmdline("sc.root=/srv sc.egress=x").is_err());
     }
 
     #[test]

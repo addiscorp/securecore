@@ -31,6 +31,9 @@
 #      while it was stopped (timed); an upload made while the writer is stopped survives a
 #      SIGKILL of the launcher; the writer killed mid-file leaves the old file whole and the
 #      next one resends it; a stop drains the sync;
+#   3c. egress (#72): curl and PHP's https stream in the guest reach api.wordpress.org on 443 by
+#      name through the host (TLS end to end); an IP the guest picks is unreachable; a host layer 2
+#      doesn't list is refused in the guest, and by the host too when the guest has no extension;
 #   4. SIGTERM stops the VM and the launcher exits 0.
 # Exits non-zero on any failure (and at once without /dev/kvm: never a skip). Writes
 # .tmp/ext-microvm/. Leaves the stack up.
@@ -551,7 +554,7 @@ if start second "$dir/microvm.json"; then
   lacks "$dir/second.log" "made the snapshot" "the same key: no new snapshot"
   has "$dir/second.log" "microVM restored from snapshot" "restored from the snapshot"
   is "$(find "$state/jail" -name 'v.sock_7777' | grep -c .)" 0 "the stale v.sock_7777 link is gone: every start begins with an empty jail"
-  is "$(find "$(jail_root)" -maxdepth 1 -name 'v.sock_*' -printf '%f\n' | sort | tr '\n' ' ')" "v.sock_1514 v.sock_3306 v.sock_4444 " "the jail holds only the planned ports"
+  is "$(find "$(jail_root)" -maxdepth 1 -name 'v.sock_*' -printf '%f\n' | sort | tr '\n' ' ')" "v.sock_1514 v.sock_1517 v.sock_3306 v.sock_4444 " "the jail holds only the planned ports (log, egress, MySQL, the peer listener)"
   r=$(first_page)
   is "${r% *}" 200 "the front page after a restore: 200 (${r#* } ms; $(sed -n 's/.*restored from snapshot [0-9a-f]* (load and php-fpm ping \([0-9.]*\) ms).*/load and ping \1 ms/p' "$dir/second.log"))"
   probe "" second
@@ -717,6 +720,63 @@ if start sync "$dir/microvm.json"; then
   fi
 else
   fail "the folder sync: the start serves"
+fi
+
+echo "# egress (#72): named hosts on the egress ports, through the host"
+wporg=https://api.wordpress.org/core/version-check/1.7/
+if start egress "$dir/microvm.json"; then
+  has "$dir/egress.log" "the guest reaches named hosts on ports [53, 443] through the host: only layer 2's hosts (127.0.0.1, api.stripe.com, api.wordpress.org, downloads.wordpress.org)" \
+    "the launcher says which names the guest may reach"
+  probe "?curl=$wporg" curl
+  is "$(val curl curl_code)" 200 "curl in the guest reaches api.wordpress.org over 443 ($(val curl curl_error))"
+  is "$(val curl curl_body | grep -c '"offers"')" 1 "and gets WordPress's answer, through TLS end to end"
+  probe "?stream=$wporg" stream
+  is "$(val stream stream_ok)" 1 "PHP's https stream reaches it too ($(val stream stream_error))"
+  has "$dir/egress.log" "egress: api.wordpress.org:443 via" "the host connected it, by name"
+  # The host's end of an egress connection is the pool user's (uid-based firewalls apply).
+  probe "?tcp=api.wordpress.org:443&hold=4" hold > /dev/null 2>&1 &
+  hold_pid=$!
+  eventually 40 "ss -Htne state established '( dport = :443 )' | grep -q 'uid:1234 '" || true
+  owners=$(ss -Htne state established '( dport = :443 )' | grep -o 'uid:[0-9]*' | sort -u | tr '\n' ' ')
+  wait "$hold_pid"
+  is "$(val hold tcp)" CONNECTED "a plain socket in the guest reaches api.wordpress.org:443 by name"
+  is "$(echo "$owners" | grep -c 'uid:1234 ')" 1 "the host connects it as the pool user (1234; owners of :443 connections: ${owners:-none})"
+  has "$dir/egress.log" "egress connects only to public addresses that aren't this host's, as the pool user" "the launcher says so"
+  # With the extension on, layer 2 refuses an unlisted IP first (no errno): the route itself is
+  # checked below, with the extension off.
+  probe "?tcp=1.1.1.1:443" ip
+  is "$(val ip tcp | cut -c1-6)" FAILED "an IP the guest picks itself, unlisted, is refused in the guest (got '$(val ip tcp)')"
+  probe "?curl=https://example.com/" other
+  is "$(val other curl_code)" 0 "a host layer 2 doesn't list is refused in the guest ($(val other curl_error | cut -c1-120))"
+  stop
+else
+  fail "egress: the start serves"
+fi
+# Without the extension (nothing in the guest checks names), the host still does.
+if start egress-noext "$dir/microvm.json" --guest-arg sc.ext=0 --no-snapshot; then
+  # Nothing in the guest refuses it now: only the missing route does (ENETUNREACH, 101).
+  probe "?tcp=1.1.1.1:443" noext-ip
+  is "$(val noext-ip tcp | cut -d' ' -f1-2)" "FAILED 101" "an IP the guest picks itself is unreachable: no network device, no route (got '$(val noext-ip tcp)')"
+  probe "?curl=https://example.com/" noext
+  is "$(val noext curl_code)" 0 "with no extension in the guest, a host no config lists is still refused"
+  has "$dir/egress-noext.log" "egress refused: example.com:443: example.com is in none of layer 2's host lists" "by the host, which says why"
+  probe "?curl=$wporg" noext-ok
+  is "$(val noext-ok curl_code)" 200 "and a listed one still works"
+  stop
+else
+  fail "egress without the extension: the start serves"
+fi
+# Layer 2 in log mode: the host lets an unlisted name through, and logs it as layer 2 would.
+sed 's/"mode": "enforce"/"mode": "log"/' "$dir/microvm.json" > "$dir/microvm-log.json"
+if start egress-log "$dir/microvm-log.json" --guest-arg sc.ext=0 --no-snapshot; then
+  has "$dir/egress-log.log" "any name, layer 2 logging those not in its hosts" "with layer 2 in log mode the launcher says any name goes, logged"
+  probe "?tcp=example.com:443" logmode
+  is "$(val logmode tcp)" CONNECTED "an unlisted host is reached in log mode (layer 2's own decision)"
+  eventually 30 "grep -q 'egress: example.com:443 via .*(layer2 log: refused in enforce by the host rule)' \"$dir/egress-log.log\"" || true
+  has "$dir/egress-log.log" "(layer2 log: refused in enforce by the host rule)" "and the host logs it as layer 2 would have refused it"
+  stop
+else
+  fail "egress in log mode: the start serves"
 fi
 
 echo "# the launcher killed (SIGKILL): the VM goes with it"

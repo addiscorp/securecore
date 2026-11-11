@@ -17,6 +17,8 @@ use std::path::PathBuf;
 
 use securecore_config::{Isolation, Layer1, Loaded};
 
+#[cfg(target_os = "linux")]
+pub mod egress;
 pub mod fcgi;
 #[cfg(target_os = "linux")]
 pub mod guest;

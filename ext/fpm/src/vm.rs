@@ -7,7 +7,8 @@
 //!   in    --listen (TCP, or a unix socket with php-fpm's listen.owner/group/mode) → vsock 9000
 //!   out   guest port P → <jail>/v.sock_P: for a connect[].socket, a link to the socket in its
 //!         folder bind-mounted into the jail (Firecracker connects as the jailed user), or a
-//!         thread that connects to its TCP `address`. A port with neither is unreachable.
+//!         thread that connects to its TCP `address`. A port with neither is an egress port:
+//!         the guest reaches named hosts on it through `<jail>/v.sock_1517` ([`crate::egress`]).
 //!   log   guest port 1514 → this process's stderr, each line marked `guest: ` (read only)
 //!   ctl   guest port 1515 ← one start message after each boot or restore (clock, fresh
 //!         randomness, the workers' refresh after a restore, then the disks); later `sync`
@@ -192,8 +193,9 @@ pub struct Plan {
     pub sockets: Vec<(u16, PathBuf)>,
     /// Guest port → host TCP address (through this process).
     pub addresses: Vec<(u16, String)>,
-    /// `connect` ports the guest can't reach: no socket or address (egress is #72).
-    pub unreachable: Vec<u16>,
+    /// `connect` ports with no socket or address: the guest reaches named hosts on them through
+    /// the host ([`crate::egress`]), never an IP of its own choosing.
+    pub egress: Vec<u16>,
     pub listen: Listen,
     pub state: PathBuf,
     /// The jail's id: `sc-` and 16 hex digits of the app root's sha256.
@@ -295,12 +297,18 @@ pub fn plan(loaded: &Loaded, opts: &Options) -> Result<Plan, String> {
             }
         }
     }
-    let (mut sockets, mut addresses, mut unreachable) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut sockets, mut addresses, mut egress) = (Vec::new(), Vec::new(), Vec::new());
     for c in &layer1.network.connect {
         let port = c.port.get();
         if u32::from(port) == LOG_PORT {
             return Err(format!(
                 "layer1.network.connect port {LOG_PORT} is the guest's log channel to the host; a microVM can't forward it"
+            ));
+        }
+        if u32::from(port) == crate::egress::EGRESS_PORT && (c.socket.is_some() || c.address.is_some()) {
+            return Err(format!(
+                "layer1.network.connect port {} is the guest's channel for named hosts; a microVM can't forward it to a socket or address",
+                crate::egress::EGRESS_PORT
             ));
         }
         match (&c.socket, &c.address) {
@@ -311,7 +319,7 @@ pub fn plan(loaded: &Loaded, opts: &Options) -> Result<Plan, String> {
                 sockets.push((port, fs::canonicalize(&p).unwrap_or(p)));
             }
             (None, Some(a)) => addresses.push((port, a.clone())),
-            (None, None) => unreachable.push(port),
+            (None, None) => egress.push(port),
         }
     }
     let listen = match &opts.listen {
@@ -327,7 +335,7 @@ pub fn plan(loaded: &Loaded, opts: &Options) -> Result<Plan, String> {
     let state = opts.state.clone().unwrap_or_else(|| Path::new(DEFAULT_STATE_DIR).join(&key[..16]));
     let id = format!("sc-{}", &key[..16]);
     let pool = pool_user(opts, &root)?;
-    Ok(Plan { root, guest_root, disks, tmpfs, sockets, addresses, unreachable, listen, state, id, pool })
+    Ok(Plan { root, guest_root, disks, tmpfs, sockets, addresses, egress, listen, state, id, pool })
 }
 
 /// The site's pool user: `--pool-user` (a name or `<uid>:<gid>`), or the app root's owner. Never
@@ -984,6 +992,9 @@ fn boot_args(plan: &Plan, opts: &Options) -> String {
     if !ports.is_empty() {
         let _ = write!(a, " sc.ports={}", ports.join(","));
     }
+    if !plan.egress.is_empty() {
+        let _ = write!(a, " sc.egress={}", plan.egress.iter().map(u16::to_string).collect::<Vec<_>>().join(","));
+    }
     for (port, socket) in &plan.sockets {
         let s = socket.display().to_string();
         if s.starts_with("/run/") && !s.chars().any(char::is_whitespace) {
@@ -1058,6 +1069,8 @@ struct Machine {
     user: User,
     /// The `connect[].socket` folders, checked and held ([`open_sockets`]).
     sockets: Vec<(u16, jail::SocketDir)>,
+    /// What the guest may reach by name.
+    egress: crate::egress::Egress,
 }
 
 /// What a jail holds for one spawn: the host ends of the guest's ports come with it.
@@ -1457,6 +1470,31 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
                 }
             });
         }
+        // Named hosts on the egress ports (#72): each connection's request line is checked here.
+        if !m.egress.ports.is_empty() {
+            let l = bind_unix(&short.join(format!("v.sock_{}", crate::egress::EGRESS_PORT)), owned)?;
+            let egress: &'static crate::egress::Egress = Box::leak(Box::new(m.egress.clone()));
+            let slots: &'static Slots = Box::leak(Box::new(Slots::new(FORWARD_SLOTS)));
+            let pool = plan.pool;
+            thread::spawn(move || {
+                for c in l.incoming().flatten() {
+                    let Some(slot) = slots.take() else {
+                        log(&format!("egress: {FORWARD_SLOTS} connections already open; refusing another"));
+                        continue;
+                    };
+                    thread::spawn(move || {
+                        let _slot = slot;
+                        // The host's addresses now (an interface may have come up since the start).
+                        let own = crate::egress::host_addresses();
+                        let connect = |conn: UnixStream, addrs: &[std::net::SocketAddr]| egress_as_pool(conn, addrs, pool);
+                        match crate::egress::serve(c, egress, &own, &connect) {
+                            Ok(what) => log(&format!("egress: {what} closed")),
+                            Err(why) => log(&format!("egress refused: {why}")),
+                        }
+                    });
+                }
+            });
+        }
     }
     // php-fpm's log, to this process's stderr: read only, and every line marked as the guest's,
     // so nothing the guest writes can pass for the launcher's own lines.
@@ -1590,9 +1628,47 @@ static LOG_SLOTS: Slots = Slots::new(4);
 /// Connections through one `address` forward at once.
 const FORWARD_SLOTS: usize = 64;
 
+/// `<exe> --egress-connect <addr>…` ([`crate::egress::helper_main`]) for one guest connection:
+/// the connection on its stdin, its verdict on its stdout; as `user` (the site's pool user, so
+/// uid-based firewall rules on the host apply) with no supplementary groups, an empty
+/// environment and no new privileges, killed if the launcher dies.
+pub fn spawn_egress_helper(exe: &Path, conn: UnixStream, addrs: &[std::net::SocketAddr], user: User) -> Result<Child, String> {
+    let mut cmd = Command::new(exe);
+    cmd.env_clear().arg0("securecore-fpm").arg("--egress-connect").args(addrs.iter().map(|a| a.to_string()));
+    cmd.stdin(Stdio::from(std::os::fd::OwnedFd::from(conn))).stdout(Stdio::piped());
+    // SAFETY: only syscalls between fork and exec, on values made before the fork.
+    unsafe {
+        cmd.pre_exec(move || {
+            let err = || Err(io::Error::last_os_error());
+            if libc::setgroups(0, std::ptr::null()) < 0 || libc::setgid(user.gid) < 0 || libc::setuid(user.uid) < 0 {
+                return err();
+            }
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                return err();
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().map_err(|e| format!("the egress helper: {e}"))
+}
+
+/// The egress connector in production: the helper as the pool user, waited on; the address it
+/// used, or why none.
+fn egress_as_pool(conn: UnixStream, addrs: &[std::net::SocketAddr], pool: User) -> Result<String, String> {
+    let child = spawn_egress_helper(Path::new("/proc/self/exe"), conn, addrs, pool)?;
+    let out = child.wait_with_output().map_err(|e| format!("the egress helper: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().next().unwrap_or("").to_owned();
+    match line.split_once(' ') {
+        Some(("via", a)) => Ok(a.to_owned()),
+        Some(("error", why)) => Err(why.to_owned()),
+        _ => Err(format!("the egress helper ended ({}) without a verdict", out.status)),
+    }
+}
+
 /// Copies both ways (each direction half-closing its destination at its end) and returns when
 /// both are done: one thread for a → b, this one for b → a.
-fn pipe_both<A: vsock::Half, B: vsock::Half>(a: A, b: B) {
+pub(crate) fn pipe_both<A: vsock::Half, B: vsock::Half>(a: A, b: B) {
     let (Ok(mut a2), Ok(mut b2)) = (a.dup(), b.dup()) else { return };
     let t = thread::spawn(move || {
         let mut a = a;
@@ -1962,12 +2038,19 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     let mounts: Vec<PathBuf> = plan.sockets.iter().map(|(p, _)| jail.root.join(format!("sock-{p}"))).collect();
     let _watchdog = jail.watchdog(&mounts)?;
     claim_state(&plan)?;
-    if !plan.unreachable.is_empty() {
+    let egress = crate::egress::Egress::new(loaded, plan.egress.clone());
+    if !plan.egress.is_empty() {
         log(&format!(
-            "layer1.network.connect ports {:?} have no socket or address, so the microVM can't reach them \
-             (outbound connections from the guest are addiscorp/securecore#72)",
-            plan.unreachable
+            "the guest reaches named hosts on ports {:?} through the host: {}",
+            egress.ports,
+            match &egress.layer2 {
+                Some((securecore_config::Mode::Log, h)) => format!("any name, layer 2 logging those not in its hosts ({})", h.join(", ")),
+                Some((_, h)) if h.is_empty() => "none (layer 2 lists no hosts)".to_owned(),
+                Some((_, h)) => format!("only layer 2's hosts ({})", h.join(", ")),
+                None => "any name (layer 2's host allowlist is off)".to_owned(),
+            }
         ));
+        log("egress connects only to public addresses that aren't this host's, as the pool user");
     }
     let files = verify(&opts.assets, &plan.state)?;
     // The site's key: the tree without the writable folders, the state folder and the config
@@ -2002,7 +2085,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
             sizes.join(",")
         ),
     };
-    let m = Machine { site: site_path, disks, args, key: key.sha256(), user, sockets };
+    let m = Machine { site: site_path, disks, args, key: key.sha256(), user, sockets, egress };
     let (mut vm, mut how) = start(&plan, opts, &m)?;
     let t_ready = ms(t0);
     let restored = matches!(how, Started::Restored { .. });
@@ -2167,7 +2250,14 @@ mod tests {
         assert_eq!(p.tmpfs, ["/var/cache/sc"], "outside the root: tmpfs; /tmp is always one");
         assert_eq!(p.sockets, [(3306, PathBuf::from("/run/mysqld/mysqld.sock"))]);
         assert_eq!(p.addresses, [(6379, "10.0.0.5:6379".to_owned())]);
-        assert_eq!(p.unreachable, [443], "no socket or address: the guest can't reach it");
+        assert_eq!(p.egress, [443], "no socket or address: named hosts through the host");
+        assert!(boot_args(&p, &opts()).contains(" sc.egress=443"), "the guest learns its egress ports");
+        let e = plan(
+            &loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"connect":[{"port":1517,"address":"10.0.0.1:1"}]}}"#),
+            &opts(),
+        )
+        .expect_err("1517 forwarded");
+        assert!(e.contains("channel for named hosts"), "{e}");
         assert_eq!(p.listen, Listen::Tcp("127.0.0.1:9000".into()), "the first bind port, on loopback");
         assert!(p.state.starts_with(DEFAULT_STATE_DIR));
         assert!(p.id.starts_with("sc-") && p.id.len() == 19, "{}", p.id);
