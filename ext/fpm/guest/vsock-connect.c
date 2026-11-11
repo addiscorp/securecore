@@ -61,9 +61,17 @@ static void load_ports(void) {
     if (!egress_host_port) negress = 0;
 }
 
-/* Read once, in php-fpm's master at load time: its workers are forks with clear_env, so the
- * variable is gone by the time a worker connects. */
-__attribute__((constructor)) static void init(void) { load_ports(); }
+/* Read once, in php-fpm's master at load time, then taken out of the environment: the workers are
+ * forks of the master (the library and what it read stay mapped), and the image's pool has
+ * clear_env = no, so without this every program a PHP script starts would inherit the preload
+ * and the list of ports it forwards (#86 review). */
+__attribute__((constructor)) static void init(void) {
+    load_ports();
+    unsetenv("LD_PRELOAD");
+    unsetenv("SC_VSOCK_PORTS");
+    unsetenv("SC_EGRESS_PORTS");
+    unsetenv("SC_EGRESS_HOST_PORT");
+}
 
 static int listed(unsigned short p) {
     if (nports < 0) load_ports();

@@ -520,6 +520,10 @@ if [ "$started" = 1 ]; then
   is "$(val first guest_init)" 1 "PID 1 is securecore-init"
   is "$(val first euid)" 1234 "the guest's php-fpm workers run as the host's pool user (1234), not the image's www-data"
   is "$(val first netdev)" lo "the guest has loopback only, no network device"
+  # #86 review: a program PHP starts gets neither the vsock preload nor its ports, and /tmp runs
+  # nothing (the same script runs through /bin/sh, so it is /tmp's noexec that stops it).
+  is "$(val first child_env)/$(val first child_sees)" "/." "neither PHP nor a program it starts sees LD_PRELOAD or SC_VSOCK_PORTS"
+  is "$(val first tmp_exec)/$(val first sh_exec)" "BLOCKED/ran" "/tmp is noexec in the guest"
   is "$(val first write_uploads)" OK "uploads are writable (their own disk)"
   is "$(val first write_root)/$(val first write_plugins)" BLOCKED/BLOCKED "the site itself is read-only"
   is "$(val first write_tmp)" OK "/tmp is writable (tmpfs)"

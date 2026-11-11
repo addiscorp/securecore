@@ -21,6 +21,15 @@ if (isset($_GET['log'])) {
     }
 }
 echo 'kernel=', php_uname('r'), "\n";
+// What a program this script starts would inherit (#86 review): neither the preload nor its ports.
+echo 'child_env=', (string) getenv('LD_PRELOAD'), (string) getenv('SC_VSOCK_PORTS'), "\n";
+// Whether /tmp runs programs (#86 review: it is noexec).
+@file_put_contents('/tmp/sc-mvm-exec.sh', "#!/bin/sh\necho ran\n");
+@chmod('/tmp/sc-mvm-exec.sh', 0755);
+echo 'tmp_exec=', trim((string) @shell_exec('/tmp/sc-mvm-exec.sh 2>/dev/null')) === 'ran' ? 'RAN' : 'BLOCKED', "\n";
+// The same through /bin/sh, so a BLOCKED above means /tmp, not "no shell_exec".
+echo 'sh_exec=', trim((string) @shell_exec('/bin/sh /tmp/sc-mvm-exec.sh 2>/dev/null')), "\n";
+echo 'child_sees=', trim((string) @shell_exec('printf "%s%s" "$LD_PRELOAD" "$SC_VSOCK_PORTS"; echo .')), "\n";
 // The worker's effective uid, from the kernel (no posix extension needed).
 echo 'euid=', preg_match('/^Uid:\s+\d+\s+(\d+)/m', (string) @file_get_contents('/proc/self/status'), $u) ? $u[1] : '?', "\n";
 echo 'time=', time(), "\n";
