@@ -827,9 +827,12 @@ and the launcher exits 125.
   the jailer and the guest image. Each release ships its guest image (#80) at
   `<version>/vm/linux-x86_64/rootfs.ext4.gz`, with its sha256 gzipped and unpacked in
   `release.json` and `vm/manifest.json`: `docker/ext.Dockerfile`'s `guest` target (its base pinned
-  by digest, compilers, sources and docs removed) exported by `scripts/guest-image.sh` to a
-  reproducible ext4 (`scripts/guest-build.sh` builds it twice and compares). The installer checks
-  both sha256s before it places anything;
+  by digest, apt from snapshot.debian.org; compilers, sources, docs and every setuid/setgid bit
+  removed) made into an ext4 inside the pinned `guest-tools` image by `scripts/guest-image.sh`
+  (`scripts/guest-build.sh`; `--check` builds it twice and compares, a CI report that never
+  gates). The installer checks both sha256s before it places anything, unpacking in
+  `<vm-dir>/.securecore-staging` after checking there is room. In the guest, the root is mounted
+  nosuid and php-fpm runs under no_new_privs;
 - the config is one the microVM can enforce (below), and every `connect[].socket` is a socket the
   jailed user may open itself (checked by running a probe as that user);
 - with layer 3 on, the kernel has Landlock and seccomp filters (its symbols are checked; mirab's
