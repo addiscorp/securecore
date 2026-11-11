@@ -286,9 +286,11 @@ fn main() -> ExitCode {
         }
         Err(problem) => return failed(&format!("{problem} ({USAGE})")),
     };
-    let loaded = match securecore_config::load(&args.config) {
+    // Never through a link, as the folder's owner, capped, and no error quotes the file
+    // (#90 review): the same reading the microVM's config watcher does.
+    let loaded = match securecore_fpm::sitefile::load(&args.config) {
         Ok(loaded) => loaded,
-        Err(err) => return failed(&err.to_string()),
+        Err(err) => return failed(&err),
     };
     let path = loaded.path.display();
     let layer1 = &loaded.config.layer1;
