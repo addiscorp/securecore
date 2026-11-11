@@ -803,8 +803,21 @@ site's settings (`WORDPRESS_DB_HOST`, …). Until #72 the test image baked them 
   fresh php-fpm master with them (graceful stop, start, then waits until it listens). A restore
   gets them again from its own start message. A `reload` (SIGUSR2/SIGHUP) starts php-fpm with
   them too.
-- **Firecracker and the sync writer get an empty environment**, so the secrets are in neither
-  process's `/proc/<pid>/environ`.
+- **A handshake comes first, and nothing echoes.** The host's first control connection carries
+  `proto <N>` alone (no secret). The guest's init answers `ok` only when it speaks protocol N
+  and was booted with `sc.proto=N`; it takes no start message otherwise. An older init (one
+  that doesn't know `proto`, and would echo an unknown line back) fails the handshake, so it
+  never sees an `env` line. Whatever a guest answers to a message that carried `env` lines is
+  never put into the launcher's error or log; the guest logs its own reason, which never holds
+  a value.
+- **Nothing the launcher runs gets its environment**, where the secrets come from: the jailer
+  (so Firecracker), the sync writer, the egress helper, and `mke2fs`, `e2fsck` and `resize2fs`
+  (PATH only). Only the host's own php-fpm (layer 1 `gelada` or `off`) gets it, as before.
+- **Guest memory can be swapped.** The secrets live in the guest's RAM (init's memory and
+  php-fpm's), which is Firecracker's memory on the host: under memory pressure the host may
+  write those pages to its swap, like any process's. Run microVM hosts with **no swap, or
+  encrypted swap** (dm-crypt with a random key per boot, `zram`), as for the host's own
+  php-fpm, which holds the same values. The snapshot files never hold them (above).
 - `test/ext-microvm.sh` checks that the DB password appears in none of these: `rootfs.ext4`,
   the snapshot's `vm.mem` (as text or hex) and `vm.snap`, `console.log`, the launcher's log. It
   also checks that a restored guest still reaches the database.

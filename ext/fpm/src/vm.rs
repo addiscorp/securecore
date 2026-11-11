@@ -63,8 +63,10 @@ pub const DEFAULT_STATE_DIR: &str = "/var/lib/securecore/vm";
 /// The user Firecracker runs as unless `--vm-user` says otherwise (the installer creates it).
 pub const DEFAULT_VM_USER: &str = "securecore-vm";
 /// Bumped whenever what goes into a guest changes shape (boot arguments, disks, the start
-/// message), so old snapshots are never restored into a new driver.
-const PROTOCOL: u32 = 3;
+/// message, the sync), so old snapshots are never restored into a new driver. The guest's init
+/// is the same binary: it boots with `sc.proto=<this>`, answers the handshake only when it is
+/// its own, and takes no start message otherwise ([`handshake`]).
+pub const PROTOCOL: u32 = 4;
 /// KVM_GET_API_VERSION, and the only value every KVM since Linux 2.6.22 returns.
 const KVM_GET_API_VERSION: libc::c_ulong = 0xAE00;
 const KVM_API_VERSION: i32 = 12;
@@ -675,6 +677,12 @@ fn rel_cstr(rel: &Path) -> Result<std::ffi::CString, String> {
 /// search right on the folders above the source. A symlink put anywhere on the way after the
 /// plan's checks fails the open (ELOOP), so the command never runs.
 fn as_user(cmd: &mut Command, who: User, source: Option<Source<'_>>, masks: &[PathBuf], output: Option<&fs::File>) -> Result<(), String> {
+    // Nothing of the launcher's environment (it holds the guest's secrets, #72) but PATH, which
+    // finds the tool.
+    cmd.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
     let source = source.map(|s| Ok::<_, String>((cpath(s.root)?, rel_cstr(s.rel)?))).transpose()?;
     let output = output.map(|f| f.as_raw_fd());
     let masks: Vec<std::ffi::CString> = masks.iter().map(|m| rel_cstr(m)).collect::<Result<_, _>>()?;
@@ -1025,7 +1033,7 @@ fn boot_args(plan: &Plan, opts: &Options, env_names: &[&str]) -> String {
     // Firecracker adds root=/dev/vda ro for a read-only root drive.
     let mut a = format!(
         "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/securecore-init i8042.noaux i8042.nokbd i8042.nopnp \
-         i8042.dumbkbd quiet loglevel=1 sc.root={} sc.user={}:{}",
+         i8042.dumbkbd quiet loglevel=1 sc.proto={PROTOCOL} sc.root={} sc.user={}:{}",
         plan.guest_root, plan.pool.uid, plan.pool.gid
     );
     let ports: Vec<String> = plan.sockets.iter().map(|(p, _)| p).chain(plan.addresses.iter().map(|(p, _)| p)).map(u16::to_string).collect();
@@ -1359,10 +1367,29 @@ fn tell_guest(uds: &Path, lines: &[Ctl], timeout: Duration) -> Result<(), String
     s.write_all(message.as_bytes()).map_err(|e| format!("the guest's control port: {e}"))?;
     s.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
     let reply = read_reply(s)?;
-    match reply.trim_end() {
-        "ok" => Ok(()),
-        other => Err(format!("the guest refused {:?}: {other}", lines.iter().map(|c| c.line().trim_end().split(' ').next().unwrap_or("").to_owned()).collect::<Vec<_>>())),
+    refused(lines, reply.trim_end())
+}
+
+/// The guest's reply to `lines` as a result. Its text is shown only when `lines` carried no
+/// `env` line: an older init echoes a line it doesn't know, and that line could be a secret
+/// (a current init never echoes one, and logs its reason on the log port).
+fn refused(lines: &[Ctl], reply: &str) -> Result<(), String> {
+    if reply == "ok" {
+        return Ok(());
     }
+    let kinds: Vec<String> = lines.iter().map(|c| c.line().trim_end().split(' ').next().unwrap_or("").to_owned()).collect();
+    if lines.iter().any(|c| matches!(c, Ctl::Env { .. })) {
+        return Err(format!("the guest refused {kinds:?} (its reply isn't shown: the message carried secrets; the guest's own log line says why)"));
+    }
+    Err(format!("the guest refused {kinds:?}: {reply}"))
+}
+
+/// The protocol handshake, alone on its connection before any start message: `proto <N>`. The
+/// guest's init answers `ok` only when it speaks this launcher's protocol and was booted for it;
+/// an older init doesn't know the line. Either way nothing secret has been sent yet.
+fn handshake(uds: &Path) -> Result<(), String> {
+    tell_guest(uds, &[Ctl::Proto { version: PROTOCOL }, Ctl::Done], START_TIMEOUT)
+        .map_err(|e| format!("the guest's init doesn't speak this launcher's protocol {PROTOCOL} (an older or newer root image?), so it gets no start message: {e}"))
 }
 
 /// The longest reply the guest's control port may give (`ok`, or `error <why>`), newline
@@ -1417,46 +1444,120 @@ fn snap_dir(plan: &Plan, m: &Machine) -> PathBuf {
     plan.state.join(format!("snap-{}", &m.key[..16]))
 }
 
-fn start(plan: &Plan, opts: &Options, m: &Machine) -> Result<(Vm, Started), String> {
-    let snap = snap_dir(plan, m);
-    let ready = Duration::from_secs(60);
-    if opts.snapshot {
-        if !snap.join("vm.mem").is_file() {
-            let t = Instant::now();
-            let mut vm = cold_boot(plan, opts, m, Wiring::LogOnly)?;
-            vm.wait_ready(&plan.state, ready)?;
-            match warm_up(&vm, &plan.guest_root) {
-                Ok(n) => log(&format!("warmed the guest's page cache for the snapshot ({n})")),
-                Err(e) => log(&format!("the warm-up failed ({e}); the snapshot has a cold page cache")),
+/// What bringing a VM up does, as steps, so their order is tested without a VM ([`bring_up`];
+/// [`Real`] boots Firecracker). The rule they keep: **a snapshot is only ever made from a VM that
+/// never took a start message**, so it holds no secret (`env` lines come only in a start message).
+trait Lifecycle {
+    type Vm;
+    fn has_snapshot(&self) -> bool;
+    /// A cold boot, ready. `for_snapshot`: the warm-up VM (log port only, no forwards).
+    fn cold(&mut self, for_snapshot: bool) -> Result<Self::Vm, String>;
+    /// The warm-up and the snapshot of `vm`, which no start message has reached.
+    fn snapshot(&mut self, vm: &Self::Vm) -> Result<(), String>;
+    fn restore(&mut self) -> Result<Self::Vm, String>;
+    fn remove_snapshot(&mut self);
+    /// The protocol handshake, then the start message (the clock, entropy, `env`, the disks).
+    fn tell(&mut self, vm: &Self::Vm, restored: bool) -> Result<(), String>;
+}
+
+/// The VM, started: restored from the snapshot (made first, from a VM of its own, when there is
+/// none) or cold-booted, then told its start message. A restore that fails, or whose start
+/// message fails, falls back to a cold boot. Also the moment it was ready, before its start
+/// message.
+fn bring_up<L: Lifecycle>(l: &mut L, snapshots: bool) -> Result<(L::Vm, Started, Instant), String> {
+    let mut restored = None;
+    if snapshots {
+        if !l.has_snapshot() {
+            let vm = l.cold(true)?;
+            if let Err(e) = l.snapshot(&vm) {
+                log(&format!("could not make a snapshot ({e}); cold-booting instead"));
             }
-            match snapshot(&vm, plan, m.user, &snap) {
-                Ok(()) => {
-                    log(&format!("made the snapshot {} (key {}) in {:.0} ms", snap.display(), &m.key[..16], ms(t)));
-                    for e in fs::read_dir(&plan.state).map_err(|e| e.to_string())?.flatten() {
-                        let name = e.file_name().to_string_lossy().into_owned();
-                        if name.starts_with("snap-") && e.path() != snap {
-                            let _ = fs::remove_dir_all(e.path());
-                        }
-                    }
-                }
-                Err(e) => log(&format!("could not make a snapshot ({e}); cold-booting instead")),
-            }
+            // Never told anything: dropped as it is.
             drop(vm);
         }
-        if snap.join("vm.mem").is_file() {
+        if l.has_snapshot() {
             let t = Instant::now();
-            match restore(plan, opts, m, &snap).and_then(|mut vm| vm.wait_ready(&plan.state, Duration::from_secs(10)).map(|()| vm)) {
-                Ok(vm) => return Ok((vm, Started::Restored { load_ms: ms(t) })),
+            match l.restore() {
+                Ok(vm) => restored = Some((vm, ms(t))),
                 Err(e) => {
-                    log(&format!("restoring {} failed ({e}); removing it and cold-booting instead", snap.display()));
-                    let _ = fs::remove_dir_all(&snap);
+                    log(&format!("restoring the snapshot failed ({e}); removing it and cold-booting instead"));
+                    l.remove_snapshot();
                 }
             }
         }
     }
-    let mut vm = cold_boot(plan, opts, m, Wiring::Full)?;
-    vm.wait_ready(&plan.state, ready)?;
-    Ok((vm, Started::Cold))
+    if let Some((vm, load_ms)) = restored {
+        let ready = Instant::now();
+        match l.tell(&vm, true) {
+            Ok(()) => return Ok((vm, Started::Restored { load_ms }, ready)),
+            Err(e) => {
+                // A snapshot that restores but can't start is as bad as one that doesn't restore.
+                log(&format!("the restored guest failed its start message ({e}); removing the snapshot and cold-booting instead"));
+                drop(vm);
+                l.remove_snapshot();
+            }
+        }
+    }
+    let vm = l.cold(false)?;
+    let ready = Instant::now();
+    l.tell(&vm, false)?;
+    Ok((vm, Started::Cold, ready))
+}
+
+/// [`Lifecycle`] with Firecracker.
+struct Real<'a> {
+    plan: &'a Plan,
+    opts: &'a Options,
+    m: &'a Machine,
+    env: &'a [(String, String)],
+}
+
+impl Lifecycle for Real<'_> {
+    type Vm = Vm;
+
+    fn has_snapshot(&self) -> bool {
+        snap_dir(self.plan, self.m).join("vm.mem").is_file()
+    }
+
+    fn cold(&mut self, for_snapshot: bool) -> Result<Vm, String> {
+        let mut vm = cold_boot(self.plan, self.opts, self.m, if for_snapshot { Wiring::LogOnly } else { Wiring::Full })?;
+        vm.wait_ready(&self.plan.state, Duration::from_secs(60))?;
+        Ok(vm)
+    }
+
+    fn snapshot(&mut self, vm: &Vm) -> Result<(), String> {
+        let (plan, m) = (self.plan, self.m);
+        let snap = snap_dir(plan, m);
+        let t = Instant::now();
+        match warm_up(vm, &plan.guest_root) {
+            Ok(n) => log(&format!("warmed the guest's page cache for the snapshot ({n})")),
+            Err(e) => log(&format!("the warm-up failed ({e}); the snapshot has a cold page cache")),
+        }
+        snapshot(vm, plan, m.user, &snap)?;
+        log(&format!("made the snapshot {} (key {}) in {:.0} ms", snap.display(), &m.key[..16], ms(t)));
+        for e in fs::read_dir(&plan.state).map_err(|e| e.to_string())?.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("snap-") && e.path() != snap {
+                let _ = fs::remove_dir_all(e.path());
+            }
+        }
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<Vm, String> {
+        let mut vm = restore(self.plan, self.opts, self.m, &snap_dir(self.plan, self.m))?;
+        vm.wait_ready(&self.plan.state, Duration::from_secs(10))?;
+        Ok(vm)
+    }
+
+    fn remove_snapshot(&mut self) {
+        let _ = fs::remove_dir_all(snap_dir(self.plan, self.m));
+    }
+
+    fn tell(&mut self, vm: &Vm, restored: bool) -> Result<(), String> {
+        handshake(&vm.vsock)?;
+        tell_guest(&vm.vsock, &start_message(self.plan, restored, random64()?, self.env), START_TIMEOUT)
+    }
 }
 
 /// Binds a unix socket at `path` with `mode` from the start (umask), never following a link at
@@ -2135,23 +2236,8 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         ),
     };
     let m = Machine { site: site_path, disks, args, key: key.sha256(), user, sockets, egress };
-    let (mut vm, mut how) = start(&plan, opts, &m)?;
-    let t_ready = ms(t0);
-    let restored = matches!(how, Started::Restored { .. });
-    if let Err(e) = tell_guest(&vm.vsock, &start_message(&plan, restored, random64()?, &env), START_TIMEOUT) {
-        if !restored {
-            return Err(e);
-        }
-        // A snapshot that restores but can't start is as bad as one that doesn't restore.
-        log(&format!("the restored guest failed its start message ({e}); removing the snapshot and cold-booting instead"));
-        drop(vm);
-        let _ = fs::remove_dir_all(snap_dir(&plan, &m));
-        let mut cold = cold_boot(&plan, opts, &m, Wiring::Full)?;
-        cold.wait_ready(&plan.state, Duration::from_secs(60))?;
-        tell_guest(&cold.vsock, &start_message(&plan, false, random64()?, &env), START_TIMEOUT)?;
-        vm = cold;
-        how = Started::Cold;
-    }
+    let (mut vm, how, ready) = bring_up(&mut Real { plan: &plan, opts, m: &m, env: &env }, opts.snapshot)?;
+    let t_ready = ready.duration_since(t0).as_secs_f64() * 1000.0;
     let t_started = ms(t0);
     match how {
         Started::Restored { load_ms } => log(&format!(
@@ -2340,6 +2426,7 @@ mod tests {
         let args = boot_args(&p, &opts(), &["WORDPRESS_DB_PASSWORD"]);
         assert!(args.contains(" sc.env=WORDPRESS_DB_PASSWORD"), "the names, for php-fpm's placeholders at boot: {args}");
         assert!(args.contains(" sc.root=/var/www/html") && args.contains(" sc.ports=3306,6379"), "{args}");
+        assert!(args.contains(&format!(" sc.proto={PROTOCOL} ")), "the guest learns the protocol it was booted for: {args}");
         assert!(args.contains(" sc.user=33:33"), "the guest's pool runs as the host's pool user: {args}");
         assert!(args.contains(" sc.sock=3306:/run/mysqld/mysqld.sock"), "{args}");
         assert!(!args.contains("sc.time"), "the clock is in no key: {args}");
@@ -2573,6 +2660,14 @@ mod tests {
         let _ = fs::remove_file(&img);
         let e = mke2fs(nobody, site, std::slice::from_ref(&uploads), &img, 64, 1024, false).expect_err("a root-only file");
         assert!(e.contains("as uid 65534"), "{e}");
+        // mke2fs, e2fsck and resize2fs get none of the launcher's environment (its secrets) but
+        // PATH: what `env` prints run the same way.
+        let mut cmd = Command::new("env");
+        as_user(&mut cmd, nobody, None, &[], None).expect("prepared");
+        let out = cmd.output().expect("env");
+        let names: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.split_once('=')).map(|(n, _)| n.to_owned()).collect();
+        assert_eq!(names, ["PATH"], "the tools' environment");
+        assert!(std::env::vars().count() > 1, "the test's own environment has more than PATH (so the check means something)");
         let _ = fs::remove_file(&img);
         fs::remove_file(dir.join("root-only.txt")).expect("rm");
         // A link put above the mask after every check by path: the mask is opened beneath the
@@ -2639,6 +2734,109 @@ mod tests {
         drop(a);
         assert!(S.take().is_some(), "a freed slot is taken again");
         drop(b);
+    }
+
+    /// A [`Lifecycle`] with numbered VMs instead of Firecracker: it records each step, and its
+    /// snapshot refuses a VM that a start message (the only carrier of `env`) has reached.
+    #[derive(Default)]
+    struct Fake {
+        next: u32,
+        snapshot: bool,
+        restore_fails: bool,
+        restored_tell_fails: bool,
+        told: Vec<(u32, bool)>,
+        snapshotted: Vec<u32>,
+        steps: Vec<String>,
+    }
+
+    impl Lifecycle for Fake {
+        type Vm = u32;
+        fn has_snapshot(&self) -> bool {
+            self.snapshot
+        }
+        fn cold(&mut self, for_snapshot: bool) -> Result<u32, String> {
+            self.next += 1;
+            self.steps.push(format!("cold {} {}", self.next, if for_snapshot { "for-snapshot" } else { "full" }));
+            Ok(self.next)
+        }
+        fn snapshot(&mut self, vm: &u32) -> Result<(), String> {
+            assert!(!self.told.iter().any(|(v, _)| v == vm), "VM {vm} took a start message (env) before its snapshot");
+            self.steps.push(format!("snapshot {vm}"));
+            self.snapshotted.push(*vm);
+            self.snapshot = true;
+            Ok(())
+        }
+        fn restore(&mut self) -> Result<u32, String> {
+            self.next += 1;
+            self.steps.push(format!("restore {}", self.next));
+            if self.restore_fails { Err("broken".into()) } else { Ok(self.next) }
+        }
+        fn remove_snapshot(&mut self) {
+            self.steps.push("remove-snapshot".into());
+            self.snapshot = false;
+        }
+        fn tell(&mut self, vm: &u32, restored: bool) -> Result<(), String> {
+            self.steps.push(format!("tell {vm}"));
+            self.told.push((*vm, restored));
+            if restored && self.restored_tell_fails { Err("refused".into()) } else { Ok(()) }
+        }
+    }
+
+    /// The snapshot is made from a VM that never took a start message, on every path: the first
+    /// start, a restore, a broken snapshot, a restore whose start message fails, no snapshots.
+    /// It would fail if the start message (with `env`) were ever sent before a snapshot.
+    #[test]
+    fn a_snapshot_is_only_made_from_a_vm_that_never_got_env() {
+        let check = |f: &Fake| {
+            for s in &f.snapshotted {
+                assert!(!f.told.iter().any(|(v, _)| v == s), "snapshotted VM {s} was told: {:?}", f.steps);
+            }
+        };
+        let mut f = Fake::default();
+        let (vm, how, _) = bring_up(&mut f, true).expect("first start");
+        assert_eq!(f.steps, ["cold 1 for-snapshot", "snapshot 1", "restore 2", "tell 2"]);
+        assert!(matches!(how, Started::Restored { .. }) && vm == 2 && f.told == [(2, true)]);
+        check(&f);
+        let mut f = Fake { snapshot: true, ..Fake::default() };
+        bring_up(&mut f, true).expect("a restore");
+        assert_eq!(f.steps, ["restore 1", "tell 1"], "a snapshot there: no new one");
+        let mut f = Fake { restore_fails: true, ..Fake::default() };
+        let (vm, how, _) = bring_up(&mut f, true).expect("a broken snapshot");
+        assert_eq!(f.steps, ["cold 1 for-snapshot", "snapshot 1", "restore 2", "remove-snapshot", "cold 3 full", "tell 3"]);
+        assert!(matches!(how, Started::Cold) && vm == 3);
+        check(&f);
+        let mut f = Fake { snapshot: true, restored_tell_fails: true, ..Fake::default() };
+        let (vm, _, _) = bring_up(&mut f, true).expect("a restore that can't start");
+        assert_eq!(f.steps, ["restore 1", "tell 1", "remove-snapshot", "cold 2 full", "tell 2"]);
+        assert_eq!((vm, f.told.as_slice()), (2, &[(1, true), (2, false)][..]));
+        let mut f = Fake::default();
+        bring_up(&mut f, false).expect("--no-snapshot");
+        assert_eq!(f.steps, ["cold 1 full", "tell 1"]);
+        assert!(f.snapshotted.is_empty());
+    }
+
+    /// An older init answers a line it doesn't know by echoing it, and a start message's `env`
+    /// lines carry secrets: such a reply is never shown. The handshake comes first, alone.
+    #[test]
+    fn a_refused_start_message_is_never_echoed_and_the_protocol_is_checked_first() {
+        let secret = hex(b"hunter2");
+        let msg = [Ctl::Time { secs: 1, nanos: 0 }, Ctl::Env { name: "WORDPRESS_DB_PASSWORD".into(), hex: secret.clone() }, Ctl::Done];
+        let e = refused(&msg, &format!("error unknown control line \"env WORDPRESS_DB_PASSWORD {secret}\"")).expect_err("refused");
+        assert!(!e.contains(&secret) && !e.contains("hunter2") && !e.contains("unknown control line"), "{e}");
+        let e = refused(&[Ctl::Sync, Ctl::Done], "error the writable folders did not sync").expect_err("refused");
+        assert!(e.contains("did not sync"), "a reply to a message with no secret is shown: {e}");
+        refused(&msg, "ok").expect("ok");
+        // The guest's side: its own protocol only, and no start message unless booted for it.
+        let mine = PROTOCOL;
+        crate::guest::protocol_ok(&[Ctl::Proto { version: mine }, Ctl::Done], Some(mine)).expect("the same protocol");
+        assert!(crate::guest::protocol_ok(&[Ctl::Proto { version: mine + 1 }, Ctl::Done], Some(mine)).is_err(), "a newer host");
+        assert!(crate::guest::protocol_ok(&[Ctl::Proto { version: mine }, Ctl::Done], Some(mine - 1)).is_err(), "booted for another");
+        assert!(crate::guest::protocol_ok(&msg, None).expect_err("no sc.proto").contains("takes no start message"));
+        assert!(crate::guest::protocol_ok(&msg, Some(mine - 1)).is_err());
+        crate::guest::protocol_ok(&msg, Some(mine)).expect("a start message for its own protocol");
+        assert!(crate::guest::allowed(&[Ctl::Proto { version: mine }, Ctl::Time { secs: 1, nanos: 0 }, Ctl::Done], false).is_err(), "the handshake comes alone");
+        assert_eq!(Ctl::parse(&Ctl::Proto { version: 7 }.line()), Ok(Ctl::Proto { version: 7 }));
+        assert_eq!(crate::guest::parse_cmdline(&format!("sc.root=/srv sc.proto={mine}")).expect("parses").proto, Some(mine));
     }
 
     /// A writable disk is sized from its folder: twice what it holds, at least 1 GiB, in powers of

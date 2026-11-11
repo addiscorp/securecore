@@ -788,6 +788,18 @@ else
   fail "egress in log mode: the start serves"
 fi
 
+echo "# a guest booted for another protocol gets no start message, so no secret (#72)"
+# What an older root image's init is to this launcher: the handshake fails before any env line.
+if start oldproto "$dir/microvm.json" --guest-arg sc.proto=3 --no-snapshot; then
+  fail "a guest booted for protocol 3 is refused before its start message" "the launcher served"
+  stop
+else
+  has "$dir/oldproto.log" "doesn't speak this launcher's protocol" "the handshake fails first: the launcher stops before its start message"
+  has "$dir/oldproto.log" "speaks protocol" "the guest's init says which protocol it speaks"
+  lacks "$dir/oldproto.log" "$dbpass" "the DB password is nowhere in the launcher's log"
+  lacks "$dir/oldproto.log" "$(printf %s "$dbpass" | od -An -tx1 | tr -d ' \n')" "nor hex-encoded"
+fi
+
 echo "# the launcher killed (SIGKILL): the VM goes with it"
 if start killed "$dir/microvm.json"; then
   kpid=$(sed -n 's/.*Firecracker runs jailed as uid [0-9]* gid [0-9]* (pid \([0-9]*\)).*/\1/p' "$dir/killed.log")

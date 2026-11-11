@@ -73,6 +73,9 @@ pub struct Boot {
     /// `sc.egress=443`: php-fpm's connections to a named host on these ports go through the
     /// host, which checks the name ([`crate::egress`]).
     pub egress: Vec<u16>,
+    /// `sc.proto=<N>`: the protocol the host booted this guest for. Unless it is this init's
+    /// own ([`crate::vm::PROTOCOL`]), the init takes no start message (so no secret).
+    pub proto: Option<u32>,
     /// `sc.env=WORDPRESS_DB_PASSWORD,…`: the names (never the values) of the environment the
     /// start message delivers. Until it does, php-fpm has [`NOT_DELIVERED`] for each, so it can
     /// start at boot (the extension's vault refuses a missing variable) and the snapshot holds
@@ -118,6 +121,7 @@ pub fn parse_cmdline(line: &str) -> Result<Boot, String> {
                 boot.socks.push((port, path.to_owned()));
             }
             "sc.ext" => boot.ext = value != "0",
+            "sc.proto" => boot.proto = Some(value.parse().map_err(|_| format!("sc.proto={value}: not a number"))?),
             "sc.user" => {
                 let bad = || format!("sc.user={value}: want <uid>:<gid>, not root");
                 let (u, g) = value.split_once(':').ok_or_else(bad)?;
@@ -161,6 +165,9 @@ pub enum Ctl {
     Sync,
     /// A graceful php-fpm reload (SIGUSR2 to its master): the launcher's SIGUSR2 or SIGHUP.
     Reload,
+    /// The handshake, alone on its connection before the start message: the host's protocol.
+    /// `ok` only when it is this init's own and the one it booted with (`sc.proto`).
+    Proto { version: u32 },
     Done,
 }
 
@@ -175,6 +182,7 @@ impl Ctl {
             Ctl::Tmpfs { path } => format!("tmpfs {path}\n"),
             Ctl::Sync => "sync\n".into(),
             Ctl::Reload => "reload\n".into(),
+            Ctl::Proto { version } => format!("proto {version}\n"),
             Ctl::Done => "done\n".into(),
         }
     }
@@ -196,6 +204,7 @@ impl Ctl {
             ["tmpfs", path] => Ok(Ctl::Tmpfs { path: (*path).into() }),
             ["sync"] => Ok(Ctl::Sync),
             ["reload"] => Ok(Ctl::Reload),
+            ["proto", v] => Ok(Ctl::Proto { version: v.parse().map_err(|_| format!("proto: {v}"))? }),
             ["done"] => Ok(Ctl::Done),
             // Never echo an env line: it carries a secret.
             ["env", ..] => Err("a malformed env line".into()),
@@ -219,6 +228,9 @@ pub fn env_name_ok(name: &str) -> bool {
 /// Exactly one start message per boot (a snapshot is taken before it, so each restore takes its
 /// own); after it only `sync` and `reload`, and nothing at all before it but a start.
 pub fn allowed(lines: &[Ctl], started: bool) -> Result<(), String> {
+    if lines.iter().any(|c| matches!(c, Ctl::Proto { .. })) && lines.len() > 1 {
+        return Err("the handshake comes alone".into());
+    }
     let starts = lines.iter().any(Ctl::starts);
     let others = lines.iter().any(|c| matches!(c, Ctl::Sync | Ctl::Reload));
     match (started, starts, others) {
@@ -227,6 +239,26 @@ pub fn allowed(lines: &[Ctl], started: bool) -> Result<(), String> {
         (false, true, true) => Err("a start message carries no sync or reload".into()),
         _ => Ok(()),
     }
+}
+
+/// Whether this init may take `lines`, given the protocol it was booted for (`sc.proto`): the
+/// handshake is answered `ok` only for its own protocol, and a start message (which may carry
+/// secrets) is taken only when it was booted for it. The host sends nothing secret until the
+/// handshake's `ok` ([`crate::vm::PROTOCOL`]).
+pub fn protocol_ok(lines: &[Ctl], booted: Option<u32>) -> Result<(), String> {
+    let mine = crate::vm::PROTOCOL;
+    let booted_s = booted.map_or_else(|| "no sc.proto".to_owned(), |b| format!("sc.proto={b}"));
+    for c in lines {
+        if let Ctl::Proto { version } = c
+            && (*version != mine || booted != Some(mine))
+        {
+            return Err(format!("this guest's init speaks protocol {mine} ({booted_s}), the host {version}"));
+        }
+    }
+    if lines.iter().any(Ctl::starts) && booted != Some(mine) {
+        return Err(format!("this guest's init speaks protocol {mine} and was booted with {booted_s}: it takes no start message"));
+    }
+    Ok(())
 }
 
 fn cstr(s: &str) -> io::Result<CString> {
@@ -458,7 +490,8 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             let drain = DRAIN.get().ok_or_else(|| io::Error::other("the folder sync never started"))?;
             drain.wait(SYNC_DRAIN).map_err(|e| io::Error::other(format!("the writable folders did not sync to the host: {e}")))
         }
-        Ctl::Done => Ok(()),
+        // Checked before anything is applied ([`protocol_ok`]).
+        Ctl::Proto { .. } | Ctl::Done => Ok(()),
     }
 }
 
@@ -495,6 +528,10 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
     if failed.is_none() {
         failed = allowed(&lines, started).err();
     }
+    // Before anything is applied: a start message only for the protocol this init booted for.
+    if failed.is_none() {
+        failed = protocol_ok(&lines, BOOT.get().and_then(|b| b.proto)).err();
+    }
     // The start message claims the boot's one start atomically (connections run concurrently).
     if failed.is_none() && lines.iter().any(Ctl::starts) && STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         failed = Some("this boot's start message was already taken".into());
@@ -515,6 +552,13 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
         } else if !fpm_listening(Duration::from_secs(10)) {
             failed = Some(format!("php-fpm with the delivered environment isn't listening on 127.0.0.1:{FPM_PORT}"));
         }
+    }
+    // The host never shows a reply to a message that carried secrets, so the reason is logged
+    // here too (no message here ever holds a value: refused env lines are never echoed).
+    if let Some(e) = &failed
+        && lines.iter().any(|c| matches!(c, Ctl::Env { .. }))
+    {
+        report(&format!("ctl: the start message was refused: {e}"));
     }
     let reply = failed.map_or_else(|| "ok\n".to_owned(), |e| format!("error {e}\n"));
     let _ = out.write_all(reply.as_bytes());
@@ -705,7 +749,9 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
         fs::write(conf, pool_conf(uid, gid))?;
         cmd.arg("-y").arg(conf);
     }
-    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    // Exactly this environment: nothing of init's own.
+    cmd.env_clear()
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         .envs(boot.env_names.iter().map(|n| (n.clone(), NOT_DELIVERED.to_owned())))
         .envs(delivered_env())
         .stdin(Stdio::null())
