@@ -106,7 +106,7 @@ fn config(json: &str) -> Config {
 }
 
 const CFG: &str = r#"{
-  "layer1": { "enabled": false },
+  "layer1": { "isolation": "off" },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "enforce",
     "core": { "hosts": ["api.wordpress.org", "downloads.wordpress.org"] },
@@ -159,7 +159,7 @@ fn outside_code_is_not_restricted() {
 fn default_hosts_is_inherited_when_a_component_has_none() {
     let c = config(
         r#"{
-          "layer1": { "enabled": false },
+          "layer1": { "isolation": "off" },
           "layer2": {
             "enabled": true, "app": "wordpress", "mode": "enforce",
             "default": { "hosts": ["cdn.example"] },

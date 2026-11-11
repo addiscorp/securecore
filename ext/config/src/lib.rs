@@ -48,22 +48,18 @@ pub struct Config {
 /// restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-#[schemars(extend(
-    "if" = { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
-    "then" = { "properties": { "isolation": { "not": { "const": "off" } } } },
-    "else" = { "properties": { "isolation": { "const": "off" } } }
-))]
 pub struct Layer1 {
-    pub enabled: bool,
-    /// What php-fpm runs inside (addiscorp/securecore#71). `auto`, the default, is a microVM
-    /// where this host can run one (`/dev/kvm` works and the VM files are installed) and gelada
-    /// otherwise; it is the only value that falls back. `microvm` refuses to start without one.
-    /// `off` is layer 1 off, as `enabled: false` is (so `enabled: true` with `off` is refused as
-    /// a contradiction, and so is `enabled: false` with any other value). Unset: `auto`
-    /// ([`Layer1::isolation`]).
-    #[serde(default, rename = "isolation", skip_serializing_if = "Option::is_none")]
-    #[schemars(default = "auto_isolation")]
-    pub isolation_set: Option<Isolation>,
+    /// Retired (Sami, 10 Nov): `isolation` is layer 1's only switch. Read only to refuse a file
+    /// that still sets it, with the reason; not in the schema, so editors flag it too.
+    #[serde(default, rename = "enabled", skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub retired_enabled: Option<serde_json::Value>,
+    /// Layer 1's switch, and what php-fpm runs inside (addiscorp/securecore#71). `off` turns
+    /// layer 1 off. `auto`, the default, is gelada while the microVM is gated (until #72), then
+    /// a microVM where one can run and gelada otherwise; it is the only value that falls back.
+    /// `gelada` is gelada. `microvm` refuses to start without one.
+    #[serde(default)]
+    pub isolation: Isolation,
     /// Folders php-fpm may write (relative to the folder containing securecore.json, or
     /// absolute). Everything else is read-only. In a microVM, each one inside the app root is a
     /// writable disk that persists, and each one outside it is a tmpfs in the guest.
@@ -78,14 +74,15 @@ pub struct Layer1 {
     pub network: Network,
 }
 
-fn auto_isolation() -> Option<Isolation> {
-    Some(Isolation::Auto)
-}
-
 impl Layer1 {
     /// `layer1.isolation`, `auto` when the file doesn't say.
     pub fn isolation(&self) -> Isolation {
-        self.isolation_set.unwrap_or_default()
+        self.isolation
+    }
+
+    /// Layer 1 is on: any `isolation` but `off`.
+    pub fn enabled(&self) -> bool {
+        self.isolation != Isolation::Off
     }
 }
 
@@ -489,19 +486,12 @@ impl Config {
     /// The rules serde can't express. Each one is also in the schema (see [`Layer2`]'s
     /// `if`/`then`), so an editor flags the same files.
     fn validate(&self) -> Result<(), Problem> {
-        match (self.layer1.enabled, self.layer1.isolation_set) {
-            (true, Some(Isolation::Off)) => {
-                return Err(Problem::Invalid(
-                    "layer1.enabled is true but layer1.isolation is \"off\": say one or the other".into(),
-                ));
-            }
-            (false, Some(i)) if i != Isolation::Off => {
-                return Err(Problem::Invalid(format!(
-                    "layer1.enabled is false but layer1.isolation is \"{}\": say one or the other",
-                    i.as_str()
-                )));
-            }
-            _ => {}
+        if self.layer1.retired_enabled.is_some() {
+            return Err(Problem::Invalid(
+                "layer1.enabled is retired: layer1.isolation is layer 1's only switch. Remove \"enabled\" and set \
+                 \"isolation\": \"off\" to turn layer 1 off, or \"auto\" (the default), \"gelada\" or \"microvm\""
+                    .into(),
+            ));
         }
         for c in &self.layer1.network.connect {
             if c.socket.is_some() && c.address.is_some() {
@@ -523,7 +513,7 @@ impl Config {
 
     /// All three layers disabled: SecureCore is off. A valid configuration.
     pub fn is_off(&self) -> bool {
-        !self.layer1.enabled && !self.layer2.enabled && !self.layer3.enabled
+        !self.layer1.enabled() && !self.layer2.enabled && !self.layer3.enabled
     }
 }
 

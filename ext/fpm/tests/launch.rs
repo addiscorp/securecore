@@ -50,7 +50,7 @@ fn tcp(port: u16) -> String {
 fn an_invalid_config_exits_125_without_running_php_fpm() {
     let dir = scratch("invalid");
     let path = dir.join("securecore.json");
-    fs::write(&path, r#"{"layer1":{"enabled":true,"network":{"connect":[{"port":0}]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#).expect("write");
+    fs::write(&path, r#"{"layer1":{"isolation":"gelada","network":{"connect":[{"port":0}]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#).expect("write");
     let marker = dir.join("ran");
     let out = launch(&path, &format!("touch {}", marker.display()));
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
@@ -72,7 +72,7 @@ fn an_invalid_config_exits_125_without_running_php_fpm() {
 #[test]
 fn unix_sockets_with_ports_exit_125_naming_57() {
     let dir = scratch("unix-ports");
-    let path = config(&dir, r#"{"enabled":true,"network":{"bind":[{"port":9000}],"connect":[{"port":3306}],"unixSockets":["/run/mysqld/mysqld.sock"]}}"#);
+    let path = config(&dir, r#"{"isolation":"gelada","network":{"bind":[{"port":9000}],"connect":[{"port":3306}],"unixSockets":["/run/mysqld/mysqld.sock"]}}"#);
     let marker = dir.join("ran");
     let out = launch(&path, &format!("touch {}", marker.display()));
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
@@ -84,7 +84,7 @@ fn unix_sockets_with_ports_exit_125_naming_57() {
 #[test]
 fn layer_one_off_runs_php_fpm_as_it_is_and_says_so() {
     let dir = scratch("off");
-    let path = config(&dir, r#"{"enabled":false}"#);
+    let path = config(&dir, r#"{"isolation":"off"}"#);
     let outside = dir.join("outside.txt");
     let out = launch(&path, &format!("echo x > {} && echo args:\"$0\"", outside.display()));
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
@@ -132,7 +132,7 @@ r udp 'echo hi 2>/dev/null > /dev/udp/127.0.0.1/{udp_port}'
     let on = config(
         &dir,
         &format!(
-            r#"{{"enabled":true,"write":["uploads"],"deny":["backups"],"network":{{"connect":[{{"port":{allowed_port}}}]}}}}"#
+            r#"{{"isolation":"gelada","write":["uploads"],"deny":["backups"],"network":{{"connect":[{{"port":{allowed_port}}}]}}}}"#
         ),
     );
     let out = launch(&on, &script);
@@ -158,7 +158,7 @@ r udp 'echo hi 2>/dev/null > /dev/udp/127.0.0.1/{udp_port}'
     // The same script with layer 1 off: every effect goes through, so each BLOCKED above is
     // the sandbox's doing (not permissions, a missing listener or a missing file).
     let _ = fs::remove_file(writable.join("a.txt"));
-    let off = config(&dir, r#"{"enabled":false}"#);
+    let off = config(&dir, r#"{"isolation":"off"}"#);
     let out = launch(&off, &script);
     let report = String::from_utf8_lossy(&out.stdout).into_owned();
     for case in ["write-allowed", "write-outside", "write-from-child", "read-denied", "read-other", "tcp-allowed", "tcp-other", "udp"] {

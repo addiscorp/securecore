@@ -18,14 +18,14 @@ fn rejected(json: &str) -> String {
 /// A valid config with `extra` spliced into layer2 (keeps each rejection test to one change).
 fn with_layer2(extra: &str) -> String {
     format!(
-        r#"{{"layer1":{{"enabled":false}},"layer2":{{"enabled":true,"app":"wordpress"{extra}}},"layer3":{{"enabled":false}}}}"#
+        r#"{{"layer1":{{"isolation":"off"}},"layer2":{{"enabled":true,"app":"wordpress"{extra}}},"layer3":{{"enabled":false}}}}"#
     )
 }
 
 #[test]
 fn wordpress_example_parses_with_every_field() {
     let c = parse(WORDPRESS).expect("examples/wordpress.json");
-    assert!(c.layer1.enabled && c.layer2.enabled && c.layer3.enabled);
+    assert!(c.layer1.enabled() && c.layer2.enabled && c.layer3.enabled);
     assert!(!c.is_off());
     assert_eq!(c.layer1.write, ["wp-content/uploads", "wp-content/cache", "/tmp"]);
     assert_eq!(c.layer1.network.bind.iter().map(|p| p.port.get()).collect::<Vec<_>>(), [9000]);
@@ -69,18 +69,18 @@ fn off_example_is_valid_and_off() {
 
 #[test]
 fn unknown_keys_are_rejected_at_every_level() {
-    let top = r#"{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false},"layer4":{}}"#;
+    let top = r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":false},"layer3":{"enabled":false},"layer4":{}}"#;
     assert!(rejected(top).contains("unknown field `layer4`"), "{}", rejected(top));
-    let l1 = r#"{"layer1":{"enabled":false,"writes":[]},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#;
+    let l1 = r#"{"layer1":{"isolation":"off","writes":[]},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#;
     assert!(rejected(l1).contains("unknown field `writes`"));
-    let net = r#"{"layer1":{"enabled":false,"network":{"unix_sockets":[]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#;
+    let net = r#"{"layer1":{"isolation":"off","network":{"unix_sockets":[]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#;
     assert!(rejected(net).contains("unknown field `unix_sockets`"));
     assert!(rejected(&with_layer2(r#","modes":"log""#)).contains("unknown field `modes`"));
     let component = with_layer2(r#","components":{"cf7":{"host":[]}}"#);
     assert!(rejected(&component).contains("unknown field `host`"));
     let files = with_layer2(r#","components":{"cf7":{"files":{"reads":[]}}}"#);
     assert!(rejected(&files).contains("unknown field `reads`"), "{}", rejected(&files));
-    let l3 = r#"{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false,"limits":{"timeout":1}}}"#;
+    let l3 = r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":false},"layer3":{"enabled":false,"limits":{"timeout":1}}}"#;
     assert!(rejected(l3).contains("unknown field `timeout`"));
 }
 
@@ -112,20 +112,21 @@ fn bad_mode_and_app_are_rejected() {
     assert!(e.contains("unknown variant `block`"), "{e}");
     let e = rejected(&with_layer2(r#","mode":"Enforce""#));
     assert!(e.contains("unknown variant `Enforce`"), "{e}");
-    let e = rejected(r#"{"layer1":{"enabled":false},"layer2":{"enabled":true,"app":"drupal"},"layer3":{"enabled":false}}"#);
+    let e = rejected(r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":true,"app":"drupal"},"layer3":{"enabled":false}}"#);
     assert!(e.contains("unknown variant `drupal`"), "{e}");
 }
 
 #[test]
 fn enabled_layer2_needs_an_app() {
-    let e = rejected(r#"{"layer1":{"enabled":false},"layer2":{"enabled":true},"layer3":{"enabled":false}}"#);
+    let e = rejected(r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":true},"layer3":{"enabled":false}}"#);
     assert!(e.contains("layer2.app is missing"), "{e}");
 }
 
 #[test]
 fn every_layer_and_enabled_is_required() {
-    assert!(rejected(r#"{"layer1":{"enabled":false},"layer2":{"enabled":false}}"#).contains("missing field `layer3`"));
-    assert!(rejected(r#"{"layer1":{},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#).contains("missing field `enabled`"));
+    assert!(rejected(r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":false}}"#).contains("missing field `layer3`"));
+    // layer1 has no required field: an empty object is auto.
+    assert_eq!(parse(r#"{"layer1":{},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#).expect("{}").layer1.isolation(), Isolation::Auto);
     assert!(rejected("").contains("EOF"));
     assert!(rejected("1").contains("invalid type"));
     rejected("[]");
@@ -146,11 +147,11 @@ fn the_array_form_is_rejected_at_every_level() {
     assert!(serde_json::from_str::<Config>(l1).is_ok());
     assert!(rejected(l1).contains("layer1 is an array"), "{}", rejected(l1));
 
-    let port = r#"{"layer1":{"enabled":true,"network":{"connect":[{"port":443},[3306]]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#;
+    let port = r#"{"layer1":{"isolation":"gelada","network":{"connect":[{"port":443},[3306]]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#;
     assert!(serde_json::from_str::<Config>(port).is_ok());
     assert!(rejected(port).contains("layer1.network.connect[1] is an array"), "{}", rejected(port));
 
-    let limits = r#"{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":true,"limits":[100,64]}}"#;
+    let limits = r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":false},"layer3":{"enabled":true,"limits":[100,64]}}"#;
     assert!(rejected(limits).contains("layer3.limits is an array"), "{}", rejected(limits));
 
     // A component's rules: `hosts` first, by position.
@@ -199,9 +200,9 @@ fn paths_resolve_against_the_folder_holding_the_file() {
 
 #[test]
 fn port_zero_and_bad_scope_are_rejected() {
-    let e = rejected(r#"{"layer1":{"enabled":true,"network":{"connect":[{"port":0}]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#);
+    let e = rejected(r#"{"layer1":{"isolation":"gelada","network":{"connect":[{"port":0}]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#);
     assert!(e.contains("nonzero"), "{e}");
-    rejected(r#"{"layer1":{"enabled":true,"network":{"connect":[{"port":65536}]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#);
+    rejected(r#"{"layer1":{"isolation":"gelada","network":{"connect":[{"port":65536}]}},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#);
     rejected(&with_layer2(r#","default":{"tables":"all"}"#));
     // `files` is an object now, not a scope keyword/list: a bare string is rejected.
     rejected(&with_layer2(r#","default":{"files":"own"}"#));
@@ -213,39 +214,44 @@ fn layer1_only(body: &str) -> String {
 
 #[test]
 fn isolation_defaults_to_auto_and_takes_four_values() {
-    let c = parse(WORDPRESS).expect("examples/wordpress.json");
-    assert_eq!(c.layer1.isolation(), Isolation::Auto, "no isolation key: auto (Sami, 10 Nov)");
-    assert_eq!(c.layer1.isolation_set, None);
+    assert_eq!(parse(WORDPRESS).expect("examples/wordpress.json").layer1.isolation(), Isolation::Auto);
+    assert_eq!(parse(&layer1_only("{}")).expect("no key").layer1.isolation(), Isolation::Auto, "no isolation key: auto (Sami, 10 Nov)");
     for (word, want) in [("off", Isolation::Off), ("gelada", Isolation::Gelada), ("microvm", Isolation::Microvm), ("auto", Isolation::Auto)] {
-        let enabled = want != Isolation::Off;
-        let c = parse(&layer1_only(&format!(r#"{{"enabled":{enabled},"isolation":"{word}"}}"#))).expect(word);
+        let c = parse(&layer1_only(&format!(r#"{{"isolation":"{word}"}}"#))).expect(word);
         assert_eq!(c.layer1.isolation(), want);
+        assert_eq!(c.layer1.enabled(), want != Isolation::Off, "isolation is layer 1's only switch");
         assert_eq!(want.as_str(), word);
     }
-    // off with enabled false is the same thing said twice, and valid.
-    assert!(parse(&layer1_only(r#"{"enabled":false,"isolation":"off"}"#)).expect("off").is_off());
-    let e = rejected(&layer1_only(r#"{"enabled":true,"isolation":"off"}"#));
-    assert!(e.contains("layer1.enabled is true but layer1.isolation is \"off\""), "{e}");
-    // A layer 1 that is off with an isolation that isn't: a contradiction too.
-    for word in ["gelada", "microvm", "auto"] {
-        let e = rejected(&layer1_only(&format!(r#"{{"enabled":false,"isolation":"{word}"}}"#)));
-        assert!(e.contains(&format!("layer1.enabled is false but layer1.isolation is \"{word}\"")), "{e}");
-    }
-    let e = rejected(&layer1_only(r#"{"enabled":true,"isolation":"vm"}"#));
+    assert!(parse(&layer1_only(r#"{"isolation":"off"}"#)).expect("off").is_off());
+    let e = rejected(&layer1_only(r#"{"isolation":"vm"}"#));
     assert!(e.contains("unknown variant `vm`"), "{e}");
+}
+
+/// `layer1.enabled` is retired (Sami, 10 Nov): any file that still sets it is refused, and told
+/// what to write instead. No compatibility shim.
+#[test]
+fn layer1_enabled_is_retired_and_refused() {
+    for body in [r#"{"enabled":true}"#, r#"{"enabled":false}"#, r#"{"enabled":false,"isolation":"off"}"#, r#"{"enabled":true,"isolation":"gelada"}"#] {
+        let e = rejected(&layer1_only(body));
+        assert!(e.contains("layer1.enabled is retired: layer1.isolation is layer 1's only switch"), "{body}: {e}");
+        assert!(e.contains("\"isolation\": \"off\""), "it says how to turn layer 1 off: {e}");
+    }
+    let schema: serde_json::Value = serde_json::from_str(&schema_json()).expect("schema");
+    assert!(schema["$defs"]["Layer1"]["properties"].get("enabled").is_none(), "not in the schema");
+    assert_eq!(schema["$defs"]["Layer1"]["additionalProperties"], false, "so editors flag it");
 }
 
 #[test]
 fn connect_takes_a_socket_or_an_address_not_both() {
     let c = parse(&layer1_only(
-        r#"{"enabled":true,"network":{"connect":[{"port":3306,"socket":"/run/mysqld/mysqld.sock"},{"port":6379,"address":"10.0.0.5:6379"},{"port":443}]}}"#,
+        r#"{"isolation":"microvm","network":{"connect":[{"port":3306,"socket":"/run/mysqld/mysqld.sock"},{"port":6379,"address":"10.0.0.5:6379"},{"port":443}]}}"#,
     ))
     .expect("valid");
     let connect = &c.layer1.network.connect;
     assert_eq!(connect[0].socket.as_deref(), Some("/run/mysqld/mysqld.sock"));
     assert_eq!(connect[1].address.as_deref(), Some("10.0.0.5:6379"));
     assert_eq!((connect[2].socket.as_deref(), connect[2].address.as_deref()), (None, None));
-    let e = rejected(&layer1_only(r#"{"enabled":true,"network":{"connect":[{"port":3306,"socket":"/s","address":"h:1"}]}}"#));
+    let e = rejected(&layer1_only(r#"{"isolation":"gelada","network":{"connect":[{"port":3306,"socket":"/s","address":"h:1"}]}}"#));
     assert!(e.contains("port 3306 has both socket and address"), "{e}");
 }
 
@@ -277,8 +283,6 @@ fn schema_covers_the_rules_serde_enforces() {
     assert_eq!(words, ["off", "gelada", "microvm", "auto"]);
     let layer1 = &schema["$defs"]["Layer1"];
     assert_eq!(layer1["properties"]["isolation"]["default"], "auto");
-    assert_eq!(layer1["then"]["properties"]["isolation"]["not"]["const"], "off");
-    assert_eq!(layer1["else"]["properties"]["isolation"]["const"], "off");
     assert_eq!(schema["$defs"]["Connect"]["not"]["required"], serde_json::json!(["socket", "address"]));
 }
 
@@ -296,7 +300,7 @@ fn load_reports_the_file_and_the_problem() {
     let path = dir.join("securecore.json");
     let e = load(&path).expect_err("missing file").to_string();
     assert!(e.starts_with(&format!("{}: cannot read it:", path.display())), "{e}");
-    fs::write(&path, r#"{"layer1":{"enabled":false},"#).expect("write");
+    fs::write(&path, r#"{"layer1":{"isolation":"off"},"#).expect("write");
     let e = load(&path).expect_err("truncated file").to_string();
     assert!(e.starts_with(&format!("{}: invalid:", path.display())) && e.contains("line 1"), "{e}");
     fs::write(&path, OFF).expect("write");
@@ -334,7 +338,7 @@ fn reloader_follows_the_file_and_never_drops_to_off() {
     assert_eq!(r.poll(t0 + 2 * interval), Poll::Unchanged, "same stamp: no reload");
 
     // An invalid edit is rejected once; the last valid config stays live.
-    fs::write(&path, r#"{"layer1":{"enabled":false}"#).expect("write");
+    fs::write(&path, r#"{"layer1":{"isolation":"off"}"#).expect("write");
     let Poll::Rejected(msg) = r.poll(t0 + 3 * interval) else { panic!("invalid file accepted") };
     assert!(msg.contains(&path.display().to_string()), "{msg}");
     assert_eq!(r.error(), Some(msg.as_str()));

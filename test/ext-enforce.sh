@@ -71,7 +71,7 @@ trap cleanup EXIT
 base_cfg() { # $1 = mode, $2 = components object body
   cat > "$dir/$3.json" <<JSON
 {
-  "layer1": { "enabled": false },
+  "layer1": { "isolation": "off" },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "$1",
     "vault": { "from": { "wpConfig": "wp-config.php" }, "secrets": [{ "name": "DB_PASSWORD", "env": "WORDPRESS_DB_PASSWORD" }] },

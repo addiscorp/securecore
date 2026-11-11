@@ -145,7 +145,9 @@ cargo run -p securecore-config --bin securecore-schema > securecore.schema.json
 ```
 
 Examples: [`examples/wordpress.json`](examples/wordpress.json) (every field, the #53 example) and
-[`examples/off.json`](examples/off.json) (the minimum: three `{"enabled": false}`).
+[`examples/off.json`](examples/off.json) (the minimum: `layer1` `{"isolation": "off"}`, and
+`layer2` and `layer3` `{"enabled": false}`; layer 1's switch is `isolation`, the others' is
+`enabled`).
 
 Beyond the schema's structure, one rule is checked in code and expressed in the schema as an
 `if`/`then`: `layer2.app` is required when layer 2 is enabled. `layer2.mode` defaults to
@@ -773,7 +775,9 @@ run inside it. It logs one line to stderr first:
 securecore-fpm: layer 1 on from /var/www/html/securecore.json (sha256 2ad59919…): write /var/www/html/wp-content/uploads /var/www/html/wp-content/cache /tmp; deny /srv/backups; tcp bind 9000; tcp connect 53 3306 443; starting php-fpm
 ```
 
-With `layer1.enabled: false` it execs php-fpm as it is and says so (`layer 1 is off in …`).
+With `layer1.isolation: "off"` it execs php-fpm as it is and says so (`layer 1 is off in …`).
+`isolation` is layer 1's only switch: `layer1.enabled` is retired, and a file that still sets it
+is refused (`layer1.enabled is retired: layer1.isolation is layer 1's only switch …`).
 A change to `layer1` applies at the next php-fpm (launcher) restart; the extension flags it as
 `restart_needed`.
 
@@ -806,7 +810,7 @@ and the launcher exits 125.
 | `auto` (the default) | gelada, with the reason. **`auto` does not pick the microVM until the guest's writable folders sync back to the host (#72)**: `AUTO_SELECTS_MICROVM` in `fpm/src/lib.rs` is that gate, and a test pins it off. Once it opens, `auto` is the microVM where it can run and gelada otherwise (`layer 1 isolation auto: gelada, because the microVM can't run here (…)`), whether the host or the config is why. The only value that falls back |
 | `microvm` | the microVM, or nothing: without one the launcher exits 125 (`layer1.isolation is "microvm" but this host can't run the microVM (…). "microvm" never falls back`) |
 | `gelada` | gelada on the host kernel, as above, even where KVM exists |
-| `off` | layer 1 off, as `enabled: false` (`enabled: true` with `off` is a contradiction, and invalid) |
+| `off` | layer 1 off: php-fpm runs as it is. The only way to turn layer 1 off (`layer1.enabled` is retired) |
 
 **The microVM can run** when all of these hold (otherwise `auto` logs why and `microvm` exits
 125 with it):

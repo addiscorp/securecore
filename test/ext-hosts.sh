@@ -124,7 +124,7 @@ trap cleanup EXIT
 cfg() { # $1 = mode, $2 = file
   cat > "$dir/$2.json" <<JSON
 {
-  "layer1": { "enabled": false },
+  "layer1": { "isolation": "off" },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "$1",
     "core": { "hosts": ["core-allowed.test"] },

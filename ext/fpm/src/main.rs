@@ -241,7 +241,7 @@ fn main() -> ExitCode {
         Ok(choice) => choice,
         Err(refusal) => return failed(&format!("{path}: {refusal}")),
     };
-    if layer1.enabled {
+    if layer1.enabled() {
         log(&format!("layer 1 isolation {}: {choice}", layer1.isolation().as_str()));
     }
     if choice == Choice::Microvm {

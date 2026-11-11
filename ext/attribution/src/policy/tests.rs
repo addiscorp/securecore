@@ -30,7 +30,7 @@ fn baseline() -> Access {
 
 #[test]
 fn core_and_outside_are_not_restricted() {
-    let json = r#"{"layer1":{"enabled":false},"layer2":{"enabled":true,"app":"wordpress"},"layer3":{"enabled":false}}"#;
+    let json = r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":true,"app":"wordpress"},"layer3":{"enabled":false}}"#;
     let l2 = Config::from_slice(json.as_bytes()).expect("config").layer2;
     assert_eq!(access_for(&l2, Path::new(ROOT), &Component::Core), None);
     assert_eq!(access_for(&l2, Path::new(ROOT), &Component::Outside), None);
@@ -40,10 +40,10 @@ fn core_and_outside_are_not_restricted() {
 
 #[test]
 fn disabled_or_off_layer2_restricts_nobody() {
-    let off = r#"{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#;
+    let off = r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":false},"layer3":{"enabled":false}}"#;
     let l2 = Config::from_slice(off.as_bytes()).expect("config").layer2;
     assert_eq!(access_for(&l2, Path::new(ROOT), &Component::Plugin("p".into())), None);
-    let mode_off = r#"{"layer1":{"enabled":false},"layer2":{"enabled":true,"app":"wordpress","mode":"off"},"layer3":{"enabled":false}}"#;
+    let mode_off = r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":true,"app":"wordpress","mode":"off"},"layer3":{"enabled":false}}"#;
     let l2 = Config::from_slice(mode_off.as_bytes()).expect("config").layer2;
     assert_eq!(access_for(&l2, Path::new(ROOT), &Component::Plugin("p".into())), None, "mode off: no restriction");
 }
@@ -109,7 +109,7 @@ fn exec_needs_the_grant_and_ignores_the_path() {
 #[test]
 fn effective_rules_inherit_default_field_by_field() {
     let root = tempdir();
-    let json = r#"{"layer1":{"enabled":false},"layer2":{"enabled":true,"app":"wordpress",
+    let json = r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":true,"app":"wordpress",
             "default":{"exec":true,"files":{"read":["def-read"]}},
             "components":{
               "keeps-default":{},
@@ -142,7 +142,7 @@ fn effective_rules_inherit_default_field_by_field() {
 fn a_component_with_no_rules_at_all_still_has_the_baseline() {
     // No default, no entry: empty access (exec off, no extra paths), but still a Policy subject.
     let root = tempdir();
-    let json = r#"{"layer1":{"enabled":false},"layer2":{"enabled":true,"app":"wordpress"},"layer3":{"enabled":false}}"#;
+    let json = r#"{"layer1":{"isolation":"off"},"layer2":{"enabled":true,"app":"wordpress"},"layer3":{"enabled":false}}"#;
     let l2 = Config::from_slice(json.as_bytes()).expect("config").layer2;
     let a = access_for(&l2, &root, &Component::Theme("twentytwentyfive".into())).expect("restricted");
     assert_eq!(a, Access::default());

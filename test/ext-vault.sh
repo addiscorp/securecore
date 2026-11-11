@@ -141,7 +141,7 @@ trap cleanup EXIT
 vault_cfg() { # $1 = mode
   cat > "$dir/$1.json" <<JSON
 {
-  "layer1": { "enabled": false },
+  "layer1": { "isolation": "off" },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "$1",
     "vault": {
@@ -318,7 +318,7 @@ is "$leak" "" "error log: no real secret in any php-fpm log line"
 echo "# revert proof"
 # (a) the vault removed from the config: the extension no longer hides anything.
 cat > "$dir/no-vault.json" <<JSON
-{ "layer1": { "enabled": false },
+{ "layer1": { "isolation": "off" },
   "layer2": { "enabled": true, "app": "wordpress", "mode": "enforce", "default": {}, "components": {} },
   "layer3": { "enabled": false } }
 JSON
@@ -359,7 +359,7 @@ echo "# opcache literal fail-closed"
 is "$(in_php 'php -v 2>/dev/null | grep -c "Zend OPcache"')" 1 "opcache: Zend OPcache is loaded, so the refusal is the fail-closed path"
 in_php "printf '<?php define(\"SC_LIT_SECRET\", \"literal-xyz-123\");\n' > $html/sc-lit-config.php"
 cat > "$dir/wpc-lit.json" <<JSON
-{ "layer1": { "enabled": false },
+{ "layer1": { "isolation": "off" },
   "layer2": { "enabled": true, "app": "wordpress", "mode": "enforce",
     "vault": { "from": { "wpConfig": "sc-lit-config.php" }, "secrets": ["SC_LIT_SECRET"] },
     "default": {}, "components": {} },

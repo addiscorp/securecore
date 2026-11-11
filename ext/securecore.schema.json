@@ -161,19 +161,9 @@
             "type": "string"
           }
         },
-        "enabled": {
-          "type": "boolean"
-        },
         "isolation": {
-          "description": "What php-fpm runs inside (addiscorp/securecore#71). `auto`, the default, is a microVM\nwhere this host can run one (`/dev/kvm` works and the VM files are installed) and gelada\notherwise; it is the only value that falls back. `microvm` refuses to start without one.\n`off` is layer 1 off, as `enabled: false` is (so `enabled: true` with `off` is refused as\na contradiction, and so is `enabled: false` with any other value). Unset: `auto`\n([`Layer1::isolation`]).",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Isolation"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "description": "Layer 1's switch, and what php-fpm runs inside (addiscorp/securecore#71). `off` turns\nlayer 1 off. `auto`, the default, is gelada while the microVM is gated (until #72), then\na microVM where one can run and gelada otherwise; it is the only value that falls back.\n`gelada` is gelada. `microvm` refuses to start without one.",
+          "$ref": "#/$defs/Isolation",
           "default": "auto"
         },
         "network": {
@@ -193,36 +183,7 @@
           }
         }
       },
-      "additionalProperties": false,
-      "else": {
-        "properties": {
-          "isolation": {
-            "const": "off"
-          }
-        }
-      },
-      "if": {
-        "properties": {
-          "enabled": {
-            "const": true
-          }
-        },
-        "required": [
-          "enabled"
-        ]
-      },
-      "required": [
-        "enabled"
-      ],
-      "then": {
-        "properties": {
-          "isolation": {
-            "not": {
-              "const": "off"
-            }
-          }
-        }
-      }
+      "additionalProperties": false
     },
     "Layer2": {
       "description": "Layer 2, the extension: engine-level policy inside php-fpm, per component (plugin or\ntheme). Reloaded when the file changes.",

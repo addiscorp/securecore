@@ -1681,7 +1681,7 @@ mod tests {
         let dir = scratch("plan");
         let l = loaded(
             &dir,
-            r#"{"enabled":true,"write":["wp-content/uploads","/tmp","/var/cache/sc"],"deny":["/srv/backups"],
+            r#"{"isolation":"microvm","write":["wp-content/uploads","/tmp","/var/cache/sc"],"deny":["/srv/backups"],
                 "network":{"bind":[{"port":9000}],"connect":[{"port":3306,"socket":"/run/mysqld/mysqld.sock"},{"port":6379,"address":"10.0.0.5:6379"},{"port":443}]}}"#,
         );
         let p = plan(&l, &opts()).expect("plan");
@@ -1716,19 +1716,19 @@ mod tests {
     fn the_plan_refuses_what_a_microvm_cant_enforce() {
         let dir = scratch("refuse");
         let refused = |layer1: &str| plan(&loaded(&dir, layer1), &opts()).expect_err(layer1);
-        let e = refused(r#"{"enabled":true,"network":{"bind":[{"port":9000}],"unixSockets":["/run/x.sock"]}}"#);
+        let e = refused(r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"unixSockets":["/run/x.sock"]}}"#);
         assert!(e.contains("connect [{ \"port\": 3306, \"socket\": \"/run/x.sock\" }]"), "{e}");
-        let e = refused(r#"{"enabled":true,"deny":["private"],"network":{"bind":[{"port":9000}]}}"#);
+        let e = refused(r#"{"isolation":"microvm","deny":["private"],"network":{"bind":[{"port":9000}]}}"#);
         assert!(e.contains("inside the app root"), "{e}");
-        let e = refused(r#"{"enabled":true,"write":["wp-content/missing"],"network":{"bind":[{"port":9000}]}}"#);
+        let e = refused(r#"{"isolation":"microvm","write":["wp-content/missing"],"network":{"bind":[{"port":9000}]}}"#);
         assert!(e.contains("no such folder"), "{e}");
-        let e = refused(r#"{"enabled":true}"#);
+        let e = refused(r#"{"isolation":"microvm"}"#);
         assert!(e.contains("layer1.network.bind is empty"), "{e}");
-        let e = refused(r#"{"enabled":true,"network":{"bind":[{"port":9000}],"connect":[{"port":1514,"address":"127.0.0.1:1514"}]}}"#);
+        let e = refused(r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"connect":[{"port":1514,"address":"127.0.0.1:1514"}]}}"#);
         assert!(e.contains("port 1514 is the guest's log channel"), "{e}");
         let mut o = opts();
         o.guest_root = Some("/var/www/my site".into());
-        let e = plan(&loaded(&dir, r#"{"enabled":true,"network":{"bind":[{"port":9000}]}}"#), &o).expect_err("space");
+        let e = plan(&loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}]}}"#), &o).expect_err("space");
         assert!(e.contains("holds a space"), "{e}");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1815,7 +1815,7 @@ mod tests {
         fs::write(old.join("w0123456789ab.ext4"), "disk").expect("disk");
         let mut o = opts();
         o.state = Some(states.join("new"));
-        let l = loaded(&dir, r#"{"enabled":true,"write":["wp-content/uploads"],"network":{"bind":[{"port":9000}]}}"#);
+        let l = loaded(&dir, r#"{"isolation":"microvm","write":["wp-content/uploads"],"network":{"bind":[{"port":9000}]}}"#);
         let p = plan(&l, &o).expect("plan");
         fs::create_dir_all(&p.state).expect("state");
         let e = claim_state(&p).expect_err("an orphan beside it");
@@ -1879,7 +1879,7 @@ mod tests {
         fs::create_dir_all(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, dir.join("wp-content/evil")).expect("link");
         let refused = |w: &str| {
-            plan(&loaded(&dir, &format!(r#"{{"enabled":true,"write":["{w}"],"network":{{"bind":[{{"port":9000}}]}}}}"#)), &opts())
+            plan(&loaded(&dir, &format!(r#"{{"isolation":"microvm","write":["{w}"],"network":{{"bind":[{{"port":9000}}]}}}}"#)), &opts())
                 .expect_err(w)
         };
         let e = refused("wp-content/uploads/../../../etc");

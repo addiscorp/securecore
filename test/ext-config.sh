@@ -132,7 +132,7 @@ is "$(field restart_needed)" 1 "layer1 changed (enabled → disabled): restart_n
 is "$(code /)" 200 "front page 200 with all layers off"
 
 # --- 3. an invalid edit while running keeps the last valid config ----------------------------
-printf '{"layer1":{"enabled":false},"layer2":{"enabled":true,"app":"wordpress","mode":"block"},"layer3":{"enabled":false}}\n' > "$dir/bad-mode.json"
+printf '{"layer1":{"isolation":"off"},"layer2":{"enabled":true,"app":"wordpress","mode":"block"},"layer3":{"enabled":false}}\n' > "$dir/bad-mode.json"
 t=$(now)
 put_live "$dir/bad-mode.json"
 wait_reload
@@ -163,9 +163,14 @@ refuses() {
 }
 refuses "invalid mode" "securecore: $conf: invalid: unknown variant \`block\`"
 
-printf '{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false},"layer4":{}}\n' > "$dir/unknown-key.json"
+printf '{"layer1":{"isolation":"off"},"layer2":{"enabled":false},"layer3":{"enabled":false},"layer4":{}}\n' > "$dir/unknown-key.json"
 put "$dir/unknown-key.json"
 refuses "unknown key" "securecore: $conf: invalid: unknown field \`layer4\`"
+
+# layer1.enabled is retired: the extension refuses a file that still sets it, saying why.
+printf '{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$dir/retired.json"
+put "$dir/retired.json"
+refuses "the retired layer1.enabled" "securecore: $conf: invalid: layer1.enabled is retired: layer1.isolation is layer 1's only switch"
 
 ini=/usr/local/etc/php/conf.d/securecore.ini
 compose cp "php:$ini" "$dir/securecore.ini" >>"$dir/cp.log" 2>&1

@@ -30,7 +30,7 @@ pub mod vsock;
 /// What layer 1 runs php-fpm inside, once `layer1.isolation` has met this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
-    /// Layer 1 is off (`enabled: false`).
+    /// Layer 1 is off (`isolation: "off"`).
     Off,
     /// gelada. `fallback` is why `auto` didn't pick a microVM (`None`: `gelada` was asked for).
     Gelada { fallback: Option<String> },
@@ -56,11 +56,7 @@ pub fn choose(layer1: &Layer1, microvm: impl FnOnce() -> Result<(), String>) -> 
 
 /// [`choose`] with the `auto` gate given, so both settings are tested.
 pub fn choose_with(layer1: &Layer1, auto_microvm: bool, microvm: impl FnOnce() -> Result<(), String>) -> Result<Choice, Refusal> {
-    if !layer1.enabled {
-        return Ok(Choice::Off);
-    }
     match layer1.isolation() {
-        // The loader refuses `enabled: true` with `off`; this is that file, read some other way.
         Isolation::Off => Ok(Choice::Off),
         Isolation::Gelada => Ok(Choice::Gelada { fallback: None }),
         Isolation::Microvm => match microvm() {
@@ -168,7 +164,7 @@ impl fmt::Display for Refusal {
 /// it), or a [`Refusal`] when it can't be enforced as written.
 pub fn plan(loaded: &Loaded) -> Result<Option<Plan>, Refusal> {
     let layer1 = &loaded.config.layer1;
-    if !layer1.enabled {
+    if !layer1.enabled() {
         return Ok(None);
     }
     let net = &layer1.network;

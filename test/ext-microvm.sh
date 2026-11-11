@@ -175,7 +175,7 @@ chown -R "$pool" "$site/wp-content/uploads" "$site/wp-content/cache"
 conf() {
   # The first "enabled" is layer1's.
   sed -e "s|{ \"port\": 3306 }|{ \"port\": 3306, \"socket\": \"$mysqld/mysqld.sock\" }, { \"port\": 4444, \"socket\": \"$peer/peer.sock\" }|" \
-      -e "0,/\"enabled\": true,/s//\"enabled\": true, \"isolation\": \"$1\",/" \
+      -e "s/\"isolation\": \"auto\"/\"isolation\": \"$1\"/" \
       -e 's#"hosts": \["api.wordpress.org", "downloads.wordpress.org"\]#"hosts": ["api.wordpress.org", "downloads.wordpress.org", "127.0.0.1"]#' \
       ext/examples/wordpress.json
 }
@@ -279,8 +279,9 @@ if [ "$what" = bench ]; then
     P50=$(jq -r '.metrics.latency_ms.p50' "$dir/$2.json")
   }
   ini=/usr/local/etc/php/conf.d/securecore.ini
-  awk '/"layer1": \{/ { s = 1 } /"layer2": \{/ { s = 2 } /"layer3": \{/ { s = 3 }
+  awk '{ sub(/"isolation": "auto"/, "\"isolation\": \"off\"") } /"layer2": \{/ { s = 2 } /"layer3": \{/ { s = 3 }
     s && /"enabled": true/ { sub(/true/, "false"); s = 0 } { print }' ext/examples/wordpress.json > "$dir/stock.json"
+  grep -q '"isolation": "off"' "$dir/stock.json" || die "the stock config has layer 1 off"
   in_php "[ -f $ini.off ] || mv $ini $ini.off"
   host="" mvm=""
   r=1
@@ -308,7 +309,9 @@ fi
 # --- 1. the values -----------------------------------------------------------------------------
 echo "# the values"
 clean_state
-sed 's|"enabled": true, "isolation": "microvm"|"enabled": false, "isolation": "off"|' "$dir/microvm.json" > "$dir/off.json"
+sed 's|"isolation": "microvm"|"isolation": "off"|' "$dir/microvm.json" > "$dir/off.json"
+# A config that still sets the retired layer1.enabled: refused, with what to write instead.
+sed 's|"isolation": "microvm"|"enabled": true, "isolation": "microvm"|' "$dir/microvm.json" > "$dir/retired.json"
 conf gelada > "$dir/gelada.json"
 conf auto > "$dir/auto.json"
 # A config the microVM can't express: a denied path inside the app root.
@@ -321,14 +324,16 @@ ln -sfn /root "$site/wp-content/sc-evil"
 sed 's|"write": \["wp-content/uploads"|"write": ["wp-content/sc-evil", "wp-content/uploads"|' "$dir/microvm.json" > "$dir/microvm-link.json"
 sed 's|"write": \["wp-content/uploads"|"write": ["wp-content/uploads/../../../root", "wp-content/uploads"|' "$dir/microvm.json" > "$dir/microvm-dotdot.json"
 if ! grep -q sc-evil "$dir/microvm-link.json" || ! grep -q '\.\./\.\./\.\./root' "$dir/microvm-dotdot.json"; then die "the link fixtures"; fi
-# A socket the VM's user can't reach: a 0777 socket in a root-only folder.
-mkdir -p "$sockdir/locked"
+# A socket the VM's user can't reach: a 0777 socket in a 0755 folder inside a root-only one (the
+# socket's own folder is open; a folder above it isn't).
+mkdir -p "$sockdir/locked/inner"
 chmod 700 "$sockdir/locked"
-rm -f "$sockdir/locked/db.sock"
-socat UNIX-LISTEN:"$sockdir/locked/db.sock",fork,mode=777 /dev/null > /dev/null 2>&1 &
+chmod 755 "$sockdir/locked/inner"
+rm -f "$sockdir/locked/inner/db.sock"
+socat UNIX-LISTEN:"$sockdir/locked/inner/db.sock",fork,mode=777 /dev/null > /dev/null 2>&1 &
 locked_pid=$!
-i=0; until [ -S "$sockdir/locked/db.sock" ]; do i=$((i + 1)); [ "$i" -lt 50 ] || die "the locked socket"; sleep 0.1; done
-sed "s|{ \"port\": 4444|{ \"port\": 5555, \"socket\": \"$sockdir/locked/db.sock\" }, { \"port\": 4444|" "$dir/microvm.json" > "$dir/microvm-locked.json"
+i=0; until [ -S "$sockdir/locked/inner/db.sock" ]; do i=$((i + 1)); [ "$i" -lt 50 ] || die "the locked socket"; sleep 0.1; done
+sed "s|{ \"port\": 4444|{ \"port\": 5555, \"socket\": \"$sockdir/locked/inner/db.sock\" }, { \"port\": 4444|" "$dir/microvm.json" > "$dir/microvm-locked.json"
 grep -q '"port": 5555' "$dir/microvm-locked.json" || die "the locked-socket fixture"
 once off "$dir/off.json" --vm-dir "$vm"
 once gelada "$dir/gelada.json" --vm-dir "$vm"
@@ -339,6 +344,7 @@ once microvm-mirabkernel "$dir/microvm.json" --vm-dir "$dir/vm-mirabkernel"
 once microvm-link "$dir/microvm-link.json" --vm-dir "$vm"
 once microvm-dotdot "$dir/microvm-dotdot.json" --vm-dir "$vm"
 once microvm-locked "$dir/microvm-locked.json" --vm-dir "$vm"
+once retired "$dir/retired.json" --vm-dir "$vm"
 kill "$locked_pid" 2>/dev/null
 rm -f "$site/wp-content/sc-evil"
 for v in off gelada auto; do
@@ -362,8 +368,11 @@ has "$dir/value-microvm-norootfs.log" "the guest root image isn't verified" "mic
 has "$dir/value-microvm-mirabkernel.log" "has no Landlock and seccomp filters" "microvm with layer 3 on mirab's kernel: says why"
 has "$dir/value-microvm-link.log" "wp-content/sc-evil is a symlink" "a writable folder that is a link (to a root-only folder) is refused, never read"
 has "$dir/value-microvm-dotdot.log" "holds \"..\"" "a writable folder with \"..\" is refused, never read"
-has "$dir/value-microvm-locked.log" "may not connect to $sockdir/locked/db.sock (Permission denied" \
-  "a socket in a folder the VM's user can't search is refused (parent permissions count)"
+has "$dir/value-microvm-locked.log" "may not connect to $sockdir/locked/inner/db.sock (Permission denied" \
+  "a socket below a folder the VM's user can't search is refused (every parent's permissions count)"
+has "$dir/value-retired.log" "exit=125" "a config that still sets layer1.enabled: exit 125"
+has "$dir/value-retired.log" "layer1.enabled is retired: layer1.isolation is layer 1's only switch" "and it says to use isolation instead"
+lacks "$dir/value-retired.log" standin-ran "and php-fpm never ran"
 # A file in the site only root may read: the site disk is copied as the pool user, so it fails.
 echo secret > "$site/sc-root-only.txt"
 chmod 600 "$site/sc-root-only.txt"

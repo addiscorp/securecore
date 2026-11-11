@@ -243,7 +243,7 @@ else
 fi
 
 # The verified extension must load in this PHP before anything is installed.
-printf '{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$WORK/off.json"
+printf '{"layer1":{"isolation":"off"},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$WORK/off.json"
 if ! out=$("$PHP" -n -d "extension=$WORK/securecore.so" -d "securecore.config=$WORK/off.json" \
     -r 'exit(extension_loaded("securecore") ? 0 : 1);' 2>&1); then
   die "The SecureCore build for $PHP_LABEL does not load in this PHP, so nothing was installed: $out"
@@ -305,7 +305,7 @@ else
   cat > "$CONFIG.securecore-new" <<EOF
 {
   "\$schema": "file://$SHARE_DIR/securecore.schema.json",
-  "layer1": { "enabled": false },
+  "layer1": { "isolation": "off" },
   "layer2": { "enabled": false },
   "layer3": { "enabled": false }
 }

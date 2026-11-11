@@ -181,6 +181,11 @@ refused "unixSockets + TCP ports" "$dir/unix-and-ports.json" \
 sed 's|{ "port": 9000 }|{ "port": 0 }|' ext/examples/wordpress.json > "$dir/invalid.json"
 refused "invalid config (port 0)" "$dir/invalid.json" \
   "securecore-fpm: $conf: invalid: invalid value: integer \`0\`, expected a nonzero u16"
+# layer1.enabled is retired: a file that still sets it is refused, with what to write instead.
+sed 's|"isolation": "auto",|"enabled": true, "isolation": "auto",|' ext/examples/wordpress.json > "$dir/retired.json"
+grep -q '"enabled": true, "isolation"' "$dir/retired.json" || fail "the retired-enabled fixture was made"
+refused "the retired layer1.enabled" "$dir/retired.json" \
+  "securecore-fpm: $conf: invalid: layer1.enabled is retired: layer1.isolation is layer 1's only switch"
 
 # Back to the example.
 put ext/examples/wordpress.json

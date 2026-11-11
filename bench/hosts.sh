@@ -33,7 +33,7 @@ wp plugin install classic-editor wordpress-seo contact-form-7 --activate >/dev/n
 # per-connection loop actually connects (and so the front page's own-site calls, if any, pass).
 cat > "$out/hosts.json" <<JSON
 {
-  "layer1": { "enabled": false },
+  "layer1": { "isolation": "off" },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "enforce",
     "core": { "hosts": ["web", "api.wordpress.org", "downloads.wordpress.org"] },

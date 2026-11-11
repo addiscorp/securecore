@@ -1,6 +1,6 @@
 {
   "layer1": {
-    "enabled": true,
+    "isolation": "auto",
     "write": ["wp-content/uploads", "wp-content/cache", "/tmp"],
     "deny": ["/srv/backups"],
     "network": {

@@ -75,7 +75,7 @@ trap cleanup EXIT
 cfg() { # $1 = name, $2 = mode, $3 = the probe's grants
   cat > "$dir/$1.json" <<JSON
 {
-  "layer1": { "enabled": false },
+  "layer1": { "isolation": "off" },
   "layer2": {
     "enabled": true, "app": "wordpress", "mode": "$2",
     "default": { "tables": "own", "options": "own" },

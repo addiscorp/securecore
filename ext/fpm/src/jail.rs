@@ -435,9 +435,17 @@ mod tests {
         let e = can_connect_as(nobody, &path).expect_err("a root-only socket");
         assert!(e.contains("may not connect") && e.contains("Permission denied"), "{e}");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).expect("chmod");
-        // The folder above counts: a 0777 socket in a root-only folder is refused.
+        // Every folder above counts, not only the socket's own: a 0777 socket in a 0755 folder
+        // inside a root-only one is refused.
+        let inner = dir.join("inner");
+        fs::create_dir_all(&inner).expect("inner");
+        fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let deep = inner.join("db.sock");
+        let _ = fs::remove_file(&deep);
+        let _l2 = std::os::unix::net::UnixListener::bind(&deep).expect("bind");
+        fs::set_permissions(&deep, fs::Permissions::from_mode(0o777)).expect("chmod");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
-        let e = can_connect_as(nobody, &path).expect_err("a socket in a root-only folder");
+        let e = can_connect_as(nobody, &deep).expect_err("a socket below a root-only folder");
         assert!(e.contains("Permission denied"), "{e}");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
         let searchable = dir.ancestors().skip(1).all(|a| fs::metadata(a).is_ok_and(|m| m.permissions().mode() & 0o001 != 0));
