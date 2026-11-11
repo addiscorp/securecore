@@ -867,10 +867,11 @@ isolated children need Landlock and seccomp in the guest kernel (mirab#89 adds t
 sha256s of Firecracker, the kernel, the root image, the site tree (every path, mode, owner, size
 and mtime, writable folders excepted) and `securecore.json`, plus the memory, vCPUs, boot
 arguments and disks. Without one, the launcher cold-boots a VM that has no way to the database,
-warms it by compiling the site's PHP files into opcache (the guest image's `warm.php`; no request
-runs, so the production database sees nothing; the cost is a slower first page after a restore,
-about 0.55–0.6 s on [xps], against about 0.2 s when the snapshot was warmed with real front
-pages, which write to the database), snapshots it, and restores that, so the next
+warms it by reading the site's PHP files into the guest's page cache (the guest image's
+`warm.php`; nothing is compiled or run, so the production database sees nothing, and opcache
+holds nothing compiled out of context: `opcache_compile_file` over a WordPress tree declares
+functions as it goes and caches classes whose traits aren't bound, which broke Contact Form 7),
+snapshots it, and restores that, so the next
 start is fast; old snapshots and site disks are removed. A restore that fails is removed and the
 launcher cold-boots instead. After every boot or restore the launcher sends the guest one start
 message, which the guest takes from the host's CID only and only once per boot: the clock (a

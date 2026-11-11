@@ -23,8 +23,9 @@
 //! sha256 of Firecracker, the jailer, the kernel and the root image, and they must match.
 //!
 //! Start: from a snapshot when there is one for this key ([`Key`]), else a cold boot that is
-//! warmed up (opcache compiles the site's PHP files; no request runs, and the VM has no way to
-//! the database while it warms) and snapshotted first, so the next start restores. A restore
+//! warmed up (the site's PHP files read into the guest's page cache; nothing is compiled or run,
+//! and the VM has no way to the database while it warms) and snapshotted first, so the next
+//! start restores. A restore
 //! that fails falls back to a cold boot; a snapshot that can't be made leaves the cold-booted VM
 //! serving.
 
@@ -62,7 +63,7 @@ const PROTOCOL: u32 = 2;
 /// KVM_GET_API_VERSION, and the only value every KVM since Linux 2.6.22 returns.
 const KVM_GET_API_VERSION: libc::c_ulong = 0xAE00;
 const KVM_API_VERSION: i32 = 12;
-/// The guest root image's warm-up script: compiles the site's PHP files into opcache.
+/// The guest root image's warm-up script: reads the site's PHP files into the page cache.
 pub const WARM_SCRIPT: &str = "/usr/local/lib/securecore/warm.php";
 /// Symbols only a kernel with Landlock and with seccomp filters has (searched in `vmlinux`).
 const LANDLOCK_SYMBOL: &[u8] = b"landlock_merge_ruleset\0";
@@ -975,8 +976,9 @@ enum Started {
     Cold,
 }
 
-/// Compiles the site's PHP into opcache through php-fpm (the guest image's warm-up script): no
-/// WordPress request runs, so nothing reaches the database (the VM has no way to it then).
+/// Reads the site's PHP files into the guest's page cache through php-fpm (the guest image's
+/// warm-up script): nothing is compiled or run, so nothing reaches the database (the VM has no
+/// way to it then) and opcache holds nothing compiled out of context.
 fn warm_up(vm: &Vm, root: &str) -> Result<String, String> {
     let mut s = vsock::connect_through(&vm.vsock, FPM_PORT, Duration::from_secs(2)).map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(Duration::from_secs(120))).map_err(|e| e.to_string())?;
@@ -993,7 +995,7 @@ fn warm_up(vm: &Vm, root: &str) -> Result<String, String> {
     )
     .map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&out);
-    text.lines().find(|l| l.starts_with("compiled=")).map(str::to_owned).ok_or_else(|| format!("the warm-up answered {:?}", text.trim()))
+    text.lines().find(|l| l.starts_with("read=")).map(str::to_owned).ok_or_else(|| format!("the warm-up answered {:?}", text.trim()))
 }
 
 /// Boots or restores the VM for `m`, by the rules in the module header.
@@ -1006,8 +1008,8 @@ fn start(plan: &Plan, opts: &Options, m: &Machine) -> Result<(Vm, Started), Stri
             let mut vm = cold_boot(plan, opts, m, Wiring::LogOnly)?;
             vm.wait_ready(&plan.state, ready)?;
             match warm_up(&vm, &plan.guest_root) {
-                Ok(n) => log(&format!("warmed opcache for the snapshot ({n} files)")),
-                Err(e) => log(&format!("the warm-up failed ({e}); the snapshot has a cold opcache")),
+                Ok(n) => log(&format!("warmed the guest's page cache for the snapshot ({n})")),
+                Err(e) => log(&format!("the warm-up failed ({e}); the snapshot has a cold page cache")),
             }
             match snapshot(&vm, plan, m.user, &snap) {
                 Ok(()) => {

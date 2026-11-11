@@ -262,11 +262,13 @@ if [ "$what" = bench ]; then
   # bench/layer1.sh's method (#70): 20 warm-up and 100 sequential requests by oha on the stack's
   # network, extension off on both sides; host php-fpm is the php container with layer 1 off.
   oha() { docker run --rm --network "${project}_default" "$OHA" --no-tui --output-format json -H "Host: 127.0.0.1:$port" "$@"; }
+  # p50 <url> <name>: sets P50; dies (in this shell, never a subshell) unless all 100 were 200s.
   p50() {
     oha -n 20 -c 1 "$1" > /dev/null
     oha -n 100 -c 1 "$1" > "$dir/$2.json"
-    [ "$(jq -r '.statusCodeDistribution["200"] // 0' "$dir/$2.json")" = 100 ] || die "$2: not all 100 responses were 200"
-    jq -r '.metrics.latency_ms.p50' "$dir/$2.json"
+    ok=$(jq -r '.statusCodeDistribution["200"] // 0' "$dir/$2.json")
+    [ "$ok" = 100 ] || die "$2: $ok of 100 responses were 200"
+    P50=$(jq -r '.metrics.latency_ms.p50' "$dir/$2.json")
   }
   ini=/usr/local/etc/php/conf.d/securecore.ini
   awk '/"layer1": \{/ { s = 1 } /"layer2": \{/ { s = 2 } /"layer3": \{/ { s = 3 }
@@ -278,9 +280,9 @@ if [ "$what" = bench ]; then
     cp "$dir/stock.json" "$site/securecore.json"
     compose restart php >/dev/null 2>&1
     i=0; until [ "$(code /)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 300 ] || die "host php-fpm did not come back"; sleep 0.2; done
-    a=$(p50 http://web/ "lat-host-$r")
+    p50 http://web/ "lat-host-$r"; a=$P50
     start "bench-$r" "$dir/microvm.json" --guest-arg sc.ext=0 || die "bench VM"
-    b=$(p50 http://mvmweb/ "lat-vm-$r")
+    p50 http://mvmweb/ "lat-vm-$r"; b=$P50
     stop
     printf 'round %s: host php-fpm %.2f ms   microVM %.2f ms\n' "$r" "$a" "$b"
     host="$host $a" mvm="$mvm $b"
@@ -363,7 +365,8 @@ unset NOTIFY_SOCKET
 q1=$(questions)
 if [ "$started" = 1 ]; then
   is "$((q1 - q0))" "$qbase" "the warm-up and snapshot sent MariaDB nothing (Questions +$((q1 - q0)), the same as asking twice)"
-  has "$dir/first.log" "warmed opcache for the snapshot (compiled=" "the warm-up compiled the site into opcache"
+  has "$dir/first.log" "warmed the guest's page cache for the snapshot (read=" "the warm-up read the site into the guest's page cache"
+  lacks "$dir/first.log" "PHP Fatal error" "no PHP fatal error in the guest (the warm-up compiles nothing out of context)"
   has "$dir/first.log" "layer 1 isolation microvm: microvm" "microvm on the KVM host: the microVM"
   has "$dir/first.log" "made the snapshot" "the first start makes a snapshot"
   has "$dir/first.log" "microVM restored from snapshot" "and serves from a restore of it"
