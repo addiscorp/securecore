@@ -1892,12 +1892,19 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
-    /// Root and mke2fs only (the Docker `check` gate is root, and Debian has e2fsprogs).
+    /// Root with CAP_SYS_ADMIN (the masks are a private mount namespace) and mke2fs only: runs on
+    /// a KVM host's unit run (and in ext-microvm, end to end); a Docker build has no
+    /// CAP_SYS_ADMIN, so it says so and stops there.
     #[test]
     fn disks_are_copied_as_the_pool_user_without_the_writable_folders() {
+        let cap_sys_admin = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("CapEff:").map(|v| v.trim().to_owned())))
+            .and_then(|v| u64::from_str_radix(&v, 16).ok())
+            .is_some_and(|caps| caps & (1 << 21) != 0);
         // SAFETY: geteuid(2) can't fail.
-        if unsafe { libc::geteuid() } != 0 || !on_path("mke2fs") || !on_path("debugfs") {
-            eprintln!("not root, or no mke2fs/debugfs: checked in the Docker gate");
+        if unsafe { libc::geteuid() } != 0 || !cap_sys_admin || !on_path("mke2fs") || !on_path("debugfs") {
+            eprintln!("not root with CAP_SYS_ADMIN, or no mke2fs/debugfs: checked on the KVM host and in test/ext-microvm.sh");
             return;
         }
         let dir = scratch("copy");
