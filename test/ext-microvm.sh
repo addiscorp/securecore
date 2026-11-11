@@ -155,7 +155,7 @@ rm -f "$dir/vm-mirabkernel/vmlinux"
 cp "$dir/vmlinux-mirab" "$dir/vm-mirabkernel/vmlinux"
 record "$dir/vm-mirabkernel"
 # The jailed user, and nginx's group (the alpine image's nginx is 101:101) for fpm.sock.
-vmuser=64000:64000
+vmuser=${SC_VM_USER:-64000:64000}
 
 # The site's files the VM sees: the probe, the status page, writable folders owned by www-data.
 cp test/ext/microvm/probe.php "$site/sc-mvm-probe.php"
