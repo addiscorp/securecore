@@ -17,7 +17,7 @@
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,26 +58,16 @@ pub fn user(spec: &str) -> Result<User, String> {
     Ok(u)
 }
 
-/// Whether `user` can connect to the unix socket at `path` the way Firecracker will in the
-/// jail, where the socket's folder is bind-mounted: through that folder (opened here as root),
-/// as `user` with no supplementary groups. So the folder's and the socket's own permissions
-/// decide, as they will for Firecracker; the folders above it don't (the jail never has them).
-/// Forks, so it runs before the launcher starts any thread.
+/// Whether `user` can connect to the unix socket at `path` (its real path: the launcher
+/// bind-mounts this path's folder) itself: a real connect, as `user` with no supplementary
+/// groups, so every folder above it counts as well as the socket's own permissions. Forks, so
+/// it runs before the launcher starts any thread.
 pub fn can_connect_as(user: User, path: &Path) -> Result<(), String> {
     let m = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()) {
         return Err(format!("{} is not a unix socket", path.display()));
     }
-    let (dir, name) = match (path.parent(), path.file_name()) {
-        (Some(d), Some(n)) => (d, n),
-        _ => return Err(format!("{}: no folder", path.display())),
-    };
-    let dir_fd = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
-        .open(dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?;
-    let via = format!("/proc/self/fd/{}/{}", std::os::fd::AsRawFd::as_raw_fd(&dir_fd), name.to_string_lossy());
+    let via = path.to_str().ok_or_else(|| format!("{}: not UTF-8", path.display()))?.to_owned();
     // SAFETY: an all-zero sockaddr_un is valid; the path is copied in below, NUL-terminated.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
@@ -108,7 +98,6 @@ pub fn can_connect_as(user: User, path: &Path) -> Result<(), String> {
     let mut status = 0;
     // SAFETY: waitpid(2) for the child just forked.
     unsafe { libc::waitpid(pid, &mut status, 0) };
-    drop(dir_fd);
     let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
     match code {
         0 => Ok(()),
@@ -209,7 +198,85 @@ impl Jail {
         fs::create_dir_all(&self.base).map_err(|e| format!("{}: {e}", self.base.display()))?;
         let dev = fs::metadata(&self.base).map_err(|e| e.to_string())?.dev();
         let jail_dir = self.base.join("firecracker");
-        remove_tree(&jail_dir, dev).map_err(|e| format!("clearing {}: {e}", jail_dir.display()))
+        remove_tree(&jail_dir, dev).map_err(|e| format!("clearing {}: {e}", jail_dir.display()))?;
+        // The VM's cgroup, once nothing is left in it (the jailer makes one per start).
+        let cg = self.cgroup();
+        if cg.exists() {
+            let _ = fs::write(cg.join("cgroup.kill"), "1");
+            for _ in 0..50 {
+                if fs::remove_dir(&cg).is_ok() || !cg.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        Ok(())
+    }
+
+    /// This jail's cgroup v2 folder (the jailer's `--parent-cgroup`/`--id`).
+    pub fn cgroup(&self) -> PathBuf {
+        Path::new(CGROUP_ROOT).join(PARENT_CGROUP).join(&self.id)
+    }
+
+    /// A process that takes the VM down when the launcher goes, however it goes (a crash, a
+    /// SIGKILL): it blocks on a pipe whose only writer is the launcher, and when that closes it
+    /// kills everything in the VM's cgroup (`cgroup.kill`), unmounts the jail's bind mounts
+    /// (`mounts`, deepest first) and removes the cgroup. The launcher keeps the returned write
+    /// end open for its whole life and never writes to it. Forks, so it runs before the
+    /// launcher starts any thread; the child makes syscalls only.
+    pub fn watchdog(&self, mounts: &[PathBuf]) -> Result<std::os::fd::OwnedFd, String> {
+        use std::os::fd::FromRawFd as _;
+        let cg = self.cgroup();
+        let kill = cstr(&cg.join("cgroup.kill")).map_err(|e| e.to_string())?;
+        let cg = cstr(&cg).map_err(|e| e.to_string())?;
+        let mounts: Vec<CString> = mounts.iter().map(|m| cstr(m)).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+        let mut fds = [0; 2];
+        // SAFETY: pipe2(2) fills the two-element array.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+            return Err(format!("pipe: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: fork(2) with one thread (see above).
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!("fork: {}", io::Error::last_os_error()));
+        }
+        if pid == 0 {
+            // SAFETY: the child: syscalls only, on strings made before the fork, then _exit.
+            unsafe {
+                libc::close(fds[1]);
+                // Not the launcher's terminal signals: it outlives the launcher on purpose.
+                libc::signal(libc::SIGINT, libc::SIG_IGN);
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+                let mut b = [0u8; 1];
+                while libc::read(fds[0], b.as_mut_ptr().cast(), 1) != 0 {
+                    if *libc::__errno_location() != libc::EINTR {
+                        break;
+                    }
+                }
+                let fd = libc::open(kill.as_ptr(), libc::O_WRONLY);
+                if fd >= 0 {
+                    libc::write(fd, c"1".as_ptr().cast(), 1);
+                    libc::close(fd);
+                }
+                for m in &mounts {
+                    libc::umount2(m.as_ptr(), libc::MNT_DETACH);
+                }
+                for _ in 0..100 {
+                    if libc::rmdir(cg.as_ptr()) == 0 || *libc::__errno_location() == libc::ENOENT {
+                        break;
+                    }
+                    libc::usleep(20_000);
+                }
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: the parent: the read end is the watchdog's; the write end is ours.
+        unsafe {
+            libc::close(fds[0]);
+            Ok(std::os::fd::OwnedFd::from_raw_fd(fds[1]))
+        }
     }
 
     /// An empty jail root, owned by the jailed user (Firecracker makes its sockets there).
@@ -227,9 +294,19 @@ impl Jail {
         if let Some(dir) = dst.parent() {
             fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        if fs::hard_link(src, &dst).is_err() {
-            fs::copy(src, &dst).map_err(|e| format!("{} → {}: {e}", src.display(), dst.display()))?;
+        if fs::hard_link(src, &dst).is_ok() {
+            return Ok(());
         }
+        // Another filesystem: a copy, into a file that must not exist yet (the jail is fresh and
+        // Firecracker isn't running), so nothing at `dst` is followed or written through.
+        let mut from = fs::File::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        let mut to = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dst)
+            .map_err(|e| format!("{}: {e}", dst.display()))?;
+        io::copy(&mut from, &mut to).map_err(|e| format!("{} → {}: {e}", src.display(), dst.display()))?;
+        to.set_permissions(from.metadata().map_err(|e| e.to_string())?.permissions()).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -358,7 +435,17 @@ mod tests {
         let e = can_connect_as(nobody, &path).expect_err("a root-only socket");
         assert!(e.contains("may not connect") && e.contains("Permission denied"), "{e}");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).expect("chmod");
-        can_connect_as(nobody, &path).expect("a socket anyone may open");
+        // The folder above counts: a 0777 socket in a root-only folder is refused.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let e = can_connect_as(nobody, &path).expect_err("a socket in a root-only folder");
+        assert!(e.contains("Permission denied"), "{e}");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let searchable = dir.ancestors().skip(1).all(|a| fs::metadata(a).is_ok_and(|m| m.permissions().mode() & 0o001 != 0));
+        if searchable {
+            can_connect_as(nobody, &path).expect("a socket anyone may reach and open");
+        } else {
+            eprintln!("{} has a folder above it others can't search: the allowed case is checked in the Docker gate", dir.display());
+        }
         assert!(can_connect_as(nobody, &dir).expect_err("a folder").contains("not a unix socket"));
         let _ = fs::remove_dir_all(&dir);
     }

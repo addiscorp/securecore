@@ -67,6 +67,9 @@ pub struct Boot {
     pub socks: Vec<(u16, String)>,
     /// `sc.ext=0`: php-fpm without the extension.
     pub ext: bool,
+    /// `sc.user=<uid>:<gid>`: the host's pool user, whom php-fpm's pool runs as here, so the
+    /// writable disks (owned as on the host) are writable whatever the image's www-data is.
+    pub user: Option<(u32, u32)>,
 }
 
 /// Parses the guest's kernel command line. Paths may not hold spaces (the command line is
@@ -89,6 +92,15 @@ pub fn parse_cmdline(line: &str) -> Result<Boot, String> {
                 boot.socks.push((port, path.to_owned()));
             }
             "sc.ext" => boot.ext = value != "0",
+            "sc.user" => {
+                let bad = || format!("sc.user={value}: want <uid>:<gid>, not root");
+                let (u, g) = value.split_once(':').ok_or_else(bad)?;
+                let (u, g) = (u.parse::<u32>().map_err(|_| bad())?, g.parse::<u32>().map_err(|_| bad())?);
+                if u == 0 || g == 0 {
+                    return Err(bad());
+                }
+                boot.user = Some((u, g));
+            }
             _ => {}
         }
     }
@@ -260,6 +272,14 @@ static FPM_MASTER: AtomicI32 = AtomicI32::new(0);
 static BOOT: std::sync::OnceLock<Boot> = std::sync::OnceLock::new();
 /// Whether this boot took its start message.
 static STARTED: AtomicBool = AtomicBool::new(false);
+/// Control connections being served now.
+static CTL_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How long a reload waits for php-fpm's graceful stop before it kills it. The host waits
+/// [`RELOAD_TIMEOUT`] for the whole reload, which includes php-fpm starting again.
+pub const RELOAD_GRACE: Duration = Duration::from_secs(20);
+pub const RELOAD_TIMEOUT: Duration = Duration::from_secs(40);
+/// The host's wait for a `sync` (and the guest's for a control connection's lines).
+pub const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 /// The writable disks' mount points, watched for space.
 static WRITABLE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -305,8 +325,8 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             unsafe { libc::kill(old, libc::SIGQUIT) };
             let t = std::time::Instant::now();
             while Path::new(&format!("/proc/{old}")).exists() {
-                if t.elapsed() > Duration::from_secs(30) {
-                    // SAFETY: as above; it didn't stop gracefully in 30 s.
+                if t.elapsed() > RELOAD_GRACE {
+                    // SAFETY: as above; it didn't stop gracefully in time.
                     unsafe { libc::kill(old, libc::SIGKILL) };
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -350,7 +370,7 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
         say(&format!("ctl: refused a connection from CID {peer_cid}: only the host (CID {HOST_CID}) controls this guest"));
         return;
     }
-    let _ = conn.set_read_timeout(Duration::from_secs(10));
+    let _ = conn.set_read_timeout(SYNC_TIMEOUT);
     let mut lines = Vec::new();
     let mut failed: Option<String> = None;
     let mut done = false;
@@ -372,10 +392,11 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
     if failed.is_none() {
         failed = allowed(&lines, started).err();
     }
+    // The start message claims the boot's one start atomically (connections run concurrently).
+    if failed.is_none() && lines.iter().any(Ctl::starts) && STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        failed = Some("this boot's start message was already taken".into());
+    }
     if failed.is_none() {
-        if lines.iter().any(Ctl::starts) {
-            STARTED.store(true, Ordering::SeqCst);
-        }
         for ctl in &lines {
             if let Err(e) = apply(ctl) {
                 failed = Some(e.to_string());
@@ -499,12 +520,26 @@ fn listen_forwards(boot: &Boot) -> io::Result<()> {
     let ctl = Vsock::listen(CTL_PORT)?;
     thread::spawn(move || {
         loop {
+            // A thread per connection: a sync must never wait behind a reload. At most a few at
+            // once (only the host can connect, and it sends one at a time per purpose).
             if let Ok((c, cid)) = ctl.accept() {
-                serve_ctl(c, cid);
+                if CTL_BUSY.fetch_add(1, Ordering::SeqCst) >= 4 {
+                    CTL_BUSY.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+                thread::spawn(move || {
+                    serve_ctl(c, cid);
+                    CTL_BUSY.fetch_sub(1, Ordering::SeqCst);
+                });
             }
         }
     });
     Ok(())
+}
+
+/// php-fpm's config with the `www` pool's user and group set to numbers (php-fpm takes ids).
+pub fn pool_conf(uid: u32, gid: u32) -> String {
+    format!("[global]\ninclude=/usr/local/etc/php-fpm.conf\n[www]\nuser = {uid}\ngroup = {gid}\n")
 }
 
 fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
@@ -516,8 +551,14 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
     // SAFETY: both fds were just returned by pipe2(2) and are owned from here.
     let (read, write) = unsafe { (fs::File::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let mut cmd = Command::new("php-fpm");
-    cmd.arg("-F")
-        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    cmd.arg("-F");
+    if let Some((uid, gid)) = boot.user {
+        // The image's php-fpm.conf, then the pool's user and group as the host's pool user's.
+        let conf = "/run/securecore-php-fpm.conf";
+        fs::write(conf, pool_conf(uid, gid))?;
+        cmd.arg("-y").arg(conf);
+    }
+    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         .envs(env_file())
         .stdin(Stdio::null())
         .stdout(Stdio::from(write.try_clone()?))
@@ -602,6 +643,10 @@ mod tests {
         assert!(b.ext, "the extension is on unless sc.ext=0");
         assert!(!parse_cmdline("sc.root=/srv sc.ext=0").expect("parses").ext);
         assert!(parse_cmdline("sc.ports=3306").is_err(), "no root: refused");
+        assert_eq!(parse_cmdline("sc.root=/srv sc.user=1234:1235").expect("parses").user, Some((1234, 1235)));
+        assert!(parse_cmdline("sc.root=/srv sc.user=0:0").is_err(), "the pool never runs as root");
+        let conf = pool_conf(1234, 1235);
+        assert!(conf.starts_with("[global]\ninclude=/usr/local/etc/php-fpm.conf\n") && conf.ends_with("[www]\nuser = 1234\ngroup = 1235\n"), "{conf}");
         assert!(parse_cmdline("sc.root=/srv sc.ports=99999").is_err());
     }
 

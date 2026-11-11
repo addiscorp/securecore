@@ -67,9 +67,10 @@ pub fn choose_with(layer1: &Layer1, auto_microvm: bool, microvm: impl FnOnce() -
             Ok(()) => Ok(Choice::Microvm),
             Err(why) => Err(Refusal::NoMicrovm { why }),
         },
+        // Gated: gelada without asking anything (no state folder, no hashing, no cgroup write).
+        Isolation::Auto if !auto_microvm => Ok(Choice::Gelada { fallback: Some(AUTO_GATE.into()) }),
         Isolation::Auto => Ok(match microvm() {
             Err(why) => Choice::Gelada { fallback: Some(why) },
-            Ok(()) if !auto_microvm => Choice::Gelada { fallback: Some(AUTO_GATE.into()) },
             Ok(()) => Choice::Microvm,
         }),
     }

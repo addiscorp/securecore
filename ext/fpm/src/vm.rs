@@ -37,6 +37,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -152,6 +153,8 @@ pub struct Options {
     pub write_disk_mib: u64,
     /// `<uid>:<gid>` or a user name: who Firecracker runs as.
     pub vm_user: String,
+    /// The site's pool user (default: the app root's owner).
+    pub pool_user: Option<String>,
     /// Start from a snapshot (and make one when there is none). Off: cold boot every time.
     pub snapshot: bool,
     /// Extra guest boot arguments (e.g. `sc.ext=0`).
@@ -185,6 +188,8 @@ pub struct Plan {
     pub state: PathBuf,
     /// The jail's id: `sc-` and 16 hex digits of the app root's sha256.
     pub id: String,
+    /// The site's pool user: disks are copied as it, and the guest's pool runs as its uid/gid.
+    pub pool: User,
 }
 
 fn no_space(what: &str, s: &str) -> Result<(), String> {
@@ -204,6 +209,28 @@ fn hex(bytes: &[u8]) -> String {
 
 fn sha_of(text: &str) -> String {
     hex(&Sha256::digest(text.as_bytes()))
+}
+
+/// Refuses a symlink anywhere from `root` (canonical) down to `path`: the launcher reads these
+/// folders to build disks, and a link the site owner controls must never take it elsewhere.
+fn no_link_beneath(root: &Path, path: &Path) -> Result<(), String> {
+    let rel = path.strip_prefix(root).map_err(|_| format!("{} is not under {}", path.display(), root.display()))?;
+    let mut at = root.to_path_buf();
+    for c in rel.components() {
+        match c {
+            std::path::Component::Normal(name) => at.push(name),
+            _ => return Err(format!("{} is not a plain path under the app root", path.display())),
+        }
+        match fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!("{} is a symlink; a microVM's writable folder must be a real folder in the app root", at.display()));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("{}: {e}", at.display())),
+        }
+    }
+    Ok(())
 }
 
 /// The microVM plan for `loaded`'s layer 1, or why it can't be one.
@@ -231,7 +258,13 @@ pub fn plan(loaded: &Loaded, opts: &Options) -> Result<Plan, String> {
     }
     let (mut disks, mut tmpfs) = (Vec::new(), Vec::new());
     for w in &layer1.write {
+        if Path::new(w).components().any(|c| c == std::path::Component::ParentDir) {
+            return Err(format!("layer1.write {w:?} holds \"..\": a microVM's writable folders are named without it"));
+        }
         let host = loaded.resolve(w);
+        if host.starts_with(&root) {
+            no_link_beneath(&root, &host).map_err(|e| format!("layer1.write {w:?}: {e}"))?;
+        }
         match host.strip_prefix(&root) {
             Ok(rel) if rel.as_os_str().is_empty() => return Err("layer1.write lists the app root itself; list its writable folders".into()),
             Ok(rel) => {
@@ -261,7 +294,12 @@ pub fn plan(loaded: &Loaded, opts: &Options) -> Result<Plan, String> {
             ));
         }
         match (&c.socket, &c.address) {
-            (Some(s), _) => sockets.push((port, loaded.resolve(s))),
+            // Its real path: the launcher checks this path as the VM's user and bind-mounts this
+            // path's folder, so a link can't make the two differ.
+            (Some(s), _) => {
+                let p = loaded.resolve(s);
+                sockets.push((port, fs::canonicalize(&p).unwrap_or(p)));
+            }
             (None, Some(a)) => addresses.push((port, a.clone())),
             (None, None) => unreachable.push(port),
         }
@@ -278,7 +316,29 @@ pub fn plan(loaded: &Loaded, opts: &Options) -> Result<Plan, String> {
     let key = sha_of(&root_str);
     let state = opts.state.clone().unwrap_or_else(|| Path::new(DEFAULT_STATE_DIR).join(&key[..16]));
     let id = format!("sc-{}", &key[..16]);
-    Ok(Plan { root, guest_root, disks, tmpfs, sockets, addresses, unreachable, listen, state, id })
+    let pool = pool_user(opts, &root)?;
+    Ok(Plan { root, guest_root, disks, tmpfs, sockets, addresses, unreachable, listen, state, id, pool })
+}
+
+/// The site's pool user: `--pool-user` (a name or `<uid>:<gid>`), or the app root's owner. Never
+/// root: the disks are copied as this user, and the guest's php-fpm pool runs as it.
+fn pool_user(opts: &Options, root: &Path) -> Result<User, String> {
+    match &opts.pool_user {
+        Some(spec) => jail::user(spec).map_err(|e| {
+            e.replace("--vm-user", "--pool-user")
+                .replace("Firecracker must not run as root", "the site's files are copied and served as this user, never root")
+        }),
+        None => {
+            let m = fs::metadata(root).map_err(|e| format!("{}: {e}", root.display()))?;
+            if m.uid() == 0 || m.gid() == 0 {
+                return Err(format!(
+                    "the app root {} is owned by root, so the site's pool user isn't known: pass --pool-user <name>|<uid>:<gid> (php-fpm's pool user)",
+                    root.display()
+                ));
+            }
+            Ok(User { uid: m.uid(), gid: m.gid() })
+        }
+    }
 }
 
 /// The site tree's sha256 (every entry's path, type, mode, owner, size, mtime and link target,
@@ -299,15 +359,18 @@ pub fn site_sha256(root: &Path, skip: &BTreeSet<PathBuf>) -> io::Result<(String,
             let m = fs::symlink_metadata(&path)?;
             let rel = path.strip_prefix(root).unwrap_or(&path);
             let link = if m.file_type().is_symlink() { fs::read_link(&path)?.display().to_string() } else { String::new() };
+            // ctime too: a touch can put mtime back, but any change to a file moves its ctime.
             h.update(format!(
-                "{}\0{:o}\0{}\0{}\0{}\0{}.{}\0{link}\n",
+                "{}\0{:o}\0{}\0{}\0{}\0{}.{}\0{}.{}\0{link}\n",
                 rel.display(),
                 m.mode(),
                 m.uid(),
                 m.gid(),
                 m.size(),
                 m.mtime(),
-                m.mtime_nsec()
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec()
             ));
             entries += 1;
             bytes += m.blocks() * 512;
@@ -495,28 +558,99 @@ fn run_tool(cmd: &mut Command, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `mke2fs -d <from>` into `<to>` (through a temporary name), `mb` MiB, owned like `<from>`.
-fn mke2fs(from: Option<&Path>, to: &Path, mb: u64, inodes: u64, journal: bool) -> Result<(), String> {
+fn cpath(p: &Path) -> Result<std::ffi::CString, String> {
+    std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).map_err(|_| format!("{}: holds a NUL", p.display()))
+}
+
+/// The fds the copy's source folder and its output image get in `mke2fs`'s process
+/// (`-d /proc/self/fd/200`, the device `/proc/self/fd/201`): both opened as root, so the pool
+/// user needs no right on the root-only folders around them.
+const SOURCE_FD: libc::c_int = 200;
+const OUTPUT_FD: libc::c_int = 201;
+
+/// Runs `cmd` as `who`, with no supplementary groups. With `source`, first (still root, in a
+/// private mount namespace of its own) every folder in `masks` is covered by an empty read-only
+/// tmpfs, and `source` is opened (after the masks, so they apply) as fd [`SOURCE_FD`]: the
+/// command reads the tree through it, as `who`, so it sees only what `who` may read, never the
+/// masked folders, and needs no search right on the folders above `source`.
+fn as_user(cmd: &mut Command, who: User, source: Option<&Path>, masks: &[PathBuf], output: Option<&fs::File>) -> Result<(), String> {
+    let source = source.map(cpath).transpose()?;
+    let output = output.map(|f| f.as_raw_fd());
+    let masks: Vec<std::ffi::CString> = masks.iter().map(|m| cpath(m)).collect::<Result<_, _>>()?;
+    let (tmpfs, none) = (c"tmpfs", c"none");
+    let data = c"mode=0755,size=4k";
+    // SAFETY: only syscalls between fork and exec, on strings made before the fork.
+    unsafe {
+        cmd.pre_exec(move || {
+            let err = || Err(io::Error::last_os_error());
+            if let Some(src) = &source {
+                if !masks.is_empty() {
+                    if libc::unshare(libc::CLONE_NEWNS) < 0 {
+                        return err();
+                    }
+                    if libc::mount(none.as_ptr(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) < 0 {
+                        return err();
+                    }
+                    for m in &masks {
+                        let flags = libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+                        if libc::mount(tmpfs.as_ptr(), m.as_ptr(), tmpfs.as_ptr(), flags, data.as_ptr().cast()) < 0 {
+                            return err();
+                        }
+                    }
+                }
+                let fd = libc::open(src.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+                if fd < 0 || libc::dup2(fd, SOURCE_FD) < 0 {
+                    return err();
+                }
+            }
+            if let Some(out) = output
+                && libc::dup2(out, OUTPUT_FD) < 0
+            {
+                return err();
+            }
+            if libc::setgroups(0, std::ptr::null()) < 0 || libc::setgid(who.gid) < 0 || libc::setuid(who.uid) < 0 {
+                return err();
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+/// `mke2fs -d <from>` into `<to>` (through a temporary name), `mb` MiB, the copy made as
+/// `who` (the site's pool user, [`as_user`]) with `masks` left out, and the image's root owned
+/// like `<from>`.
+fn mke2fs(who: User, from: &Path, masks: &[PathBuf], to: &Path, mb: u64, inodes: u64, journal: bool) -> Result<(), String> {
     let tmp = to.with_extension("ext4.new");
     let _ = fs::remove_file(&tmp);
+    // Made and opened here, owned by `who`, and handed to mke2fs (as `who`) as an fd.
+    let out = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let f = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::os::unix::fs::fchown(&f, Some(who.uid), Some(who.gid)).map_err(|e| e.to_string())?;
+        f
+    };
+    let m = fs::symlink_metadata(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    if !m.is_dir() {
+        return Err(format!("{} is not a folder", from.display()));
+    }
     let mut cmd = Command::new("mke2fs");
     cmd.args(["-q", "-F", "-t", "ext4", "-b", "4096", "-m", "0"]).arg("-N").arg(inodes.to_string());
     if !journal {
         cmd.args(["-O", "^has_journal"]);
     }
-    if let Some(from) = from {
-        let m = fs::metadata(from).map_err(|e| format!("{}: {e}", from.display()))?;
-        cmd.arg("-E").arg(format!("root_owner={}:{}", m.uid(), m.gid())).arg("-d").arg(from);
-    }
-    cmd.arg(&tmp).arg(format!("{mb}M"));
-    if let Err(e) = run_tool(&mut cmd, &format!("mke2fs {}", to.display())) {
+    cmd.arg("-E").arg(format!("root_owner={}:{}", m.uid(), m.gid())).arg("-d").arg(format!("/proc/self/fd/{SOURCE_FD}"));
+    cmd.arg(format!("/proc/self/fd/{OUTPUT_FD}")).arg(format!("{mb}M"));
+    as_user(&mut cmd, who, Some(from), masks, Some(&out))?;
+    if let Err(e) = run_tool(&mut cmd, &format!("mke2fs {} (copying {} as uid {})", to.display(), from.display(), who.uid)) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
     fs::rename(&tmp, to).map_err(|e| format!("{}: {e}", to.display()))
 }
 
-/// The site's read-only disk for this tree, built when it isn't there yet (older ones removed).
+/// The site's read-only disk for this tree, built when it isn't there yet (older ones removed):
+/// the app root without its writable folders (only their mount points), copied as the pool user.
 /// Readable by the jailed group only: it holds the site's files, wp-config.php included.
 fn site_disk(plan: &Plan, sha: &str, bytes: u64, entries: u64, user: User) -> Result<PathBuf, String> {
     let path = plan.state.join(format!("site-{}.ext4", &sha[..16]));
@@ -524,7 +658,8 @@ fn site_disk(plan: &Plan, sha: &str, bytes: u64, entries: u64, user: User) -> Re
         let t = Instant::now();
         // What the tree uses on disk, plus a third for ext4's own blocks and directories, plus 64 MiB.
         let mb = bytes * 4 / 3 / (1 << 20) + 64;
-        mke2fs(Some(&plan.root), &path, mb, entries * 2 + 1024, false)?;
+        let masks: Vec<PathBuf> = plan.disks.iter().map(|d| d.host.clone()).collect();
+        mke2fs(plan.pool, &plan.root, &masks, &path, mb, entries * 2 + 1024, false)?;
         log(&format!("built the site disk {} ({mb} MiB, {entries} entries) in {:.0} ms", path.display(), ms(t)));
         for e in fs::read_dir(&plan.state).map_err(|e| e.to_string())?.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -554,15 +689,30 @@ fn write_disk(plan: &Plan, disk: &WriteDisk, mib: u64, user: User) -> Result<Pat
                 bytes >> 20
             ));
         }
-        mke2fs(Some(&disk.host), &path, mib, (entries * 2 + 4096).max(16384), true)?;
+        mke2fs(plan.pool, &disk.host, &[], &path, mib, (entries * 2 + 4096).max(16384), true)?;
         log(&format!("made the writable disk {} for {} ({mib} MiB)", path.display(), disk.guest));
     } else {
         let have = fs::metadata(&path).map_err(|e| e.to_string())?.len();
         if have < want {
-            run_tool(Command::new("e2fsck").args(["-f", "-y"]).arg(&path), "e2fsck")
-                .or_else(|e| if e.contains("exit status: 1") { Ok(()) } else { Err(e) })?;
-            fs::OpenOptions::new().write(true).open(&path).and_then(|f| f.set_len(want)).map_err(|e| e.to_string())?;
-            run_tool(Command::new("resize2fs").arg(&path), "resize2fs")?;
+            // The guest wrote this image: root never parses it. e2fsck and resize2fs run as the
+            // VM's user, on the image root opened for them (no link followed).
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let img = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let via = format!("/proc/self/fd/{OUTPUT_FD}");
+            let mut fsck = Command::new("e2fsck");
+            fsck.args(["-f", "-y", &via]);
+            as_user(&mut fsck, user, None, &[], Some(&img))?;
+            run_tool(&mut fsck, "e2fsck").or_else(|e| if e.contains("exit status: 1") { Ok(()) } else { Err(e) })?;
+            img.set_len(want).map_err(|e| e.to_string())?;
+            let mut resize = Command::new("resize2fs");
+            resize.arg(&via);
+            as_user(&mut resize, user, None, &[], Some(&img))?;
+            run_tool(&mut resize, "resize2fs")?;
             log(&format!("grew the writable disk {} for {} from {} to {mib} MiB", path.display(), disk.guest, have >> 20));
         } else if have > want {
             log(&format!(
@@ -670,8 +820,8 @@ fn boot_args(plan: &Plan, opts: &Options) -> String {
     // Firecracker adds root=/dev/vda ro for a read-only root drive.
     let mut a = format!(
         "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/securecore-init i8042.noaux i8042.nokbd i8042.nopnp \
-         i8042.dumbkbd quiet loglevel=1 sc.root={}",
-        plan.guest_root
+         i8042.dumbkbd quiet loglevel=1 sc.root={} sc.user={}:{}",
+        plan.guest_root, plan.pool.uid, plan.pool.gid
     );
     let ports: Vec<String> = plan.sockets.iter().map(|(p, _)| p).chain(plan.addresses.iter().map(|(p, _)| p)).map(u16::to_string).collect();
     if !ports.is_empty() {
@@ -730,9 +880,9 @@ impl Drop for Vm {
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
-        } else {
+        } else if !FIRECRACKER_EXITED.load(Ordering::SeqCst) {
             // SAFETY: kill(2) on the Firecracker this VM started (its Child was handed to the
-            // waiter thread).
+            // waiter thread, which hasn't reaped it: it would have said so).
             unsafe { libc::kill(self.pid, libc::SIGKILL) };
             thread::sleep(Duration::from_millis(50));
         }
@@ -778,23 +928,27 @@ impl Vm {
         for (id, path) in &m.disks {
             j.place(path, &format!("/{id}.ext4"))?;
         }
+        // Every folder Firecracker uses is made here, as root, before it runs: nothing below is
+        // created by root inside the jail while the jailed user is in it.
         if let Some(snap) = snap {
             j.user_dir(IN_SNAP)?;
             j.place(&snap.join("vm.snap"), &format!("{IN_SNAP}/vm.snap"))?;
             j.place(&snap.join("vm.mem"), &format!("{IN_SNAP}/vm.mem"))?;
         }
+        if wiring == Wiring::LogOnly {
+            j.user_dir(IN_SNAP_NEW)?;
+        }
         let (root, short) = short_dir(&j.root)?;
         wire(plan, j, &short, m.user, wiring)?;
-        let console = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(plan.state.join("console.log"))
-            .map_err(|e| format!("console.log: {e}"))?;
-        let console2 = console.try_clone().map_err(|e| e.to_string())?;
         let mut cmd = j.command(&opts.assets.jailer, &opts.assets.firecracker, opts.vcpus, opts.mem_mib, &["--api-sock", IN_API]);
-        cmd.stdin(Stdio::null()).stdout(console).stderr(console2);
+        // stdout and stderr together, through a pipe, into a capped console.log.
+        let (rd, wr) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
+        let wr2 = wr.try_clone().map_err(|e| e.to_string())?;
+        cmd.stdin(Stdio::null()).stdout(wr).stderr(wr2);
         let child = cmd.spawn().map_err(|e| format!("{}: {e}", opts.assets.jailer.display()))?;
+        drop(cmd);
+        let console = plan.state.join("console.log");
+        thread::spawn(move || console_writer(rd, console, CONSOLE_CAP));
         let pid = child.id() as i32;
         let _ = fs::write(j.base.join("firecracker.pid"), pid.to_string());
         let inside = |p: &str| short.join(p.trim_start_matches('/'));
@@ -895,7 +1049,8 @@ fn restore(plan: &Plan, opts: &Options, m: &Machine, snap: &Path) -> Result<Vm, 
 /// out to `<snap>` (through a temporary folder).
 fn snapshot(vm: &Vm, plan: &Plan, user: User, snap: &Path) -> Result<(), String> {
     let j = Jail::new(&plan.state, &plan.id, user);
-    let inside = j.user_dir(IN_SNAP_NEW)?;
+    // Made before the VM started (spawn_in); the jailed user may have changed what is in it.
+    let inside = j.host(IN_SNAP_NEW);
     vm.api("PATCH", "/vm", r#"{"state":"Paused"}"#)?;
     vm.api(
         "PUT",
@@ -912,11 +1067,36 @@ fn snapshot(vm: &Vm, plan: &Plan, user: User, snap: &Path) -> Result<(), String>
     }
     fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     for f in ["vm.snap", "vm.mem"] {
-        fs::hard_link(inside.join(f), tmp.join(f))
-            .or_else(|_| fs::copy(inside.join(f), tmp.join(f)).map(|_| ()))
-            .map_err(|e| format!("{f}: {e}"))?;
+        take_out(&inside.join(f), &tmp.join(f), user).map_err(|e| format!("{f}: {e}"))?;
     }
     fs::rename(&tmp, snap).map_err(|e| format!("{}: {e}", snap.display()))
+}
+
+/// Links the file the jailed user wrote at `inside` to `out`, never through a link: opened with
+/// O_NOFOLLOW, it must be a regular file the jailed user owns; it becomes root's, readable by the
+/// jailed group only (a restore reads it, nothing in the jail may change it), and that very inode
+/// is linked out (linkat AT_EMPTY_PATH). No copy: the jail and the state folder are one
+/// filesystem.
+fn take_out(inside: &Path, out: &Path, user: User) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(inside)
+        .map_err(|e| format!("{}: {e}", inside.display()))?;
+    let m = f.metadata().map_err(|e| e.to_string())?;
+    if !m.is_file() || m.uid() != user.uid || m.nlink() != 1 {
+        return Err(format!("{} is not a file the VM wrote (type, owner or links differ)", inside.display()));
+    }
+    std::os::unix::fs::fchown(&f, Some(0), Some(user.gid)).map_err(|e| e.to_string())?;
+    f.set_permissions(fs::Permissions::from_mode(0o640)).map_err(|e| e.to_string())?;
+    let dst = cpath(out)?;
+    // SAFETY: linkat(2) of the open fd's inode (AT_EMPTY_PATH) to a NUL-terminated path.
+    let r = unsafe { libc::linkat(f.as_raw_fd(), c"".as_ptr(), libc::AT_FDCWD, dst.as_ptr(), libc::AT_EMPTY_PATH) };
+    if r < 0 {
+        return Err(format!("linking out {}: {}", inside.display(), io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// The start message: the clock, fresh randomness, the workers' refresh after a restore, then
@@ -999,8 +1179,12 @@ fn warm_up(vm: &Vm, root: &str) -> Result<String, String> {
 }
 
 /// Boots or restores the VM for `m`, by the rules in the module header.
+fn snap_dir(plan: &Plan, m: &Machine) -> PathBuf {
+    plan.state.join(format!("snap-{}", &m.key[..16]))
+}
+
 fn start(plan: &Plan, opts: &Options, m: &Machine) -> Result<(Vm, Started), String> {
-    let snap = plan.state.join(format!("snap-{}", &m.key[..16]));
+    let snap = snap_dir(plan, m);
     let ready = Duration::from_secs(60);
     if opts.snapshot {
         if !snap.join("vm.mem").is_file() {
@@ -1076,15 +1260,24 @@ fn wire(plan: &Plan, j: &Jail, short: &Path, user: User, wiring: Wiring) -> Resu
             let l = bind_unix(&short.join(format!("v.sock_{port}")), owned)?;
             let address = address.clone();
             let port = *port;
+            let slots: &'static Slots = Box::leak(Box::new(Slots::new(FORWARD_SLOTS)));
             thread::spawn(move || {
                 for c in l.incoming().flatten() {
-                    match TcpStream::connect(&address) {
-                        Ok(t) => {
-                            let _ = t.set_nodelay(true);
-                            let _ = vsock::join(c, t);
+                    let Some(slot) = slots.take() else {
+                        log(&format!("guest port {port}: {FORWARD_SLOTS} connections already open; refusing another"));
+                        continue;
+                    };
+                    let address = address.clone();
+                    thread::spawn(move || {
+                        let _slot = slot;
+                        match TcpStream::connect(&address) {
+                            Ok(t) => {
+                                let _ = t.set_nodelay(true);
+                                pipe_both(c, t);
+                            }
+                            Err(e) => log(&format!("guest port {port} → {address}: {e}")),
                         }
-                        Err(e) => log(&format!("guest port {port} → {address}: {e}")),
-                    }
+                    });
                 }
             });
         }
@@ -1094,7 +1287,9 @@ fn wire(plan: &Plan, j: &Jail, short: &Path, user: User, wiring: Wiring) -> Resu
     let l = bind_unix(&short.join(format!("v.sock_{LOG_PORT}")), owned)?;
     thread::spawn(move || {
         for c in l.incoming().flatten() {
+            let Some(slot) = LOG_SLOTS.take() else { continue };
             thread::spawn(move || {
+                let _slot = slot;
                 let _ = c.shutdown(std::net::Shutdown::Write);
                 mark_guest_lines(c, &mut io::stderr());
             });
@@ -1105,12 +1300,130 @@ fn wire(plan: &Plan, j: &Jail, short: &Path, user: User, wiring: Wiring) -> Resu
 
 /// Copies the guest's log to `to`, every line marked `guest: `, so no line the guest writes
 /// reads as the launcher's own (`securecore-fpm: …`).
+/// A line longer than [`MAX_LINE`] bytes is cut there (and marked), so the guest can't make the
+/// launcher buffer without bound.
 pub fn mark_guest_lines(from: impl Read, to: &mut impl Write) {
-    for line in BufReader::new(from).split(b'\n').map_while(Result::ok) {
-        let line = String::from_utf8_lossy(&line);
-        let _ = writeln!(to, "guest: {}", line.trim_end_matches('\r'));
+    let mut r = BufReader::new(from);
+    let mut line: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        line.clear();
+        let mut cut = false;
+        let mut eof = false;
+        loop {
+            let buf = match r.fill_buf() {
+                Ok([]) => {
+                    eof = true;
+                    break;
+                }
+                Ok(b) => b,
+                Err(_) => {
+                    eof = true;
+                    break;
+                }
+            };
+            let (take, done) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => (i, true),
+                None => (buf.len(), false),
+            };
+            let room = MAX_LINE.saturating_sub(line.len());
+            line.extend_from_slice(&buf[..take.min(room)]);
+            cut |= take > room;
+            r.consume(if done { take + 1 } else { take });
+            if done {
+                break;
+            }
+        }
+        if eof && line.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&line);
+        let _ = writeln!(to, "guest: {}{}", text.trim_end_matches('\r'), if cut { " …[cut]" } else { "" });
+        if eof {
+            return;
+        }
     }
 }
+
+/// The longest guest log line kept whole.
+pub const MAX_LINE: usize = 8 * 1024;
+
+/// A fixed number of slots: a connection takes one or is turned away.
+pub struct Slots(std::sync::atomic::AtomicUsize, usize);
+
+impl Slots {
+    pub const fn new(n: usize) -> Slots {
+        Slots(std::sync::atomic::AtomicUsize::new(0), n)
+    }
+    pub fn take(&'static self) -> Option<SlotGuard> {
+        if self.0.fetch_add(1, Ordering::SeqCst) >= self.1 {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(SlotGuard(self))
+    }
+}
+
+pub struct SlotGuard(&'static Slots);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The guest's log connections at once (its php-fpm stream, and the init's short reports).
+static LOG_SLOTS: Slots = Slots::new(4);
+/// Connections through one `address` forward at once.
+const FORWARD_SLOTS: usize = 64;
+
+/// Copies both ways (each direction half-closing its destination at its end) and returns when
+/// both are done: one thread for a → b, this one for b → a.
+fn pipe_both<A: vsock::Half, B: vsock::Half>(a: A, b: B) {
+    let (Ok(mut a2), Ok(mut b2)) = (a.dup(), b.dup()) else { return };
+    let t = thread::spawn(move || {
+        let mut a = a;
+        let _ = io::copy(&mut a, &mut b2);
+        b2.shut(std::net::Shutdown::Write);
+    });
+    let mut b = b;
+    let _ = io::copy(&mut b, &mut a2);
+    a2.shut(std::net::Shutdown::Write);
+    let _ = t.join();
+}
+
+/// Firecracker's stdout and stderr to `<state>/console.log`, at most `cap` bytes in it: past that
+/// the file moves to `console.log.1` (replacing an older one) and a new one starts.
+fn console_writer(from: impl Read, path: PathBuf, cap: u64) {
+    let open = |p: &Path| OpenOptions::new().create(true).write(true).truncate(true).open(p);
+    let Ok(mut out) = open(&path) else { return };
+    let mut written = 0u64;
+    let mut from = from;
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        let mut rest = &buf[..n];
+        while !rest.is_empty() {
+            if written >= cap {
+                let _ = fs::rename(&path, path.with_extension("log.1"));
+                match open(&path) {
+                    Ok(f) => out = f,
+                    Err(_) => return,
+                }
+                written = 0;
+            }
+            let take = rest.len().min((cap - written) as usize);
+            let _ = out.write_all(&rest[..take]);
+            written += take as u64;
+            rest = &rest[take..];
+        }
+    }
+}
+
+/// `console.log`'s cap.
+const CONSOLE_CAP: u64 = 8 << 20;
 
 fn serve<S: vsock::Half>(incoming: impl Iterator<Item = io::Result<S>>, uds: PathBuf) {
     for c in incoming.flatten() {
@@ -1140,6 +1453,9 @@ pub fn notify_ready(socket: Option<&str>, pid: u32) -> io::Result<bool> {
 }
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
+static FIRECRACKER_EXITED: AtomicBool = AtomicBool::new(false);
+/// The host's wait for the guest to take its start message.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The signals the launcher takes itself: TERM, INT and QUIT stop the VM (after a sync); USR2
 /// and HUP reload the guest's php-fpm gracefully; USR1 (php-fpm's log reopen) is acknowledged:
@@ -1190,6 +1506,10 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     fs::create_dir_all(&plan.state).map_err(|e| format!("{}: {e}", plan.state.display()))?;
     fs::set_permissions(&plan.state, fs::Permissions::from_mode(0o700)).map_err(|e| format!("{}: {e}", plan.state.display()))?;
     let _lock = lock_state(&plan.state)?;
+    // Before any thread: whatever ends this process, the VM ends with it.
+    let jail = Jail::new(&plan.state, &plan.id, user);
+    let mounts: Vec<PathBuf> = plan.sockets.iter().map(|(p, _)| jail.root.join(format!("sock-{p}"))).collect();
+    let _watchdog = jail.watchdog(&mounts)?;
     claim_state(&plan)?;
     if !plan.unreachable.is_empty() {
         log(&format!(
@@ -1226,10 +1546,23 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         ),
     };
     let m = Machine { site: site_path, disks, args, key: key.sha256(), user };
-    let (mut vm, how) = start(&plan, opts, &m)?;
+    let (mut vm, mut how) = start(&plan, opts, &m)?;
     let t_ready = ms(t0);
     let restored = matches!(how, Started::Restored { .. });
-    tell_guest(&vm.vsock, &start_message(&plan, restored, random64()?), Duration::from_secs(30))?;
+    if let Err(e) = tell_guest(&vm.vsock, &start_message(&plan, restored, random64()?), START_TIMEOUT) {
+        if !restored {
+            return Err(e);
+        }
+        // A snapshot that restores but can't start is as bad as one that doesn't restore.
+        log(&format!("the restored guest failed its start message ({e}); removing the snapshot and cold-booting instead"));
+        drop(vm);
+        let _ = fs::remove_dir_all(snap_dir(&plan, &m));
+        let mut cold = cold_boot(&plan, opts, &m, Wiring::Full)?;
+        cold.wait_ready(&plan.state, Duration::from_secs(60))?;
+        tell_guest(&cold.vsock, &start_message(&plan, false, random64()?), START_TIMEOUT)?;
+        vm = cold;
+        how = Started::Cold;
+    }
     let t_started = ms(t0);
     match how {
         Started::Restored { load_ms } => log(&format!(
@@ -1242,7 +1575,9 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     let uds = vm.vsock.clone();
     match &plan.listen {
         Listen::Unix(path) => {
-            let l = bind_unix(path, opts.listen_mode)?;
+            // nginx must reach it: by default the pool user's group, as php-fpm's listen.group.
+            let mode = SocketMode { group: opts.listen_mode.group.or(Some(plan.pool.gid)), ..opts.listen_mode };
+            let l = bind_unix(path, mode)?;
             thread::spawn(move || serve(l.incoming(), uds.clone()));
         }
         Listen::Tcp(addr) => {
@@ -1262,25 +1597,37 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         let st = child.wait();
         if !QUITTING.load(Ordering::SeqCst) {
             log(&format!("Firecracker exited ({st:?}); see {}; stopping", state.join("console.log").display()));
-            std::process::exit(1);
+            // The main thread stops as for a signal, so the jail is cleared on the way out.
+            FIRECRACKER_EXITED.store(true, Ordering::SeqCst);
+            // SAFETY: kill(2) to this process, whose main thread waits for SIGTERM.
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
         }
     });
     let sig = loop {
         let sig = wait_for_signal(&set);
         match sig {
             libc::SIGUSR1 => log("SIGUSR1: nothing to reopen (the launcher and the guest log to stderr)"),
-            libc::SIGUSR2 | libc::SIGHUP => match tell_guest(&vm.vsock, &[Ctl::Reload, Ctl::Done], Duration::from_secs(10)) {
-                Ok(()) => log(&format!("signal {sig}: reloaded the guest's php-fpm gracefully")),
-                Err(e) => log(&format!("signal {sig}: the guest's php-fpm reload failed: {e}")),
-            },
+            // In its own thread: a stop signal during a reload is handled at once, and its sync
+            // reaches the guest on its own connection, never behind the reload.
+            libc::SIGUSR2 | libc::SIGHUP => {
+                let uds = vm.vsock.clone();
+                thread::spawn(move || match tell_guest(&uds, &[Ctl::Reload, Ctl::Done], crate::guest::RELOAD_TIMEOUT) {
+                    Ok(()) => log(&format!("signal {sig}: reloaded the guest's php-fpm gracefully")),
+                    Err(e) => log(&format!("signal {sig}: the guest's php-fpm reload failed: {e}")),
+                });
+            }
             _ => break sig,
         }
     };
+    QUITTING.store(true, Ordering::SeqCst);
+    if FIRECRACKER_EXITED.load(Ordering::SeqCst) {
+        drop(vm);
+        return Err("Firecracker exited on its own; the jail is cleared".into());
+    }
     // The guest's writes to the writable disks reach the host's images before the VM stops.
-    if let Err(e) = tell_guest(&vm.vsock, &[Ctl::Sync, Ctl::Done], Duration::from_secs(10)) {
+    if let Err(e) = tell_guest(&vm.vsock, &[Ctl::Sync, Ctl::Done], crate::guest::SYNC_TIMEOUT) {
         log(&format!("the guest did not sync its disks before the stop: {e}"));
     }
-    QUITTING.store(true, Ordering::SeqCst);
     // Stops Firecracker (still unreaped, so its pid is still its own) and empties the jail.
     drop(vm);
     if let Listen::Unix(p) = &plan.listen {
@@ -1323,6 +1670,7 @@ mod tests {
             vcpus: 2,
             write_disk_mib: 1024,
             vm_user: "64000:64000".into(),
+            pool_user: Some("33:33".into()),
             snapshot: true,
             guest_args: vec![],
         }
@@ -1349,6 +1697,7 @@ mod tests {
         assert!(p.id.starts_with("sc-") && p.id.len() == 19, "{}", p.id);
         let args = boot_args(&p, &opts());
         assert!(args.contains(" sc.root=/var/www/html") && args.contains(" sc.ports=3306,6379"), "{args}");
+        assert!(args.contains(" sc.user=33:33"), "the guest's pool runs as the host's pool user: {args}");
         assert!(args.contains(" sc.sock=3306:/run/mysqld/mysqld.sock"), "{args}");
         assert!(!args.contains("sc.time"), "the clock is in no key: {args}");
         let msg = start_message(&p, true, [7; 64]);
@@ -1520,6 +1869,86 @@ mod tests {
         let n = rx.recv(&mut buf).expect("recv");
         let msg = String::from_utf8_lossy(&buf[..n]);
         assert!(msg.starts_with("READY=1\nMAINPID=42\n"), "{msg}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writable_folders_are_real_folders_in_the_root() {
+        let dir = scratch("links");
+        let outside = dir.with_extension("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, dir.join("wp-content/evil")).expect("link");
+        let refused = |w: &str| {
+            plan(&loaded(&dir, &format!(r#"{{"enabled":true,"write":["{w}"],"network":{{"bind":[{{"port":9000}}]}}}}"#)), &opts())
+                .expect_err(w)
+        };
+        let e = refused("wp-content/uploads/../../../etc");
+        assert!(e.contains("holds \"..\""), "{e}");
+        let e = refused("wp-content/evil");
+        assert!(e.contains("is a symlink"), "{e}");
+        let e = refused("wp-content/evil/sub");
+        assert!(e.contains("is a symlink"), "a link anywhere along the path: {e}");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// Root and mke2fs only (the Docker `check` gate is root, and Debian has e2fsprogs).
+    #[test]
+    fn disks_are_copied_as_the_pool_user_without_the_writable_folders() {
+        // SAFETY: geteuid(2) can't fail.
+        if unsafe { libc::geteuid() } != 0 || !on_path("mke2fs") || !on_path("debugfs") {
+            eprintln!("not root, or no mke2fs/debugfs: checked in the Docker gate");
+            return;
+        }
+        let dir = scratch("copy");
+        fs::write(dir.join("index.php"), "<?php echo 1;").expect("write");
+        fs::write(dir.join("wp-content/uploads/big.bin"), vec![7u8; 1 << 20]).expect("upload");
+        let nobody = User { uid: 65534, gid: 65534 };
+        let img = dir.with_extension("ext4");
+        let uploads = dir.join("wp-content/uploads");
+        mke2fs(nobody, &dir, std::slice::from_ref(&uploads), &img, 64, 1024, false).expect("the site, as nobody");
+        let ls = |p: &str| {
+            let out = Command::new("debugfs").arg("-R").arg(format!("ls -l {p}")).arg(&img).output().expect("debugfs");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert!(ls("/").contains("index.php"), "{}", ls("/"));
+        assert!(!ls("/wp-content/uploads").contains("big.bin"), "the writable folder is only a mount point: {}", ls("/wp-content/uploads"));
+        // A file only root may read is not copied by root: the copy fails as the pool user.
+        fs::write(dir.join("root-only.txt"), "secret").expect("write");
+        fs::set_permissions(dir.join("root-only.txt"), fs::Permissions::from_mode(0o600)).expect("chmod");
+        let _ = fs::remove_file(&img);
+        let e = mke2fs(nobody, &dir, &[uploads], &img, 64, 1024, false).expect_err("a root-only file");
+        assert!(e.contains("as uid 65534"), "{e}");
+        let _ = fs::remove_file(&img);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_lines_are_capped_and_connections_counted() {
+        let long = format!("{}\nnext\n", "x".repeat(MAX_LINE * 3));
+        let mut out = Vec::new();
+        mark_guest_lines(long.as_bytes(), &mut out);
+        let text = String::from_utf8(out).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one cut line, then the next");
+        assert!(lines[0].len() < MAX_LINE + 32 && lines[0].ends_with("…[cut]"), "{}", &lines[0][..40]);
+        assert_eq!(lines[1], "guest: next");
+        static S: Slots = Slots::new(2);
+        let (a, b) = (S.take(), S.take());
+        assert!(a.is_some() && b.is_some() && S.take().is_none(), "two slots, a third is refused");
+        drop(a);
+        assert!(S.take().is_some(), "a freed slot is taken again");
+        drop(b);
+    }
+
+    #[test]
+    fn the_console_log_is_capped() {
+        let dir = scratch("console");
+        let path = dir.join("console.log");
+        console_writer(&vec![b'c'; 3000][..], path.clone(), 1000);
+        let now = fs::metadata(&path).expect("console.log").len();
+        let old = fs::metadata(path.with_extension("log.1")).expect("console.log.1").len();
+        assert!(now <= 1000 && old <= 1000, "{now} {old}: never more than the cap in one file");
         let _ = fs::remove_dir_all(&dir);
     }
 

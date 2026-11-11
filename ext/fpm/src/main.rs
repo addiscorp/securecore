@@ -25,7 +25,7 @@ use std::process::{Command, ExitCode};
 use securecore_fpm::{Choice, FAILED, choose, plan};
 
 const USAGE: &str = "usage: securecore-fpm --config <securecore.json> [--php-fpm <program>] \
-[--vm-dir <dir>] [--vm-user <name>|<uid>:<gid>] [--kvm <device>] [--state-dir <dir>] \
+[--vm-dir <dir>] [--vm-user <name>|<uid>:<gid>] [--pool-user <name>|<uid>:<gid>] [--kvm <device>] [--state-dir <dir>] \
 [--listen unix:<path>|<host>:<port>] [--listen-owner <user>] [--listen-group <group>] [--listen-mode <octal>] \
 [--guest-root <path>] [--mem <MiB>] [--vcpus <n>] [--write-disk-mib <MiB>] [--no-snapshot] \
 [--guest-arg <word>]... [--] [php-fpm args...]";
@@ -35,6 +35,7 @@ struct Args {
     php_fpm: OsString,
     vm_dir: PathBuf,
     vm_user: String,
+    pool_user: Option<String>,
     kvm: PathBuf,
     state_dir: Option<PathBuf>,
     listen: Option<String>,
@@ -59,6 +60,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
         php_fpm: OsString::from("php-fpm"),
         vm_dir: PathBuf::from("/usr/local/share/securecore/vm"),
         vm_user: "securecore-vm".into(),
+        pool_user: None,
         kvm: PathBuf::from("/dev/kvm"),
         state_dir: None,
         listen: None,
@@ -86,7 +88,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
                 args.next();
                 a.snapshot = false;
             }
-            "--config" | "--php-fpm" | "--vm-dir" | "--vm-user" | "--kvm" | "--state-dir" | "--listen" | "--listen-owner"
+            "--config" | "--php-fpm" | "--vm-dir" | "--vm-user" | "--pool-user" | "--kvm" | "--state-dir" | "--listen" | "--listen-owner"
             | "--listen-group" | "--listen-mode" | "--guest-root" | "--mem" | "--vcpus" | "--write-disk-mib" | "--guest-arg" => {
                 args.next();
                 let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
@@ -97,6 +99,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
                     "--php-fpm" => a.php_fpm = value,
                     "--vm-dir" => a.vm_dir = PathBuf::from(&value),
                     "--vm-user" => a.vm_user = text()?,
+                    "--pool-user" => a.pool_user = Some(text()?),
                     "--kvm" => a.kvm = PathBuf::from(&value),
                     "--state-dir" => a.state_dir = Some(PathBuf::from(&value)),
                     "--listen" => a.listen = Some(text()?),
@@ -173,6 +176,7 @@ mod microvm {
             vcpus: a.vcpus,
             write_disk_mib: a.write_disk_mib,
             vm_user: a.vm_user.clone(),
+            pool_user: a.pool_user.clone(),
             snapshot: a.snapshot,
             guest_args: a.guest_args.clone(),
         })

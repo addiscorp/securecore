@@ -106,8 +106,8 @@ fn each_isolation_value_behaves_as_decided() {
     );
     // auto today (#72 not landed): gelada even where the microVM could run, and it says why.
     const { assert!(!AUTO_SELECTS_MICROVM, "auto must not pick the microVM before uploads sync back (#72)") };
-    assert_eq!(choose(&auto, yes), Ok(Choice::Gelada { fallback: Some(AUTO_GATE.into()) }));
-    assert_eq!(choose(&auto, no), Ok(Choice::Gelada { fallback: Some("/dev/kvm: No such file or directory (os error 2)".into()) }));
+    // Gated auto asks the host nothing at all: a gelada start pays for no probe.
+    assert_eq!(choose(&auto, || panic!("gated auto must not probe")), Ok(Choice::Gelada { fallback: Some(AUTO_GATE.into()) }));
     // No isolation key is auto.
     let default = securecore_config::Config::from_slice(layer1(r#"{"enabled":true}"#).as_bytes()).expect("valid").layer1;
     assert_eq!(choose_with(&default, true, yes), Ok(Choice::Microvm));

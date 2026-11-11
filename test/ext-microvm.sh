@@ -45,12 +45,16 @@ dir=$PWD/.tmp/ext-microvm
 vm=$dir/vm
 state=$dir/state
 run=$dir/run
-mysqld=$dir/mysqld
+# Host sockets the guest reaches live where the VM's user can reach them: every folder above a
+# connect[].socket counts (a 0700 home in between would refuse it, as it should).
+sockdir=/run/$project
+mysqld=$sockdir/mysqld
 fpm=${SECURECORE_FPM:-$PWD/.target/release/securecore-fpm}
 kernel=${KERNEL:-$PWD/.tmp/mvm/vmlinux-sc}
 OHA=ghcr.io/hatoo/oha@sha256:3ec3dbf549ea197793482d47a6324797411406bbf438c2fe8b91f244ec641a2f # oha 1.16.0
 html=/var/www/html
 mkdir -p "$dir" "$vm" "$state" "$run" "$mysqld"
+chmod 755 "$sockdir"
 find "$dir" -maxdepth 1 -type f -delete
 fails=0
 pass() { echo "ok   $1"; }
@@ -161,7 +165,11 @@ vmuser=${SC_VM_USER:-64000:64000}
 cp test/ext/microvm/probe.php "$site/sc-mvm-probe.php"
 cp test/ext/securecore-status.php "$site/sc-status.php"
 mkdir -p "$site/wp-content/uploads" "$site/wp-content/cache"
-chown 33:33 "$site/wp-content/uploads" "$site/wp-content/cache" "$site/wp-content/plugins" "$site"
+chown 33:33 "$site/wp-content/plugins" "$site"
+# The site's pool user, as php-fpm runs it on this host: not the image's www-data (33), so the
+# guest must map it. It owns the writable folders.
+pool=1234:1234
+chown -R "$pool" "$site/wp-content/uploads" "$site/wp-content/cache"
 # layer1 for the microVM: the example's, with MySQL's port pointed at MariaDB's socket.
 # Port 4444 goes to the peer-credential listener; layer 2 lets core (the probe) reach 127.0.0.1.
 conf() {
@@ -171,7 +179,7 @@ conf() {
       -e 's#"hosts": \["api.wordpress.org", "downloads.wordpress.org"\]#"hosts": ["api.wordpress.org", "downloads.wordpress.org", "127.0.0.1"]#' \
       ext/examples/wordpress.json
 }
-peer=$dir/peer
+peer=$sockdir/peer
 mkdir -p "$peer"
 chmod 755 "$peer"
 rm -f "$peer/peer.sock"
@@ -193,7 +201,7 @@ start() {
   name=$1 config=$2; shift 2
   cp "$config" "$site/securecore.json"
   "$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --listen "unix:$run/fpm.sock" \
-    --listen-owner 0 --listen-group 101 --listen-mode 0660 --vm-user "$vmuser" \
+    --listen-owner 0 --listen-group 101 --listen-mode 0660 --vm-user "$vmuser" --pool-user "$pool" \
     --guest-root "$html" "$@" > "$dir/$name.log" 2>&1 &
   PID=$!
   i=0
@@ -228,7 +236,7 @@ standin="grep -E '^(NoNewPrivs|Seccomp_filters):' /proc/self/status | tr -s '\t 
 once() {
   name=$1 config=$2; shift 2
   cp "$config" "$site/securecore.json"
-  "$fpm" --config "$site/securecore.json" --state-dir "$state" --vm-user "$vmuser" "$@" --php-fpm /bin/sh -- -c "$standin" > "$dir/value-$name.log" 2>&1
+  "$fpm" --config "$site/securecore.json" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" "$@" --php-fpm /bin/sh -- -c "$standin" > "$dir/value-$name.log" 2>&1
   echo "exit=$?" >> "$dir/value-$name.log"
 }
 
@@ -307,15 +315,33 @@ conf auto > "$dir/auto.json"
 sed 's|"deny": \["/srv/backups"\]|"deny": ["/srv/backups", "wp-content/private"]|' "$dir/microvm.json" > "$dir/microvm-deny.json"
 sed 's|"isolation": "microvm"|"isolation": "auto"|' "$dir/microvm-deny.json" > "$dir/auto-deny.json"
 grep -q 'wp-content/private' "$dir/auto-deny.json" || die "the inexpressible fixture"
+# Writable folders that aren't real folders in the root: one through a link to a root-only
+# folder, one with "..". Neither may be read by the launcher.
+ln -sfn /root "$site/wp-content/sc-evil"
+sed 's|"write": \["wp-content/uploads"|"write": ["wp-content/sc-evil", "wp-content/uploads"|' "$dir/microvm.json" > "$dir/microvm-link.json"
+sed 's|"write": \["wp-content/uploads"|"write": ["wp-content/uploads/../../../root", "wp-content/uploads"|' "$dir/microvm.json" > "$dir/microvm-dotdot.json"
+if ! grep -q sc-evil "$dir/microvm-link.json" || ! grep -q '\.\./\.\./\.\./root' "$dir/microvm-dotdot.json"; then die "the link fixtures"; fi
+# A socket the VM's user can't reach: a 0777 socket in a root-only folder.
+mkdir -p "$sockdir/locked"
+chmod 700 "$sockdir/locked"
+rm -f "$sockdir/locked/db.sock"
+socat UNIX-LISTEN:"$sockdir/locked/db.sock",fork,mode=777 /dev/null > /dev/null 2>&1 &
+locked_pid=$!
+i=0; until [ -S "$sockdir/locked/db.sock" ]; do i=$((i + 1)); [ "$i" -lt 50 ] || die "the locked socket"; sleep 0.1; done
+sed "s|{ \"port\": 4444|{ \"port\": 5555, \"socket\": \"$sockdir/locked/db.sock\" }, { \"port\": 4444|" "$dir/microvm.json" > "$dir/microvm-locked.json"
+grep -q '"port": 5555' "$dir/microvm-locked.json" || die "the locked-socket fixture"
 once off "$dir/off.json" --vm-dir "$vm"
 once gelada "$dir/gelada.json" --vm-dir "$vm"
-once auto "$dir/auto.json" --vm-dir "$vm"
-once auto-deny "$dir/auto-deny.json" --vm-dir "$vm"
+once auto "$dir/auto.json" --vm-dir "$vm" --state-dir "$dir/gated-state"
 once microvm-deny "$dir/microvm-deny.json" --vm-dir "$vm"
-once auto-norootfs "$dir/auto.json" --vm-dir "$dir/vm-norootfs"
 once microvm-norootfs "$dir/microvm.json" --vm-dir "$dir/vm-norootfs"
 once microvm-mirabkernel "$dir/microvm.json" --vm-dir "$dir/vm-mirabkernel"
-for v in off gelada auto auto-deny auto-norootfs; do
+once microvm-link "$dir/microvm-link.json" --vm-dir "$vm"
+once microvm-dotdot "$dir/microvm-dotdot.json" --vm-dir "$vm"
+once microvm-locked "$dir/microvm-locked.json" --vm-dir "$vm"
+kill "$locked_pid" 2>/dev/null
+rm -f "$site/wp-content/sc-evil"
+for v in off gelada auto; do
   has "$dir/value-$v.log" "exit=0" "$v (KVM host): the launcher execs php-fpm"
   has "$dir/value-$v.log" standin-ran "$v: php-fpm ran"
 done
@@ -326,22 +352,32 @@ has "$dir/value-gelada.log" "NoNewPrivs: 1 Seccomp_filters: 2" "gelada: php-fpm 
 has "$dir/value-auto.log" "layer 1 isolation auto: gelada, because auto doesn't pick the microVM until its writable folders sync back to the host (addiscorp/securecore#72)" \
   "auto on a KVM host that could run the microVM: gelada, with the #72 gate as the reason"
 has "$dir/value-auto.log" "NoNewPrivs: 1 Seccomp_filters: 2" "auto: php-fpm runs under gelada"
-has "$dir/value-auto-deny.log" "layer 1 isolation auto: gelada, because the microVM can't run here (layer1.deny $site/wp-content/private is inside the app root" \
-  "auto with a config the microVM can't express: gelada, and exactly why"
-has "$dir/value-microvm-deny.log" "exit=125" "microvm with a config the microVM can't express: exit 125"
-has "$dir/value-microvm-deny.log" "is inside the app root" "and it says why"
-lacks "$dir/value-microvm-deny.log" standin-ran "and php-fpm never ran"
-has "$dir/value-auto-norootfs.log" "gelada, because the microVM can't run here (the guest root image isn't verified" "auto without a verified root image: gelada"
-has "$dir/value-microvm-norootfs.log" "exit=125" "microvm without a verified root image: exit 125"
-has "$dir/value-microvm-norootfs.log" "the guest root image isn't verified" "and it says why"
-has "$dir/value-microvm-mirabkernel.log" "exit=125" "microvm with layer 3 on mirab's kernel (no Landlock): exit 125"
-has "$dir/value-microvm-mirabkernel.log" "has no Landlock and seccomp filters" "and it says why"
+is "$( [ -e "$dir/gated-state" ] && echo made || echo none)" none "gated auto probes nothing: no state folder, no hashing, no cgroup write"
+for v in deny norootfs mirabkernel link dotdot locked; do
+  has "$dir/value-microvm-$v.log" "exit=125" "microvm, $v: exit 125"
+  lacks "$dir/value-microvm-$v.log" standin-ran "microvm, $v: php-fpm never ran"
+done
+has "$dir/value-microvm-deny.log" "is inside the app root" "microvm with a denied path in the root: says why"
+has "$dir/value-microvm-norootfs.log" "the guest root image isn't verified" "microvm without a verified root image: says why"
+has "$dir/value-microvm-mirabkernel.log" "has no Landlock and seccomp filters" "microvm with layer 3 on mirab's kernel: says why"
+has "$dir/value-microvm-link.log" "wp-content/sc-evil is a symlink" "a writable folder that is a link (to a root-only folder) is refused, never read"
+has "$dir/value-microvm-dotdot.log" "holds \"..\"" "a writable folder with \"..\" is refused, never read"
+has "$dir/value-microvm-locked.log" "may not connect to $sockdir/locked/db.sock (Permission denied" \
+  "a socket in a folder the VM's user can't search is refused (parent permissions count)"
+# A file in the site only root may read: the site disk is copied as the pool user, so it fails.
+echo secret > "$site/sc-root-only.txt"
+chmod 600 "$site/sc-root-only.txt"
+once microvm-rootonly "$dir/microvm.json" --vm-dir "$vm"
+rm -f "$site/sc-root-only.txt"
+has "$dir/value-microvm-rootonly.log" "exit=125" "a root-only file in the site: the start fails"
+has "$dir/value-microvm-rootonly.log" "as uid 1234" "because the site disk is copied as the pool user, never as root"
+clean_state
 # The php container has no /dev/kvm: auto falls back, microvm refuses. The image's own launcher.
 for v in auto microvm; do
   compose cp "$dir/$v.json" "php:/tmp/sc-$v.json" >/dev/null 2>&1
   in_php "rm -f /tmp/sc-ran; securecore-fpm --config /tmp/sc-$v.json --php-fpm /bin/sh -- -c \"$standin; touch /tmp/sc-ran\"; echo exit=\$?; ls /tmp/sc-ran 2>/dev/null" > "$dir/container-$v.log" 2>&1
 done
-has "$dir/container-auto.log" "layer 1 isolation auto: gelada, because the microVM can't run here" "auto without KVM: falls back to gelada and says why"
+has "$dir/container-auto.log" "layer 1 isolation auto: gelada, because auto doesn't pick the microVM" "auto without KVM: gelada (the gate answers before any probe)"
 has "$dir/container-auto.log" "exit=0" "auto without KVM: php-fpm starts"
 has "$dir/container-auto.log" "Seccomp_filters: 3" "auto without KVM: php-fpm runs under gelada (Docker's filter + gelada's 2)"
 has "$dir/container-microvm.log" "exit=125" "microvm without KVM: the launcher exits 125"
@@ -351,6 +387,9 @@ lacks "$dir/container-microvm.log" "standin-ran" "microvm without KVM: php-fpm n
 # --- 2. WordPress from the jailed guest, and 3. the snapshot -----------------------------------
 echo "# microvm: the first start makes the snapshot"
 clean_state
+# Real uploads, larger than the site's code: the site disk must not carry them.
+head -c 300M /dev/urandom > "$site/wp-content/uploads/sc-big.bin"
+chown "$pool" "$site/wp-content/uploads/sc-big.bin"
 # What asking costs: two asks in a row, nothing between.
 qa=$(questions); qb=$(questions); qbase=$((qb - qa))
 q0=$(questions)
@@ -370,6 +409,10 @@ if [ "$started" = 1 ]; then
   has "$dir/first.log" "layer 1 isolation microvm: microvm" "microvm on the KVM host: the microVM"
   has "$dir/first.log" "made the snapshot" "the first start makes a snapshot"
   has "$dir/first.log" "microVM restored from snapshot" "and serves from a restore of it"
+  sitedisk=$(find "$state" -maxdepth 1 -name 'site-*.ext4' | head -1)
+  is "$(debugfs -R 'ls /wp-content/uploads' "$sitedisk" 2>/dev/null | grep -c sc-big.bin)" 0 \
+    "the site disk holds no upload (the writable folders are only mount points in it)"
+  is "$( [ "$(du -m "$sitedisk" | cut -f1)" -lt 300 ] && echo smaller)" smaller "and uses less than the 300 MiB of uploads ($(du -m "$sitedisk" | cut -f1) MiB)"
   fcpid=$(sed -n 's/.*Firecracker runs jailed as uid [0-9]* gid [0-9]* (pid \([0-9]*\)).*/\1/p' "$dir/first.log")
   is "$(awk '/^Uid:/ { print $2 "/" $3 }' "/proc/$fcpid/status" 2>/dev/null)/$(awk '/^Gid:/ { print $2 }' "/proc/$fcpid/status" 2>/dev/null)" 64000/64000/64000 \
     "Firecracker (pid $fcpid) runs as the unprivileged uid and gid, not root"
@@ -387,6 +430,7 @@ if [ "$started" = 1 ]; then
   is "$(val first kernel | cut -d. -f1-2)/$( [ "$(val first kernel)" != "$(uname -r)" ] && echo other)" 6.12/other \
     "PHP runs on the guest's kernel, mirab's Linux 6.12 ($(val first kernel); this host is $(uname -r))"
   is "$(val first guest_init)" 1 "PID 1 is securecore-init"
+  is "$(val first euid)" 1234 "the guest's php-fpm workers run as the host's pool user (1234), not the image's www-data"
   is "$(val first netdev)" lo "the guest has loopback only, no network device"
   is "$(val first write_uploads)" OK "uploads are writable (their own disk)"
   is "$(val first write_root)/$(val first write_plugins)" BLOCKED/BLOCKED "the site itself is read-only"
@@ -425,8 +469,12 @@ if [ "$started" = 1 ]; then
   has "$dir/first.log" "SIGUSR1: nothing to reopen" "SIGUSR1 is acknowledged"
   has "$dir/first.log" "reloaded the guest's php-fpm gracefully" "SIGUSR2 reloads the guest's php-fpm"
   is "$(vcode /)" 200 "the front page after the reload: 200"
+  # A reload, and at once a stop: the stop's sync must still reach the guest (the upload above
+  # must survive into the next start).
+  kill -USR2 "$PID"
   stop
-  is "$STOPPED" 0 "SIGTERM: the launcher exits 0"
+  is "$STOPPED" 0 "SIGTERM right after SIGUSR2: the launcher exits 0"
+  lacks "$dir/first.log" "did not sync" "and the guest synced its disks first"
   has "$dir/first.log" "stopped by signal 15" "and says so"
   is "$(pgrep -fc "api-sock /fc.sock")" 0 "no Firecracker left running"
   is "$(grep -c " $state/jail" /proc/self/mountinfo)" 0 "and nothing mounted in its jail"
@@ -459,6 +507,58 @@ if start second "$dir/microvm.json"; then
   stop
 else
   fail "microvm: the second start serves"
+fi
+
+echo "# the launcher killed (SIGKILL): the VM goes with it"
+if start killed "$dir/microvm.json"; then
+  kpid=$(sed -n 's/.*Firecracker runs jailed as uid [0-9]* gid [0-9]* (pid \([0-9]*\)).*/\1/p' "$dir/killed.log")
+  cgk=$(cut -d: -f3 "/proc/$kpid/cgroup")
+  kill -KILL "$PID"; wait "$PID" 2>/dev/null; PID=""
+  i=0; while kill -0 "$kpid" 2>/dev/null && [ "$i" -lt 50 ]; do i=$((i + 1)); sleep 0.1; done
+  is "$(kill -0 "$kpid" 2>/dev/null && echo alive || echo gone)" gone "Firecracker (pid $kpid) is gone once its launcher is killed"
+  sleep 0.5
+  is "$(grep -c " $state/jail" /proc/self/mountinfo)" 0 "nothing stays mounted in the jail"
+  is "$( [ -d "/sys/fs/cgroup$cgk" ] && echo left || echo removed)" removed "and its cgroup ($cgk) is removed"
+else
+  fail "the launcher killed: the start serves"
+fi
+
+echo "# Firecracker exits on its own: the launcher stops and clears the jail"
+if start fcdied "$dir/microvm.json"; then
+  dpid=$(sed -n 's/.*Firecracker runs jailed as uid [0-9]* gid [0-9]* (pid \([0-9]*\)).*/\1/p' "$dir/fcdied.log")
+  kill -KILL "$dpid"
+  wait "$PID"; rc=$?; PID=""
+  is "$( [ "$rc" != 0 ] && echo failed)" failed "the launcher exits non-zero (exit $rc)"
+  has "$dir/fcdied.log" "Firecracker exited on its own; the jail is cleared" "and says the jail is cleared"
+  is "$(grep -c " $state/jail" /proc/self/mountinfo)" 0 "nothing stays mounted in the jail"
+else
+  fail "Firecracker exits: the start serves"
+fi
+
+echo "# a snapshot that restores but can't start falls back to a cold boot"
+if start badsnap "$dir/microvm.json"; then
+  # Snapshot this VM after its start message (as a stale or broken snapshot would be): restoring
+  # it works, but its guest refuses the next start message.
+  (cd "$(jail_root)" && curl -s --unix-socket fc.sock -X PATCH http://localhost/vm -H 'Content-Type: application/json' -d '{"state":"Paused"}' \
+    && curl -s --unix-socket fc.sock -X PUT http://localhost/snapshot/create -H 'Content-Type: application/json' \
+         -d '{"snapshot_type":"Full","snapshot_path":"/snap/bad.snap","mem_file_path":"/snap/bad.mem"}') > "$dir/badsnap.api" 2>&1
+  cp "$(jail_root)/snap/bad.snap" "$dir/bad.snap"
+  cp "$(jail_root)/snap/bad.mem" "$dir/bad.mem"
+  stop
+  snapd=$(find "$state" -maxdepth 1 -name 'snap-*' | head -1)
+  install -m 640 -o 0 -g 64000 "$dir/bad.snap" "$snapd/vm.snap"
+  install -m 640 -o 0 -g 64000 "$dir/bad.mem" "$snapd/vm.mem"
+  rm -f "$dir/bad.snap" "$dir/bad.mem"
+  if start badsnap2 "$dir/microvm.json"; then
+    has "$dir/badsnap2.log" "the restored guest failed its start message" "the restore works but its start message fails"
+    has "$dir/badsnap2.log" "removing the snapshot and cold-booting instead" "so the snapshot goes and the launcher cold-boots"
+    is "$(vcode /)" 200 "the front page: 200"
+    stop
+  else
+    fail "a snapshot that can't start: the launcher falls back" "$(tail -3 "$dir/badsnap2.log" | tr '\n' ' ')"
+  fi
+else
+  fail "a bad snapshot: the first start serves"
 fi
 
 echo "# a site change, and a larger --write-disk-mib"
@@ -513,7 +613,7 @@ has "$dir/moved.log" "holds the writable disks (uploads) of the site that was at
 has "$dir/moved.log" "--state-dir $moved/old" "and how to keep it"
 find "$moved" -mindepth 1 -delete
 
-for f in sc-mvm-probe.php sc-status.php sc-mvm-changed.txt; do rm -f "$site/$f"; done
+for f in sc-mvm-probe.php sc-status.php sc-mvm-changed.txt wp-content/uploads/sc-big.bin; do rm -f "$site/$f"; done
 cp ext/examples/wordpress.json "$site/securecore.json"
 echo
 if [ "$fails" -eq 0 ]; then echo "all ext-microvm checks passed"; else echo "$fails check(s) failed"; fi

@@ -57,9 +57,8 @@ jobs:
         run: TMPDIR="$PWD/.tmp" test/promote-check.sh
 
   # Layer 1's microVM end to end (#71): WordPress served from a jailed Firecracker guest, the
-  # four isolation values, the snapshot lifecycle. GitHub's ubuntu-24.04 runners have /dev/kvm
-  # (APS 11's exception: a mirab VM can't nest KVM and Docker yet, mirab#59). No KVM is a
-  # failure, never a skip.
+  # four isolation values, the snapshot lifecycle. On ubuntu-24.04, as the cell job above runs;
+  # its runners have /dev/kvm. No KVM is a failure, never a skip.
   microvm:
     name: microVM (test/ext-microvm.sh)
     runs-on: ubuntu-24.04
@@ -75,19 +74,29 @@ jobs:
           [ -c /dev/kvm ] || { echo "::error::this runner has no /dev/kvm: the microVM tests need KVM"; exit 1; }
           ls -l /dev/kvm
       - name: Tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends socat jq e2fsprogs
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends socat jq e2fsprogs curl python3
       - name: The host launcher (cargo build --release -p securecore-fpm)
         run: |
           set -euo pipefail
           mkdir -p .tmp
           cd ext && CARGO_TARGET_DIR="$PWD/../.target" cargo build --locked --release -p securecore-fpm
       # Until mirab#89 ships Landlock and seccomp in mirab's kernel: mirab's recipe plus the five
-      # lines (bench/microvm/kernel.sh), from the guest-agent config at mirab's newest canary.
+      # lines (bench/microvm/kernel.sh), built from the guest-agent config at the commit of the
+      # same mirab release the test runs (scripts/mirab-vm.sh: stable; while stable has no vm/,
+      # it exits 3 and the newest canary is taken, as an override that is logged here).
       - name: The guest kernel with Landlock and seccomp (bench/microvm/kernel.sh)
         run: |
-          set -euo pipefail
-          commit=$(curl -fsSL https://mirab-releases.addis.gg/canary.json | jq -r .commit)
-          curl -fsSL -o .tmp/mirab-kernel-x86_64.config "https://raw.githubusercontent.com/addiscorp/mirab/${commit}/guest-agent/kernel-x86_64.config"
+          set -uo pipefail
+          TMPDIR="$PWD/.tmp" scripts/mirab-vm.sh .tmp/mirab; rc=$?
+          if [ "$rc" = 3 ]; then
+            manifest="https://mirab-releases.addis.gg/$(curl -fsSL https://mirab-releases.addis.gg/canary.json | jq -r .version)/vm/manifest.json"
+            echo "::warning::mirab's stable release has no vm/ yet (mirab#89): using ${manifest} for the test"
+            TMPDIR="$PWD/.tmp" scripts/mirab-vm.sh .tmp/mirab "$manifest" || exit 1
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+          commit=$(jq -er .commit .tmp/mirab/mirab-vm.json) || exit 1
+          curl -fsSL -o .tmp/mirab-kernel-x86_64.config "https://raw.githubusercontent.com/addiscorp/mirab/${commit}/guest-agent/kernel-x86_64.config" || exit 1
           sudo -E env PATH="$PATH" TMPDIR="$PWD/.tmp" bench/microvm/kernel.sh .tmp/mirab-kernel-x86_64.config
       - name: test/ext-microvm.sh
         run: sudo -E env PATH="$PATH" TMPDIR="$PWD/.tmp" test/ext-microvm.sh

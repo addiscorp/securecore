@@ -5,6 +5,8 @@
 header('Content-Type: text/plain');
 $root = __DIR__;
 echo 'kernel=', php_uname('r'), "\n";
+// The worker's effective uid, from the kernel (no posix extension needed).
+echo 'euid=', preg_match('/^Uid:\s+\d+\s+(\d+)/m', (string) @file_get_contents('/proc/self/status'), $u) ? $u[1] : '?', "\n";
 echo 'time=', time(), "\n";
 $cmdline = (string) @file_get_contents('/proc/cmdline');
 echo 'guest_init=', strpos($cmdline, 'init=/sbin/securecore-init') !== false ? 1 : 0, "\n";
