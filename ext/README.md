@@ -868,7 +868,9 @@ sha256s of Firecracker, the kernel, the root image, the site tree (every path, m
 and mtime, writable folders excepted) and `securecore.json`, plus the memory, vCPUs, boot
 arguments and disks. Without one, the launcher cold-boots a VM that has no way to the database,
 warms it by compiling the site's PHP files into opcache (the guest image's `warm.php`; no request
-runs, so the production database sees nothing), snapshots it, and restores that, so the next
+runs, so the production database sees nothing; the cost is a slower first page after a restore,
+about 0.55–0.6 s on [xps], against about 0.2 s when the snapshot was warmed with real front
+pages, which write to the database), snapshots it, and restores that, so the next
 start is fast; old snapshots and site disks are removed. A restore that fails is removed and the
 launcher cold-boots instead. After every boot or restore the launcher sends the guest one start
 message, which the guest takes from the host's CID only and only once per boot: the clock (a
@@ -1076,15 +1078,22 @@ WordPress boot in a new zygote, on the request that brings it.
   are refused from core and from a child program, the denied path is unreadable; unixSockets +
   ports and an invalid file exit 125 at launch with php-fpm never starting. In the container
   there is no `/dev/kvm`, so this is also `auto` falling back to gelada.
-- `test/ext-microvm.sh` (a Linux host with KVM, as root; #71): the four `layer1.isolation`
-  values (off and gelada on the host; auto and microvm boot the microVM there; in the php
-  container without `/dev/kvm`, auto falls back to gelada and microvm exits 125 without php-fpm
-  running), then the same WordPress served from a Firecracker guest: the guest's kernel,
-  loopback only, a read-only site with writable uploads, layer 2 enforcing and layer 3's child
-  running in the guest, the database through MariaDB's socket; the first start making a
-  snapshot and the next restoring it with the clock resynced and the uploads kept; a site change
-  making a new snapshot, a broken one falling back to a cold boot, `--no-snapshot`. `bench [n]`
-  is #70's latency comparison and `restore [n]` times the requests after a restore.
+- `test/ext-microvm.sh` (a Linux host with KVM, as root; #71; also CI's `microvm` job, which
+  fails without KVM): the `layer1.isolation` values (off and gelada; auto gelada behind the #72
+  gate; auto falling back and microvm refusing on a config the VM can't express, on an
+  unverified root image and on a kernel without Landlock; in the php container without
+  `/dev/kvm`, auto falls back and microvm exits 125 without php-fpm running), then the same
+  WordPress served from a jailed Firecracker guest: Firecracker as 64000:64000 with no
+  supplementary groups, chrooted, in its own network namespace and cgroup; a host socket seeing
+  the guest's connections as that uid (`SO_PEERCRED`); the guest's kernel, loopback only, a
+  read-only site with writable uploads, layer 2 enforcing and layer 3's child running in the
+  guest, the database through MariaDB's socket; the warm-up sending MariaDB nothing; fpm.sock
+  0660; `READY=1` to `NOTIFY_SOCKET`; USR1/USR2 not stopping it; a second start message and a
+  second launcher refused; the first start making a snapshot and the next restoring it with the
+  clock resynced, fresh randomness and the uploads kept; a stale jail link gone; a site change
+  making a new snapshot, a larger `--write-disk-mib` growing the uploads disk, a broken snapshot
+  falling back to a cold boot, `--no-snapshot`, an orphaned uploads disk refused. `bench [n]` is
+  #70's latency comparison and `restore [n]` times the requests after a restore.
 - All the `test/ext-*.sh` scripts take `SECURECORE_EXT_PROJECT` and `SECURECORE_EXT_PORT` to run
   as another compose project on another port.
 - `DOCKER_CONTEXT=colima test/ext-config.sh`: WordPress on the docker stack with the extension

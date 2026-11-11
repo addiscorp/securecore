@@ -602,6 +602,11 @@ The product version of items 1, 2 and 4 is in `ext/fpm` (`securecore-fpm`; `ext/
 - Snapshots are keyed by the sha256s of Firecracker, the kernel, the root image, the site tree and
   the config, plus the machine; the writable disks are mounted only after a restore, after the
   clock is set; a stop syncs them first.
+- After the security review (PR #75): Firecracker runs under its jailer as an unprivileged
+  user, chrooted, in its own namespaces and cgroup, so the guest's socket connections carry that
+  user's credentials, not root's; only files the installer recorded by sha256 boot; `auto` is
+  gated off until #72 syncs uploads back; the snapshot is warmed without the database; every
+  start message brings fresh entropy and replaces php-fpm's workers.
 - Nothing is pinned: `scripts/mirab-vm.sh` resolves mirab's newest stable release, its
   `vm/manifest.json` and the Firecracker mirab pins at that commit, and `install-ext.sh` checks
   each file against those sha256s. `bench/microvm/firecracker.json` and `mirab-kernel.json`
