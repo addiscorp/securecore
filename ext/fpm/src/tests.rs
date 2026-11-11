@@ -104,10 +104,12 @@ fn each_isolation_value_behaves_as_decided() {
         choose_with(&auto, true, inexpressible),
         Ok(Choice::Gelada { fallback: Some("layer1.deny /srv/site/private is inside the app root".into()) })
     );
-    // auto today (#72 not landed): gelada even where the microVM could run, and it says why.
-    const { assert!(!AUTO_SELECTS_MICROVM, "auto must not pick the microVM before uploads sync back (#72)") };
-    // Gated auto asks the host nothing at all: a gelada start pays for no probe.
-    assert_eq!(choose(&auto, || panic!("gated auto must not probe")), Ok(Choice::Gelada { fallback: Some(AUTO_GATE.into()) }));
+    // auto today: uploads sync back (#72), so the gate is open and `choose` is the above.
+    const { assert!(AUTO_SELECTS_MICROVM, "auto picks the microVM where it can run, now that uploads sync back (#72)") };
+    assert_eq!(choose(&auto, yes), Ok(Choice::Microvm));
+    assert_eq!(choose(&auto, no), Ok(Choice::Gelada { fallback: Some("/dev/kvm: No such file or directory (os error 2)".into()) }));
+    // The gate, closed: gelada, and the host asked nothing at all.
+    assert_eq!(choose_with(&auto, false, || panic!("gated auto must not probe")), Ok(Choice::Gelada { fallback: Some(AUTO_GATE.into()) }));
     // No isolation key is auto.
     let default = securecore_config::Config::from_slice(layer1(r#"{}"#).as_bytes()).expect("valid").layer1;
     assert_eq!(choose_with(&default, true, yes), Ok(Choice::Microvm));

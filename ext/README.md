@@ -811,7 +811,7 @@ and the launcher exits 125.
 
 | value | what runs |
 |---|---|
-| `auto` (the default) | gelada, with the reason. **`auto` does not pick the microVM until the guest's writable folders sync back to the host (#72)**: `AUTO_SELECTS_MICROVM` in `fpm/src/lib.rs` is that gate, and a test pins it off. Once it opens, `auto` is the microVM where it can run and gelada otherwise (`layer 1 isolation auto: gelada, because the microVM can't run here (…)`), whether the host or the config is why. The only value that falls back |
+| `auto` (the default) | the microVM where it can run, and gelada otherwise. (It was gated off until the guest's writable folders synced back to the host, #72; `AUTO_SELECTS_MICROVM` in `fpm/src/lib.rs` is that gate, now open, and a test pins it on.) The fallback says why (`layer 1 isolation auto: gelada, because the microVM can't run here (…)`), whether the host or the config is the reason. The only value that falls back |
 | `microvm` | the microVM, or nothing: without one the launcher exits 125 (`layer1.isolation is "microvm" but this host can't run the microVM (…). "microvm" never falls back`) |
 | `gelada` | gelada on the host kernel, as above, even where KVM exists |
 | `off` | layer 1 off: php-fpm runs as it is. The only way to turn layer 1 off (`layer1.enabled` is retired) |
@@ -1104,8 +1104,8 @@ WordPress boot in a new zygote, on the request that brings it.
   ports and an invalid file exit 125 at launch with php-fpm never starting. In the container
   there is no `/dev/kvm`, so this is also `auto` falling back to gelada.
 - `test/ext-microvm.sh` (a Linux host with KVM, as root; #71; also CI's `microvm` job, which
-  fails without KVM): the `layer1.isolation` values (off and gelada; auto gelada behind the #72
-  gate; auto falling back and microvm refusing on a config the VM can't express, on an
+  fails without KVM): the `layer1.isolation` values (off and gelada; auto the microVM on the KVM
+  host; auto falling back and microvm refusing on a config the VM can't express, on an
   unverified root image and on a kernel without Landlock; in the php container without
   `/dev/kvm`, auto falls back and microvm exits 125 without php-fpm running), then the same
   WordPress served from a jailed Firecracker guest: Firecracker as 64000:64000 with no
