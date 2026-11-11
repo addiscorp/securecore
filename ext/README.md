@@ -811,7 +811,7 @@ and the launcher exits 125.
 
 | value | what runs |
 |---|---|
-| `auto` (the default) | the microVM where it can run, and gelada otherwise. (It was gated off until the guest's writable folders synced back to the host, #72; `AUTO_SELECTS_MICROVM` in `fpm/src/lib.rs` is that gate, now open, and a test pins it on.) The fallback says why (`layer 1 isolation auto: gelada, because the microVM can't run here (…)`), whether the host or the config is the reason. The only value that falls back |
+| `auto` (the default) | gelada, with the reason. **`auto` does not pick the microVM until the guest's writable folders sync back to the host (#72)**: `AUTO_SELECTS_MICROVM` in `fpm/src/lib.rs` is that gate, and a test pins it off. Once it opens, `auto` is the microVM where it can run and gelada otherwise (`layer 1 isolation auto: gelada, because the microVM can't run here (…)`), whether the host or the config is why. The only value that falls back |
 | `microvm` | the microVM, or nothing: without one the launcher exits 125 (`layer1.isolation is "microvm" but this host can't run the microVM (…). "microvm" never falls back`) |
 | `gelada` | gelada on the host kernel, as above, even where KVM exists |
 | `off` | layer 1 off: php-fpm runs as it is. The only way to turn layer 1 off (`layer1.enabled` is retired) |
@@ -873,7 +873,7 @@ only vsock, and `layer1` maps onto it as follows:
 | `network.connect` with `socket` | the guest's `127.0.0.1:<port>` reaches that unix socket on the host, with nothing in between (Firecracker connects it, as the jailed user; mysqlnd's connect goes onto vsock in place, #70). Only a socket the jailed user can reach and open itself counts (its real path; every folder above it too). With the socket under `/run`, the same path works in the guest too (WordPress's `DB_HOST=localhost`) |
 | `network.connect` with `address` | the launcher connects the guest's `127.0.0.1:<port>` to that TCP `host:port` |
 | `network.connect` port 1514 | refused: it is the guest's log channel |
-| `network.connect`, neither | an egress port (#72): the guest reaches *named* hosts on it through the host (`getaddrinfo` in the guest answers a placeholder address, and the connect goes over vsock with the name). With layer 2 on, only names in its host lists (core's, `default`'s or a component's) are allowed, and layer 2 still checks each caller in the guest; with layer 2 off, any name. The host resolves the name and connects only to public addresses. No DNS and no IP routes in the guest |
+| `network.connect`, neither | an egress port (#72): the guest reaches *named* hosts on it through the host (`getaddrinfo` in the guest answers a placeholder address, and the connect goes over vsock with the name). Layer 2's own decision applies: in `enforce` only names in its host lists (core's, `default`'s or a component's), in `log` any name with the unlisted ones logged, with layer 2 off (or `off`) any name; layer 2 still checks each caller in the guest. The host resolves the name and connects only to public addresses that aren't its own (an IP literal too), as the site's pool user, so uid-based firewall rules apply. An internal target needs a `socket` or `address` entry. No DNS and no IP routes in the guest |
 | `network.connect` port 1517 with a socket or address | refused: it is the guest's egress channel |
 | `network.unixSockets` | refused: give the port the socket instead |
 | `write`, inside the app root | its own read-write disk, `--write-disk-mib` (1024) MiB, made once from the folder's contents and kept across starts; a larger value grows it in place, and the guest logs past 90 % and 98 % full, before writes fail with ENOSPC. **The host's folder mirrors it** (#72): every change the guest makes (a file once it is closed, folders, deletes, renames, modes) is applied to the real folder, the one nginx serves, by `securecore-fpm --sync-writer`, which runs as the pool user with no network and opens every path beneath the folder (no symlink, no `..`); each connection starts with the guest's whole listing, so a crash on either side loses nothing the guest has. The guest's disk is the authority: change uploads through the site, not on the host while the VM runs (a file put there is removed at the next listing). A new site's disks are refused while a state folder beside it holds the disks of a root that no longer exists (a moved site: `--state-dir <that folder>` adopts them) |
@@ -1114,8 +1114,8 @@ WordPress boot in a new zygote, on the request that brings it.
   ports and an invalid file exit 125 at launch with php-fpm never starting. In the container
   there is no `/dev/kvm`, so this is also `auto` falling back to gelada.
 - `test/ext-microvm.sh` (a Linux host with KVM, as root; #71; also CI's `microvm` job, which
-  fails without KVM): the `layer1.isolation` values (off and gelada; auto the microVM on the KVM
-  host; auto falling back and microvm refusing on a config the VM can't express, on an
+  fails without KVM): the `layer1.isolation` values (off and gelada; auto gelada behind the #72
+  gate; auto falling back and microvm refusing on a config the VM can't express, on an
   unverified root image and on a kernel without Landlock; in the php container without
   `/dev/kvm`, auto falls back and microvm exits 125 without php-fpm running), then the same
   WordPress served from a jailed Firecracker guest: Firecracker as 64000:64000 with no

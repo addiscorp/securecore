@@ -21,7 +21,7 @@
 
 use std::net::IpAddr;
 
-use securecore_config::Layer2;
+use securecore_config::{Layer2, Mode};
 
 use crate::Component;
 
@@ -146,6 +146,44 @@ pub fn host_allowed(patterns: &[String], host: &str) -> HostDecision {
         HostDecision::Allow
     } else {
         HostDecision::Refuse
+    }
+}
+
+/// Whether layer 2's host allowlist is active: layer 2 on, an app set, and the mode not `off`.
+/// The one gate the extension and the microVM's egress share.
+pub fn checks_hosts(l2: &Layer2) -> bool {
+    l2.enabled && l2.app.is_some() && l2.mode != Mode::Off
+}
+
+/// What layer 2 does with a connection to `host` under `patterns` ([`net_verdict`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetVerdict {
+    /// A pattern allows it.
+    Allow,
+    /// `log` mode: it would be refused with this rule; it goes through, and is audited.
+    Log(&'static str),
+    /// `enforce` mode: refused with this rule (audited).
+    Refuse(&'static str),
+}
+
+impl NetVerdict {
+    /// Whether the connection goes through.
+    pub fn passes(self) -> bool {
+        !matches!(self, NetVerdict::Refuse(_))
+    }
+}
+
+/// Layer 2's decision on a connection to `host`, given the patterns that apply and the mode:
+/// allowed by a pattern, or else logged (`log`) or refused (`enforce`). `off` never gets here
+/// ([`checks_hosts`]); it is treated as `log`'s pass, never a refusal.
+pub fn net_verdict(mode: Mode, patterns: &[String], host: &str) -> NetVerdict {
+    let decision = host_allowed(patterns, host);
+    if decision.is_allowed() {
+        return NetVerdict::Allow;
+    }
+    match mode {
+        Mode::Enforce => NetVerdict::Refuse(decision.rule()),
+        Mode::Log | Mode::Off => NetVerdict::Log(decision.rule()),
     }
 }
 

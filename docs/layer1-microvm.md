@@ -604,8 +604,8 @@ The product version of items 1, 2 and 4 is in `ext/fpm` (`securecore-fpm`; `ext/
   clock is set; a stop syncs them first.
 - After the security review (PR #75): Firecracker runs under its jailer as an unprivileged
   user, chrooted, in its own namespaces and cgroup, so the guest's socket connections carry that
-  user's credentials, not root's; only files the installer recorded by sha256 boot; `auto` was
-  gated off until #72 synced uploads back (it is now open, below); the snapshot is warmed without the database; every
+  user's credentials, not root's; only files the installer recorded by sha256 boot; `auto` is
+  gated off until #72 syncs uploads back; the snapshot is warmed without the database; every
   start message brings fresh entropy and replaces php-fpm's workers.
 - Nothing is pinned: `scripts/mirab-vm.sh` resolves mirab's newest stable release, its
   `vm/manifest.json` and the Firecracker mirab pins at that commit, and `install-ext.sh` checks
@@ -623,31 +623,71 @@ host what changes, and the host applies it to the real folder (`ext/fpm/src/sync
 guest  securecore-init: inotify on every folder of each writable disk
          │ vsock 516: the guest listens (below 1024, so only its root can); the host connects
 host   securecore-fpm ── hands the connection to ──► securecore-fpm --sync-writer
-         the site's pool user (never root: it refuses), no supplementary groups, its own empty
-         network namespace, killed with the launcher; one O_PATH handle per folder (opened
-         beneath the app root); every path opened beneath it with openat2 RESOLVE_BENEATH and
-         no symlinks
+         the site's pool user (never root: it refuses), no supplementary groups, an empty
+         environment, its own empty network namespace, no new privileges, RLIMIT_AS 1 GiB,
+         killed with the launcher; then it confines itself: Landlock to its folders and their
+         trash (nothing else, not even reads), a seccomp allowlist of the calls it makes
+         (anything else is EPERM); one O_PATH handle per folder (opened beneath the app root);
+         every path opened beneath it with openat2 RESOLVE_BENEATH | NO_SYMLINKS |
+         NO_MAGICLINKS | NO_XDEV (never across a mount inside the folder)
 ```
 
-- **The guest's disk is the authority, the host's folder its mirror.** Each connection starts
-  with the guest's whole listing. The host removes what the guest doesn't have, makes the
-  folders it lacks, and asks for every file whose size or mtime differs. After that the guest
-  streams its changes:
-  - a file when it is closed after writing;
-  - new folders (with what is already in them);
-  - deletes (a folder with what it holds), renames (a folder's watches follow it) and modes;
-  - a hard link when it is made.
+- **Who wins: the record.** The host keeps, per folder, a record of what the writer last wrote
+  there or found in step with the guest: path → (size, mtime, inode). It lives in the state
+  folder (`<state>/sync-<disk>.record`, root's, 0600), where neither the guest nor the writer
+  can write. The writer gets a read-only copy at its start and reports each change on its stdout;
+  the launcher appends it, and compacts the file at the next start.
+  - The writer replaces, renames over or removes a host entry **only while it still matches the
+    record**. Anything else (a file the site owner added, or one that changed since the sync
+    wrote it) is the owner's and wins. The guest's op on it is refused and logged, and the
+    connection goes on.
+  - A losing guest change isn't lost on the host side alone: at the next connection (every
+    start, and every reconnect) the host pushes its winning files and folders into the guest's
+    disk, so the two agree again.
+  - A lost record line (a crash before it was appended) costs nothing: an entry both sides have
+    with the same size and mtime is recorded again at the next listing, and anything else is the
+    host's, which only means a push.
+- **The listing.** Each connection starts with the guest's whole tree. Against it the host:
+  - records what agrees (size and mtime; `mke2fs -d` keeps both, so a new disk sends nothing);
+  - asks for each file the guest changed or made;
+  - moves to the trash what the guest removed (recorded entries only; a folder goes once
+    empty, so one holding an owner's file stays);
+  - pushes what the host changed or made (the data as extents, holes skipped). The guest writes
+    each into a temporary file, renames it into place, and answers; only a push the guest
+    took is recorded. Its own inotify events for those files aren't sent back.
 
-  A queue overflow resends the listing.
-- **What the guest can do to the host** is what it can do to its own disk, inside the folders
-  and within caps:
+  After that the guest streams its changes: a file when it is closed after writing; new
+  folders (with what is already in them); deletes, renames (a folder's watches follow it) and
+  modes; a hard link when it is made. A queue overflow resends the listing.
+- **The trash.** A removal never unlinks: the file moves to
+  `<state>/trash/<YYYY-MM-DD>/<disk>/<its path>` (a rename, or a copy when the state folder is on
+  another filesystem). The trash and each day's folder are root's, 0700, outside the web root;
+  the day's folder for a disk is the pool user's, reachable only through the writer's handle.
+  Days older than 7 are removed at a start.
+- **What the guest can do to the host** is what it can do to its own disk, inside the folders,
+  within caps, and only to entries the record says are the sync's:
   - paths are plain and relative (`..`, `.`, empty names, more than 64 levels or 4096 bytes are
-    refused, and the connection closes);
-  - a symlink in the host's folder is never followed or written through: it is replaced by
-    what the guest has (a folder, a file), or removed by the listing;
-  - a folder's files never total more than its disk's size (`--write-disk-mib`);
+    refused, and the connection closes); a name is its bytes, so one that isn't UTF-8 syncs too;
+  - a symlink, a device, another mount or a name that isn't UTF-8 found on the host (and not in
+    the record) is never followed, written through, removed or pushed: it is skipped, and
+    logged once;
+  - a file is refused before its body when it would take its folder past its cap (its disk's
+    size, below), counting blocks, not length (a sparse file costs its data); the connection
+    goes on, so a lowered `--write-disk-mib` or a full folder refuses those files once per
+    listing and never loops. A guest that sends more data than it declared has that file
+    refused at the cap;
+  - a hard link reaches the host as a link to the copy already there (its blocks count once);
+  - at most 1 Mi files and folders per folder, and a listing of at most 1 Mi entries and 64 MiB
+    of paths;
+  - a mode change goes only to a recorded entry, and never to a file with more than one name
+    (a hard link the site owner made to a file outside the folder would carry it there);
   - 256 MiB/s and 2000 operations a second, each with one second of burst;
   - setuid, setgid and sticky bits are dropped.
+- **A disk sized from its folder.** A writable disk is twice what its host folder takes (each
+  inode once), at least 1 GiB, rounded up to a power of two (so the snapshot's key changes only
+  when it doubles), and never less than `--write-disk-mib`. It only grows. `available` refuses a
+  folder of more than 1 Mi entries, or one whose new disk's copy doesn't fit the state folder's
+  filesystem, so `auto` falls back to gelada with the reason and `microvm` exits 125.
 - **Crash safety.**
   - The host writes each file into a nameless file (O_TMPFILE), fsyncs it, links it to a
     temporary name and renames it into place, then fsyncs the folder. A writer killed in the
@@ -692,9 +732,6 @@ The sync costs a page nothing: its threads wait in `poll` until a writable folde
   which #75 rules out.
 - **Offload plugins** (object storage) work unchanged in the guest, but they aren't a default.
 
-**`auto` now picks the microVM** wherever it can run (`AUTO_SELECTS_MICROVM = true`, pinned
-on by a compile-time assert). That was the gate #75 left for this work.
-
 ## Egress: named hosts through the host (#72)
 
 The guest still has no network device and no DNS. A `layer1.network.connect` port with
@@ -707,20 +744,34 @@ guest  php-fpm (curl, PHP streams, anything that calls getaddrinfo + connect)
          getaddrinfo("api.wordpress.org")  → 127.77.0.1: the preload answers, and keeps the name
          connect(127.77.0.1:443)           → vsock host:1517, "api.wordpress.org 443\n", the
                                               host's "OK\n" (or "ERR <why>\n" = ECONNREFUSED)
-host   securecore-fpm: is 443 an egress port, and is the name in layer 2's host lists? Resolve
-       it here; connect only to globally routable addresses; then a byte pipe (TLS end to end)
+host   securecore-fpm: is 443 an egress port, and what does layer 2 decide for the name? Resolve
+       it here; keep only public addresses that aren't the host's own; then
+       securecore-fpm --egress-connect, as the pool user, connects and pipes (TLS end to end)
 ```
 
-- **Only the hosts the config allows are reachable.** With layer 2 on, a name must match one of
-  layer 2's host patterns: core's, `default`'s, or any component's. The match uses layer 2's own
-  matcher (`securecore_attribution::hosts::host_allowed`: exact names, `*.` wildcards, IP
-  literals; IDNA, case and trailing dot normalised). Layer 2 then checks the caller inside the
-  guest, per component, as on the host. With layer 2 off, any name is allowed on an egress
-  port, as gelada's port rules allow any host.
-- **Never an internal address.** Whatever a name resolves to, the host connects only to globally
-  routable addresses. It refuses loopback, RFC 1918, link-local (cloud metadata), CGNAT,
-  benchmarking, unique-local, documentation and v4-mapped forms of these. An IP literal is
-  reachable only when layer 2 lists it as itself.
+- **Only the hosts the config allows are reachable**, by layer 2's own decision
+  (`securecore_attribution::hosts::net_verdict`, the function the extension uses too). While
+  layer 2's host allowlist is active (on, an app set, mode not `off`), the name is checked
+  against all of layer 2's host patterns: core's, `default`'s and every component's (exact
+  names, `*.` wildcards, IP literals; IDNA, case and trailing dot normalised).
+  - `enforce`: a name no pattern allows is refused.
+  - `log`: it goes through, and the launcher logs it as layer 2 would have refused it
+    (`egress: example.com:443 via … (layer2 log: refused in enforce by the host rule)`).
+  - `off`, or layer 2 disabled: any name on an egress port, as gelada's port rules allow any
+    host.
+
+  Layer 2 then checks the caller inside the guest, per component, as on the host.
+- **Never an internal address, whatever layer 2 says.** For a name and an IP literal alike, the
+  host connects only to globally routable addresses. It refuses loopback, RFC 1918, link-local
+  (cloud metadata), CGNAT, benchmarking, unique-local, documentation and v4-mapped forms of
+  these, and every address on the host's own interfaces (read at each connection), public ones
+  included. An internal target is reachable only through an explicit `connect` entry with a
+  `socket` or an `address`, never through egress.
+- **As the pool user.** The connect is made by `securecore-fpm --egress-connect`, one per
+  connection, running as the site's pool user (no supplementary groups, an empty environment,
+  no new privileges). The host's uid-based firewall rules (`iptables -m owner`, nftables
+  `skuid`) apply to the guest's traffic as they would to the site's own php-fpm. The launcher
+  (root) only parses the request, decides and resolves.
 - **No DNS in the guest.** The names never leave the guest as DNS queries; the host resolves them.
   Port 53 in a connect list is just another egress port.
 - **No tap device**, no host network configuration, and nothing in the guest listens. An IP the
