@@ -22,8 +22,32 @@
         }
         return $v;
     };
+    $mariadb = static function (): bool {
+        global $wpdb;
+        return stripos((string) $wpdb->db_server_info(), 'mariadb') !== false;
+    };
+    // The server's error for the child: its code and its text, with the connection's database
+    // name, user and host taken out (`'db.table'`, `'user'@'host'`), so the child learns no part
+    // of the credentials from an error.
+    $clean = static function (string $error, int $errno): string {
+        global $wpdb;
+        if ($error === '' || str_starts_with($error, 'securecore: ')) return $error;
+        $error = (string) preg_replace("/'[^']*'@'[^']*'/", "'<user>'@'<host>'", $error);
+        $facts = [
+            defined('DB_NAME') ? (string) DB_NAME : (string) ($wpdb->dbname ?? ''),
+            defined('DB_USER') ? (string) DB_USER : (string) ($wpdb->dbuser ?? ''),
+            defined('DB_HOST') ? (string) DB_HOST : (string) ($wpdb->dbhost ?? ''),
+        ];
+        foreach (array_unique(array_filter($facts, static fn ($f) => strlen($f) >= 2)) as $f) {
+            $error = str_ireplace([$f . '.', $f], ['', '<db>'], $error);
+        }
+        return $errno > 0 ? "[$errno] $error" : $error;
+    };
     // One query from the child, on this worker's connection: what $wpdb saw, PHP-serialized.
-    $run = static function () use ($slug): string {
+    // The rows are copied only up to $limit bytes (layer3.limits.dbResultBytes): past it the
+    // answer is a refusal, and the worker's copies are freed, so a result far over the cap never
+    // costs more than the one $wpdb buffered.
+    $run = static function (int $limit) use ($slug, $clean): string {
         global $wpdb;
         $sql = \securecore_layer3_db_begin($slug);
         if (!is_string($sql)) {
@@ -31,26 +55,38 @@
         }
         $ret = false;
         $cols = [];
+        $errno = 0;
         try {
             $ret = $wpdb->query($sql);
             $error = (string) $wpdb->last_error;
+            $dbh = $wpdb->dbh ?? null;
+            if ($error !== '' && $dbh instanceof \mysqli) $errno = (int) mysqli_errno($dbh);
             if ($ret !== false && ($wpdb->result ?? null) instanceof \mysqli_result) {
                 $cols = (array) $wpdb->get_col_info('name');
             }
         } catch (\Throwable $e) {
             $ret = false;
-            $error = 'securecore: ' . get_class($e) . ': ' . $e->getMessage();
+            $error = 'securecore: ' . get_class($e);
         }
         $keys = [];
         $rows = [];
+        $bytes = 0;
         foreach (is_array($wpdb->last_result) ? $wpdb->last_result : [] as $row) {
             $v = is_object($row) ? get_object_vars($row) : [];
             if ($keys === []) $keys = array_keys($v);
+            // What serialize() writes for each value, near enough (its text and ~16 bytes).
+            foreach ($v as $x) $bytes += strlen((string) $x) + 16;
+            if ($limit > 0 && $bytes > $limit) {
+                unset($rows, $v);
+                $wpdb->flush();
+                error_log("securecore: layer3 plugin:$slug database answer refused: over the dbResultBytes cap of $limit");
+                return serialize(['ret' => false, 'error' => "securecore: layer3 refused this answer (over the dbResultBytes cap of $limit)"]);
+            }
             $rows[] = array_values($v);
         }
         $a = [
             'ret' => is_int($ret) || is_bool($ret) ? $ret : false,
-            'error' => $error,
+            'error' => $clean($error, $errno),
             'keys' => $keys,
             'rows' => $rows,
             'cols' => $cols,
@@ -59,14 +95,18 @@
         // As wpdb::query() sets them: rows_affected for a write, insert_id for an INSERT/REPLACE.
         if (preg_match('/^\s*(insert|delete|update|replace)\s/i', $sql)) $a['affected'] = (int) $wpdb->rows_affected;
         if (preg_match('/^\s*(insert|replace)\s/i', $sql)) $a['insert_id'] = (int) $wpdb->insert_id;
+        if ($rows !== []) $wpdb->flush();
         return serialize($a);
     };
-    // The statement time cap: the call's remaining milliseconds while it queries, then the
-    // session's own value again (read once per request).
+    // The statement time cap: the time left before the call's deadline, set before a query
+    // whenever the last setting is more than 50 ms old (so a statement never runs more than 50 ms
+    // past the deadline on the server), then the session's own value again (read once per
+    // request). MariaDB's max_statement_time covers every statement; MySQL's max_execution_time
+    // only SELECTs (addiscorp/securecore#99).
     $before = null;
-    $cap = static function (?int $ms) use (&$before): void {
+    $cap = static function (?int $ms) use (&$before, $mariadb): void {
         global $wpdb;
-        $var = stripos((string) $wpdb->db_server_info(), 'mariadb') !== false ? 'max_statement_time' : 'max_execution_time';
+        $var = $mariadb() ? 'max_statement_time' : 'max_execution_time';
         $before ??= (string) $wpdb->get_var("SELECT @@SESSION.$var");
         if ($ms === null) {
             $value = is_numeric($before) ? $before : '0';
@@ -75,21 +115,40 @@
         }
         $wpdb->query("SET SESSION $var = $value");
     };
-    // Waits out the child's queries: the answer (a string), or null.
-    $pump = static function ($answer) use ($slug, $run, $cap) {
+    // The connection's transaction state, as the server reports it (never read from the SQL
+    // text): [autocommit on, a transaction open].
+    $state = static function () use ($mariadb): array {
         global $wpdb;
-        $capped = false;
+        $open = $mariadb()
+            ? '@@in_transaction'
+            : '(SELECT COUNT(*) FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID())';
+        $r = $wpdb->get_row("SELECT @@autocommit, $open", ARRAY_N);
+        return [(int) ($r[0] ?? 1) === 1, (int) ($r[1] ?? 0) > 0];
+    };
+    // Waits out the child's queries: the answer (a string), or null. However the exchange ended
+    // (an answer, a timeout, a crash), a transaction the plugin opened, or autocommit it turned
+    // off, is rolled back and restored, so core's later writes in the request never join it.
+    $pump = static function ($answer) use ($slug, $run, $cap, $state) {
+        global $wpdb;
+        $was = null;
+        $set_at = null;
         while (is_array($answer)) {
-            if (!$capped) {
-                $capped = true;
+            $was ??= $state();
+            if ($set_at === null || microtime(true) - $set_at > 0.05) {
                 $cap(max(1, (int) ($answer['ms'] ?? 1)));
+                $set_at = microtime(true);
             }
-            $answer = \securecore_layer3_db_reply($slug, $run());
+            $answer = \securecore_layer3_db_reply($slug, $run((int) ($answer['bytes'] ?? 0)));
         }
-        if ($capped) $cap(null);
-        if (!is_string($answer) && \securecore_layer3_take_rollback($slug)) {
-            $wpdb->query('ROLLBACK');
-            error_log("securecore: layer3 plugin:$slug rolled back the transaction its child left open");
+        if ($was !== null) {
+            $cap(null);
+            [$autocommit, $open] = $state();
+            if (($open && !$was[1]) || (!$autocommit && $was[0])) {
+                $wpdb->query('ROLLBACK');
+                if (!$autocommit && $was[0]) $wpdb->query('SET autocommit = 1');
+                error_log("securecore: layer3 plugin:$slug left " . ($open ? 'a transaction open' : 'autocommit off')
+                    . " on the worker's connection: rolled back" . (!$autocommit && $was[0] ? ', autocommit restored' : ''));
+            }
         }
         return $answer;
     };

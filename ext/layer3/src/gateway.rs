@@ -85,37 +85,6 @@ fn touches_time_cap(sql: &str) -> bool {
     lower.contains("max_statement_time") || lower.contains("max_execution_time")
 }
 
-/// What a statement does to a transaction on the connection: `Some(true)` opens one,
-/// `Some(false)` ends it, `None` neither. The worker rolls back a transaction a plugin left open
-/// when its child dies, so core's later writes in the request don't join it.
-pub fn transaction_effect(sql: &str) -> Option<bool> {
-    let words: Vec<String> = sql
-        .trim_start()
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .filter(|w| !w.is_empty())
-        .take(3)
-        .map(str::to_ascii_uppercase)
-        .collect();
-    let w = |i: usize| words.get(i).map_or("", String::as_str);
-    match (w(0), w(1)) {
-        ("BEGIN", _) | ("START", "TRANSACTION") => Some(true),
-        // ROLLBACK TO [SAVEPOINT] x keeps the transaction open.
-        ("ROLLBACK", "TO") => None,
-        ("COMMIT" | "ROLLBACK", _) => Some(false),
-        ("SET", _) => {
-            let compact: String = sql.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_uppercase();
-            if compact.contains("AUTOCOMMIT=0") || compact.contains("AUTOCOMMIT=OFF") {
-                Some(true)
-            } else if compact.contains("AUTOCOMMIT=1") || compact.contains("AUTOCOMMIT=ON") {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 /// The worker's answer for a query it refused or could not run: what a failed `$wpdb` query
 /// leaves (`false`, and `message` as `last_error`), PHP-serialized as the worker's PHP answers.
 pub fn failed_answer(message: &str) -> Vec<u8> {
@@ -159,20 +128,6 @@ mod tests {
             assert_eq!(admit(sql.as_bytes(), 0, 10), Err(Refusal::TimeCap), "{sql}");
         }
         assert!(admit(b"SET SESSION sql_mode = 'TRADITIONAL'", 0, 10).is_ok());
-    }
-
-    #[test]
-    fn transactions_are_tracked_by_their_control_statements() {
-        assert_eq!(transaction_effect("START TRANSACTION"), Some(true));
-        assert_eq!(transaction_effect("  begin;"), Some(true));
-        assert_eq!(transaction_effect("start transaction read only"), Some(true));
-        assert_eq!(transaction_effect("COMMIT"), Some(false));
-        assert_eq!(transaction_effect("rollback"), Some(false));
-        assert_eq!(transaction_effect("ROLLBACK TO SAVEPOINT a"), None);
-        assert_eq!(transaction_effect("SET autocommit = 0"), Some(true));
-        assert_eq!(transaction_effect("SET autocommit=1"), Some(false));
-        assert_eq!(transaction_effect("SELECT 'BEGIN'"), None);
-        assert_eq!(transaction_effect("INSERT INTO t VALUES (1)"), None);
     }
 
     #[test]

@@ -102,6 +102,11 @@ d_sleep=$(page "L3 db sleep" '[sc_l3db_sleep] SC-L3DB-AFTER-SLEEP')
 d_secrets=$(page "L3 db secrets" '[sc_l3db_secrets]')
 d_time=$(page "L3 db time" '[sc_l3db_time n=50]')
 d_txn=$(page "L3 db txn" '[sc_l3db_txn_dies] SC-L3DB-AFTER-TXN')
+d_txo=$(page "L3 db txn open" '[sc_l3db_txn_open] SC-L3DB-AFTER-TXO')
+d_aco=$(page "L3 db autocommit off" '[sc_l3db_autocommit_off] SC-L3DB-AFTER-ACO')
+d_huge=$(page "L3 db huge" '[sc_l3db_huge] SC-L3DB-AFTER-HUGE')
+d_err=$(page "L3 db error" '[sc_l3db_err]')
+d_sleeps=$(page "L3 db sleeps" '[sc_l3db_sleeps] SC-L3DB-AFTER-SLEEPS')
 # scan_secrets <name>: fetch the secrets page into $dir/<name> and, while the process serving its
 # call waits, read that process's environment and memory from outside (as root with
 # CAP_SYS_PTRACE in the php container: a layer 3 child isn't dumpable) into $dir/<name>.scan,
@@ -126,7 +131,7 @@ cost() {
 
 cleanup() {
   wp plugin deactivate sc-l3probe sc-l3-neighbour hello sc-l3db >/dev/null 2>&1
-  for p in $p_main $p_loop $p_mem $p_probe $d_rw $d_l2 $d_l3 $d_many $d_big $d_sleep $d_secrets $d_time $d_txn; do wp post delete "$p" --force >/dev/null 2>&1; done
+  for p in $p_main $p_loop $p_mem $p_probe $d_rw $d_l2 $d_l3 $d_many $d_big $d_sleep $d_secrets $d_time $d_txn $d_txo $d_aco $d_huge $d_err $d_sleeps; do wp post delete "$p" --force >/dev/null 2>&1; done
   wp option update blogname SecureCore >/dev/null 2>&1
   db_exec "DROP TABLE IF EXISTS wp_sc_l3db_items, wp_sc_l3_neighbour_data; DELETE FROM wp_options WHERE option_name LIKE 'sc\\_l3db\\_%' OR option_name LIKE '\\_transient\\_%sc\\_l3db%' OR option_name = 'sc_l3_neighbour_mark'"
   in_php "rm -rf $probe $content/plugins/sc-l3-neighbour.php $content/plugins/sc-l3db.php $content/uploads/sc-l3db $content/uploads/sc-l3probe $content/uploads/sc-l3-up.txt"
@@ -278,10 +283,46 @@ mark=m$$x$(date +%s)
 get txn "/?page_id=$d_txn&sc_l3_mark=$mark"
 contains txn SC-L3DB-AFTER-TXN "transactions: the page goes on after the child is killed"
 lacks txn "survived=" "transactions: the call did not finish"
-has "$T" "layer3 plugin:sc-l3db rolled back the transaction its child left open" "transactions: the worker rolled back what the dead child left open"
+has "$T" "layer3 plugin:sc-l3db left a transaction open on the worker's connection: rolled back" "transactions: the worker rolled back what the dead child left open"
 is "$(db_exec "SELECT COUNT(*) FROM wp_sc_l3db_items WHERE name = 'orphan'")" 0 "transactions: the dead child's write is not in the database"
 is "$(db_exec "SELECT option_value FROM wp_options WHERE option_name = 'sc_l3_neighbour_mark'")" "$mark" \
   "transactions: a later write in the same request (another plugin's) committed, not swallowed by the open transaction"
+# Left open on a normal return: a START TRANSACTION behind a comment, and autocommit turned off.
+# Read from the server's state, not the SQL: rolled back, autocommit restored, core's write commits.
+for c in txo:open1 aco:ac1; do
+  n=${c%%:*} row=${c#*:}
+  eval "pg=\$d_$n"
+  T=$(now); sleep 1
+  mark=m$$${n}$(date +%s)
+  get "$n" "/?page_id=$pg&sc_l3_mark=$mark"
+  want "$n" returned yes "transactions ($n): the call returned normally"
+  has "$T" "layer3 plugin:sc-l3db left a transaction open on the worker's connection: rolled back" "transactions ($n): the worker rolled back what the plugin left open"
+  is "$(db_exec "SELECT COUNT(*) FROM wp_sc_l3db_items WHERE name = '$row'")" 0 "transactions ($n): the plugin's uncommitted row is not in the database"
+  is "$(db_exec "SELECT option_value FROM wp_options WHERE option_name = 'sc_l3_neighbour_mark'")" "$mark" \
+    "transactions ($n): core's later write in the same request committed"
+done
+has "$T" "rolled back, autocommit restored" "transactions (aco): autocommit is restored"
+# dbResultBytes against a result far over it (40 MiB, cap 64 KiB): refused while the rows are
+# copied, and the worker stays within memory_limit.
+get huge "/?page_id=$d_huge&sc_l3_peak=1"
+is "$(status_of huge)" 200 "result cap: the 40 MiB result's page renders (no memory_limit fatal)"
+contains huge SC-L3DB-AFTER-HUGE "result cap: the rest of the page is there"
+want huge huge BLOCKED "result cap"
+want huge error dbResultBytes "result cap"
+peak=$(verdict huge peak)
+if [ -n "$peak" ] && [ "$peak" -lt 120000000 ]; then pass "result cap: the worker's peak memory stayed at $peak bytes"; else fail "result cap: the worker's peak memory stayed under 120 MB" "'$peak'"; fi
+# The error the child sees names neither the database nor its user.
+get err "/?page_id=$d_err"
+e=$(verdict err err)
+case "$e" in *sc_l3db_nope*) pass "errors: the child sees the error ($e)" ;; *) fail "errors: the child sees the error" "'$e'" ;; esac
+case "$e" in "[1146] "*) pass "errors: with its code" ;; *) fail "errors: with its code" "'$e'" ;; esac
+case "$e" in *wordpress*) fail "errors: the database name is taken out" "'$e'" ;; *) pass "errors: the database name is taken out" ;; esac
+# The statement cap is the time left: two 1 s statements in a 1.5 s call end at ~1.5 s, not 2.
+get sleeps "/?page_id=$d_sleeps"
+contains sleeps SC-L3DB-AFTER-SLEEPS "time cap: the page goes on"
+lacks sleeps "slept=" "time cap: the call did not finish"
+s=$(cut -d' ' -f2 "$dir/sleeps.meta")
+if awk "BEGIN { exit !($s < 1.85) }"; then pass "time cap: the second statement was cut at the time left ($s s)"; else fail "time cap: the second statement was cut at the time left" "$s s"; fi
 # The secrets: the child has no database password, in its environment or its memory.
 scan_secrets secrets
 want secrets isolated 1 "secrets"

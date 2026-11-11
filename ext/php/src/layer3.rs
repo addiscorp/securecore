@@ -210,8 +210,6 @@ struct Channel {
     queries: u32,
     /// The query cap's line was written (once per request).
     cap_logged: bool,
-    /// The plugin's last transaction-control statement left a transaction open.
-    transaction: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,8 +230,6 @@ static CHANNELS: Mutex<Option<HashMap<String, Option<Channel>>>> = Mutex::new(No
 /// Slugs whose query the stand-in is running now (a stack: a query's `query` filter may call
 /// another isolated plugin that queries in turn). Read by [`gateway_component`].
 static GATEWAY: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// Slugs whose child died with a transaction open: the stand-in rolls it back.
-static ROLLBACK: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The name the stand-in for `slug` is compiled under (its frames' filename).
 fn stub_name(slug: &str) -> String {
@@ -256,7 +252,6 @@ pub(crate) fn gateway_component(file: &str) -> Option<Component> {
 pub(crate) fn request_shutdown() {
     lock(&CHANNELS).take();
     lock(&GATEWAY).clear();
-    lock(&ROLLBACK).clear();
 }
 
 /// Whether the `zend_compile_file` wrapper is needed for layer 3: a worker with plugins to
@@ -386,7 +381,6 @@ pub fn securecore_layer3_open(slug: String, file: String, abspath: String, prefi
                 busy: false,
                 queries: 0,
                 cap_logged: false,
-                transaction: false,
             };
             let slot = channels.entry(slug.clone()).or_insert(Some(channel));
             pump(&slug, slot, Some(first))
@@ -459,7 +453,8 @@ enum Failure {
 }
 
 /// Ends `slot`'s channel after a failed exchange, with the line for it; a child past its deadline
-/// is killed. A transaction the plugin left open is noted for the stand-in to roll back.
+/// is killed. (A transaction the plugin left open is the stand-in's to roll back: it reads the
+/// connection's state after every exchange.)
 fn fail(slug: &str, slot: &mut Option<Channel>, failure: Failure) {
     let Some(ch) = slot.take() else { return };
     let phase = ch.waiting.map_or(Phase::Load, |w| w.phase);
@@ -481,9 +476,6 @@ fn fail(slug: &str, slot: &mut Option<Channel>, failure: Failure) {
         // SAFETY: the control socket, open for the process's life.
         let _ = wire::send_packet(unsafe { BorrowedFd::borrow_raw(control) }, &wire::encode_kill(pid), None);
     }
-    if ch.transaction {
-        lock(&ROLLBACK).push(slug.to_owned());
-    }
 }
 
 /// Reads the child's frames until the answer the channel waits for. A query frame on the way is
@@ -492,7 +484,8 @@ fn fail(slug: &str, slot: &mut Option<Channel>, failure: Failure) {
 /// string), a query (an array), or null when the channel failed.
 fn pump(slug: &str, slot: &mut Option<Channel>, mut first: Option<Vec<u8>>) -> Zval {
     let mut out = Zval::new();
-    let cap = crate::with_live(|l| l.config.layer3.limits.db_queries.get()).unwrap_or(1000);
+    let (cap, result_cap) =
+        crate::with_live(|l| (l.config.layer3.limits.db_queries.get(), l.config.layer3.limits.db_result_bytes.get())).unwrap_or((1000, 4 << 20));
     loop {
         let Some(ch) = slot.as_mut() else { return out };
         let Some(w) = ch.waiting else { return out };
@@ -515,14 +508,13 @@ fn pump(slug: &str, slot: &mut Option<Channel>, mut first: Option<Vec<u8>>) -> Z
             match gateway::admit(sql, ch.queries, cap) {
                 Ok(text) => {
                     ch.queries += 1;
-                    if let Some(open) = gateway::transaction_effect(text) {
-                        ch.transaction = open;
-                    }
                     ch.pending = Some(text.to_owned());
                     let left = w.deadline.saturating_duration_since(Instant::now());
                     let mut q = ZendHashTable::new();
                     let ms = i64::try_from(left.as_millis()).unwrap_or(i64::MAX).max(1);
-                    if q.insert("ms", ms).is_err() {
+                    // The stand-in stops copying rows past dbResultBytes (the reply is checked
+                    // again on the way out).
+                    if q.insert("ms", ms).is_err() || q.insert("bytes", i64::from(result_cap)).is_err() {
                         return out;
                     }
                     out.set_hashtable(q);
@@ -619,17 +611,6 @@ pub fn securecore_layer3_db_reply(slug: String, answer: &Zval) -> Zval {
         return out;
     }
     pump(&slug, slot, None)
-}
-
-/// Whether the plugin's child died with a transaction open on the worker's connection (once):
-/// the stand-in then rolls it back, so core's later writes don't join it.
-#[php_function]
-#[php(name = "securecore_layer3_take_rollback")]
-pub fn securecore_layer3_take_rollback(slug: String) -> bool {
-    let mut owed = lock(&ROLLBACK);
-    let before = owed.len();
-    owed.retain(|s| *s != slug);
-    owed.len() != before
 }
 
 // --- the helper: supervisor ---------------------------------------------------------------------
@@ -1006,7 +987,6 @@ pub(crate) fn register(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(securecore_layer3_call))
         .function(wrap_function!(securecore_layer3_db_begin))
         .function(wrap_function!(securecore_layer3_db_reply))
-        .function(wrap_function!(securecore_layer3_take_rollback))
         .function(wrap_function!(securecore_layer3_db))
         .function(wrap_function!(securecore_layer3_helper))
         .function(wrap_function!(securecore_layer3_zygote))

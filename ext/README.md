@@ -1091,13 +1091,23 @@ isolated plugin, where the same `get_option()` in the worker is core's.
 | cap | where | what happens |
 |---|---|---|
 | `limits.dbQueries` (default 1000) | the worker, per request and plugin (its load and its calls) | each query past it fails (`last_error`: `over the dbQueries cap`); one line per request |
-| `limits.dbResultBytes` (default 4 MiB, at most 16 MiB) | the worker, per answer | a larger answer fails instead (the query ran); a line |
-| `limits.timeoutMs` | the worker, per call, queries included | the call's remaining time caps each statement on the server (`SET SESSION max_statement_time` on MariaDB, `max_execution_time` on MySQL, SELECTs only there), set once per call that queries and restored to the session's own value after; past the deadline the child is killed as for any call. A plugin's query naming either variable is refused |
+| `limits.dbResultBytes` (default 4 MiB, at most 16 MiB) | the worker, per answer | the stand-in counts the bytes as it copies the rows and stops past the cap: the answer fails (the query ran) and the worker's copies are freed, with a line. The one copy `$wpdb` buffered (mysqli's) is the worker's own `memory_limit`'s to bound; the serialized answer is checked again on the way out |
+| `limits.timeoutMs` | the worker, per call, queries included | the time left before the call's deadline caps each statement on the server (`SET SESSION max_statement_time` on MariaDB; `max_execution_time` on MySQL, which covers SELECTs only, #99), re-set before a query whenever the last setting is over 50 ms old (so no statement runs more than 50 ms past the deadline there), and the session's own value restored after; past the deadline the child is killed as for any call. A plugin's query naming either variable is refused |
 
-**Transactions** are the plugin's statements on the worker's connection, as unisolated. If the
-child dies (timeout, memory, a crash) after a `START TRANSACTION`/`BEGIN`/`SET autocommit = 0`
-it didn't end, the worker rolls back (with a line), so core's later writes in the request don't
-join it.
+**Transactions.** The plugin's statements run on the worker's connection, as unisolated. After
+every exchange that queried (the load or a call, however it ended: an answer, a timeout, a
+crash), the stand-in asks the server for the connection's state (`@@autocommit` and
+`@@in_transaction` on MariaDB; on MySQL `information_schema.innodb_trx` for the connection), never
+the SQL text, which a comment, `SET autocommit = FALSE` or the like would hide. If the plugin left
+a transaction open or autocommit off that wasn't before, it rolls back, turns autocommit on again
+and writes `layer3 plugin:<slug> left a transaction open on the worker's connection: rolled back`,
+so core's later writes in the request never join it and no row lock outlives the call. (A
+transaction the plugin opens and ends within one call is its own, as unisolated; XA transactions
+never open, layer 2 refuses `XA`.)
+
+**Errors.** The child gets the server's error code and text with the connection's database name,
+user and host taken out (`[1146] Table 'wp_x' doesn't exist`, not `'<database>.wp_x'`; a user
+and host read `'<user>'@'<host>'`); layer 2's and layer 3's own refusals come through as they are.
 
 **Cost.** One query is one round trip on the request socket plus PHP serialize/unserialize of the
 answer, on top of the query itself. `test/ext-layer3.sh` times a one-row `get_row(prepare(…))` 50

@@ -128,6 +128,44 @@ add_shortcode('sc_l3db_txn_dies', static function () {
     return sc_l3db_out(['survived' => 'yes']);
 });
 
+// Transactions left open on a normal return: one opened behind a comment, one by turning
+// autocommit off. Each writes a row and returns without committing.
+add_shortcode('sc_l3db_txn_open', static function () {
+    global $wpdb;
+    $wpdb->query('/* hidden */ START TRANSACTION');
+    $wpdb->insert($wpdb->prefix . 'sc_l3db_items', ['name' => 'open1', 'n' => 8]);
+    return sc_l3db_out(['returned' => 'yes']);
+});
+add_shortcode('sc_l3db_autocommit_off', static function () {
+    global $wpdb;
+    $wpdb->query('SET autocommit = FALSE');
+    $wpdb->insert($wpdb->prefix . 'sc_l3db_items', ['name' => 'ac1', 'n' => 8]);
+    return sc_l3db_out(['returned' => 'yes']);
+});
+
+// The result cap against a result far larger than it: 40 rows of 1 MiB.
+add_shortcode('sc_l3db_huge', static function () {
+    global $wpdb;
+    $v = $wpdb->get_col("SELECT REPEAT('x', 1048576) FROM information_schema.COLLATIONS LIMIT 40");
+    return sc_l3db_out(['huge' => count($v) === 40 ? 'OK' : 'BLOCKED', 'error' => str_contains($wpdb->last_error, 'dbResultBytes') ? 'dbResultBytes' : 'other']);
+});
+
+// A server error naming the database: what the child sees of it.
+add_shortcode('sc_l3db_err', static function () {
+    global $wpdb;
+    $wpdb->query("SELECT * FROM {$wpdb->prefix}sc_l3db_nope");
+    return sc_l3db_out(['err' => $wpdb->last_error]);
+});
+
+// Two 1 s statements in one call: the second must be capped at the time left, not at the time
+// there was before the first.
+add_shortcode('sc_l3db_sleeps', static function () {
+    global $wpdb;
+    $wpdb->query('SELECT SLEEP(1)');
+    $wpdb->query('SELECT SLEEP(1)');
+    return sc_l3db_out(['slept' => 'twice']);
+});
+
 // The query cap: n queries in a row, how many ran.
 add_shortcode('sc_l3db_many', static function ($atts) {
     global $wpdb;

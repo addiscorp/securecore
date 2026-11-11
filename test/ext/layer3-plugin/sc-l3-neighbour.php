@@ -24,5 +24,9 @@ add_filter('the_content', static function ($content) {
     if (isset($_GET['sc_l3_mark'])) {
         update_option('sc_l3_neighbour_mark', sanitize_key($_GET['sc_l3_mark']), false);
     }
+    // ?sc_l3_peak=1: the worker's peak memory so far (the result cap's test).
+    if (isset($_GET['sc_l3_peak'])) {
+        $content .= "\n<pre>\npeak=" . memory_get_peak_usage() . "\n</pre>";
+    }
     return $content;
 }, 30);

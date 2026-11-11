@@ -373,6 +373,12 @@ fn core_is_unrestricted_but_for_the_allowlist() {
     ] {
         assert_eq!(core(sql), Decision::Allow, "{sql}");
     }
+    // ...and reads the connection's transaction state after each exchange, as core.
+    assert_eq!(core("SELECT @@autocommit, @@in_transaction"), Decision::Allow);
+    // XA transactions (which a plain ROLLBACK can't end) never open for a component.
+    for sql in ["XA START 'x'", "XA BEGIN 'x'"] {
+        assert!(matches!(verdict(&plain(), sql), Decision::Refuse(_)), "{sql}");
+    }
 }
 
 // --- the WordPress shapes the parser must take (a component in place of core) -------------------

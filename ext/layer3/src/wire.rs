@@ -384,6 +384,21 @@ mod tests {
         assert_eq!(decode_kill(b"R"), None);
     }
 
+    /// A hostile peer's length prefix is checked before anything is allocated or read: a header
+    /// claiming more than MAX_FRAME is refused at once, with its body never sent.
+    #[test]
+    fn an_oversized_frame_is_refused_from_its_header() {
+        let (a, b) = socketpair(libc::SOCK_STREAM).unwrap();
+        let len = u32::try_from(MAX_FRAME + 1).unwrap();
+        send_all(a.as_fd(), &len.to_be_bytes(), None).unwrap();
+        let e = read_frame(b.as_fd(), Some(Instant::now() + Duration::from_secs(5))).unwrap_err();
+        assert!(e.to_string().contains("over the"), "{e}");
+        send_all(a.as_fd(), &u32::MAX.to_be_bytes(), None).unwrap();
+        assert!(read_frame(b.as_fd(), Some(Instant::now() + Duration::from_secs(5))).is_err());
+        // And a writer can't send one.
+        assert!(write_frame(a.as_fd(), &vec![0; MAX_FRAME + 1], None).is_err());
+    }
+
     #[test]
     fn frames_cross_a_socketpair_and_time_out() {
         let (a, b) = socketpair(libc::SOCK_STREAM).unwrap();
