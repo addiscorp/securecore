@@ -744,20 +744,34 @@ guest  php-fpm (curl, PHP streams, anything that calls getaddrinfo + connect)
          getaddrinfo("api.wordpress.org")  → 127.77.0.1: the preload answers, and keeps the name
          connect(127.77.0.1:443)           → vsock host:1517, "api.wordpress.org 443\n", the
                                               host's "OK\n" (or "ERR <why>\n" = ECONNREFUSED)
-host   securecore-fpm: is 443 an egress port, and is the name in layer 2's host lists? Resolve
-       it here; connect only to globally routable addresses; then a byte pipe (TLS end to end)
+host   securecore-fpm: is 443 an egress port, and what does layer 2 decide for the name? Resolve
+       it here; keep only public addresses that aren't the host's own; then
+       securecore-fpm --egress-connect, as the pool user, connects and pipes (TLS end to end)
 ```
 
-- **Only the hosts the config allows are reachable.** With layer 2 on, a name must match one of
-  layer 2's host patterns: core's, `default`'s, or any component's. The match uses layer 2's own
-  matcher (`securecore_attribution::hosts::host_allowed`: exact names, `*.` wildcards, IP
-  literals; IDNA, case and trailing dot normalised). Layer 2 then checks the caller inside the
-  guest, per component, as on the host. With layer 2 off, any name is allowed on an egress
-  port, as gelada's port rules allow any host.
-- **Never an internal address.** Whatever a name resolves to, the host connects only to globally
-  routable addresses. It refuses loopback, RFC 1918, link-local (cloud metadata), CGNAT,
-  benchmarking, unique-local, documentation and v4-mapped forms of these. An IP literal is
-  reachable only when layer 2 lists it as itself.
+- **Only the hosts the config allows are reachable**, by layer 2's own decision
+  (`securecore_attribution::hosts::net_verdict`, the function the extension uses too). While
+  layer 2's host allowlist is active (on, an app set, mode not `off`), the name is checked
+  against all of layer 2's host patterns: core's, `default`'s and every component's (exact
+  names, `*.` wildcards, IP literals; IDNA, case and trailing dot normalised).
+  - `enforce`: a name no pattern allows is refused.
+  - `log`: it goes through, and the launcher logs it as layer 2 would have refused it
+    (`egress: example.com:443 via … (layer2 log: refused in enforce by the host rule)`).
+  - `off`, or layer 2 disabled: any name on an egress port, as gelada's port rules allow any
+    host.
+
+  Layer 2 then checks the caller inside the guest, per component, as on the host.
+- **Never an internal address, whatever layer 2 says.** For a name and an IP literal alike, the
+  host connects only to globally routable addresses. It refuses loopback, RFC 1918, link-local
+  (cloud metadata), CGNAT, benchmarking, unique-local, documentation and v4-mapped forms of
+  these, and every address on the host's own interfaces (read at each connection), public ones
+  included. An internal target is reachable only through an explicit `connect` entry with a
+  `socket` or an `address`, never through egress.
+- **As the pool user.** The connect is made by `securecore-fpm --egress-connect`, one per
+  connection, running as the site's pool user (no supplementary groups, an empty environment,
+  no new privileges). The host's uid-based firewall rules (`iptables -m owner`, nftables
+  `skuid`) apply to the guest's traffic as they would to the site's own php-fpm. The launcher
+  (root) only parses the request, decides and resolves.
 - **No DNS in the guest.** The names never leave the guest as DNS queries; the host resolves them.
   Port 53 in a connect list is just another egress port.
 - **No tap device**, no host network configuration, and nothing in the guest listens. An IP the

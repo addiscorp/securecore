@@ -119,11 +119,7 @@ unsafe impl Send for SyncPtrs {}
 
 /// Layer 2's hostname allowlist is active right now: enabled, an app set, mode not `off`.
 pub(crate) fn hosts_active() -> bool {
-    crate::with_live(|l| {
-        let l2 = &l.config.layer2;
-        l2.enabled && l2.app.is_some() && l2.mode != Mode::Off
-    })
-    .unwrap_or(false)
+    crate::with_live(|l| hosts::checks_hosts(&l.config.layer2)).unwrap_or(false)
 }
 
 // --- the volatile net wrapper -------------------------------------------------------------------
@@ -709,7 +705,7 @@ enum PreVerdict {
 fn precheck_curl(id: u32, from: *const zend_execute_data) -> PreVerdict {
     let Some(loaded) = crate::live_arc() else { return PreVerdict::NotOurs };
     let l2 = &loaded.config.layer2;
-    if !l2.enabled || l2.app.is_none() || l2.mode == Mode::Off {
+    if !hosts::checks_hosts(l2) {
         return PreVerdict::NotOurs;
     }
     let rule = attribution::settings().map_or(Rule::Component, |s| s.rule);
@@ -940,7 +936,7 @@ fn handle_id(zv: &Zval) -> Option<u32> {
 fn check_host(from: *const zend_execute_data, host: &str, op: &str, detail: &str) -> bool {
     let Some(loaded) = crate::live_arc() else { return false };
     let l2 = &loaded.config.layer2;
-    if !l2.enabled || l2.app.is_none() || l2.mode == Mode::Off {
+    if !hosts::checks_hosts(l2) {
         return false;
     }
     // A database connect is charged the way the vault charges it (attribution::db_connector): the
@@ -966,17 +962,18 @@ fn check_host(from: *const zend_execute_data, host: &str, op: &str, detail: &str
     }
     // `None` means outside the app root: not a restricted component, let through.
     let Some(patterns) = hosts::hosts_for(l2, &component) else { return false };
-    let decision = hosts::host_allowed(patterns, host);
-    if decision.is_allowed() {
-        return false;
-    }
-    let rule_token = decision.rule();
-    audit(l2.mode, &component.to_string(), op, host, detail, rule_token);
-    if l2.mode == Mode::Enforce {
-        warn(&component.to_string(), host);
-        true
-    } else {
-        false
+    // Layer 2's own decision, shared with the microVM's egress (securecore-fpm).
+    match hosts::net_verdict(l2.mode, patterns, host) {
+        hosts::NetVerdict::Allow => false,
+        hosts::NetVerdict::Log(rule) => {
+            audit(l2.mode, &component.to_string(), op, host, detail, rule);
+            false
+        }
+        hosts::NetVerdict::Refuse(rule) => {
+            audit(l2.mode, &component.to_string(), op, host, detail, rule);
+            warn(&component.to_string(), host);
+            true
+        }
     }
 }
 

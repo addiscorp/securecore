@@ -102,6 +102,13 @@ if (isset($_GET['stream'])) {
 if (isset($_GET['tcp'])) {
     $f = @stream_socket_client('tcp://' . $_GET['tcp'], $en, $es, 5);
     echo 'tcp=', $f ? 'CONNECTED' : "FAILED $en $es", "\n";
+    // ?hold=<secs>: keeps it open that long (the test looks at the host's side meanwhile).
+    if ($f && isset($_GET['hold'])) {
+        $until = microtime(true) + min(30, (int) $_GET['hold']);
+        while (microtime(true) < $until) {
+            usleep(0);
+        }
+    }
 }
 // Fresh randomness: the kernel's (random_bytes) and a worker's userland generator (mt_rand).
 echo 'random=', bin2hex(random_bytes(16)), "\n";

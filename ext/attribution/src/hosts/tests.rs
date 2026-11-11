@@ -7,6 +7,25 @@ fn t(host: &str) -> Target {
     parse_target(host).unwrap_or_else(|| panic!("{host:?} did not parse"))
 }
 
+/// Layer 2's decision, shared by the extension and the microVM's egress: allow on a pattern,
+/// else refuse in `enforce` and let through (audited) in `log`.
+#[test]
+fn the_net_verdict_follows_the_mode() {
+    let pats = vec!["api.wordpress.org".to_owned()];
+    assert_eq!(net_verdict(Mode::Enforce, &pats, "api.wordpress.org"), NetVerdict::Allow);
+    assert_eq!(net_verdict(Mode::Enforce, &pats, "evil.example"), NetVerdict::Refuse("host"));
+    assert_eq!(net_verdict(Mode::Log, &pats, "evil.example"), NetVerdict::Log("host"));
+    assert_eq!(net_verdict(Mode::Enforce, &pats, ""), NetVerdict::Refuse("unparseable-host"));
+    assert!(NetVerdict::Log("host").passes() && !NetVerdict::Refuse("host").passes());
+    let mut l2 = config(CFG).layer2;
+    assert!(checks_hosts(&l2));
+    l2.enabled = false;
+    assert!(!checks_hosts(&l2), "layer 2 disabled");
+    l2.enabled = true;
+    l2.mode = Mode::Off;
+    assert!(!checks_hosts(&l2), "off checks nothing");
+}
+
 #[test]
 fn ipv4_and_ipv6_literals_parse() {
     assert_eq!(t("127.0.0.1"), Target::Ip("127.0.0.1".parse().unwrap()));

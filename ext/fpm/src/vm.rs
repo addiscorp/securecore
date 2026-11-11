@@ -1475,6 +1475,7 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
             let l = bind_unix(&short.join(format!("v.sock_{}", crate::egress::EGRESS_PORT)), owned)?;
             let egress: &'static crate::egress::Egress = Box::leak(Box::new(m.egress.clone()));
             let slots: &'static Slots = Box::leak(Box::new(Slots::new(FORWARD_SLOTS)));
+            let pool = plan.pool;
             thread::spawn(move || {
                 for c in l.incoming().flatten() {
                     let Some(slot) = slots.take() else {
@@ -1483,7 +1484,10 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
                     };
                     thread::spawn(move || {
                         let _slot = slot;
-                        match crate::egress::serve(c, egress) {
+                        // The host's addresses now (an interface may have come up since the start).
+                        let own = crate::egress::host_addresses();
+                        let connect = |conn: UnixStream, addrs: &[std::net::SocketAddr]| egress_as_pool(conn, addrs, pool);
+                        match crate::egress::serve(c, egress, &own, &connect) {
                             Ok(what) => log(&format!("egress: {what} closed")),
                             Err(why) => log(&format!("egress refused: {why}")),
                         }
@@ -1623,6 +1627,44 @@ impl Default for Coalesce {
 static LOG_SLOTS: Slots = Slots::new(4);
 /// Connections through one `address` forward at once.
 const FORWARD_SLOTS: usize = 64;
+
+/// `<exe> --egress-connect <addr>…` ([`crate::egress::helper_main`]) for one guest connection:
+/// the connection on its stdin, its verdict on its stdout; as `user` (the site's pool user, so
+/// uid-based firewall rules on the host apply) with no supplementary groups, an empty
+/// environment and no new privileges, killed if the launcher dies.
+pub fn spawn_egress_helper(exe: &Path, conn: UnixStream, addrs: &[std::net::SocketAddr], user: User) -> Result<Child, String> {
+    let mut cmd = Command::new(exe);
+    cmd.env_clear().arg0("securecore-fpm").arg("--egress-connect").args(addrs.iter().map(|a| a.to_string()));
+    cmd.stdin(Stdio::from(std::os::fd::OwnedFd::from(conn))).stdout(Stdio::piped());
+    // SAFETY: only syscalls between fork and exec, on values made before the fork.
+    unsafe {
+        cmd.pre_exec(move || {
+            let err = || Err(io::Error::last_os_error());
+            if libc::setgroups(0, std::ptr::null()) < 0 || libc::setgid(user.gid) < 0 || libc::setuid(user.uid) < 0 {
+                return err();
+            }
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                return err();
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().map_err(|e| format!("the egress helper: {e}"))
+}
+
+/// The egress connector in production: the helper as the pool user, waited on; the address it
+/// used, or why none.
+fn egress_as_pool(conn: UnixStream, addrs: &[std::net::SocketAddr], pool: User) -> Result<String, String> {
+    let child = spawn_egress_helper(Path::new("/proc/self/exe"), conn, addrs, pool)?;
+    let out = child.wait_with_output().map_err(|e| format!("the egress helper: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().next().unwrap_or("").to_owned();
+    match line.split_once(' ') {
+        Some(("via", a)) => Ok(a.to_owned()),
+        Some(("error", why)) => Err(why.to_owned()),
+        _ => Err(format!("the egress helper ended ({}) without a verdict", out.status)),
+    }
+}
 
 /// Copies both ways (each direction half-closing its destination at its end) and returns when
 /// both are done: one thread for a → b, this one for b → a.
@@ -2001,12 +2043,14 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         log(&format!(
             "the guest reaches named hosts on ports {:?} through the host: {}",
             egress.ports,
-            match &egress.hosts {
-                Some(h) if h.is_empty() => "none (layer 2 lists no hosts)".to_owned(),
-                Some(h) => format!("only layer 2's hosts ({})", h.join(", ")),
-                None => "any name (layer 2 is off)".to_owned(),
+            match &egress.layer2 {
+                Some((securecore_config::Mode::Log, h)) => format!("any name, layer 2 logging those not in its hosts ({})", h.join(", ")),
+                Some((_, h)) if h.is_empty() => "none (layer 2 lists no hosts)".to_owned(),
+                Some((_, h)) => format!("only layer 2's hosts ({})", h.join(", ")),
+                None => "any name (layer 2's host allowlist is off)".to_owned(),
             }
         ));
+        log("egress connects only to public addresses that aren't this host's, as the pool user");
     }
     let files = verify(&opts.assets, &plan.state)?;
     // The site's key: the tree without the writable folders, the state folder and the config

@@ -259,6 +259,12 @@ fn main() -> ExitCode {
         // The microVM's folder sync (#72): started by the launcher itself, never by hand.
         return ExitCode::from(securecore_fpm::sync::writer_main(argv.get(2).and_then(|c| c.to_str()).unwrap_or("")));
     }
+    #[cfg(target_os = "linux")]
+    if argv.get(1).is_some_and(|a| a == "--egress-connect") {
+        // The microVM's egress (#72): one checked guest connection, as the pool user.
+        let addrs: Vec<String> = argv[2..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        return ExitCode::from(securecore_fpm::egress::helper_main(&addrs));
+    }
     if argv.get(1).is_some_and(|a| a == "--migrate-config") {
         return match argv.get(2..) {
             Some([file]) => migrate_config(std::path::Path::new(file)),
