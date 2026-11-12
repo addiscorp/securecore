@@ -1211,18 +1211,19 @@ hostile hostile-owner "localhost" "is owned by uid 1234, not the database's user
 chown 999:999 "$mysqld/mysqld.sock"
 # The database's socket directly in /run (a hard link to MariaDB's, so it is the database's
 # own): it reaches the database, and only that socket is mounted into the jail, never /run.
-ln -f "$mysqld/mysqld.sock" /run/sc101-db.sock
-sed 's|^WORDPRESS_DB_HOST=.*|WORDPRESS_DB_HOST=localhost:/run/sc101-db.sock|' "$dir/guest.env.keep" > "$dir/guest.env"
+inrun=$project-db.sock
+ln -f "$mysqld/mysqld.sock" "/run/$inrun"
+sed "s|^WORDPRESS_DB_HOST=.*|WORDPRESS_DB_HOST=localhost:/run/$inrun|" "$dir/guest.env.keep" > "$dir/guest.env"
 if start in-run "$dir/bare.json"; then
-  has "$dir/in-run.log" "goes to the database's socket /run/sc101-db.sock" "a socket directly in /run: the database's, so it is reached"
+  has "$dir/in-run.log" "goes to the database's socket /run/$inrun" "a socket directly in /run: the database's, so it is reached"
   is "$(vcode /)" 200 "WordPress reaches its database through it (the front page: 200)"
-  is "$(awk -v j="$(jail_root)/sock-3306" '$5 == j "/sc101-db.sock" { f++ } $5 == j { d++ } END { print f + 0 "/" d + 0 }' /proc/self/mountinfo)" 1/0 \
-    "only the socket is mounted into the jail (sock-3306/sc101-db.sock), not /run"
+  is "$(awk -v j="$(jail_root)/sock-3306" -v n="/$inrun" '$5 == j n { f++ } $5 == j { d++ } END { print f + 0 "/" d + 0 }' /proc/self/mountinfo)" 1/0 \
+    "only the socket is mounted into the jail (sock-3306/$inrun), not /run"
   stop
 else
   fail "a socket directly in /run: the start serves"
 fi
-rm -f /run/sc101-db.sock
+rm -f "/run/$inrun"
 cp "$dir/guest.env.keep" "$dir/guest.env"
 in_php "rm -f /usr/local/etc/php/conf.d/zz-sc101-db.ini"
 # One microVM per pool (#100 review): each listens where its pool says (with its allowed_clients
