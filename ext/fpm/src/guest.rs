@@ -656,7 +656,59 @@ fn pump_log(from: fs::File) {
             line.extend_from_slice(" …[cut]".as_bytes());
         }
         LOG.line(&line);
+        let mut last = LAST_WORDS.lock().unwrap_or_else(|p| p.into_inner());
+        if last.len() == LAST_WORDS_N {
+            last.pop_front();
+        }
+        last.push_back(String::from_utf8_lossy(&line).into_owned());
     }
+}
+
+/// php-fpm's last lines, for the console when it exits (#87): the log port may be what failed.
+static LAST_WORDS: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+const LAST_WORDS_N: usize = 20;
+/// Each php-fpm master's log pump, by the master's pid: its exit is explained only once its
+/// output is read to the end.
+static PUMPS: Mutex<Vec<(i32, thread::JoinHandle<()>)>> = Mutex::new(Vec::new());
+/// How long init waits, after php-fpm's master exits, for its last lines and for the host to
+/// acknowledge them before it stops the VM.
+const LAST_WORDS_WAIT: Duration = Duration::from_secs(3);
+
+/// What a wait status says: `exit code N` or `killed by signal N`.
+pub fn wait_status(status: libc::c_int) -> String {
+    if libc::WIFEXITED(status) {
+        format!("exit code {}", libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        format!("killed by signal {}", libc::WTERMSIG(status))
+    } else {
+        format!("wait status {status}")
+    }
+}
+
+/// php-fpm's master `pid` exited with `status`, so the VM stops: its remaining output is read
+/// to the end, the reason goes to the host's log (and the console), and the host acknowledges it
+/// before init returns (#87). The launcher quotes it.
+fn explain_exit(pid: i32, status: libc::c_int, started: bool) -> String {
+    let t = std::time::Instant::now();
+    let pump = {
+        let mut p = PUMPS.lock().unwrap_or_else(|p| p.into_inner());
+        p.iter().position(|(m, _)| *m == pid).map(|i| p.remove(i).1)
+    };
+    if let Some(pump) = pump {
+        // The workers may hold the pipe a moment longer than the master.
+        while !pump.is_finished() && t.elapsed() < LAST_WORDS_WAIT {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let when = if started { "while serving" } else { "at boot, before it served" };
+    let why = format!("php-fpm exited {when} ({}): its own lines above say why; stopping the VM", wait_status(status));
+    for l in LAST_WORDS.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        say(&format!("php-fpm: {l}"));
+    }
+    say(&why);
+    report(&why);
+    let _ = LOG.drain(LAST_WORDS_WAIT.saturating_sub(t.elapsed()).max(Duration::from_secs(1)));
+    why
 }
 
 fn say(message: &str) {
@@ -816,9 +868,17 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
     }
     let child = cmd.spawn().map_err(|e| io::Error::new(e.kind(), format!("php-fpm: {e}")))?;
     drop(cmd);
-    thread::spawn(move || pump_log(read));
+    let pump = thread::spawn(move || pump_log(read));
+    let mut pumps = PUMPS.lock().unwrap_or_else(|p| p.into_inner());
+    // An earlier master's pump ends with its output (a reload).
+    pumps.retain(|(_, p)| !p.is_finished());
+    pumps.push((child.id() as i32, pump));
     Ok(child.id())
 }
+
+/// The standard `/dev` links ([`boot_guest`]).
+pub const STD_LINKS: [(&str, &str); 4] =
+    [("/dev/fd", "/proc/self/fd"), ("/dev/stdin", "/proc/self/fd/0"), ("/dev/stdout", "/proc/self/fd/1"), ("/dev/stderr", "/proc/self/fd/2")];
 
 fn boot_guest() -> io::Result<u32> {
     let flags = libc::MS_NOSUID | libc::MS_NODEV;
@@ -828,9 +888,21 @@ fn boot_guest() -> io::Result<u32> {
     mount("proc", "/proc", "proc", flags | libc::MS_NOEXEC, "")?;
     mount("sysfs", "/sys", "sysfs", flags | libc::MS_NOEXEC, "")?;
     mount("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, "")?;
+    // The links udev makes on a normal system and devtmpfs doesn't (#87): the image's php.ini has
+    // `error_log = /dev/stderr`, and without the link every PHP error that isn't a request's
+    // (the extension refusing to start at MINIT among them) went nowhere.
+    for (link, to) in STD_LINKS {
+        if let Err(e) = std::os::unix::fs::symlink(to, link)
+            && e.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(io::Error::new(e.kind(), format!("{link}: {e}")));
+        }
+    }
     // noexec: nothing a site writes there runs (#86 review).
     mount("tmpfs", "/tmp", "tmpfs", flags | libc::MS_NOEXEC, "mode=1777")?;
     mount("tmpfs", "/run", "tmpfs", flags, "mode=755")?;
+    // The host's log first: whatever fails from here on can be said there (#87).
+    start_log();
     let boot = parse_cmdline(&fs::read_to_string("/proc/cmdline")?).map_err(io::Error::other)?;
     if let Some(t) = boot.time {
         set_clock(t, 0)?;
@@ -846,7 +918,6 @@ fn boot_guest() -> io::Result<u32> {
     // (`commit=1` on the mount). The defaults are 30 s and 5 s.
     fs::write("/proc/sys/vm/dirty_expire_centisecs", "100")?;
     fs::write("/proc/sys/vm/dirty_writeback_centisecs", "50")?;
-    start_log();
     listen_forwards(&boot)?;
     let pid = start_php_fpm(&boot)?;
     FPM_MASTER.store(pid as i32, Ordering::SeqCst);
@@ -867,6 +938,9 @@ fn boot_guest() -> io::Result<u32> {
 /// which panics the kernel, and `panic=1 reboot=k` stops the VM: no php-fpm, no VM.
 pub fn init() -> io::Error {
     if let Err(e) = boot_guest() {
+        // The host's log may be up (it is started first): the reason goes there too.
+        report(&format!("the guest's boot failed: {e}; stopping the VM"));
+        let _ = LOG.drain(LAST_WORDS_WAIT);
         return e;
     }
     loop {
@@ -875,7 +949,7 @@ pub fn init() -> io::Error {
         let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
         // The current master only: a reload's old master exits on purpose.
         if pid > 0 && pid == FPM_MASTER.load(Ordering::SeqCst) {
-            return io::Error::other(format!("php-fpm exited (wait status {status})"));
+            return io::Error::other(explain_exit(pid, status, STARTED.load(Ordering::SeqCst)));
         }
         if pid < 0 {
             thread::sleep(Duration::from_millis(100));
@@ -975,6 +1049,14 @@ mod tests {
         // kill(0, …) is init's process group and kill(-1, …) every process: never.
         assert!(signal(0, 0).is_err() && signal(-1, 0).is_err());
         signal(std::process::id() as i32, 0).expect("a real pid");
+    }
+
+    /// php-fpm's exit, as init reports it before the VM stops (#87).
+    #[test]
+    fn a_wait_status_says_the_exit_code_or_the_signal() {
+        assert_eq!(wait_status(78 << 8), "exit code 78");
+        assert_eq!(wait_status(9), "killed by signal 9");
+        assert_eq!(wait_status(0), "exit code 0");
     }
 
     #[test]

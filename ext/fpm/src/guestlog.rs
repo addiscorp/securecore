@@ -485,7 +485,12 @@ fn deliver<C: Conn>(outbox: &'static Outbox, mut conn: C, key: &Key) -> io::Resu
 #[derive(Debug, Default)]
 pub struct Inbox {
     last: Option<u64>,
+    /// The guest's last few lines, for the launcher to quote when the VM stops on its own (#87).
+    recent: VecDeque<String>,
 }
+
+/// How many of the guest's last lines an [`Inbox`] keeps to quote.
+pub const RECENT: usize = 6;
 
 impl Inbox {
     /// What `frame` adds to the launcher's log: nothing for a frame already logged; a count of
@@ -507,8 +512,16 @@ impl Inbox {
         }
         self.last = Some(seq);
         match frame {
-            Frame::Line { text, .. } => out.push(guest_line(text, cut)),
-            Frame::Init { text, .. } => out.push(init_line(text, cut)),
+            Frame::Line { text, .. } | Frame::Init { text, .. } => {
+                let init = matches!(frame, Frame::Init { .. });
+                if self.recent.len() == RECENT {
+                    self.recent.pop_front();
+                }
+                // Quoted with its label (#87): which of the guest's lines is the init's own.
+                let label = if init { "guest-init: " } else { "" };
+                self.recent.push_back(format!("{label}{}", String::from_utf8_lossy(text).chars().take(1024).collect::<String>()));
+                out.push(if init { init_line(text, cut) } else { guest_line(text, cut) });
+            }
             Frame::Lost { count, .. } => out.push(lost_line(*count, "the guest's log buffer was full")),
         }
         Ok(out)
@@ -516,6 +529,13 @@ impl Inbox {
 
     pub fn last(&self) -> Option<u64> {
         self.last
+    }
+
+    /// The guest's last lines, oldest first, as one quotable string (`a | b | c`).
+    pub fn recent(&self) -> String {
+        // Each line quoted and escaped (#87 review): what the guest wrote can't close the quote,
+        // start a line of its own or read as the launcher's words inside the launcher's line.
+        self.recent.iter().map(|l| format!("{l:?}")).collect::<Vec<_>>().join(" | ")
     }
 }
 
@@ -826,6 +846,14 @@ mod tests {
         assert!(inbox.take(&line(u64::MAX, "x"), false).is_err(), "a jump to the end of the numbers");
         assert_eq!(inbox.last(), Some(9), "and it moved nothing");
         assert_eq!(inbox.take(&line(10, "next"), false).expect("ok"), ["guest: next"]);
+        // The last RECENT lines, to quote when the guest stops on its own (#87), each quoted and
+        // escaped (#87 review), so a guest line can't end the quote or start a line of its own.
+        for i in 11..20 {
+            inbox.take(&line(i, &format!("l{i}")), false).expect("ok");
+        }
+        inbox.take(&line(20, "x\" | securecore-fpm: forged\nsecurecore-fpm: also"), false).expect("ok");
+        assert_eq!(inbox.recent(), r#""l15" | "l16" | "l17" | "l18" | "l19" | "x\" | securecore-fpm: forged\nsecurecore-fpm: also""#);
+        assert!(!inbox.recent().contains('\n'));
     }
 
     /// A line is acknowledged only once it is in the launcher's log (#86 review): a write that
@@ -878,7 +906,7 @@ mod tests {
         ob.ack(u64::MAX);
         ob.line(b"after");
         let log = Log::default();
-        let inbox = Mutex::new(Inbox { last: Some(queued as u64) });
+        let inbox = Mutex::new(Inbox { last: Some(queued as u64), ..Inbox::default() });
         let frames: Vec<u8> = ob.lock().frames.iter().flat_map(|(_, b)| b.clone()).collect();
         serve(&frames[..], io::sink(), &inbox, &*log.emit()).expect("serves");
         assert_eq!(log.text(), format!("securecore-fpm: {lost} guest log lines lost (the guest's log buffer was full)\nguest: after\n"));
