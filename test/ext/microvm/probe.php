@@ -40,7 +40,15 @@ echo 'child_sees=', trim((string) @shell_exec('printf "%s%s" "$LD_PRELOAD" "$SC_
 echo 'euid=', preg_match('/^Uid:\s+\d+\s+(\d+)/m', (string) @file_get_contents('/proc/self/status'), $u) ? $u[1] : '?', "\n";
 echo 'time=', time(), "\n";
 $cmdline = (string) @file_get_contents('/proc/cmdline');
-echo 'guest_init=', strpos($cmdline, 'init=/sbin/securecore-init') !== false ? 1 : 0, "\n";
+echo 'guest_init=', strpos($cmdline, 'init=/sc/securecore-init') !== false ? 1 : 0, "\n";
+// The guest's PHP is the host's (#101): php-fpm from sc.fpm, the config layer's php-fpm.conf.
+echo 'guest_fpm=', preg_match('/ sc\.fpm=(\S+)/', $cmdline, $f) ? $f[1] : '', "\n";
+echo 'php_ini_scan=', (string) getenv('PHP_INI_SCAN_DIR'), "\n";
+echo 'ini_files=', (string) php_ini_scanned_files() === '' ? '' : str_replace(["\n", ' '], '', (string) php_ini_scanned_files()), "\n";
+// A program the guest lacks (the preload says so on stderr, into the launcher's log).
+if (isset($_GET['missing'])) {
+    echo 'missing_rc=', trim((string) @shell_exec('sc-no-such-program-101; echo $?')), "\n";
+}
 // Network devices: the guest has loopback only.
 echo 'netdev=', implode(',', array_map('basename', glob('/sys/class/net/*') ?: [])), "\n";
 $upload = "$root/wp-content/uploads/sc-mvm.txt";

@@ -118,41 +118,33 @@ FROM toolchain AS preload
 COPY ext/fpm/guest/vsock-connect.c /src/vsock-connect.c
 RUN mkdir -p /out && clang -O2 -Wall -Werror -shared -fPIC -o /out/libsc-vsock-connect.so /src/vsock-connect.c -ldl
 
-# Layer 1 as a microVM (#71): the guest's root filesystem. The same php-fpm and extension as the
-# `php` target, with securecore-fpm as PID 1 (/sbin/securecore-init), the preload and the pool
-# overrides. scripts/guest-image.sh exports it to the read-only rootfs.ext4 the host boots; the
-# site and its writable folders come in on their own disks, never from here. The image carries
-# no site secrets (delivering them per site is #72).
-FROM php AS guest
-COPY --from=build /out/securecore-fpm /usr/local/bin/securecore-fpm
-COPY --from=preload /out/libsc-vsock-connect.so /usr/local/lib/libsc-vsock-connect.so
-COPY ext/fpm/guest/zz-microvm.conf /usr/local/etc/php-fpm.d/zz-microvm.conf
-COPY ext/fpm/guest/warm.php /usr/local/lib/securecore/warm.php
-# The same ini files without the extension, for the extension-off latency runs (sc.ext=0).
-# Then what a guest never uses goes (#80: the image ships with every release, so its size is a
-# download on every install): the compilers and build tools the php images keep for
-# docker-php-ext-install (PHPIZE_DEPS) and the C headers, PHP's sources and WordPress's (the site
-# comes on its own disk), documentation, man pages, translations, and apt's lists and caches.
-# No file keeps a setuid or setgid bit (su, mount, passwd, …): nothing in the guest needs one, and
-# the guest's root is mounted nosuid with php-fpm under no_new_privs besides (securecore-init).
-# ldconfig's aux-cache goes too: it records the libraries' inode times, the one file that made
-# two builds of this stage differ (ld.so.cache itself is what the loader reads, and stays).
-# guest-image.sh exports the flattened filesystem, so what is deleted here is not in the disk.
-RUN ln -sf /usr/local/bin/securecore-fpm /sbin/securecore-init \
- && mkdir -p /usr/local/etc/php/conf.d-noext /etc/securecore \
- && cp /usr/local/etc/php/conf.d/*.ini /usr/local/etc/php/conf.d-noext/ \
- && rm /usr/local/etc/php/conf.d-noext/securecore.ini \
- && apt-get purge -y --auto-remove autoconf dpkg-dev file g++ gcc make pkg-config re2c libc6-dev > /dev/null \
- && for d in /usr/src /usr/include /usr/local/include /usr/local/lib/php/build /usr/local/lib/php/doc \
-      /usr/local/lib/php/test /usr/share/doc /usr/share/man /usr/share/info /usr/share/locale \
-      /usr/share/lintian /var/lib/apt/lists /var/cache/apt /var/cache/debconf /var/cache/ldconfig /var/log; do \
-      [ ! -d "$d" ] || find "$d" -mindepth 1 -delete; \
-    done \
- && find / -xdev -perm /6000 -type f -exec chmod ug-s {} + \
- && [ -z "$(find / -xdev -perm /6000 -type f)" ] \
- && ! ldd /usr/local/sbin/php-fpm /usr/local/lib/php/extensions/*/*.so /usr/local/lib/php/extensions/securecore.so /usr/local/lib/libsc-vsock-connect.so | grep 'not found' \
- && PHP_INI_SCAN_DIR=/usr/local/etc/php/conf.d-noext php -m > /tmp/m 2>&1 \
- && ! grep -iE 'warning|unable' /tmp/m && grep -qx imagick /tmp/m && find /tmp -mindepth 1 -delete
+# The guest's init, static (#101): the guest's /usr and /lib are the host's (its own glibc,
+# whatever version), so the init depends on no library at all. The same sources as securecore-fpm.
+FROM toolchain AS build-init
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    find /build/ext -name '*.rs' -exec touch {} + \
+ && export CARGO_TARGET_DIR="/build/target/init-static" \
+ && RUSTFLAGS="-C target-feature=+crt-static" cargo build --locked --release -p securecore-fpm --target x86_64-unknown-linux-gnu \
+ && mkdir -p /out && cp "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/securecore-fpm" /out/securecore-init \
+ && ! ldd /out/securecore-init > /dev/null 2>&1
+
+# Layer 1 as a microVM: the SecureCore base (#101). The guest is the host's own PHP: the launcher
+# captures the host's php-fpm, its extensions and their libraries into a disk of their own, its
+# php.ini, scan folder and pool into another, and mounts both over this base, which holds only
+# what is SecureCore's: the init (PID 1, /sc/securecore-init), the preload, the warm-up script,
+# the mount points (/sc/php, /sc/conf, and an empty folder for each top-level folder the host's
+# PHP lives in) and nothing else. No shell, no libraries, no PHP: nothing here runs but the init.
+# scripts/guest-image.sh exports it to the read-only rootfs.ext4 the installer records.
+FROM toolchain AS guest-root
+COPY --from=build-init /out/securecore-init /g/sc/securecore-init
+COPY --from=preload /out/libsc-vsock-connect.so /g/sc/libsc-vsock-connect.so
+COPY ext/fpm/guest/warm.php /g/sc/warm.php
+RUN cd /g && mkdir -p proc sys dev tmp run sc/php sc/conf bin etc home lib lib32 lib64 libx32 nix opt root sbin srv usr var \
+ && chmod 755 sc sc/php sc/conf && chmod 1777 tmp && chmod 755 sc/securecore-init && chmod 644 sc/libsc-vsock-connect.so sc/warm.php
+FROM scratch AS guest
+COPY --from=guest-root /g/ /
+CMD ["/sc/securecore-init"]
 
 # The guest disk's tools (#80): scripts/guest-image.sh runs scripts/guest-disk.sh in this image, so
 # the export's tar, mke2fs and gzip are these pinned bytes and never the host's. mke2fs's version

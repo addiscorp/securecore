@@ -18,8 +18,8 @@ UUID=5ec0c0de-0080-4000-8000-000000000080
 stage=/guest-root
 mkdir "$stage"
 tar -x --numeric-owner -C "$stage"
-[ -x "$stage/usr/local/bin/securecore-fpm" ] && [ -L "$stage/sbin/securecore-init" ] \
-  || { echo "$0: this is not a guest image (no securecore-fpm or /sbin/securecore-init)" >&2; exit 1; }
+[ -x "$stage/sc/securecore-init" ] && [ -d "$stage/sc/php" ] && [ -d "$stage/sc/conf" ] \
+  || { echo "$0: this is not a guest base (no /sc/securecore-init, /sc/php or /sc/conf)" >&2; exit 1; }
 find "$stage" -exec touch -h -d "@$epoch" {} +
 # Each file in whole 4 KiB blocks and a block for every other entry, plus 10 % and 32 MiB for the
 # inode tables, block groups and extent blocks. Read-only in the VM: no journal, no reserved blocks.

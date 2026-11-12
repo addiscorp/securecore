@@ -43,8 +43,23 @@ pub const FPM_PORT: u32 = 9000;
 pub const LOG_PORT: u32 = 1514;
 /// The guest port the host's start message arrives on.
 pub const CTL_PORT: u32 = 1515;
-/// mysqlnd's connect onto vsock, preloaded into php-fpm (#70).
-pub const PRELOAD: &str = "/usr/local/lib/libsc-vsock-connect.so";
+/// mysqlnd's connect onto vsock, preloaded into php-fpm (#70): in the SecureCore base, beside
+/// the init.
+pub const PRELOAD: &str = "/sc/libsc-vsock-connect.so";
+/// The guest's PID 1 in the base (`init=` on the kernel's command line).
+pub const INIT: &str = "/sc/securecore-init";
+/// Where the host's captured PHP is mounted (vdb, read-only), and its top-level folders then
+/// bound onto the base's (#101): `/sc/php/usr` → `/usr`, and so on.
+pub const PHP_LAYER: &str = "/sc/php";
+/// Where the host's php.ini, scan folder and the guest's php-fpm config are mounted (vdc).
+pub const CONF_LAYER: &str = "/sc/conf";
+/// The drives in order: vda the base (the root), vdb the PHP layer, vdc the config layer, vdd the
+/// site; the writable folders from vde on.
+pub const PHP_DEV: &str = "/dev/vdb";
+pub const CONF_DEV: &str = "/dev/vdc";
+pub const SITE_DEV: &str = "/dev/vdd";
+/// The first writable disk's drive letter.
+pub const FIRST_WRITABLE: u8 = b'e';
 /// php-fpm's environment as the host's start message delivered it (`env` lines: the vault's
 /// secrets and the site's settings, #72). Only in this process's memory: never in an image, a
 /// boot argument or the console, and empty in a snapshot (it is taken before any start
@@ -54,8 +69,9 @@ static GUEST_ENV: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 pub const MAX_ENV_VALUE: usize = 16 * 1024;
 /// php-fpm's value for a delivered variable before the start message has delivered it.
 pub const NOT_DELIVERED: &str = "securecore-not-delivered-yet";
-/// The same ini folder without securecore.ini (`sc.ext=0`, the latency comparison).
-pub const NOEXT_INI: &str = "/usr/local/etc/php/conf.d-noext";
+/// The same ini folder without the files that load the extension (`sc.ext=0`, the latency
+/// comparison).
+pub const NOEXT_INI: &str = "/sc/conf/conf.d-noext";
 
 /// BLKFLSBUF, `_IO(0x12, 97)`: drop a block device's buffer cache.
 const BLKFLSBUF: libc::c_ulong = 0x1261;
@@ -86,9 +102,12 @@ pub struct Boot {
     pub env_names: Vec<String>,
     /// `sc.ext=0`: php-fpm without the extension.
     pub ext: bool,
-    /// `sc.user=<uid>:<gid>`: the host's pool user, whom php-fpm's pool runs as here, so the
-    /// writable disks (owned as on the host) are writable whatever the image's www-data is.
+    /// `sc.user=<uid>:<gid>`: the host's pool user, whom php-fpm's pool runs as here (the config
+    /// layer's php-fpm.conf names the same numbers), so the writable disks (owned as on the host)
+    /// are writable.
     pub user: Option<(u32, u32)>,
+    /// `sc.fpm=<path>`: the host's php-fpm, at its own path on the PHP layer (#101).
+    pub fpm: String,
 }
 
 /// Parses the guest's kernel command line. Paths may not hold spaces (the command line is
@@ -124,6 +143,12 @@ pub fn parse_cmdline(line: &str) -> Result<Boot, String> {
                 boot.socks.push((port, path.to_owned()));
             }
             "sc.ext" => boot.ext = value != "0",
+            "sc.fpm" => {
+                if !value.starts_with('/') {
+                    return Err(format!("sc.fpm={value}: want php-fpm's absolute path"));
+                }
+                boot.fpm = value.to_owned();
+            }
             "sc.proto" => boot.proto = Some(value.parse().map_err(|_| format!("sc.proto={value}: not a number"))?),
             "sc.user" => {
                 let bad = || format!("sc.user={value}: want <uid>:<gid>, not root");
@@ -139,6 +164,9 @@ pub fn parse_cmdline(line: &str) -> Result<Boot, String> {
     }
     if !boot.root.starts_with('/') {
         return Err(format!("sc.root={:?}: want an absolute path", boot.root));
+    }
+    if boot.fpm.is_empty() {
+        boot.fpm = "/usr/local/sbin/php-fpm".to_owned();
     }
     Ok(boot)
 }
@@ -193,10 +221,10 @@ pub enum Ctl {
 pub const MAX_CONFIG: usize = crate::sitefile::MAX_CONFIG;
 /// Where the guest keeps delivered configs and the site's ini.
 const LIVE_DIR: &str = "/run/securecore";
-/// php-fpm's extra ini folder, after the image's own: the site's settings ([`Ctl::Ini`]).
+/// php-fpm's extra ini folder, after the host's own: the site's settings ([`Ctl::Ini`]).
 pub const SITE_INI_DIR: &str = "/run/securecore/conf.d";
-/// The image's ini folder (PHP's compiled-in scan dir in the official images).
-pub const IMAGE_INI: &str = "/usr/local/etc/php/conf.d";
+/// The host's scan folder's files, on the config layer.
+pub const IMAGE_INI: &str = "/sc/conf/conf.d";
 /// At most this many configs are delivered into one running guest: each is a file mounted over
 /// the one before it (the swap is atomic for the extension's readers), so they stack, each file
 /// kept in the guest's memory: at most 200 × [`MAX_CONFIG`] (25 MiB), a few hundred KiB for
@@ -986,10 +1014,16 @@ fn listen_forwards(boot: &Boot) -> io::Result<()> {
     Ok(())
 }
 
-/// php-fpm's config with the `www` pool's user and group set to numbers (php-fpm takes ids).
-pub fn pool_conf(uid: u32, gid: u32) -> String {
-    format!("[global]\ninclude=/usr/local/etc/php-fpm.conf\n[www]\nuser = {uid}\ngroup = {gid}\n")
+/// php-fpm's arguments in the guest: in the foreground, the config layer's php-fpm.conf (the
+/// host pool, as [`crate::phpconf::guest_fpm_conf`] wrote it) and its php.ini (or, when the
+/// host has none, that folder, which then holds none either).
+pub fn fpm_args(has_ini: bool) -> Vec<String> {
+    let ini = if has_ini { format!("{CONF_LAYER}/php.ini") } else { CONF_LAYER.to_owned() };
+    vec!["-F".into(), "-y".into(), format!("{CONF_LAYER}/php-fpm.conf"), "-c".into(), ini]
 }
+
+/// The guest's PATH: the host's usual folders, which the PHP layer fills.
+pub const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
     let mut fds = [0; 2];
@@ -999,17 +1033,12 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
     }
     // SAFETY: both fds were just returned by pipe2(2) and are owned from here.
     let (read, write) = unsafe { (fs::File::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    let mut cmd = Command::new("php-fpm");
-    cmd.arg("-F");
-    if let Some((uid, gid)) = boot.user {
-        // The image's php-fpm.conf, then the pool's user and group as the host's pool user's.
-        let conf = "/run/securecore-php-fpm.conf";
-        fs::write(conf, pool_conf(uid, gid))?;
-        cmd.arg("-y").arg(conf);
-    }
+    // The host's own php-fpm, at its own path, with the host's settings (#101).
+    let mut cmd = Command::new(&boot.fpm);
+    cmd.args(fpm_args(Path::new(&format!("{CONF_LAYER}/php.ini")).exists()));
     // Exactly this environment: nothing of init's own.
     cmd.env_clear()
-        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("PATH", GUEST_PATH)
         .envs(boot.env_names.iter().map(|n| (n.clone(), NOT_DELIVERED.to_owned())))
         .envs(delivered_env())
         .stdin(Stdio::null())
@@ -1022,12 +1051,12 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
             cmd.env("SC_EGRESS_PORTS", list(&boot.egress)).env("SC_EGRESS_HOST_PORT", crate::egress::EGRESS_PORT.to_string());
         }
     }
-    // The image's ini folder, then the site's settings when it has any (#90).
+    // The host's scan folder (as captured), then the site's settings when it has any (#90).
     let base = if boot.ext { IMAGE_INI } else { NOEXT_INI };
     if Path::new(&format!("{SITE_INI_DIR}/zz-site.ini")).exists() {
         cmd.env("PHP_INI_SCAN_DIR", format!("{base}:{SITE_INI_DIR}"));
-    } else if !boot.ext {
-        cmd.env("PHP_INI_SCAN_DIR", NOEXT_INI);
+    } else {
+        cmd.env("PHP_INI_SCAN_DIR", base);
     }
     // php-fpm and every worker under no_new_privs (#80): no exec ever gains privileges (a setuid
     // file, file capabilities), whatever the image or a writable disk holds. The master keeps
@@ -1049,6 +1078,44 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
     pumps.retain(|(_, p)| !p.is_finished());
     pumps.push((child.id() as i32, pump));
     Ok(child.id())
+}
+
+/// Mounts the PHP layer (vdb) read-only at [`PHP_LAYER`] and binds each of its top-level
+/// folders onto the base's empty one of the same name (`/sc/php/usr` → `/usr`); a top-level link
+/// (`lib64` → `usr/lib64`, a merged `/usr`) binds the folder it names inside the layer. Folders
+/// first, so a link's target is the layer's own. The names bound, in order.
+fn mount_php_layer() -> io::Result<Vec<String>> {
+    let flags = libc::MS_NOSUID | libc::MS_NODEV;
+    // Programs run from here: not noexec (the site disk and the writable ones are).
+    mount(PHP_DEV, PHP_LAYER, "ext4", libc::MS_RDONLY | flags, "noload")?;
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    for e in fs::read_dir(PHP_LAYER)? {
+        let e = e?;
+        let Ok(name) = e.file_name().into_string() else { continue };
+        if name == "lost+found" {
+            continue;
+        }
+        let link = e.file_type()?.is_symlink();
+        entries.push((name, link));
+    }
+    entries.sort_by_key(|(n, link)| (*link, n.clone()));
+    let mut bound = Vec::new();
+    for (name, link) in entries {
+        let from = if link {
+            let t = fs::read_link(format!("{PHP_LAYER}/{name}"))?;
+            format!("{PHP_LAYER}/{}", t.to_string_lossy().trim_start_matches('/'))
+        } else {
+            format!("{PHP_LAYER}/{name}")
+        };
+        if !Path::new(&from).is_dir() {
+            continue;
+        }
+        let to = format!("/{name}");
+        mount(&from, &to, "", libc::MS_BIND, "").map_err(|e| io::Error::new(e.kind(), format!("{to}: {e}")))?;
+        mount("", &to, "", libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | flags, "")?;
+        bound.push(if link { format!("{name}→{}", from.trim_start_matches(PHP_LAYER)) } else { name });
+    }
+    Ok(bound)
 }
 
 /// The standard `/dev` links ([`boot_guest`]).
@@ -1082,8 +1149,12 @@ fn boot_guest() -> io::Result<u32> {
     if let Some(t) = boot.time {
         set_clock(t, 0)?;
     }
+    // The host's PHP over the base (#101), then its settings.
+    let tops = mount_php_layer()?;
+    mount(CONF_DEV, CONF_LAYER, "ext4", libc::MS_RDONLY | flags | libc::MS_NOEXEC, "noload")?;
     // noexec too: php-fpm reads the site's PHP, nothing on the site disk ever runs as a program.
-    mount("/dev/vdb", &boot.root, "ext4", libc::MS_RDONLY | flags | libc::MS_NOEXEC, "noload")?;
+    mount(SITE_DEV, &boot.root, "ext4", libc::MS_RDONLY | flags | libc::MS_NOEXEC, "noload")?;
+    say(&format!("the host's PHP is mounted over the base: {}", tops.join(" ")));
     loopback_up()?;
     // The folder sync watches every folder of the writable disks (8192 by default here).
     let _ = fs::write("/proc/sys/fs/inotify/max_user_watches", "65536");
@@ -1152,8 +1223,11 @@ mod tests {
         assert!(parse_cmdline("sc.ports=3306").is_err(), "no root: refused");
         assert_eq!(parse_cmdline("sc.root=/srv sc.user=1234:1235").expect("parses").user, Some((1234, 1235)));
         assert!(parse_cmdline("sc.root=/srv sc.user=0:0").is_err(), "the pool never runs as root");
-        let conf = pool_conf(1234, 1235);
-        assert!(conf.starts_with("[global]\ninclude=/usr/local/etc/php-fpm.conf\n") && conf.ends_with("[www]\nuser = 1234\ngroup = 1235\n"), "{conf}");
+        assert_eq!(parse_cmdline("sc.root=/srv sc.fpm=/usr/sbin/php-fpm8.3").expect("parses").fpm, "/usr/sbin/php-fpm8.3");
+        assert_eq!(parse_cmdline("sc.root=/srv").expect("parses").fpm, "/usr/local/sbin/php-fpm");
+        assert!(parse_cmdline("sc.root=/srv sc.fpm=php-fpm").is_err(), "php-fpm's path, never a name to look up");
+        assert_eq!(fpm_args(true), ["-F", "-y", "/sc/conf/php-fpm.conf", "-c", "/sc/conf/php.ini"]);
+        assert_eq!(fpm_args(false), ["-F", "-y", "/sc/conf/php-fpm.conf", "-c", "/sc/conf"]);
         assert!(parse_cmdline("sc.root=/srv sc.ports=99999").is_err());
         assert_eq!(parse_cmdline("sc.root=/srv sc.egress=443,8443").expect("parses").egress, [443, 8443]);
         assert!(parse_cmdline("sc.root=/srv sc.egress=x").is_err());
