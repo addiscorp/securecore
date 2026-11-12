@@ -29,7 +29,7 @@ const USAGE: &str = "usage: securecore-fpm --config <securecore.json> [--php-fpm
 [--listen unix:<path>|<host>:<port>] [--listen-owner <user>] [--listen-group <group>] [--listen-mode <octal>] \
 [--guest-root <path>] [--mem <MiB>] [--vcpus <n>] [--write-disk-mib <MiB>] [--no-snapshot] \
 [--guest-arg <word>]... [--guest-env <NAME>]... [--guest-ini <file>] [--php-root <dir>] [--pool <name>] \
-[--unpackaged-record <file>] [--db-user <name>|<uid>] [--] [php-fpm args...] \
+[--unpackaged-record <file>] [--db-user <name>|<uid>] [--db-address <host:port>] [--db-socket <path>] [--pools-ready-within <s>] [--] [php-fpm args...] \
 | securecore-fpm --migrate-config <securecore.json>";
 
 struct Args {
@@ -61,6 +61,11 @@ struct Args {
     record: PathBuf,
     /// The database server's user, who may own the MySQL socket a bare 3306 reaches.
     db_user: String,
+    /// Database targets the operator approves for a bare 3306 (root's configuration).
+    db_address: Option<String>,
+    db_socket: Option<PathBuf>,
+    /// How long several pools' launchers get to all serve, in seconds.
+    pools_within: u32,
     rest: Vec<OsString>,
 }
 
@@ -92,6 +97,9 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
         pool: None,
         record: PathBuf::from("/var/lib/securecore/unpackaged.json"),
         db_user: "mysql".into(),
+        db_address: None,
+        db_socket: None,
+        pools_within: 300,
         rest: Vec::new(),
     };
     let mut config = None;
@@ -109,7 +117,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
             }
             "--config" | "--php-fpm" | "--vm-dir" | "--vm-user" | "--pool-user" | "--kvm" | "--state-dir" | "--listen" | "--listen-owner"
             | "--listen-group" | "--listen-mode" | "--guest-root" | "--mem" | "--vcpus" | "--write-disk-mib" | "--guest-arg" | "--guest-env" | "--guest-ini"
-            | "--php-root" | "--pool" | "--unpackaged-record" | "--db-user" => {
+            | "--php-root" | "--pool" | "--unpackaged-record" | "--db-user" | "--db-address" | "--db-socket" | "--pools-ready-within" => {
                 args.next();
                 let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
                 let text = || value.to_str().map(str::to_owned).ok_or_else(|| format!("{flag}: not UTF-8"));
@@ -141,6 +149,9 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
                     "--pool" => a.pool = Some(text()?),
                     "--unpackaged-record" => a.record = PathBuf::from(&value),
                     "--db-user" => a.db_user = text()?,
+                    "--db-address" => a.db_address = Some(text()?),
+                    "--db-socket" => a.db_socket = Some(PathBuf::from(&value)),
+                    "--pools-ready-within" => a.pools_within = number()?,
                     _ => a.guest_args.push(text()?),
                 }
             }
@@ -219,13 +230,15 @@ mod microvm {
             pool: a.pool.clone(),
             record: a.record.clone(),
             db_user: a.db_user.clone(),
+            db_address: a.db_address.clone(),
+            db_socket: a.db_socket.clone(),
         })
     }
 
     pub struct Ready(vm::Ready);
 
-    /// How long the pools' launchers get to all serve.
-    const POOLS_READY_WITHIN: std::time::Duration = std::time::Duration::from_secs(300);
+    /// How long a pool's launcher gets to stop after SIGTERM before it is killed.
+    const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
     pub fn stop_extending() {
         vm::stop_extending();
@@ -257,7 +270,7 @@ mod microvm {
                 Err(vm::RunError::BeforeServing(e)) => Outcome::Fallback(e),
                 Err(vm::RunError::AfterServing(e)) => Outcome::Done(Err(e)),
             },
-            vm::Ready::Pools(names) => pools(loaded, &opts, &names, argv),
+            vm::Ready::Pools(names) => pools(loaded, &opts, &names, argv, std::time::Duration::from_secs(u64::from(a.pools_within))),
         }
     }
 
@@ -267,7 +280,7 @@ mod microvm {
     /// systemd once all do. Stop and reload signals go to every pool's launcher. A pool that
     /// fails before all serve stops the others (`auto` then runs gelada); one that stops later
     /// stops them all.
-    fn pools(loaded: &Loaded, opts: &vm::Options, names: &[String], argv: &[std::ffi::OsString]) -> Outcome {
+    fn pools(loaded: &Loaded, opts: &vm::Options, names: &[String], argv: &[std::ffi::OsString], within: std::time::Duration) -> Outcome {
         use std::os::unix::net::UnixDatagram;
         let set = vm::block_signals();
         let base = vm::state_base(loaded, opts);
@@ -280,12 +293,23 @@ mod microvm {
         let _ = d.set_read_timeout(Some(std::time::Duration::from_millis(200)));
         let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
         let mut kids: Vec<(String, std::process::Child, bool)> = Vec::new();
+        // SIGTERM to every pool's launcher, up to STOP_GRACE for them to stop their VMs, then
+        // SIGKILL for any still running (its jail's watchdog ends its VM), and every one reaped:
+        // a stop always ends (#102 verification).
         let stop_all = |kids: &mut Vec<(String, std::process::Child, bool)>| {
             for (_, c, _) in kids.iter_mut() {
                 // SAFETY: kill(2) to a child this process started and hasn't reaped.
                 unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
             }
-            for (_, c, _) in kids.iter_mut() {
+            let t = std::time::Instant::now();
+            while t.elapsed() < STOP_GRACE && kids.iter_mut().any(|(_, c, _)| matches!(c.try_wait(), Ok(None))) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            for (n, c, _) in kids.iter_mut() {
+                if matches!(c.try_wait(), Ok(None)) {
+                    super::log(&format!("pool [{n}]'s launcher didn't stop within {} s of SIGTERM; killing it", STOP_GRACE.as_secs()));
+                    let _ = c.kill();
+                }
                 let _ = c.wait();
             }
         };
@@ -306,15 +330,27 @@ mod microvm {
         // snapshot yet, the warm-up VM and the snapshot), so this is a generous ceiling. Past it
         // the pools that serve are stopped too, and `auto` runs gelada (#102 review: never a
         // wait without end).
-        let deadline = std::time::Instant::now() + POOLS_READY_WITHIN;
+        let deadline = std::time::Instant::now() + within;
         loop {
             if std::time::Instant::now() > deadline {
                 let waiting: Vec<&str> = kids.iter().filter(|(_, _, r)| !r).map(|(n, _, _)| n.as_str()).collect();
                 let waiting = waiting.join(", ");
-                stop_all(&mut kids);
                 vm::stop_extending();
+                stop_all(&mut kids);
                 vm::unblock_signals();
-                return Outcome::Fallback(format!("pool(s) {waiting} didn't serve within {} s", POOLS_READY_WITHIN.as_secs()));
+                return Outcome::Fallback(format!("pool(s) {waiting} didn't serve within {} s", within.as_secs()));
+            }
+            // A stop during the wait is taken at once (never only after the deadline), and from
+            // then on systemd is asked for no more time.
+            let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: sigtimedwait(2) on the set this thread blocked, not waiting.
+            let sig = unsafe { libc::sigtimedwait(&set, std::ptr::null_mut(), &now) };
+            if [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT].contains(&sig) {
+                vm::stop_extending();
+                stop_all(&mut kids);
+                let _ = std::fs::remove_file(&sock);
+                super::log(&format!("stopped by signal {sig} before every pool served; every pool's launcher is stopped"));
+                return Outcome::Done(Ok(()));
             }
             if let Ok(n) = d.recv(&mut buf) {
                 let msg = String::from_utf8_lossy(&buf[..n]).into_owned();
@@ -352,9 +388,7 @@ mod microvm {
                     unsafe { libc::kill(c.id() as i32, sig) };
                 }
                 if [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT].contains(&sig) {
-                    for (_, c, _) in kids.iter_mut() {
-                        let _ = c.wait();
-                    }
+                    stop_all(&mut kids);
                     let _ = std::fs::remove_file(&sock);
                     super::log(&format!("stopped every pool's microVM by signal {sig}"));
                     return Outcome::Done(Ok(()));

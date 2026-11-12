@@ -1013,7 +1013,12 @@ of its own (`--pool <name>`, state in `<state>/pool-<name>/`, the PHP layer shar
   paths (logs, slowlog, chroot, chdir; the launcher logs which). `env[X] = $NAME` delivers `NAME`
   from the launcher's environment, as php-fpm's master on the host would read it;
 - the first launcher tells systemd it is ready once every pool's VM serves, passes stop and reload
-  signals on, and stops them all when one stops.
+  signals on, and stops them all when one stops. Its wait has a deadline (`--pools-ready-within`,
+  300 s); a stop signal during it is taken at once. Stopping the pools' launchers is SIGTERM, up
+  to 10 s, then SIGKILL, and each is reaped. A pool's own launcher never falls back by itself: the
+  first one decides for the whole config. Every Firecracker API call has a 60 s timeout.
+- `--listen` keeps the pool's `allowed_clients` or ACLs, and refuses when they can't apply to its
+  kind of socket.
 
 Several pools of one site share its writable folders; each VM syncs its own disk with them.
 
@@ -1027,16 +1032,26 @@ that then fails before it serves anything (its boot, its listening socket) falls
 too (`layer 1 isolation auto: gelada, because the microVM failed before it served (…)`);
 `microvm` still exits 125.
 
-**A bare 3306 and `localhost`** (#100 and #102 reviews). A `{ "port": 3306 }` with no socket or
-address goes where the site's own `DB_HOST` says, never to whatever happens to listen. The
+**A bare 3306 and `localhost`** (#100 and #102 reviews, and Sami's decision on the second's
+verification). A `{ "port": 3306 }` with no socket or address: the site's own `DB_HOST` is only a
+hint for which target the operator approved to use, never a target of its own, because the
+launcher is root and a site must not point it at Redis, D-Bus or another pool's php-fpm. The
 launcher reads `DB_HOST` from `wp-config.php` (a literal, or the official image's
-`getenv_docker('WORDPRESS_DB_HOST', …)` from its own environment):
+`getenv_docker('WORDPRESS_DB_HOST', …)` from its own environment; comments are skipped, and two
+defines that disagree are no answer):
 - `localhost` (or `localhost:/path`): that socket, PHP's default socket
   (`mysqli.default_socket`, `pdo_mysql.default_socket`), or MySQL's standard places, never `/tmp`.
-  The socket must be root's or the database user's (`--db-user`, `mysql`), in folders only they
-  may write; any other socket refuses the start with the reason (`auto` falls back);
-- `127.0.0.1` or `::1`: that address and port on the host;
-- another host, or a `DB_HOST` the launcher can't read: an egress port (reached by name), said so.
+  The socket must be the database user's (`--db-user`, `mysql`, else `mariadb`), in folders only
+  root or that user may write, or exactly the one `--db-socket` names (then root's is accepted);
+- TCP: MySQL's own ports on the loopback (3306, 33060 for the X protocol), or exactly the
+  host:port `--db-address` names. The connection is made as the pool user (`--egress-connect`), so
+  the host's uid-based firewall rules apply, never as root;
+- anything else, or a `DB_HOST` the launcher can't read: the guest gets no database on 3306 (it
+  stays an egress port, public names only), and the launcher says why. The start still serves.
+
+A socket in its own folder is bind-mounted into the jail with that folder; a socket directly in a
+folder services share (`/`, `/run`, `/var/run`, `/tmp`, `/var/tmp`, `/dev`, `/dev/shm`) is
+bind-mounted alone, never the folder. This holds for `connect[].socket` entries too.
 
 Whatever 3306 reaches, the guest has a unix socket at each of PHP's default sockets, the host
 socket's own path and `/run/mysqld/mysqld.sock`, so `DB_HOST=localhost` works as on the host.

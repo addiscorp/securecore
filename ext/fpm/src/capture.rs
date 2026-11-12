@@ -224,8 +224,21 @@ pub fn write_record(path: &Path, items: &[Item]) -> Result<usize, Refused> {
     Ok(map.len())
 }
 
+/// [`check_record`] for a start: no record at all is a refusal too (#102 verification: a start
+/// never writes it; the installer does, `--check-capture --write-record`).
+pub fn require_record(path: &Path, items: &[Item]) -> Result<(), Refused> {
+    if check_record(path, items)? {
+        Ok(())
+    } else {
+        Err(refused(
+            path.display().to_string(),
+            "there is no record of this host's unpackaged files yet: run the installer to record unpackaged files (securecore-fpm --check-capture --write-record)",
+        ))
+    }
+}
+
 /// Every unpackaged file against the record: one it doesn't hold, or whose bytes differ, is
-/// refused, naming the file. `Ok(false)`: there was no record (the caller writes one).
+/// refused, naming the file. `Ok(false)`: there was no record.
 pub fn check_record(path: &Path, items: &[Item]) -> Result<bool, Refused> {
     let text = match fs::read(path) {
         Ok(t) => t,
@@ -898,11 +911,10 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
     }
     let mysql_sockets = phpconf::mysql_default_sockets(&settings.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>());
     let items: Vec<Item> = w.items.values().cloned().collect();
-    // Trust on first use: the install's record of what no package's checksum covers.
-    if let Some(rec) = &req.record
-        && !check_record(rec, &items)?
-    {
-        write_record(rec, &items)?;
+    // The install's record of what no package's checksum covers (trust on first use, the
+    // installer the only writer): a start without one refuses, so `auto` runs gelada.
+    if let Some(rec) = &req.record {
+        require_record(rec, &items)?;
     }
     let php_key = items_key(&items);
     Ok(Capture {
@@ -1453,6 +1465,8 @@ mod tests {
             source: "unpackaged (root-owned)".into(),
         }];
         assert_eq!(check_record(&rec, &items), Ok(false), "no record yet");
+        assert!(require_record(&rec, &items).expect_err("a start without a record").why.contains("run the installer to record unpackaged files"));
+        assert!(!rec.exists(), "a start never writes the record");
         let mut with_etc = items.clone();
         with_etc.push(Item::File {
             path: "/etc/hostname".into(),

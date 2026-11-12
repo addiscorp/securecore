@@ -232,6 +232,10 @@ dbpass=$(sed -n 's/^WORDPRESS_DB_PASSWORD=//p' "$dir/guest.env")
 # libraries are dpkg's, php-fpm and the extensions are compiled and root's), read through its root.
 php_root() { echo "/proc/$(docker inspect -f '{{.State.Pid}}' "$(compose ps -q php)")/root"; }
 [ -x "$(php_root)/usr/local/sbin/php-fpm" ] || die "no php-fpm in the php container at $(php_root)"
+# The record of the php container's unpackaged files, as the installer writes it (#101: trust on
+# first use; a start never writes it).
+"$fpm" --check-capture --php-root "$(php_root)" --write-record "$dir/unpackaged.json" > "$dir/record.log" 2>&1 \
+  || die "recording the unpackaged files: $(tail -2 "$dir/record.log" | tr '\n' ' ')"
 start() {
   name=$1 config=$2; shift 2
   cp "$config" "$site/securecore.json"
@@ -1152,6 +1156,12 @@ in_php "cat /tmp/sc101-ext > $ext && touch -r /tmp/sc101-ext $ext && rm -f /tmp/
 in_php "mkdir -p /opt/sc101 && cp $ext /opt/sc101/evil.so && printf 'extension=/opt/sc101/evil.so\n' > /usr/local/etc/php/conf.d/zz-sc101-evil.ini"
 refuses outside-so "/usr/local/etc/php/conf.d/zz-sc101-evil.ini:1" "extension = /opt/sc101/evil.so loads native code from outside the captured set"
 in_php "rm -rf /opt/sc101 /usr/local/etc/php/conf.d/zz-sc101-evil.ini"
+# No record of the unpackaged files (#102 verification): a start never writes one; it refuses
+# (auto: gelada), saying to run the installer.
+mv "$dir/unpackaged.json" "$dir/unpackaged.json.keep"
+refuses no-record "$dir/unpackaged.json" "run the installer to record unpackaged files"
+is "$( [ -e "$dir/unpackaged.json" ] && echo written || echo absent)" absent "and the start wrote no record"
+mv "$dir/unpackaged.json.keep" "$dir/unpackaged.json"
 # After each refusal the host is as it was: the next start serves (and recaptures).
 if start after-tamper "$dir/microvm.json"; then
   is "$(vcode /)" 200 "with the host restored, the microVM serves again"
@@ -1167,19 +1177,52 @@ in_php "printf 'mysqli.default_socket = $mysqld/mysqld.sock\n' > /usr/local/etc/
 cp "$dir/guest.env" "$dir/guest.env.keep"
 sed 's|^WORDPRESS_DB_HOST=.*|WORDPRESS_DB_HOST=localhost|' "$dir/guest.env.keep" > "$dir/guest.env"
 if start bare "$dir/bare.json"; then
-  has "$dir/bare.log" "port 3306 has no socket or address: DB_HOST is localhost, so it goes to the host's MySQL socket $mysqld/mysqld.sock" \
-    "a bare 3306 goes where the site's DB_HOST says: the host's MySQL socket (the database's own, uid 999)"
+  has "$dir/bare.log" "port 3306 has no socket or address: DB_HOST is localhost, so it goes to the database's socket $mysqld/mysqld.sock" \
+    "a bare 3306 goes where the site's DB_HOST says: the database's own socket (uid 999)"
   is "$(vcode /)" 200 "and WordPress reaches its database at localhost (the front page: 200)"
   is "$(vget / | grep -c yoast-schema-graph)" 1 "with its content"
   stop
 else
   fail "a bare 3306: the start serves"
 fi
-# A socket any local user could have put there is never the database (#102 review): the same
-# start with the socket another user's refuses, naming it.
+# DB_HOST is a hint among the targets the operator approved, never a target (#102 verification).
+# hostile <name> <DB_HOST> <why>: the start serves, the guest gets no database (WordPress can't
+# connect), and the launcher says why.
+hostile() {
+  sed "s|^WORDPRESS_DB_HOST=.*|WORDPRESS_DB_HOST=$2|" "$dir/guest.env.keep" > "$dir/guest.env"
+  if start "$1" "$dir/bare.json"; then
+    has "$dir/$1.log" "$3" "$1: DB_HOST $2: $3"
+    has "$dir/$1.log" "the guest gets no database on it" "$1: the guest gets no database, and the launcher says so"
+    is "$(vget / | grep -c 'Error establishing a database connection')" 1 "$1: WordPress can't reach a database"
+    stop
+  else
+    fail "$1: the start serves (with no database)"
+  fi
+}
+hostile hostile-redis "127.0.0.1:6379" "port 6379 on this host isn't MySQL's"
+if [ -S /run/dbus/system_bus_socket ]; then
+  hostile hostile-dbus "localhost:/run/dbus/system_bus_socket" "not the database's user"
+else
+  fail "hostile-dbus: this host has no /run/dbus/system_bus_socket to point DB_HOST at"
+fi
+# Another user's socket in the database's folder: the same.
 chown 1234:1234 "$mysqld/mysqld.sock"
-refuses untrusted-db "" "the MySQL socket $mysqld/mysqld.sock is owned by uid 1234" "$dir/bare.json"
+hostile hostile-owner "localhost" "is owned by uid 1234, not the database's user"
 chown 999:999 "$mysqld/mysqld.sock"
+# The database's socket directly in /run (a hard link to MariaDB's, so it is the database's
+# own): it reaches the database, and only that socket is mounted into the jail, never /run.
+ln -f "$mysqld/mysqld.sock" /run/sc101-db.sock
+sed 's|^WORDPRESS_DB_HOST=.*|WORDPRESS_DB_HOST=localhost:/run/sc101-db.sock|' "$dir/guest.env.keep" > "$dir/guest.env"
+if start in-run "$dir/bare.json"; then
+  has "$dir/in-run.log" "goes to the database's socket /run/sc101-db.sock" "a socket directly in /run: the database's, so it is reached"
+  is "$(vcode /)" 200 "WordPress reaches its database through it (the front page: 200)"
+  is "$(awk -v j="$(jail_root)/sock-3306" '$5 == j "/sc101-db.sock" { f++ } $5 == j { d++ } END { print f + 0 "/" d + 0 }' /proc/self/mountinfo)" 1/0 \
+    "only the socket is mounted into the jail (sock-3306/sc101-db.sock), not /run"
+  stop
+else
+  fail "a socket directly in /run: the start serves"
+fi
+rm -f /run/sc101-db.sock
 cp "$dir/guest.env.keep" "$dir/guest.env"
 in_php "rm -f /usr/local/etc/php/conf.d/zz-sc101-db.ini"
 # One microVM per pool (#100 review): each listens where its pool says (with its allowed_clients
@@ -1213,6 +1256,41 @@ stop
 is "$STOPPED" 0 "SIGTERM stops both pools' microVMs, exit 0"
 is "$(pgrep -f -- "--id sc-[0-9a-f]*-[0-9a-f]\{6\}" | wc -l)" 0 "no pool's Firecracker is left running"
 kill "$npid" 2>/dev/null
+# The readiness wait always ends (#102 verification). A pool's launcher that hangs before it
+# serves (stopped with SIGSTOP the moment it starts): the first launcher gives up at the deadline
+# (--pools-ready-within 20), stops every pool's (SIGTERM, then SIGKILL after 10 s) and exits
+# (microvm: 125) within the deadline plus the grace.
+pools_run() {
+  fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" \
+    --guest-root "$html" --php-root "$(php_root)" "$@" > "$dir/$pname.log" 2>&1 &
+  PID=$!
+}
+cp "$dir/microvm.json" "$site/securecore.json"
+pname=pools-hang
+pools_run --pools-ready-within 20
+eventually 600 "[ -n \"\$(pgrep -P $PID | head -1)\" ]" || true
+hung=$(pgrep -P "$PID" | head -1)
+kill -STOP "$hung" 2>/dev/null
+# From the moment the pools' launchers start, the deadline runs.
+t0=$(date +%s)
+wait "$PID"; rc=$?; PID=""
+took=$(( $(date +%s) - t0 ))
+is "$rc" 125 "a pool's launcher that never serves: the first launcher gives up (microvm: exit 125)"
+is "$( [ "$took" -le 45 ] && echo within)" within "within the deadline (20 s) and the grace (10 s) (took ${took} s)"
+has "$dir/pools-hang.log" "didn't serve within 20 s" "and says which pool and why"
+is "$(kill -0 "$hung" 2>/dev/null && echo alive || echo gone)" gone "the hung launcher is killed and reaped (pid $hung)"
+# SIGTERM while the pools start: taken at once, every pool's launcher stopped, exit 0.
+pname=pools-term
+pools_run
+sleep 2
+t0=$(date +%s)
+kill -TERM "$PID"
+wait "$PID"; rc=$?; PID=""
+took=$(( $(date +%s) - t0 ))
+is "$rc" 0 "SIGTERM during the pools' start: exit 0"
+is "$( [ "$took" -le 15 ] && echo within)" within "within the grace (took ${took} s)"
+has "$dir/pools-term.log" "before every pool served" "and says it stopped before they served"
+is "$(pgrep -fc -- "--id sc-$(printf %s "$site" | sha256sum | cut -c1-12)-")" 0 "no pool's Firecracker is left running"
 # A pool of another site (#102 review, Sami's decision): microvm refuses the whole config, naming
 # it (auto falls back to gelada once, with the same reason).
 in_php "printf '[www]\nchdir = /var/www/html\nlisten = $run/www.sock\n[other]\nchdir = /srv/other-site\nuser = www-data\nlisten = $run/other.sock\n' > /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"

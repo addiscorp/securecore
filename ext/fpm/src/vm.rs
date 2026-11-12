@@ -193,6 +193,10 @@ pub struct Options {
     /// The database server's user (`--db-user`, `mysql`): a MySQL socket the guest reaches is
     /// this user's or root's, in folders only they may write.
     pub db_user: String,
+    /// The database targets the operator approves for a bare 3306 (`--db-address`,
+    /// `--db-socket`), beside MySQL's own loopback ports and the database user's sockets.
+    pub db_address: Option<String>,
+    pub db_socket: Option<PathBuf>,
 }
 
 /// The site's php.ini settings as the guest gets them: `None` without `--guest-ini` or while the
@@ -331,6 +335,22 @@ impl Admit {
         match self {
             Admit::Users { uids, gids, members } => uid == 0 || uids.contains(&uid) || gids.contains(&gid) || members.contains(&uid),
             _ => true,
+        }
+    }
+}
+
+/// The pool's rule of who may connect (`admit`), for where the launcher listens: kept as it is
+/// when it fits that socket, refused when it can't (a pool's `allowed_clients` with a unix
+/// `--listen`, its ACLs with a TCP one), never dropped.
+pub fn listen_admit(listen: &Listen, admit: &Admit) -> Result<Admit, String> {
+    match (listen, admit) {
+        (_, Admit::Any) | (Listen::Tcp(_), Admit::Addresses(_)) | (Listen::Unix(_), Admit::Users { .. }) => Ok(admit.clone()),
+        (Listen::Unix(p), Admit::Addresses(_)) => Err(format!(
+            "its listen.allowed_clients can't apply to the unix socket --listen unix:{} names: listen on TCP, or remove allowed_clients",
+            p.display()
+        )),
+        (Listen::Tcp(a), Admit::Users { .. }) => {
+            Err(format!("its listen.acl_users/acl_groups can't apply to the TCP address --listen {a} names: listen on a unix socket, or remove the ACLs"))
         }
     }
 }
@@ -921,15 +941,25 @@ pub const MYSQL_SOCKETS: [&str; 3] = ["/run/mysqld/mysqld.sock", "/var/run/mysql
 /// database's user (`db`: uid and gid), every folder above it owned by one of them and writable
 /// by no one else (its group only when that is root's or the database's). Any local user could
 /// otherwise put a socket where the guest's database connections (and their passwords) go.
-pub fn trusted_db_socket(path: &Path, db: Option<(u32, u32)>) -> Result<(), String> {
+/// `approved`: the operator named this very socket (`--db-socket`), so root's is accepted too;
+/// otherwise only the database user's (#102 verification: a root-owned socket such as D-Bus's is
+/// never a database because a site's `DB_HOST` names it).
+pub fn trusted_db_socket(path: &Path, db: Option<(u32, u32)>, approved: bool) -> Result<(), String> {
     let ok_uid = |u: u32| u == 0 || db.is_some_and(|(d, _)| d == u);
     let ok_gid = |g: u32| g == 0 || db.is_some_and(|(_, d)| d == g);
     let m = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()) {
         return Err(format!("{} is not a socket", path.display()));
     }
-    if !ok_uid(m.uid()) {
-        return Err(format!("the MySQL socket {} is owned by uid {}, neither root nor the database's user (--db-user): any local user could have put it there", path.display(), m.uid()));
+    let owner_ok = if approved { ok_uid(m.uid()) } else { db.is_some_and(|(d, _)| d == m.uid()) };
+    if !owner_ok {
+        return Err(format!(
+            "the socket {} is owned by uid {}, not the database's user (--db-user{}){}",
+            path.display(),
+            m.uid(),
+            db.map_or_else(|| ", which this host doesn't have".to_owned(), |(d, _)| format!(", uid {d}")),
+            if approved { "" } else { "; name it with --db-socket if it really is the database's" }
+        ));
     }
     let mut dir = path.parent();
     while let Some(d) = dir {
@@ -962,6 +992,8 @@ pub fn db_ids(spec: &str) -> Option<(u32, u32)> {
     };
     match spec.parse::<u32>() {
         Ok(uid) => by(&|f| f[2] == spec).or(Some((uid, uid))),
+        // The default names MySQL's user; MariaDB's packages may name theirs mariadb.
+        Err(_) if spec == "mysql" => by(&|f| f[0] == "mysql").or_else(|| by(&|f| f[0] == "mariadb")),
         Err(_) => by(&|f| f[0] == spec),
     }
 }
@@ -988,55 +1020,94 @@ fn guest_sock_ok(p: &str) -> bool {
     (p.starts_with("/run/") || p.starts_with("/var/run/") || p.starts_with("/tmp/")) && !p.contains("/../") && !p.chars().any(char::is_whitespace)
 }
 
-/// The database port (#100 review, #102 review): a bare `{ "port": 3306 }` goes where the
-/// site's own `DB_HOST` says (`db_host`, from `wp-config.php`), never to whatever happens to
-/// listen:
-/// - `localhost` (with or without a socket): the socket `DB_HOST` names, else PHP's default
-///   socket (`hint_sockets`, from its settings), else MySQL's standard places, and only a socket
-///   [`trusted_db_socket`] accepts (`trusted`); an untrusted one is an error, so `auto` falls back
-///   with the reason;
-/// - `127.0.0.1` or `::1`: that address and port on the host, because `DB_HOST` names it;
-/// - any other host, or no `DB_HOST` the launcher can read: an egress port (a database reached
-///   by name), and said so. An explicit `connect` entry (`socket` or `address`) wins over all of
-///   this.
+/// The database targets the operator approved, in root's own configuration (the launcher's
+/// flags), never the site's: `--db-address <host:port>` and `--db-socket <path>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DbApproved {
+    pub address: Option<String>,
+    pub socket: Option<PathBuf>,
+}
+
+/// MySQL's own TCP ports: the classic protocol and the X protocol.
+pub const MYSQL_PORTS: [u16; 2] = [3306, 33060];
+
+/// The database port (#100 review, #102 review and its verification): a bare
+/// `{ "port": 3306 }`. The site's `DB_HOST` (`db_host`, from `wp-config.php`) is only a hint for
+/// which of the targets the operator approved to use, never a target of its own (Sami's
+/// decision): a site must not point the launcher, which is root, at Redis, D-Bus or another
+/// pool's php-fpm.
+/// - **TCP** (`127.0.0.1`/`::1`, or any host): only MySQL's ports on the loopback
+///   ([`MYSQL_PORTS`]), or exactly the host:port `approved.address` names. The connection is made
+///   as the pool user, so the host's uid-based firewall rules apply.
+/// - **A unix socket** (`localhost`, with a socket or PHP's default, `hint_sockets`, or MySQL's
+///   standard places): only one the database user owns, in folders only root or that user may
+///   write (`trusted(path, approved)`, [`trusted_db_socket`]), or exactly `approved.socket`.
+/// - Anything else, or no `DB_HOST` the launcher can read: no database for the guest on 3306
+///   (it stays an egress port: public names only), and the launcher says why.
 ///
-/// Whatever 3306 reaches, PHP's `localhost` reaches too: a socket in the guest at each of PHP's
-/// default sockets, the host socket's own path and `/run/mysqld/mysqld.sock`. Returns what was
-/// decided, for the log.
-pub fn resolve_db(plan: &mut Plan, db_host: Option<&str>, hint_sockets: &[String], trusted: &dyn Fn(&Path) -> Result<(), String>) -> Result<Option<String>, String> {
+/// An explicit `connect` entry (`socket` or `address`) wins over all of this. Whatever 3306
+/// reaches, PHP's `localhost` reaches too: a socket in the guest at each of PHP's default
+/// sockets, the host socket's own path and `/run/mysqld/mysqld.sock`. Returns what was decided,
+/// for the log.
+pub fn resolve_db(
+    plan: &mut Plan,
+    db_host: Option<&str>,
+    hint_sockets: &[String],
+    approved: &DbApproved,
+    trusted: &dyn Fn(&Path, bool) -> Result<(), String>,
+) -> Result<Option<String>, String> {
     const DB: u16 = 3306;
     let mut said = None;
+    let no_db = |why: String| Some(format!("port {DB} has no socket or address, and {why}: the guest gets no database on it (only public names)"));
     if plan.egress.contains(&DB) {
         let target = db_host.and_then(securecore_config::dbhost::parse_db_host);
         let defaults = securecore_config::dbhost::Defaults { host: "localhost", port: DB, socket: hint_sockets.first().map(String::as_str) };
         match (db_host, target.map(|t| t.resolve(&defaults))) {
             (None, _) | (_, None) => {
-                said = Some(format!(
-                    "port {DB} has no socket or address, and the site's DB_HOST isn't one the launcher can read (wp-config.php's define, a literal or the environment): \
-                     the guest reaches a database on it only by name; give the connect entry a socket or address"
-                ));
+                said = no_db(
+                    "the site's DB_HOST isn't one the launcher can read (wp-config.php's define, a literal or the environment); \
+                     give the connect entry a socket or address, or approve one with --db-socket / --db-address"
+                        .into(),
+                );
             }
             (Some(h), Some(ep)) if ep.host == "localhost" => {
-                let named = ep.socket.clone();
-                let sock = match &named {
-                    Some(s) => PathBuf::from(s),
-                    None => MYSQL_SOCKETS.iter().map(PathBuf::from).find(|p| p.exists()).ok_or_else(|| {
-                        format!("DB_HOST is {h}, but this host has no MySQL socket at {} (and PHP names none): give the connect entry the socket", MYSQL_SOCKETS.join(", "))
-                    })?,
+                let sock = match &ep.socket {
+                    Some(s) => Some(PathBuf::from(s)),
+                    None => approved.socket.clone().or_else(|| MYSQL_SOCKETS.iter().map(PathBuf::from).find(|p| p.exists())),
                 };
-                trusted(&sock).map_err(|e| format!("DB_HOST is {h}: {e}"))?;
-                plan.egress.retain(|p| *p != DB);
-                said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, so it goes to the host's MySQL socket {}", sock.display()));
-                plan.sockets.push((DB, fs::canonicalize(&sock).unwrap_or(sock)));
+                match sock {
+                    None => said = no_db(format!("DB_HOST is {h}, but this host has no MySQL socket at {} (and PHP names none)", MYSQL_SOCKETS.join(", "))),
+                    Some(sock) => {
+                        let real = fs::canonicalize(&sock).unwrap_or_else(|_| sock.clone());
+                        let is_approved = approved.socket.as_ref().is_some_and(|a| fs::canonicalize(a).unwrap_or_else(|_| a.clone()) == real);
+                        match trusted(&real, is_approved) {
+                            Err(e) => said = no_db(format!("DB_HOST is {h}, but {e}")),
+                            Ok(()) => {
+                                plan.egress.retain(|p| *p != DB);
+                                said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, so it goes to the database's socket {}", real.display()));
+                                plan.sockets.push((DB, real));
+                            }
+                        }
+                    }
+                }
             }
-            (Some(h), Some(ep)) if ep.host == "127.0.0.1" || ep.host == "::1" => {
-                plan.egress.retain(|p| *p != DB);
-                let addr = if ep.host == "::1" { format!("[::1]:{}", ep.port) } else { format!("127.0.0.1:{}", ep.port) };
-                said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, so it goes to the host's {addr}"));
-                plan.addresses.push((DB, addr));
-            }
-            (Some(h), Some(_)) => {
-                said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, a database the guest reaches by name"));
+            (Some(h), Some(ep)) => {
+                let addr = if ep.host.contains(':') { format!("[{}]:{}", ep.host, ep.port) } else { format!("{}:{}", ep.host, ep.port) };
+                let loopback = ep.host == "127.0.0.1" || ep.host == "::1";
+                let named = approved.address.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&addr));
+                if named || (loopback && MYSQL_PORTS.contains(&ep.port)) {
+                    plan.egress.retain(|p| *p != DB);
+                    said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, so it goes to {addr}, connected as the pool user"));
+                    plan.addresses.push((DB, addr));
+                } else if loopback {
+                    said = no_db(format!(
+                        "DB_HOST is {h}: port {} on this host isn't MySQL's ({}) nor the one --db-address approves",
+                        ep.port,
+                        MYSQL_PORTS.map(|p| p.to_string()).join(", ")
+                    ));
+                } else {
+                    said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, a database the guest reaches by name (public addresses only)"));
+                }
             }
         }
     }
@@ -1176,15 +1247,19 @@ fn prepare(loaded: &Loaded, opts: &Options, capture: capture::Capture) -> Result
     let hints = pool_hints(&opts.php_root, pool)?;
     let mut plan = plan_with(loaded, opts, &hints, false)?;
     // Where the pool listens, with its listen.owner/group/mode; --listen and its flags win.
-    let (listen_mode, admit) = match (&opts.listen, &hints.listen, hints.listen_mode) {
-        (None, Some(_), Some(m)) => (m, hints.admit.clone()),
-        _ => (opts.listen_mode, Admit::Any),
+    let listen_mode = match (&opts.listen, &hints.listen, hints.listen_mode) {
+        (None, Some(_), Some(m)) => m,
+        _ => opts.listen_mode,
     };
+    // The pool's own rule of who may connect stands whatever --listen says (#102 verification);
+    // one that can't apply to --listen's kind of socket is refused, never dropped.
+    let admit = listen_admit(&plan.listen, &hints.admit).map_err(|e| format!("pool [{}]: {e}", pool.name))?;
     let user = jail::user(&opts.vm_user)?;
     let lock = lock_state(&plan.state)?;
     let db = db_ids(&opts.db_user);
     let db_host = site_db_host(&plan.root);
-    if let Some(said) = resolve_db(&mut plan, db_host.as_deref(), &capture.mysql_sockets, &|p| trusted_db_socket(p, db))? {
+    let approved = DbApproved { address: opts.db_address.clone(), socket: opts.db_socket.clone() };
+    if let Some(said) = resolve_db(&mut plan, db_host.as_deref(), &capture.mysql_sockets, &approved, &|p, a| trusted_db_socket(p, db, a))? {
         log(&said);
     }
     // Checked again here, not only in host_checks: what is checked is what is bind-mounted.
@@ -1752,9 +1827,16 @@ fn claim_state(plan: &Plan) -> Result<(), String> {
     fs::write(&mine, serde_json::json!({ "root": root }).to_string()).map_err(|e| format!("{}: {e}", mine.display()))
 }
 
+/// How long one Firecracker API call may take.
+pub const API_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One request on Firecracker's API socket. Errors carry Firecracker's own fault message.
 fn api(sock: &Path, method: &str, path: &str, body: &str) -> Result<(), String> {
     let mut s = UnixStream::connect(sock).map_err(|e| format!("{}: {e}", sock.display()))?;
+    // A Firecracker that stops answering never holds a start forever (#102 verification): the
+    // slowest call, a snapshot of the whole guest memory, takes about a second.
+    s.set_read_timeout(Some(API_TIMEOUT)).map_err(|e| e.to_string())?;
+    s.set_write_timeout(Some(API_TIMEOUT)).map_err(|e| e.to_string())?;
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
@@ -2677,6 +2759,7 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, keys: 
             let l = bind_unix(&short.join(format!("v.sock_{port}")), owned)?;
             let address = address.clone();
             let port = *port;
+            let pool = plan.pool;
             let slots: &'static Slots = Box::leak(Box::new(Slots::new(FORWARD_SLOTS)));
             thread::spawn(move || {
                 for c in l.incoming().flatten() {
@@ -2687,12 +2770,14 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, keys: 
                     let address = address.clone();
                     thread::spawn(move || {
                         let _slot = slot;
-                        match TcpStream::connect(&address) {
-                            Ok(t) => {
-                                let _ = t.set_nodelay(true);
-                                pipe_both(c, t);
-                            }
-                            Err(e) => log(&format!("guest port {port} → {address}: {e}")),
+                        // Never as root (#102 verification): the pool user connects, as the host's
+                        // own php-fpm would, so uid-based firewall rules apply to the guest's.
+                        let addrs: Vec<std::net::SocketAddr> = match std::net::ToSocketAddrs::to_socket_addrs(address.as_str()) {
+                            Ok(a) => a.collect(),
+                            Err(e) => return log(&format!("guest port {port} → {address}: {e}")),
+                        };
+                        if let Err(e) = egress_as_pool(c, &addrs, pool) {
+                            log(&format!("guest port {port} → {address}: {e}"));
                         }
                     });
                 }
@@ -3280,7 +3365,18 @@ pub fn run(loaded: &Loaded, opts: &Options, p: Prepared, t0: Instant) -> Result<
     let Prepared { plan, user, sockets, env, ini, machine_parts: (php, conf, site_path, disks, args, key), sync, listen_mode, admit, _lock, pool_name: _ } = p;
     // Before any thread: whatever ends this process, the VM ends with it.
     let jail = Jail::new(&plan.state, &plan.id, user);
-    let mounts: Vec<PathBuf> = plan.sockets.iter().map(|(p, _)| jail.root.join(format!("sock-{p}"))).collect();
+    // What [`Jail::bind_dir`] mounts: the socket's folder, or the socket alone in a shared folder.
+    let mounts: Vec<PathBuf> = plan
+        .sockets
+        .iter()
+        .map(|(p, s)| {
+            let at = jail.root.join(format!("sock-{p}"));
+            match (s.parent(), s.file_name()) {
+                (Some(d), Some(n)) if jail::bind_socket_only(d) => at.join(n),
+                _ => at,
+            }
+        })
+        .collect();
     let _watchdog = jail.watchdog(&mounts).map_err(before)?;
     let egress = crate::egress::Egress::new(loaded, plan.egress.clone());
     if !plan.egress.is_empty() {
@@ -3461,6 +3557,8 @@ mod tests {
             pool: None,
             record: PathBuf::from("/nonexistent/record.json"),
             db_user: "mysql".into(),
+            db_address: None,
+            db_socket: None,
         }
     }
 
@@ -3496,36 +3594,60 @@ mod tests {
         let l = loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"connect":[{"port":3306},{"port":443}]}}"#);
         let p0 = plan(&l, &opts()).expect("plan");
         assert_eq!(p0.egress, [3306, 443], "planned as egress until the host is asked");
-        let ok: &dyn Fn(&Path) -> Result<(), String> = &|_| Ok(());
-        // DB_HOST localhost:<socket>: that socket, when it is trusted.
+        let none = DbApproved::default();
+        let ok: &dyn Fn(&Path, bool) -> Result<(), String> = &|_, _| Ok(());
+        let no_db = |p: &Plan| p.sockets.is_empty() && p.addresses.is_empty() && p.guest_socks.is_empty() && p.egress.contains(&3306);
+        // DB_HOST localhost:<socket>: that socket, when the database's user owns it.
         let mut p = p0.clone();
-        let said = resolve_db(&mut p, Some("localhost:/run/sc-test/mysqld.sock"), &[], ok).expect("ok").expect("said");
-        assert!(said.contains("MySQL socket /run/sc-test/mysqld.sock"), "{said}");
+        let said = resolve_db(&mut p, Some("localhost:/run/sc-test/mysqld.sock"), &[], &none, ok).expect("ok").expect("said");
+        assert!(said.contains("database's socket /run/sc-test/mysqld.sock"), "{said}");
         assert_eq!(p.egress, [443]);
         assert_eq!(p.sockets, [(3306, PathBuf::from("/run/sc-test/mysqld.sock"))]);
         assert!(p.guest_socks.contains(&(3306, "/run/sc-test/mysqld.sock".to_owned())), "localhost in the guest: {:?}", p.guest_socks);
         assert!(!p.guest_socks.iter().any(|(_, s)| s.starts_with("/tmp")), "never /tmp: {:?}", p.guest_socks);
         // DB_HOST localhost: PHP's own default socket.
         let mut p = p0.clone();
-        resolve_db(&mut p, Some("localhost"), &["/run/php-says/mysqld.sock".to_owned()], ok).expect("ok");
+        resolve_db(&mut p, Some("localhost"), &["/run/php-says/mysqld.sock".to_owned()], &none, ok).expect("ok");
         assert_eq!(p.sockets, [(3306, PathBuf::from("/run/php-says/mysqld.sock"))]);
-        // An untrusted socket refuses (auto falls back with it), never forwards.
+        // A hostile DB_HOST (#102 verification): D-Bus's socket (root's, not the database user's)
+        // gives the guest no database, and says why; it is never an error that hides the site.
         let mut p = p0.clone();
-        let e = resolve_db(&mut p, Some("localhost:/tmp/mysql.sock"), &[], &|_| Err("owned by uid 1000".into())).expect_err("untrusted");
-        assert!(e.contains("owned by uid 1000"), "{e}");
-        assert!(p.sockets.is_empty() && p.egress.contains(&3306));
-        // DB_HOST 127.0.0.1:3307: that address, because DB_HOST names it.
+        let said = resolve_db(&mut p, Some("localhost:/run/dbus/system_bus_socket"), &[], &none, &|_, approved| {
+            if approved { Ok(()) } else { Err("the socket /run/dbus/system_bus_socket is owned by uid 0, not the database's user".into()) }
+        })
+        .expect("not an error")
+        .expect("said");
+        assert!(said.contains("not the database's user") && said.contains("the guest gets no database"), "{said}");
+        assert!(no_db(&p), "{p:?}");
+        // The operator may approve a root-owned socket by naming it (--db-socket).
         let mut p = p0.clone();
-        let said = resolve_db(&mut p, Some("127.0.0.1:3307"), &[], ok).expect("ok").expect("said");
-        assert!(said.contains("127.0.0.1:3307"), "{said}");
-        assert_eq!(p.addresses, [(3306, "127.0.0.1:3307".to_owned())]);
+        let named = DbApproved { socket: Some("/run/dbus/system_bus_socket".into()), ..DbApproved::default() };
+        resolve_db(&mut p, Some("localhost:/run/dbus/system_bus_socket"), &[], &named, &|_, approved| if approved { Ok(()) } else { Err("x".into()) }).expect("ok");
+        assert_eq!(p.sockets.len(), 1, "approved by root's configuration");
+        // A hostile DB_HOST at Redis (127.0.0.1:6379), or any other loopback port: no database.
+        for h in ["127.0.0.1:6379", "127.0.0.1:2375", "[::1]:9000", "127.0.0.1:3307"] {
+            let mut p = p0.clone();
+            let said = resolve_db(&mut p, Some(h), &[], &none, ok).expect("ok").expect("said");
+            assert!(said.contains("isn't MySQL's") && said.contains("the guest gets no database"), "{h}: {said}");
+            assert!(no_db(&p), "{h}: {p:?}");
+        }
+        // MySQL's own ports on the loopback, and exactly what --db-address names.
+        for (h, want) in [("127.0.0.1", "127.0.0.1:3306"), ("127.0.0.1:33060", "127.0.0.1:33060"), ("[::1]:3306", "[::1]:3306")] {
+            let mut p = p0.clone();
+            let said = resolve_db(&mut p, Some(h), &[], &none, ok).expect("ok").expect("said");
+            assert!(said.contains("as the pool user"), "{said}");
+            assert_eq!(p.addresses, [(3306, want.to_owned())], "{h}");
+        }
+        let mut p = p0.clone();
+        let addr = DbApproved { address: Some("10.0.0.5:3307".into()), ..DbApproved::default() };
+        resolve_db(&mut p, Some("10.0.0.5:3307"), &[], &addr, ok).expect("ok");
+        assert_eq!(p.addresses, [(3306, "10.0.0.5:3307".to_owned())], "the address root's configuration names");
         // Another host, or no DB_HOST: an egress port still, never a guess at the loopback.
         for h in [Some("db.example.com"), None] {
             let mut p = p0.clone();
-            let said = resolve_db(&mut p, h, &[], ok).expect("ok").expect("said");
-            assert!(said.contains("by name"), "{said}");
-            assert_eq!(p.egress, [3306, 443]);
-            assert!(p.sockets.is_empty() && p.addresses.is_empty() && p.guest_socks.is_empty());
+            let said = resolve_db(&mut p, h, &[], &none, ok).expect("ok").expect("said");
+            assert!(said.contains("by name") || said.contains("only public names"), "{said}");
+            assert!(no_db(&p));
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3554,22 +3676,26 @@ mod tests {
             let t = tmp.join(format!("sc-dbsock-{}.sock", std::process::id()));
             let _ = fs::remove_file(&t);
             let _lt = std::os::unix::net::UnixListener::bind(&t).expect("bind");
-            assert!(trusted_db_socket(&t, None).is_err(), "a socket in a folder anyone may write");
+            assert!(trusted_db_socket(&t, None, true).is_err(), "a socket in a folder anyone may write, even approved");
             let _ = fs::remove_file(&t);
         }
         chown(&d, 999, 999);
         chmod(&d, 0o755);
         chown(&sock, 999, 999);
-        assert_eq!(trusted_db_socket(&sock, Some((999, 999))), Ok(()), "the database's socket in its own folder");
-        assert!(trusted_db_socket(&sock, None).is_err(), "not root's, and no database user known");
+        assert_eq!(trusted_db_socket(&sock, Some((999, 999)), false), Ok(()), "the database's socket in its own folder");
+        assert!(trusted_db_socket(&sock, None, false).is_err(), "no database user known");
         chown(&sock, 1234, 1234);
-        assert!(trusted_db_socket(&sock, Some((999, 999))).expect_err("another user's").contains("owned by uid 1234"));
+        assert!(trusted_db_socket(&sock, Some((999, 999)), false).expect_err("another user's").contains("owned by uid 1234"));
+        // Root's socket (D-Bus's, say): never because a site names it; only when the operator does.
+        chown(&sock, 0, 0);
+        assert!(trusted_db_socket(&sock, Some((999, 999)), false).expect_err("root's, not approved").contains("--db-socket"));
+        assert_eq!(trusted_db_socket(&sock, Some((999, 999)), true), Ok(()), "root's, approved by --db-socket");
         chown(&sock, 999, 999);
         chmod(&d, 0o777);
-        assert!(trusted_db_socket(&sock, Some((999, 999))).expect_err("a folder anyone may write").contains("may be written"));
+        assert!(trusted_db_socket(&sock, Some((999, 999)), false).expect_err("a folder anyone may write").contains("may be written"));
         chmod(&d, 0o775);
         chown(&d, 999, 1234);
-        assert!(trusted_db_socket(&sock, Some((999, 999))).is_err(), "group-writable by another group");
+        assert!(trusted_db_socket(&sock, Some((999, 999)), false).is_err(), "group-writable by another group");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3583,6 +3709,15 @@ mod tests {
         assert!(u.unix(33, 5) && u.unix(7, 101) && u.unix(1500, 7) && u.unix(0, 0));
         assert!(!u.unix(1234, 1234), "a user the ACLs don't list");
         assert!(Admit::Any.tcp("192.0.2.1".parse().unwrap()) && Admit::Any.unix(1, 1));
+        // --listen keeps the pool's rule, or refuses: never drops it.
+        let (tcp, unix) = (Listen::Tcp("127.0.0.1:9000".into()), Listen::Unix("/run/x.sock".into()));
+        assert_eq!(listen_admit(&tcp, &a), Ok(a.clone()));
+        assert_eq!(listen_admit(&unix, &u), Ok(u.clone()));
+        assert!(listen_admit(&unix, &a).expect_err("allowed_clients on a unix socket").contains("allowed_clients"));
+        assert!(listen_admit(&tcp, &u).expect_err("ACLs on TCP").contains("acl_users"));
+        assert_eq!(listen_admit(&tcp, &Admit::Any), Ok(Admit::Any));
+        assert!(jail::bind_socket_only(Path::new("/run")) && jail::bind_socket_only(Path::new("/tmp/")) && jail::bind_socket_only(Path::new("/")));
+        assert!(!jail::bind_socket_only(Path::new("/run/mysqld")), "a socket's own folder is bound as a folder");
     }
 
     #[test]
@@ -3650,7 +3785,7 @@ mod tests {
         );
         let mut p = plan(&l, &opts()).expect("plan");
         // A forwarded 3306 is PHP's `localhost` too: sockets in the guest.
-        assert_eq!(resolve_db(&mut p, None, &[], &|_| Err("never asked".into())), Ok(None), "3306 has its socket: nothing to decide");
+        assert_eq!(resolve_db(&mut p, None, &[], &DbApproved::default(), &|_, _| Err("never asked".into())), Ok(None), "3306 has its socket: nothing to decide");
         assert_eq!(p.guest_socks, [(3306, "/run/mysqld/mysqld.sock".to_owned())]);
         assert_eq!(p.disks.len(), 1);
         assert_eq!(p.disks[0].guest, "/var/www/html/wp-content/uploads", "a folder in the root, at the guest root");

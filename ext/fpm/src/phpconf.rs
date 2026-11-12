@@ -460,6 +460,11 @@ pub fn parse_phpinfo(text: &str) -> BTreeMap<String, String> {
 /// php-fpm gets too). `None` for anything else: the database is then where an explicit
 /// `connect` entry says, or reached by name.
 pub fn wp_db_host(text: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    // PHP's comments out first (`/* … */`, `// …` and `# …` to the end of the line, outside
+    // strings), then the last define: a later define of a constant is what PHP keeps reading
+    // (it warns, and the first one stands), so only the first one counts.
+    let code = strip_php_comments(text);
+    let text = code.as_str();
     let lit = |s: &str| {
         let s = s.trim();
         let q = s.chars().next().filter(|c| *c == '\'' || *c == '"')?;
@@ -467,19 +472,9 @@ pub fn wp_db_host(text: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<St
         let end = body.find(q)?;
         Some(body[..end].to_owned())
     };
-    for (i, _) in text.match_indices("define") {
-        let rest = text[i + 6..].trim_start();
-        let Some(args) = rest.strip_prefix('(') else { continue };
-        let args = args.trim_start();
-        let name_ok = args.starts_with("'DB_HOST'") || args.starts_with("\"DB_HOST\"");
-        if !name_ok {
-            continue;
-        }
-        let expr = args[9..].trim_start().strip_prefix(',')?.trim_start();
-        // The expression up to the define's closing parenthesis on this line.
-        let line = expr.lines().next().unwrap_or("");
-        if let Some(v) = lit(line).filter(|_| line.starts_with(['\'', '"'])) {
-            return Some(v);
+    let value = |line: &str| -> Option<String> {
+        if line.starts_with(['\'', '"']) {
+            return lit(line);
         }
         for f in ["getenv_docker(", "getenv("] {
             if let Some(call) = line.strip_prefix(f) {
@@ -491,9 +486,77 @@ pub fn wp_db_host(text: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<St
                 return parts.next().and_then(lit);
             }
         }
-        return None;
+        None
+    };
+    let mut found: Vec<Option<String>> = Vec::new();
+    for (i, _) in text.match_indices("define") {
+        let rest = text[i + 6..].trim_start();
+        let Some(args) = rest.strip_prefix('(') else { continue };
+        let args = args.trim_start();
+        if !(args.starts_with("'DB_HOST'") || args.starts_with("\"DB_HOST\"")) {
+            continue;
+        }
+        let Some(expr) = args[9..].trim_start().strip_prefix(',') else {
+            found.push(None);
+            continue;
+        };
+        // The expression up to the define's closing parenthesis on this line.
+        found.push(value(expr.trim_start().lines().next().unwrap_or("")));
     }
-    None
+    // PHP keeps the first define that runs; which one runs (an `if` around it) isn't known
+    // here, so two defines that disagree, or one that can't be read, are no answer at all.
+    match found.split_first() {
+        Some((first, rest)) if first.is_some() && rest.iter().all(|v| v == first) => first.clone(),
+        _ => None,
+    }
+}
+
+/// PHP source without its comments: `/* … */`, and `// …` / `# …` to the end of the line, none of
+/// them inside a quoted string. Line breaks are kept.
+pub fn strip_php_comments(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = quote {
+            let ch_len = s[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&s[i..i + ch_len]);
+            if c == b'\\' && i + 1 < b.len() {
+                let n = s[i + 1..].chars().next().map_or(1, char::len_utf8);
+                out.push_str(&s[i + 1..i + 1 + n]);
+                i += 1 + n;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += ch_len;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => {
+                quote = Some(c);
+                out.push(c as char);
+                i += 1;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let end = s[i + 2..].find("*/").map_or(b.len(), |e| i + 2 + e + 2);
+                out.extend(s[i..end].chars().filter(|c| *c == '\n'));
+                i = end;
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => i = s[i..].find('\n').map_or(b.len(), |e| i + e),
+            b'#' if b.get(i + 1) != Some(&b'[') => i = s[i..].find('\n').map_or(b.len(), |e| i + e),
+            _ => {
+                // Bytes as they are: the source may not be ASCII, and only ASCII is looked at.
+                let ch_len = s[i..].chars().next().map_or(1, char::len_utf8);
+                out.push_str(&s[i..i + ch_len]);
+                i += ch_len;
+            }
+        }
+    }
+    out
 }
 
 /// The MySQL default sockets PHP's own settings name (where `localhost` goes for mysqli, PDO
@@ -561,6 +624,14 @@ mod tests {
         assert_eq!(wp_db_host(docker, &env).as_deref(), Some("localhost"), "the launcher's environment");
         assert_eq!(wp_db_host("define('DB_HOST', $cfg['host']);", &none), None, "anything else: unknown");
         assert_eq!(wp_db_host("define('DB_NAME', 'wp');", &none), None);
+        // Comments are PHP's: a commented-out define is never read.
+        let commented = "<?php\n// define('DB_HOST', '127.0.0.1:6379');\n# define('DB_HOST', '127.0.0.1:2375');\n/* define('DB_HOST', 'x');\n */\ndefine('DB_HOST', 'localhost'); // trailing\n";
+        assert_eq!(wp_db_host(commented, &none).as_deref(), Some("localhost"), "the one define not in a comment");
+        assert_eq!(wp_db_host("define('DB_HOST', 'a//b#c');", &none).as_deref(), Some("a//b#c"), "comment marks inside a string are the string's");
+        // Two defines that disagree (one may sit in an `if`): no answer, never a guess.
+        assert_eq!(wp_db_host("define('DB_HOST', 'localhost');\ndefine('DB_HOST', '127.0.0.1:6379');", &none), None);
+        assert_eq!(wp_db_host("define('DB_HOST', 'localhost');\ndefine('DB_HOST', 'localhost');", &none).as_deref(), Some("localhost"));
+        assert_eq!(strip_php_comments("a /* x\ny */ b // c\nd"), "a \n b \nd");
     }
 
     #[test]

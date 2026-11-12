@@ -346,6 +346,10 @@ stack_up() {
     # The microVM mounts a disk at each writable folder inside the root, so they must exist.
     mkdir -p "$_site/wp-content/uploads" "$_site/wp-content/cache"
     chown 33:33 "$_site/wp-content/uploads" "$_site/wp-content/cache"
+    # The record of the php container's unpackaged files, as the installer writes it (#101; a
+    # start never writes it).
+    "$mvm_fpm" --check-capture --php-root "$(mvm_php_root)" --write-record "$tdir/unpackaged.json" > "$tdir/record.log" 2>&1 \
+      || { echo "FAIL recording the unpackaged files: $(tail -2 "$tdir/record.log" | tr '\n' ' ')"; exit 1; }
   fi
   put ext/examples/wordpress.json
   if on_microvm; then
