@@ -27,33 +27,31 @@
 #      case goes through, the loop holds the page for its 8 s and the memory probe kills the page.
 # Exits non-zero on any failure. Writes .tmp/ext-layer3/. Restores examples/wordpress.json and
 # removes the fixtures at the end.
+# On the microVM target (SC_TARGET=microvm, test/lib/target.sh) the helper and its children run
+# in the guest (Landlock in the guest's kernel). The helper's /proc check is n/a there (the
+# guest's processes aren't the php container's). In the revert run, layer 1 still holds in the
+# guest: the plugin folder is on its read-only site disk, and the guest has no name `db` (its
+# database is 127.0.0.1:3306), so those two cases are checked as BLOCKED / n/a.
 #   DOCKER_CONTEXT=colima test/ext-config.sh && DOCKER_CONTEXT=colima test/ext-layer3.sh
 set -u
 cd "$(dirname "$0")/.." || exit 1
 project=${SECURECORE_EXT_PROJECT:-securecore-ext}
 port=${SECURECORE_EXT_PORT:-8089}
-base=http://127.0.0.1:$port
 dir=.tmp/ext-layer3
 mkdir -p "$dir"
 find "$dir" -mindepth 1 -delete 2>/dev/null
-html=/var/www/html
-conf=$html/securecore.json
+. test/lib/target.sh
 content=$html/wp-content
 probe=$content/plugins/sc-l3probe
 fails=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
 is() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$3" "got '$1', want '$2'"; fi; }
-compose() { SECURECORE_PORT=$port docker compose -f docker/compose.yml -f docker/compose.ext.yml -p "$project" "$@"; }
 wp() { compose run --rm -T cli wp "$@" 2>>"$dir/wp.err" | tr -d '\r'; }
 in_php() { compose exec -T php sh -c "$1"; }
-code() { curl -s -o /dev/null -w '%{http_code}' "$base$1"; }
-now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # The login page: the front page lists the probe posts, and in the revert run the memory probe
 # kills any page that renders it.
-wait_200() { i=0; until [ "$(code /wp-login.php)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 60 ] || return 1; sleep 1; done; }
-put_live() { compose exec -T php sh -c "cat > $conf.new && mv $conf.new $conf" < "$1"; }
-phplog() { compose logs --no-log-prefix --since "$1" php 2>&1; }
+wait_login() { wait_200 /wp-login.php; }
 # has <since> <substring> <label>: php-fpm's log (the helper's included) has a securecore line with it.
 has() { if phplog "$1" | grep -F 'securecore: ' | grep -qF -- "$2"; then pass "$3"; else fail "$3" "no securecore line matching '$2'"; fi; }
 # haslog <since> <substring> <label>: any line of php-fpm's log (PHP's own errors from the child).
@@ -70,7 +68,7 @@ pid_after() { sed -n "s/.*$2\([0-9][0-9]*\).*/\1/p" "$dir/$1" | head -1; }
 verdict() { sed -n "s/^$2=//p" "$dir/$1" | head -1; }
 want() { v=$(verdict "$1" "$2"); if [ "$v" = "$3" ]; then pass "$4: $2 is $3"; else fail "$4: $2 is $3" "got '$v'"; fi; }
 
-[ "$(code /)" = 200 ] || { echo "FAIL the extension stack is not up on $base: run test/ext-config.sh first"; exit 1; }
+stack_is_up
 
 # --- fixtures --------------------------------------------------------------------------------
 in_php "rm -rf $probe $content/plugins/sc-l3-neighbour.php && mkdir -p $probe $content/uploads/sc-l3probe"
@@ -139,9 +137,9 @@ cleanup() {
   wp option update blogname SecureCore >/dev/null 2>&1
   db_exec "DROP TABLE IF EXISTS wp_sc_l3db_items, wp_sc_l3_neighbour_data; DELETE FROM wp_options WHERE option_name LIKE 'sc\\_l3db\\_%' OR option_name LIKE '\\_transient\\_%sc\\_l3db%' OR option_name = 'sc_l3_neighbour_mark'"
   in_php "rm -rf $probe $content/plugins/sc-l3-neighbour.php $content/plugins/sc-l3db.php $content/uploads/sc-l3db $content/uploads/sc-l3probe $content/uploads/sc-l3-up.txt"
-  compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
-  compose restart php >/dev/null 2>&1
-  wait_200 || echo "FAIL php-fpm did not come back after cleanup"
+  put ext/examples/wordpress.json
+  php_restart >/dev/null 2>&1
+  wait_login || echo "FAIL php-fpm did not come back after cleanup"
 }
 trap cleanup EXIT
 
@@ -172,9 +170,9 @@ cfg revert log false
 
 # use <config>: install it and restart php-fpm (the helper starts with php-fpm), wait for 200.
 use() {
-  compose cp "$dir/$1.json" "php:$conf" >>"$dir/cp.log" 2>&1
-  compose restart php >/dev/null 2>&1
-  wait_200 || fail "$1: php-fpm serves 200 after the restart"
+  put "$dir/$1.json"
+  php_restart >/dev/null 2>&1
+  wait_login || fail "$1: php-fpm serves 200 after the restart"
 }
 login() {
   rm -f "$dir/jar"
@@ -210,10 +208,15 @@ get dash "/wp-admin/"
 is "$(status_of dash)" 200 "on: the dashboard renders"
 contains dash 'id="dolly"' "on: Hello Dolly (isolated) prints its lyric on the dashboard"
 # The helper: never root once serving, and an empty environment (no DB password, no salts).
-in_php 'for p in /proc/[0-9]*; do if [ "$(cat $p/comm 2>/dev/null)" = php ] && tr "\0" " " < $p/cmdline 2>/dev/null | grep -q "securecore.layer3_role=helper"; then echo "$(basename $p) $(sed -n "s/^Uid:[[:space:]]*\([0-9]*\).*/\1/p" $p/status) $(tr "\0" "\n" < $p/environ | grep -c .)"; fi; done' > "$dir/helpers"
-if [ -s "$dir/helpers" ]; then pass "on: helper processes exist ($(wc -l < "$dir/helpers"))"; else fail "on: helper processes exist"; fi
-is "$(awk '$2 != 33' "$dir/helpers" | grep -c .)" 0 "on: every helper process runs as www-data (uid 33)"
-is "$(awk '$3 != 0' "$dir/helpers" | grep -c .)" 0 "on: every helper process has an empty environment"
+if on_microvm; then
+  why="the helper runs in the guest; /proc here is the php container's (the guest has no exec channel)"
+  for l in "on: helper processes exist" "on: every helper process runs as www-data (uid 33)" "on: every helper process has an empty environment"; do na "$l" "$why"; done
+else
+  in_php 'for p in /proc/[0-9]*; do if [ "$(cat $p/comm 2>/dev/null)" = php ] && tr "\0" " " < $p/cmdline 2>/dev/null | grep -q "securecore.layer3_role=helper"; then echo "$(basename $p) $(sed -n "s/^Uid:[[:space:]]*\([0-9]*\).*/\1/p" $p/status) $(tr "\0" "\n" < $p/environ | grep -c .)"; fi; done' > "$dir/helpers"
+  if [ -s "$dir/helpers" ]; then pass "on: helper processes exist ($(wc -l < "$dir/helpers"))"; else fail "on: helper processes exist"; fi
+  is "$(awk '$2 != 33' "$dir/helpers" | grep -c .)" 0 "on: every helper process runs as www-data (uid 33)"
+  is "$(awk '$3 != 0' "$dir/helpers" | grep -c .)" 0 "on: every helper process has an empty environment"
+fi
 # A core option change: the helper re-boots from the new snapshot, so the child sees it.
 wp option update blogname "SC-L3-Renamed" >/dev/null
 get renamed "/?p=$p_main"
@@ -359,6 +362,9 @@ lacks sleeps "slept=" "time cap: the call did not finish"
 s=$(cut -d' ' -f2 "$dir/sleeps.meta")
 if awk "BEGIN { exit !($s < 1.85) }"; then pass "time cap: the second statement was cut at the time left ($s s)"; else fail "time cap: the second statement was cut at the time left" "$s s"; fi
 # The secrets: the child has no database password, in its environment or its memory.
+if on_microvm; then
+  na "secrets: the child's environment and memory scanned for the DB password" "the child runs in the guest; the scan reads /proc in the php container"
+else
 scan_secrets secrets
 want secrets isolated 1 "secrets"
 want secrets scanned yes "secrets: the process was scanned while it ran the call"
@@ -371,6 +377,7 @@ if [ -n "$bytes" ] && [ "$bytes" -gt 4000000 ]; then pass "secrets: read $bytes 
 scan_is secrets found_0 0 "secrets: the DB password is nowhere in the child's memory"
 scan_is secrets found_1 0 "secrets: nor a salt"
 if [ "$(scan_val secrets found_2)" -gt 0 ] 2>/dev/null; then pass "secrets: control: the scan finds WordPress's strings in it"; else fail "secrets: control: the scan finds WordPress's strings" "$(scan_val secrets found_2)"; fi
+fi
 
 # --- 2. the limits ---------------------------------------------------------------------------
 echo "# limits (timeoutMs 1500, memoryMb 64, write: uploads/sc-l3probe)"
@@ -457,20 +464,31 @@ get rmain "/?p=$p_main"
 contains rmain 'probe-in-worker' "revert: the probe's code is in the worker"
 is "$(pid_after rmain 'l3 filter pid=')" "$(pid_after rmain 'neighbour pid=')" "revert: the filter ran in the worker"
 get rprobe "/?p=$p_probe"
-for c in write-own write-uploads write-plugin-dir read-config read-securecore-json net-db; do want rprobe "$c" OK "revert"; done
+if on_microvm; then
+  for c in write-own write-uploads read-config read-securecore-json; do want rprobe "$c" OK "revert"; done
+  want rprobe write-plugin-dir BLOCKED "revert (layer 1: the guest's site disk is read-only)"
+  na "revert: net-db is OK" "the probe connects to the name db, which the guest doesn't have (its database is 127.0.0.1:3306 through the host)"
+else
+  for c in write-own write-uploads write-plugin-dir read-config read-securecore-json net-db; do want rprobe "$c" OK "revert"; done
+fi
 get rloop "/?p=$p_loop"
 contains rloop "loop-finished" "revert: the loop ran to the end"
 if [ "$(secs_of rloop)" -ge 7 ]; then pass "revert: the loop held the page for $(cut -d' ' -f2 "$dir/rloop.meta") s"; else fail "revert: the loop held the page for 8 s" "$(cut -d' ' -f2 "$dir/rloop.meta") s"; fi
 get rmem "/?p=$p_mem"
 if [ "$(status_of rmem)" != 200 ] || ! grep -qF SC-L3-AFTER-MEMORY "$dir/rmem"; then pass "revert: too much memory kills the page ($(status_of rmem))"; else fail "revert: too much memory kills the page" "200 with content"; fi
 # The secrets' control: the same scan of the worker serving the call does find the DB password.
-scan_secrets rsecrets
-want rsecrets isolated 0 "revert: the secrets probe runs in the worker"
-n=$(scan_val rsecrets found_0)
-if [ -n "$n" ] && [ "$n" -gt 0 ]; then pass "revert: the worker's memory holds the DB password ($n times), so the scan finds it"; else fail "revert: the worker's memory holds the DB password" "'$n'"; fi
+if on_microvm; then
+  na "revert: the worker's memory scan finds the DB password" "the worker runs in the guest"
+else
+  scan_secrets rsecrets
+  want rsecrets isolated 0 "revert: the secrets probe runs in the worker"
+  n=$(scan_val rsecrets found_0)
+  if [ -n "$n" ] && [ "$n" -gt 0 ]; then pass "revert: the worker's memory holds the DB password ($n times), so the scan finds it"; else fail "revert: the worker's memory holds the DB password" "'$n'"; fi
+fi
 get rdbl2 "/?page_id=$d_l2"
 for c in core-table statement cross-plugin; do want rdbl2 "$c" OK "revert (layer 2 log): db"; done
 
 echo
+na_summary
 if [ "$fails" -eq 0 ]; then echo "all ext-layer3 checks passed"; else echo "$fails check(s) failed"; fi
 [ "$fails" -eq 0 ]

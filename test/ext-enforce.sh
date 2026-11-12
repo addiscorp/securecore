@@ -13,17 +13,19 @@
 #      protected file, ungranted paths and securecore_status() stay BLOCKED.
 # Exits non-zero on any failure. Writes .tmp/ext-enforce/. Restores examples/wordpress.json and
 # removes the fixture at the end.
+# On the microVM target (SC_TARGET=microvm, test/lib/target.sh) layer 1 is the guest's: its site
+# disk is read-only, so in log/off/granted the writes outside uploads, cache and /tmp are refused
+# by layer 1 instead of going through (checked as such); the symlink-escape fixtures can't exist
+# in the guest (the folder sync never pushes a host symlink, #72), so those cases are n/a.
 #   DOCKER_CONTEXT=colima test/ext-config.sh && DOCKER_CONTEXT=colima test/ext-enforce.sh
 set -u
 cd "$(dirname "$0")/.." || exit 1
 project=${SECURECORE_EXT_PROJECT:-securecore-ext}
 port=${SECURECORE_EXT_PORT:-8089}
-base=http://127.0.0.1:$port
 dir=.tmp/ext-enforce
 mkdir -p "$dir"
 find "$dir" -mindepth 1 -delete 2>/dev/null
-html=/var/www/html
-conf=$html/securecore.json
+. test/lib/target.sh
 content=$html/wp-content
 plugin=$content/plugins/securecore-enforce
 victim=$content/sc-enf-victim.txt
@@ -34,20 +36,23 @@ escapedir=$content/sc-enf-escape-dir
 fails=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
-compose() { SECURECORE_PORT=$port docker compose -f docker/compose.yml -f docker/compose.ext.yml -p "$project" "$@"; }
 wp() { compose run --rm -T cli wp "$@" 2>>"$dir/wp.err" | tr -d '\r'; }
 in_php() { compose exec -T php sh -c "$1"; }
-code() { curl -s -o /dev/null -w '%{http_code}' "$base$1"; }
-now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-wait_200() { i=0; until [ "$(code /)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 60 ] || return 1; sleep 1; done; }
-put_live() { compose exec -T php sh -c "cat > $conf.new && mv $conf.new $conf" < "$1"; }
-# The audit lines php-fpm logged since <time>, prefix stripped: "layer2 <mode> <component> <op> <rule> <path>".
-audit() { compose logs --no-log-prefix --since "$1" php 2>&1 | sed -n 's/.*securecore: //p' | grep '^layer2 '; }
+# The audit lines php-fpm logged since <mark>, prefix stripped: "layer2 <mode> <component> <op> <rule> <path>".
+audit() { phplog "$1" | sed -n 's/.*securecore: //p' | grep '^layer2 '; }
 # has <since> <substring> <label>: a layer2 line since <since> contains <substring>.
 has() { if audit "$1" | grep -qF "$2"; then pass "$3"; else fail "$3" "no layer2 line matching '$2'"; fi; }
 hasnt() { if audit "$1" | grep -qF "$2"; then fail "$3" "unexpected line '$2'"; else pass "$3"; fi; }
+# The cases a symlink fixture in uploads drives: the folder sync never pushes a host symlink into
+# the guest (#72), so on the microVM they'd test a plain file instead.
+symlinked="symlink-dangling-write mkdir-escape symlink-chain-write"
+# The cases that write the site outside uploads, cache and /tmp (or hard-link across into
+# uploads): layer 1 refuses them in the guest whatever layer 2 says (its site disk is read-only).
+# include-outside: /opt/sc-enf-out.php is the php container's; the guest's root has none.
+l1_refused="write-own fopen-write-own unlink-core mkdir-core rename-core symlink-write link-protected include-outside"
+listed() { case " $2 " in *" $1 "*) return 0 ;; esac; return 1; }
 
-[ "$(code /)" = 200 ] || { echo "FAIL the extension stack is not up on $base: run test/ext-config.sh first"; exit 1; }
+stack_is_up
 
 # --- fixtures --------------------------------------------------------------------------------
 in_php "rm -rf $plugin && mkdir -p $plugin/inc"
@@ -61,13 +66,13 @@ wp plugin activate securecore-enforce >/dev/null
 cleanup() {
   wp plugin deactivate securecore-enforce >/dev/null 2>&1
   in_php "rm -rf $plugin $victim $renamef $renamef.moved $hardlink $content/sc-enf-newdir /opt/sc-enf-out.php /tmp/sc-enf.txt $content/uploads/sc-enf $escape $escapedir"
-  compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
-  compose restart php >/dev/null 2>&1
+  put ext/examples/wordpress.json
+  php_restart >/dev/null 2>&1
   wait_200 || echo "FAIL php-fpm did not come back after cleanup"
 }
 trap cleanup EXIT
 
-# --- config variants (layer 2 only; layers 1 and 3 are inert on this stack) -------------------
+# --- config variants (layer 2 only; layers 1 and 3 are inert on the docker target) -----------
 base_cfg() { # $1 = mode, $2 = components object body
   cat > "$dir/$3.json" <<JSON
 {
@@ -88,27 +93,41 @@ base_cfg log     ''        log
 base_cfg off     ''        off
 base_cfg enforce "$grant"  granted
 
-# run <config> : apply it, recreate the victim, fetch the report into $dir/out, return the log window start.
+# run <config> : recreate the victim, apply the config, fetch the report into $dir/out, return the
+# log window start. (The fixtures first: on the microVM the config's restart is what brings them
+# into the guest.)
 run() {
-  put_live "$dir/$1.json"
-  sleep 1.3 # > RELOAD_INTERVAL, so every worker has the new config
   in_php "printf victim > $victim && printf rn > $renamef && ln -f $html/wp-config.php $hardlink && chown www-data:www-data $victim $renamef"
   # Escape fixtures under uploads, each pointing where the lexical path does not: a dangling symlink,
   # a dir symlink outside uploads, and a 9-deep symlink chain (one past SYMLINK_FOLLOW_MAX = 8). The
   # write/mkdir probes must resolve the first two; the chain must be refused as unresolvable, not
   # guessed from its lexical path.
-  in_php "d=$content/uploads/sc-enf; rm -rf \$d/dangle \$d/esc-dir-link \$d/chain* \$d/chaindst $escape $escapedir; mkdir -p \$d $escapedir; chown -R www-data:www-data \$d $escapedir; ln -s $escape \$d/dangle; ln -s $escapedir \$d/esc-dir-link; for i in 1 2 3 4 5 6 7 8; do ln -s chain\$((i+1)) \$d/chain\$i; done; ln -s chaindst \$d/chain9"
+  # (Not on the microVM, where those cases are n/a: the folder sync never pushes a host symlink.)
+  on_microvm || in_php "d=$content/uploads/sc-enf; rm -rf \$d/dangle \$d/esc-dir-link \$d/chain* \$d/chaindst $escape $escapedir; mkdir -p \$d $escapedir; chown -R www-data:www-data \$d $escapedir; ln -s $escape \$d/dangle; ln -s $escapedir \$d/esc-dir-link; for i in 1 2 3 4 5 6 7 8; do ln -s chain\$((i+1)) \$d/chain\$i; done; ln -s chaindst \$d/chain9"
+  put_live "$dir/$1.json"
+  sleep 1.3 # > RELOAD_INTERVAL, so every worker has the new config
   T=$(now); sleep 1
   curl -s "$base/?sc_enf=run" > "$dir/out.$1"
   sleep 1
 }
 # verdict <config> <case> : the plugin's OK/BLOCKED for a case.
 verdict() { sed -n "s/^$2=//p" "$dir/out.$1"; }
-# want <config> <case> <OK|BLOCKED> : assert the verdict.
+# want <config> <case> <OK|BLOCKED> : assert the verdict. On the microVM: a symlink-fixture case is
+# n/a, and an OK for a case layer 1 refuses in the guest is BLOCKED there.
 want() {
+  w=$3 why=""
+  if on_microvm; then
+    if listed "$2" "$symlinked"; then
+      na "$1: $2 is $3" "the case needs a symlink fixture in uploads, and the folder sync never pushes a host symlink into the guest (#72)"
+      return
+    fi
+    if [ "$w" = OK ] && listed "$2" "$l1_refused"; then w=BLOCKED why=" (by layer 1: the guest's site disk is read-only / has no /opt file)"; fi
+  fi
   v=$(verdict "$1" "$2")
-  if [ "$v" = "$3" ]; then pass "$1: $2 is $3"; else fail "$1: $2 is $3" "got '$v'"; fi
+  if [ "$v" = "$w" ]; then pass "$1: $2 is $w$why"; else fail "$1: $2 is $w$why" "got '$v'"; fi
 }
+# has_ <since> <substring> <label>: has, except n/a on the microVM for a symlink-fixture line.
+has_() { if on_microvm; then na "$3" "the symlink fixture can't reach the guest (#72's sync never pushes a host symlink)"; else has "$@"; fi; }
 
 # --- 1. enforce, ungranted -------------------------------------------------------------------
 echo "# enforce (ungranted)"
@@ -129,9 +148,9 @@ has "$T" "layer2 enforce plugin:securecore-enforce securecore_status core-only" 
 has "$T" "layer2 enforce plugin:securecore-enforce link-target read-protected $html/wp-config.php" "enforce: hard-linking a protected file is refused (1c)"
 has "$T" "layer2 enforce plugin:securecore-enforce open read-protected $hardlink" "enforce: a hard link to a protected file is caught by inode (1b)"
 has "$T" "layer2 enforce plugin:securecore-enforce symlink-target write $escape" "enforce: a symlink target outside the writable area is refused (item 1, create)"
-has "$T" "layer2 enforce plugin:securecore-enforce open write $escape" "enforce: a write through a dangling symlink resolves to its target (item 1, write)"
-has "$T" "layer2 enforce plugin:securecore-enforce mkdir write $escapedir/a/b" "enforce: a recursive mkdir through a symlink resolves to the real folder (item 2)"
-has "$T" "layer2 enforce plugin:securecore-enforce open unresolvable $content/uploads/sc-enf/chain1" "enforce: a write past the symlink hop limit is refused as unresolvable (hop limit)"
+has_ "$T" "layer2 enforce plugin:securecore-enforce open write $escape" "enforce: a write through a dangling symlink resolves to its target (item 1, write)"
+has_ "$T" "layer2 enforce plugin:securecore-enforce mkdir write $escapedir/a/b" "enforce: a recursive mkdir through a symlink resolves to the real folder (item 2)"
+has_ "$T" "layer2 enforce plugin:securecore-enforce open unresolvable $content/uploads/sc-enf/chain1" "enforce: a write past the symlink hop limit is refused as unresolvable (hop limit)"
 
 # --- 2. log mode: the revert proof — the same ops now all succeed ----------------------------
 echo "# log (nothing blocked)"
@@ -144,9 +163,9 @@ for c in read-own read-config read-etc fopen-read-etc scandir-etc write-uploads 
 done
 has "$T" "layer2 log plugin:securecore-enforce open read-protected $html/wp-config.php" "log: the would-be refusal is recorded, mode log"
 has "$T" "layer2 log plugin:securecore-enforce open read-protected $hardlink" "log: the hard-link read is recorded (1b), mode log"
-has "$T" "layer2 log plugin:securecore-enforce open write $escape" "log: the dangling-symlink write is recorded (item 1), mode log"
-has "$T" "layer2 log plugin:securecore-enforce mkdir write $escapedir/a/b" "log: the mkdir-through-symlink is recorded (item 2), mode log"
-has "$T" "layer2 log plugin:securecore-enforce open unresolvable $content/uploads/sc-enf/chain1" "log: the over-limit symlink chain is recorded as unresolvable, mode log"
+has_ "$T" "layer2 log plugin:securecore-enforce open write $escape" "log: the dangling-symlink write is recorded (item 1), mode log"
+has_ "$T" "layer2 log plugin:securecore-enforce mkdir write $escapedir/a/b" "log: the mkdir-through-symlink is recorded (item 2), mode log"
+has_ "$T" "layer2 log plugin:securecore-enforce open unresolvable $content/uploads/sc-enf/chain1" "log: the over-limit symlink chain is recorded as unresolvable, mode log"
 has "$T" "layer2 log plugin:securecore-enforce exec exec echo scok" "log: exec would-be refusal recorded"
 
 # --- 3. layer 2 off: everything works, nothing recorded --------------------------------------
@@ -173,5 +192,6 @@ has "$T" "layer2 enforce plugin:securecore-enforce securecore_status core-only" 
 hasnt "$T" "read-outside-root /etc/hostname" "granted: /etc is no longer refused"
 
 echo
+na_summary
 if [ "$fails" -eq 0 ]; then echo "all ext-enforce checks passed"; else echo "$fails check(s) failed"; fi
 [ "$fails" -eq 0 ]

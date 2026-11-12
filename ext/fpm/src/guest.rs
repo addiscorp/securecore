@@ -7,7 +7,9 @@
 //!   out   php-fpm's connect to 127.0.0.1:<port> is a vsock connect to the host on that port
 //!         (libsc-vsock-connect.so, #70), for each port the host forwards (sc.ports); a unix
 //!         socket under /run (sc.sock) reaches the same port through a forwarder here
-//!   log   php-fpm's stdout and stderr → vsock host:1514 (the serial console is too slow)
+//!   log   php-fpm's stdout and stderr, and this init's own lines → vsock host:1514 (the serial
+//!         console is too slow), numbered and held until the host acknowledges them (#86,
+//!         [`crate::guestlog`])
 //!   ctl   vsock 1515: the host's start message, sent after every cold boot and every restore:
 //!         the clock, then the writable disks to mount; and `sync` before it stops the VM
 //!         (see [`Ctl`])
@@ -21,7 +23,7 @@
 
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
@@ -169,7 +171,76 @@ pub enum Ctl {
     /// The handshake, alone on its connection before the start message: the host's protocol.
     /// `ok` only when it is this init's own and the one it booted with (`sc.proto`).
     Proto { version: u32 },
+    /// A new `securecore.json` (hex), after the start (#90): put in place of the site disk's
+    /// copy at `<root>/securecore.json`, where the extension's own reload picks it up, as it does
+    /// on a host. The host validated it first.
+    Config { hex: String },
+    /// The site's php.ini settings (hex, the whole file; empty: none), in the start message or
+    /// after it (#90): php-fpm is started again with them (a graceful stop first), as a php.ini
+    /// change needs on a host. The host allows only `securecore.debug_*` keys ([`site_ini`]).
+    Ini { hex: String },
+    /// This VM's log key (hex, [`crate::guestlog::KEY_LEN`] bytes): the host takes the log only
+    /// from connections that present it (#86). Alone on its connection, at any time; only the
+    /// host can reach this port, and no other process in the guest learns the key.
+    LogKey { hex: String },
+    /// A question, alone on its connection: the sha256 of the config the guest's extension reads
+    /// now, answered `sha <hex>` (#90 review: a delivery whose reply was lost is decided by it).
+    ConfigSha,
     Done,
+}
+
+/// The largest `securecore.json` the host delivers (bytes).
+pub const MAX_CONFIG: usize = crate::sitefile::MAX_CONFIG;
+/// Where the guest keeps delivered configs and the site's ini.
+const LIVE_DIR: &str = "/run/securecore";
+/// php-fpm's extra ini folder, after the image's own: the site's settings ([`Ctl::Ini`]).
+pub const SITE_INI_DIR: &str = "/run/securecore/conf.d";
+/// The image's ini folder (PHP's compiled-in scan dir in the official images).
+pub const IMAGE_INI: &str = "/usr/local/etc/php/conf.d";
+/// At most this many configs are delivered into one running guest: each is a file mounted over
+/// the one before it (the swap is atomic for the extension's readers), so they stack, each file
+/// kept in the guest's memory: at most 200 × [`MAX_CONFIG`] (25 MiB), a few hundred KiB for
+/// configs of the usual size. A restart starts the count again.
+pub const MAX_CONFIG_SWAPS: usize = 200;
+
+/// A value a site's php.ini setting may have in the guest: `[a-z0-9_.,:-]{0,64}`.
+pub fn site_ini_value_ok(value: &str) -> bool {
+    value.len() <= 64 && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.,:-".contains(&b))
+}
+
+/// The settings a site's php.ini may give the guest's php-fpm (#90): the extension's per-site
+/// debug settings only, with plain-word values ([`site_ini_value_ok`]). Everything else in
+/// php.ini is the image's (the same for every site); a line setting anything else, or that
+/// isn't `key = value`, is refused with the reason, which never quotes the file. Returns the
+/// file as the guest writes it.
+pub fn site_ini(text: &str) -> Result<String, String> {
+    let mut out = String::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        // Nothing from the file is ever quoted back (#90 review): a refused line could hold
+        // anything, a secret among it, and the reason goes to the launcher's log.
+        let n = n + 1;
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("line {n}: not `key = value`"));
+        };
+        let (key, value) = (key.trim(), value.trim());
+        let ok = key.strip_prefix("securecore.debug_").is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+        if !ok {
+            return Err(format!(
+                "line {n}: a site's php.ini may set only the extension's securecore.debug_* settings in the guest (the rest of php.ini is the guest image's)"
+            ));
+        }
+        // Plain words only: PHP's ini parser expands ${VAR} from php-fpm's environment, where the
+        // vault's secrets are, and quotes would let a value say more than a word (#90 review).
+        if !site_ini_value_ok(value) {
+            return Err(format!("line {n}: {key}: a value may hold only a-z, 0-9 and _ . , : - (at most 64)"));
+        }
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+    Ok(out)
 }
 
 impl Ctl {
@@ -184,6 +255,11 @@ impl Ctl {
             Ctl::Sync => "sync\n".into(),
             Ctl::Reload => "reload\n".into(),
             Ctl::Proto { version } => format!("proto {version}\n"),
+            Ctl::Config { hex } => format!("config {hex}\n"),
+            Ctl::Ini { hex } if hex.is_empty() => "ini\n".into(),
+            Ctl::Ini { hex } => format!("ini {hex}\n"),
+            Ctl::LogKey { hex } => format!("logkey {hex}\n"),
+            Ctl::ConfigSha => "configsha\n".into(),
             Ctl::Done => "done\n".into(),
         }
     }
@@ -206,6 +282,16 @@ impl Ctl {
             ["sync"] => Ok(Ctl::Sync),
             ["reload"] => Ok(Ctl::Reload),
             ["proto", v] => Ok(Ctl::Proto { version: v.parse().map_err(|_| format!("proto: {v}"))? }),
+            ["config", hex] if hex.len() % 2 == 0 && hex.len() <= 2 * MAX_CONFIG && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                Ok(Ctl::Config { hex: (*hex).into() })
+            }
+            ["ini", hex] if hex.len() % 2 == 0 && hex.len() <= 2 * MAX_CONFIG && hex.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(Ctl::Ini { hex: (*hex).into() }),
+            ["ini"] => Ok(Ctl::Ini { hex: String::new() }),
+            ["config" | "ini", ..] => Err(format!("a malformed {} line", words[0])),
+            ["logkey", hex] if hex.len() == 2 * crate::guestlog::KEY_LEN && hex.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(Ctl::LogKey { hex: (*hex).into() }),
+            // Never echo it: it is a secret.
+            ["logkey", ..] => Err("a malformed logkey line".into()),
+            ["configsha"] => Ok(Ctl::ConfigSha),
             ["done"] => Ok(Ctl::Done),
             // Never echo an env line: it carries a secret.
             ["env", ..] => Err("a malformed env line".into()),
@@ -229,15 +315,17 @@ pub fn env_name_ok(name: &str) -> bool {
 /// Exactly one start message per boot (a snapshot is taken before it, so each restore takes its
 /// own); after it only `sync` and `reload`, and nothing at all before it but a start.
 pub fn allowed(lines: &[Ctl], started: bool) -> Result<(), String> {
-    if lines.iter().any(|c| matches!(c, Ctl::Proto { .. })) && lines.len() > 1 {
+    if lines.iter().any(|c| matches!(c, Ctl::Proto { .. } | Ctl::LogKey { .. })) && lines.len() > 1 {
         return Err("the handshake comes alone".into());
     }
     let starts = lines.iter().any(Ctl::starts);
-    let others = lines.iter().any(|c| matches!(c, Ctl::Sync | Ctl::Reload));
+    // (`ini` goes with either: at the start, or alone after it.)
+    let others = lines.iter().any(|c| matches!(c, Ctl::Sync | Ctl::Reload | Ctl::Config { .. }));
     match (started, starts, others) {
         (true, true, _) => Err("this boot's start message was already taken".into()),
         (false, false, true) => Err("nothing but the start message before the start message".into()),
-        (false, true, true) => Err("a start message carries no sync or reload".into()),
+        (false, false, false) if lines.iter().any(|c| matches!(c, Ctl::Ini { .. })) => Err("nothing but the start message before the start message".into()),
+        (false, true, true) => Err("a start message carries no sync, reload or config".into()),
         _ => Ok(()),
     }
 }
@@ -435,6 +523,79 @@ pub fn reload(master: &AtomicI32, stop: impl FnOnce(i32), start: impl FnOnce() -
     Ok(())
 }
 
+/// Configs delivered into this guest so far ([`MAX_CONFIG_SWAPS`]).
+static CONFIG_SWAPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Puts `bytes` in place of `<root>/securecore.json` (#90): written to a new file on tmpfs, then
+/// bind-mounted (read-only) over the path, on top of the one before. A reader opens either the
+/// old file or the new one, never a half-written one, and the extension's stat sees a new inode.
+fn put_config(bytes: &[u8]) -> io::Result<()> {
+    let boot = BOOT.get().ok_or_else(|| io::Error::other("no boot settings"))?;
+    if bytes.len() > MAX_CONFIG {
+        return Err(io::Error::other(format!("a config over {MAX_CONFIG} bytes")));
+    }
+    let n = CONFIG_SWAPS.fetch_add(1, Ordering::SeqCst) + 1;
+    if n > MAX_CONFIG_SWAPS {
+        CONFIG_SWAPS.fetch_sub(1, Ordering::SeqCst);
+        return Err(io::Error::other(format!("{MAX_CONFIG_SWAPS} configs were already delivered to this guest; restart the launcher to apply more")));
+    }
+    fs::create_dir_all(LIVE_DIR)?;
+    let file = format!("{LIVE_DIR}/securecore-{n}.json");
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&file)?;
+        f.write_all(bytes)?;
+    }
+    let target = format!("{}/securecore.json", boot.root);
+    // Mounted on the file itself, never through a link (#90 review): the site disk is the site's,
+    // and `<root>/securecore.json` there could be a link to anywhere in the guest. Opened without
+    // following one, it must be a regular file, and the mount goes on that very file.
+    let at = regular_target(&target)?;
+    mount(&file, &fd_path(&at), "", libc::MS_BIND, "")?;
+    // A bind mount takes its flags only on a remount: on the new mount, again by its file.
+    let top = regular_target(&target)?;
+    mount("", &fd_path(&top), "", libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, "")?;
+    // The file stays: the next config is mounted on this one, and Linux refuses a mount on a
+    // file that has been unlinked. (Under /run, which php-fpm's pool user can't write.)
+    Ok(())
+}
+
+/// `path` opened `O_PATH | O_NOFOLLOW`: refused unless it is a regular file itself (a link is
+/// not followed, and is refused).
+pub fn regular_target(path: &str) -> io::Result<OwnedFd> {
+    let c = cstr(path)?;
+    // SAFETY: open(2) with a NUL-terminated path; the fd is owned below.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("{path}: {e}")));
+    }
+    // SAFETY: fd was just returned by open(2).
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let f = fs::File::from(fd);
+    let m = f.metadata().map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
+    if !m.file_type().is_file() {
+        return Err(io::Error::other(format!("{path} is not a regular file (a link, a folder or a device): not replaced")));
+    }
+    Ok(OwnedFd::from(f))
+}
+
+/// `/proc/self/fd/<n>`: the open file itself, for a call that takes a path.
+fn fd_path(fd: &OwnedFd) -> String {
+    format!("/proc/self/fd/{}", fd.as_raw_fd())
+}
+
+/// The sha256 of the config the guest's extension reads now (`<root>/securecore.json`), for the
+/// host to ask after a delivery whose answer it didn't get (#90 review).
+fn config_sha() -> io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    let boot = BOOT.get().ok_or_else(|| io::Error::other("no boot settings"))?;
+    // Never through a link, capped (#90 verification review, N5): the launcher's own reading.
+    let path = format!("{}/securecore.json", boot.root);
+    let bytes = crate::sitefile::read(Path::new(&path), MAX_CONFIG).map_err(io::Error::other)?.ok_or_else(|| io::Error::other(format!("{path}: missing")))?;
+    Ok(hex_of(&Sha256::digest(&bytes)))
+}
+
 /// Applies one control line.
 fn apply(ctl: &Ctl) -> io::Result<()> {
     match ctl {
@@ -476,7 +637,8 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
                 return Err(io::Error::new(e.kind(), format!("{device}: BLKFLSBUF: {e}")));
             }
             drop(dev);
-            mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV, WRITABLE_MOUNT_DATA)?;
+            // noexec (#86 verification review): nothing written to a writable folder runs.
+            mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, WRITABLE_MOUNT_DATA)?;
             WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).push(path.clone());
             // Every file closed after writing is made durable at once, whatever the host's sync
             // is doing (it may be stuck behind a host that doesn't answer).
@@ -488,17 +650,37 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             });
             Ok(())
         }
-        Ctl::Tmpfs { path } => mount("tmpfs", path, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777"),
+        Ctl::Tmpfs { path } => mount("tmpfs", path, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, "mode=1777"),
         Ctl::Sync => {
             // SAFETY: sync(2) takes nothing and can't fail.
             unsafe { libc::sync() };
             // And every change to a writable folder is on the host's copy of it (#72).
-            if WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
-                return Ok(());
+            if !WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
+                let drain = DRAIN.get().ok_or_else(|| io::Error::other("the folder sync never started"))?;
+                drain.wait(SYNC_DRAIN).map_err(|e| io::Error::other(format!("the writable folders did not sync to the host: {e}")))?;
             }
-            let drain = DRAIN.get().ok_or_else(|| io::Error::other("the folder sync never started"))?;
-            drain.wait(SYNC_DRAIN).map_err(|e| io::Error::other(format!("the writable folders did not sync to the host: {e}")))
+            // The host stops the VM after a sync: every log line must be in its log by then, or
+            // counted there as lost (the reply is the launcher's to log).
+            LOG.drain(LOG_DRAIN).map_err(|n| io::Error::other(crate::guestlog::lost(n as u64, crate::guestlog::UNACKED_AT_STOP)))
         }
+        Ctl::Config { hex } => put_config(&unhex(hex)),
+        Ctl::Ini { hex } => {
+            let text = String::from_utf8(unhex(hex)).map_err(|_| io::Error::other("ini: not UTF-8"))?;
+            // Checked again here: the guest takes no php.ini line but the extension's debug ones.
+            let text = site_ini(&text).map_err(io::Error::other)?;
+            fs::create_dir_all(SITE_INI_DIR)?;
+            let path = format!("{SITE_INI_DIR}/zz-site.ini");
+            fs::write(format!("{path}.new"), &text)?;
+            fs::rename(format!("{path}.new"), &path)?;
+            Ok(())
+        }
+        Ctl::LogKey { hex } => {
+            let key: crate::guestlog::Key = unhex(hex).try_into().map_err(|_| io::Error::other("logkey: not a key"))?;
+            LOG.set_key(key);
+            Ok(())
+        }
+        // Answered by serve_ctl itself.
+        Ctl::ConfigSha => Ok(()),
         // Checked before anything is applied ([`protocol_ok`]).
         Ctl::Proto { .. } | Ctl::Done => Ok(()),
     }
@@ -533,6 +715,12 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
     if !done {
         return say("ctl: a control connection closed or timed out before `done`; nothing applied");
     }
+    // The one question: which config the extension reads now.
+    if failed.is_none() && lines == [Ctl::ConfigSha] {
+        let reply = config_sha().map_or_else(|e| format!("error {e}\n"), |sha| format!("sha {sha}\n"));
+        let _ = out.write_all(reply.as_bytes());
+        return;
+    }
     let started = STARTED.load(Ordering::SeqCst);
     if failed.is_none() {
         failed = allowed(&lines, started).err();
@@ -554,13 +742,19 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
         }
     }
     // The delivered environment reaches php-fpm only through a fresh master: the one running
-    // now started at boot (before any start message, so a snapshot holds none of it).
-    if failed.is_none() && lines.iter().any(|c| matches!(c, Ctl::Env { .. })) {
+    // now started at boot (before any start message, so a snapshot holds none of it). The same
+    // for the site's php.ini settings, which PHP reads only at startup.
+    if failed.is_none() && lines.iter().any(|c| matches!(c, Ctl::Env { .. } | Ctl::Ini { .. })) {
         if let Err(e) = apply(&Ctl::Reload) {
             failed = Some(format!("starting php-fpm with the delivered environment: {e}"));
         } else if !fpm_listening(Duration::from_secs(10)) {
             failed = Some(format!("php-fpm with the delivered environment isn't listening on 127.0.0.1:{FPM_PORT}"));
         }
+    } else if failed.is_none() && lines.contains(&Ctl::Reload) && !fpm_listening(Duration::from_secs(10)) {
+        // A reload is done once the fresh php-fpm takes requests, not once it is started: the
+        // host says "reloaded" on this answer, and sends requests on (found by #86's stress on
+        // GitHub's runners, where requests right after a reload met no listener).
+        failed = Some(format!("the reloaded php-fpm isn't listening on 127.0.0.1:{FPM_PORT}"));
     }
     // The host never shows a reply to a message that carried secrets, so the reason is logged
     // here too (no message here ever holds a value: refused env lines are never echoed).
@@ -569,15 +763,30 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
     {
         report(&format!("ctl: the start message was refused: {e}"));
     }
+    // A refusal may end the launcher: the lines that explain it reach its log first.
+    if failed.is_some() {
+        let _ = LOG.drain(LOG_DRAIN);
+    }
     let reply = failed.map_or_else(|| "ok\n".to_owned(), |e| format!("error {e}\n"));
     let _ = out.write_all(reply.as_bytes());
 }
 
+/// Every line for the host's log (php-fpm's output and this init's own), held until the host
+/// acknowledges it (#86): one numbered stream on one connection ([`crate::guestlog`]).
+static LOG: crate::guestlog::Outbox = crate::guestlog::Outbox::new(crate::guestlog::OUTBOX_BYTES);
+/// How long a `sync` waits for the host to have every log line (inside [`SYNC_TIMEOUT`]).
+const LOG_DRAIN: Duration = Duration::from_secs(1);
+
+/// The log's sender, once per boot (a restore resumes it with the snapshot).
+fn start_log() {
+    thread::spawn(|| crate::guestlog::send(&LOG, || Vsock::connect(HOST_CID, LOG_PORT)));
+}
+
 /// One line to the host's log, from this init (the host marks every guest line as the guest's).
 fn report(message: &str) {
-    if let Ok(mut c) = Vsock::connect(HOST_CID, LOG_PORT) {
-        let _ = c.write_all(format!("securecore-init: {message}\n").as_bytes());
-    }
+    // Its own kind of frame: the launcher logs it as `guest-init: `, which php-fpm's lines can't
+    // be (#86 verification review).
+    LOG.init_line(message.as_bytes());
 }
 
 /// Warns once a writable disk passes 90 % (and again past 98 %): beyond it, php-fpm's writes
@@ -608,29 +817,69 @@ fn watch_space() {
     }
 }
 
-/// php-fpm's output to the host, reconnecting when the connection breaks (every restore
-/// resets the guest's vsock connections).
-fn pump_log(mut from: fs::File) {
-    let mut conn: Option<Vsock> = None;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match from.read(&mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
-        };
-        for _ in 0..50 {
-            if conn.is_none() {
-                conn = Vsock::connect(HOST_CID, LOG_PORT).ok();
-            }
-            match conn.as_mut().map(|c| c.write_all(&buf[..n])) {
-                Some(Ok(())) => break,
-                _ => {
-                    conn = None;
-                    thread::sleep(Duration::from_millis(20));
-                }
-            }
+/// php-fpm's output to the host's log, a line at a time ([`LOG`] delivers it). Never blocks on
+/// the host: php-fpm's master writes every worker's lines to this pipe.
+fn pump_log(from: fs::File) {
+    let mut r = BufReader::with_capacity(64 << 10, from);
+    let mut line = Vec::with_capacity(256);
+    while let Some(cut) = crate::guestlog::read_capped(&mut r, &mut line, crate::guestlog::MAX_LINE) {
+        if cut {
+            line.extend_from_slice(" …[cut]".as_bytes());
+        }
+        LOG.line(&line);
+        let mut last = LAST_WORDS.lock().unwrap_or_else(|p| p.into_inner());
+        if last.len() == LAST_WORDS_N {
+            last.pop_front();
+        }
+        last.push_back(String::from_utf8_lossy(&line).into_owned());
+    }
+}
+
+/// php-fpm's last lines, for the console when it exits (#87): the log port may be what failed.
+static LAST_WORDS: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+const LAST_WORDS_N: usize = 20;
+/// Each php-fpm master's log pump, by the master's pid: its exit is explained only once its
+/// output is read to the end.
+static PUMPS: Mutex<Vec<(i32, thread::JoinHandle<()>)>> = Mutex::new(Vec::new());
+/// How long init waits, after php-fpm's master exits, for its last lines and for the host to
+/// acknowledge them before it stops the VM.
+const LAST_WORDS_WAIT: Duration = Duration::from_secs(3);
+
+/// What a wait status says: `exit code N` or `killed by signal N`.
+pub fn wait_status(status: libc::c_int) -> String {
+    if libc::WIFEXITED(status) {
+        format!("exit code {}", libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        format!("killed by signal {}", libc::WTERMSIG(status))
+    } else {
+        format!("wait status {status}")
+    }
+}
+
+/// php-fpm's master `pid` exited with `status`, so the VM stops: its remaining output is read
+/// to the end, the reason goes to the host's log (and the console), and the host acknowledges it
+/// before init returns (#87). The launcher quotes it.
+fn explain_exit(pid: i32, status: libc::c_int, started: bool) -> String {
+    let t = std::time::Instant::now();
+    let pump = {
+        let mut p = PUMPS.lock().unwrap_or_else(|p| p.into_inner());
+        p.iter().position(|(m, _)| *m == pid).map(|i| p.remove(i).1)
+    };
+    if let Some(pump) = pump {
+        // The workers may hold the pipe a moment longer than the master.
+        while !pump.is_finished() && t.elapsed() < LAST_WORDS_WAIT {
+            thread::sleep(Duration::from_millis(10));
         }
     }
+    let when = if started { "while serving" } else { "at boot, before it served" };
+    let why = format!("php-fpm exited {when} ({}): its own lines above say why; stopping the VM", wait_status(status));
+    for l in LAST_WORDS.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        say(&format!("php-fpm: {l}"));
+    }
+    say(&why);
+    report(&why);
+    let _ = LOG.drain(LAST_WORDS_WAIT.saturating_sub(t.elapsed()).max(Duration::from_secs(1)));
+    why
 }
 
 fn say(message: &str) {
@@ -773,7 +1022,11 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
             cmd.env("SC_EGRESS_PORTS", list(&boot.egress)).env("SC_EGRESS_HOST_PORT", crate::egress::EGRESS_PORT.to_string());
         }
     }
-    if !boot.ext {
+    // The image's ini folder, then the site's settings when it has any (#90).
+    let base = if boot.ext { IMAGE_INI } else { NOEXT_INI };
+    if Path::new(&format!("{SITE_INI_DIR}/zz-site.ini")).exists() {
+        cmd.env("PHP_INI_SCAN_DIR", format!("{base}:{SITE_INI_DIR}"));
+    } else if !boot.ext {
         cmd.env("PHP_INI_SCAN_DIR", NOEXT_INI);
     }
     // php-fpm and every worker under no_new_privs (#80): no exec ever gains privileges (a setuid
@@ -790,9 +1043,17 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
     }
     let child = cmd.spawn().map_err(|e| io::Error::new(e.kind(), format!("php-fpm: {e}")))?;
     drop(cmd);
-    thread::spawn(move || pump_log(read));
+    let pump = thread::spawn(move || pump_log(read));
+    let mut pumps = PUMPS.lock().unwrap_or_else(|p| p.into_inner());
+    // An earlier master's pump ends with its output (a reload).
+    pumps.retain(|(_, p)| !p.is_finished());
+    pumps.push((child.id() as i32, pump));
     Ok(child.id())
 }
+
+/// The standard `/dev` links ([`boot_guest`]).
+pub const STD_LINKS: [(&str, &str); 4] =
+    [("/dev/fd", "/proc/self/fd"), ("/dev/stdin", "/proc/self/fd/0"), ("/dev/stdout", "/proc/self/fd/1"), ("/dev/stderr", "/proc/self/fd/2")];
 
 fn boot_guest() -> io::Result<u32> {
     let flags = libc::MS_NOSUID | libc::MS_NODEV;
@@ -802,13 +1063,27 @@ fn boot_guest() -> io::Result<u32> {
     mount("proc", "/proc", "proc", flags | libc::MS_NOEXEC, "")?;
     mount("sysfs", "/sys", "sysfs", flags | libc::MS_NOEXEC, "")?;
     mount("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, "")?;
-    mount("tmpfs", "/tmp", "tmpfs", flags, "mode=1777")?;
+    // The links udev makes on a normal system and devtmpfs doesn't (#87): the image's php.ini has
+    // `error_log = /dev/stderr`, and without the link every PHP error that isn't a request's
+    // (the extension refusing to start at MINIT among them) went nowhere.
+    for (link, to) in STD_LINKS {
+        if let Err(e) = std::os::unix::fs::symlink(to, link)
+            && e.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(io::Error::new(e.kind(), format!("{link}: {e}")));
+        }
+    }
+    // noexec: nothing a site writes there runs (#86 review).
+    mount("tmpfs", "/tmp", "tmpfs", flags | libc::MS_NOEXEC, "mode=1777")?;
     mount("tmpfs", "/run", "tmpfs", flags, "mode=755")?;
+    // The host's log first: whatever fails from here on can be said there (#87).
+    start_log();
     let boot = parse_cmdline(&fs::read_to_string("/proc/cmdline")?).map_err(io::Error::other)?;
     if let Some(t) = boot.time {
         set_clock(t, 0)?;
     }
-    mount("/dev/vdb", &boot.root, "ext4", libc::MS_RDONLY | flags, "noload")?;
+    // noexec too: php-fpm reads the site's PHP, nothing on the site disk ever runs as a program.
+    mount("/dev/vdb", &boot.root, "ext4", libc::MS_RDONLY | flags | libc::MS_NOEXEC, "noload")?;
     loopback_up()?;
     // The folder sync watches every folder of the writable disks (8192 by default here).
     let _ = fs::write("/proc/sys/fs/inotify/max_user_watches", "65536");
@@ -838,6 +1113,9 @@ fn boot_guest() -> io::Result<u32> {
 /// which panics the kernel, and `panic=1 reboot=k` stops the VM: no php-fpm, no VM.
 pub fn init() -> io::Error {
     if let Err(e) = boot_guest() {
+        // The host's log may be up (it is started first): the reason goes there too.
+        report(&format!("the guest's boot failed: {e}; stopping the VM"));
+        let _ = LOG.drain(LAST_WORDS_WAIT);
         return e;
     }
     loop {
@@ -846,7 +1124,7 @@ pub fn init() -> io::Error {
         let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
         // The current master only: a reload's old master exits on purpose.
         if pid > 0 && pid == FPM_MASTER.load(Ordering::SeqCst) {
-            return io::Error::other(format!("php-fpm exited (wait status {status})"));
+            return io::Error::other(explain_exit(pid, status, STARTED.load(Ordering::SeqCst)));
         }
         if pid < 0 {
             thread::sleep(Duration::from_millis(100));
@@ -895,6 +1173,9 @@ mod tests {
             Ctl::Refresh,
             Ctl::Sync,
             Ctl::Reload,
+            Ctl::Config { hex: hex_of(br#"{"layer1":{}}"#) },
+            Ctl::Ini { hex: hex_of(b"securecore.debug_attribution_log = both\n") },
+            Ctl::Ini { hex: String::new() },
             Ctl::Done,
         ] {
             assert_eq!(Ctl::parse(ctl.line().trim_end()), Ok(ctl.clone()), "{ctl:?}");
@@ -948,6 +1229,14 @@ mod tests {
         signal(std::process::id() as i32, 0).expect("a real pid");
     }
 
+    /// php-fpm's exit, as init reports it before the VM stops (#87).
+    #[test]
+    fn a_wait_status_says_the_exit_code_or_the_signal() {
+        assert_eq!(wait_status(78 << 8), "exit code 78");
+        assert_eq!(wait_status(9), "killed by signal 9");
+        assert_eq!(wait_status(0), "exit code 0");
+    }
+
     #[test]
     fn a_boot_takes_one_start_message_then_only_sync_and_reload() {
         let start = [Ctl::Time { secs: 1, nanos: 0 }, Ctl::Entropy { hex: "00".repeat(64) }, Ctl::Mount { device: "/dev/vdc".into(), path: "/u".into() }];
@@ -957,6 +1246,72 @@ mod tests {
         assert_eq!(allowed(&[Ctl::Sync], true), Ok(()));
         assert_eq!(allowed(&[Ctl::Reload], true), Ok(()));
         assert!(allowed(&[Ctl::Sync], false).is_err(), "nothing before the start");
+        // The log key (#86 review): at any time, alone, and never echoed when malformed.
+        let key = Ctl::LogKey { hex: "ab".repeat(crate::guestlog::KEY_LEN) };
+        assert_eq!(Ctl::parse(key.line().trim_end()), Ok(key.clone()));
+        assert_eq!(allowed(std::slice::from_ref(&key), false), Ok(()));
+        assert_eq!(allowed(std::slice::from_ref(&key), true), Ok(()));
+        assert!(allowed(&[key, Ctl::Sync], true).is_err(), "alone on its connection");
+        let e = Ctl::parse(&format!("logkey {}", "5ec7".repeat(8))).expect_err("short");
+        assert!(!e.contains("5ec7"), "{e}");
         assert!(allowed(&[Ctl::Time { secs: 1, nanos: 0 }, Ctl::Reload], false).is_err());
+        // #90: a config only after the start; the site's ini in the start message or after it.
+        let config = Ctl::Config { hex: hex_of(b"{}") };
+        let ini = Ctl::Ini { hex: String::new() };
+        assert_eq!(allowed(std::slice::from_ref(&config), true), Ok(()));
+        assert!(allowed(std::slice::from_ref(&config), false).is_err(), "no config before the start");
+        assert!(allowed(&[Ctl::Time { secs: 1, nanos: 0 }, config], false).is_err(), "nor in the start message");
+        assert_eq!(allowed(&[Ctl::Time { secs: 1, nanos: 0 }, ini.clone()], false), Ok(()));
+        assert_eq!(allowed(std::slice::from_ref(&ini), true), Ok(()));
+        assert!(allowed(&[ini], false).is_err(), "nothing but the start message before it");
+    }
+
+    /// A site's php.ini in the guest (#90): the extension's debug settings only.
+    #[test]
+    fn a_sites_ini_carries_only_the_debug_settings() {
+        assert_eq!(
+            site_ini("; comment\n\nsecurecore.debug_attribution_log=both\n  securecore.debug_attribution_rule = frame \n").as_deref(),
+            Ok("securecore.debug_attribution_log = both\nsecurecore.debug_attribution_rule = frame\n")
+        );
+        assert_eq!(site_ini("").as_deref(), Ok(""));
+        for bad in ["securecore.config = /etc/x.json", "extension = evil.so", "memory_limit = 1G", "securecore.debug_ = x", "securecore.debug_attribution_log"] {
+            assert!(site_ini(bad).is_err(), "{bad}");
+        }
+        assert!(site_ini("securecore.debug_attribution_log = a\u{7}b").is_err());
+        // #90 review: values are plain words (PHP expands ${VAR} from php-fpm's environment,
+        // where the vault's secrets are), and a refusal never quotes the file.
+        for bad in [
+            "securecore.debug_attribution_log = ${WORDPRESS_DB_PASSWORD}",
+            "securecore.debug_attribution_log = \"both\"",
+            "securecore.debug_attribution_log = {x}",
+            "securecore.debug_attribution_log = Both",
+            "securecore.debug_attribution_log = $SECRET",
+        ] {
+            let e = site_ini(bad).expect_err(bad);
+            assert!(!e.contains("WORDPRESS") && !e.contains("SECRET") && !e.contains("both") && !e.contains("Both"), "{e}");
+        }
+        for bad in ["sk_live_SECRET = 1", "SECRET-NO-EQUALS"] {
+            let e = site_ini(bad).expect_err(bad);
+            assert!(!e.contains("SECRET") && !e.contains("sk_live"), "a refused line is never quoted: {e}");
+        }
+        assert_eq!(site_ini("securecore.debug_db_attribution = component").as_deref(), Ok("securecore.debug_db_attribution = component\n"));
+    }
+
+    /// #90 review: the config is mounted on `<root>/securecore.json` only when that is a regular
+    /// file itself, never through a link the site disk holds.
+    #[test]
+    fn a_mount_target_must_be_a_regular_file_not_a_link() {
+        let dir = std::env::temp_dir().join(format!("sc-guest-target-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("securecore.json");
+        fs::write(&file, "{}").expect("write");
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&file, &link).expect("link");
+        assert!(regular_target(file.to_str().expect("utf8")).is_ok());
+        let e = regular_target(link.to_str().expect("utf8")).expect_err("a link");
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+        assert!(regular_target(dir.to_str().expect("utf8")).is_err(), "a folder");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

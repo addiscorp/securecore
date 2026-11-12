@@ -22,16 +22,19 @@
 #
 #   DOCKER_CONTEXT=colima test/ext-hosts.sh
 #   SECURECORE_EXT_PROJECT / SECURECORE_EXT_PORT override the project / port.
+# On the microVM target (SC_TARGET=microvm, test/lib/target.sh) the probe runs in the guest,
+# which has no network device: it reaches only its listed ports through the host, and egress only
+# public addresses by name (#72). The helper is on the stack's private network, so every case
+# that expects to reach it is n/a there; the refusals, the audit lines and the database cases
+# (through MariaDB's socket) are checked as on the docker target.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 project=${SECURECORE_EXT_PROJECT:-securecore-hosts}
 port=${SECURECORE_EXT_PORT:-8092}
-base=http://127.0.0.1:$port
 dir=.tmp/ext-hosts
 mkdir -p "$dir"
 find "$dir" -mindepth 1 -delete 2>/dev/null
-html=/var/www/html
-conf=$html/securecore.json
+. test/lib/target.sh
 content=$html/wp-content
 plugindir=$content/plugins/securecore-hosts-probe
 mudir=$content/mu-plugins
@@ -39,43 +42,17 @@ helper=${project}-hoststest
 fails=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
-compose() { SECURECORE_PORT=$port docker compose -f docker/compose.yml -f docker/compose.ext.yml -p "$project" "$@"; }
 wp() { compose run --rm -T cli wp "$@" 2>>"$dir/wp.err" | tr -d '\r'; }
 in_php() { compose exec -T php sh -c "$1"; }
-code() { curl -s -o /dev/null -w '%{http_code}' "$base$1"; }
-now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-php_state() { docker inspect -f '{{.State.Status}}' "$(compose ps -aq php)" 2>/dev/null; }
-wait_200() { i=0; until [ "$(code /)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 60 ] || return 1; sleep 1; done; }
-put_live() { compose exec -T php sh -c "cat > $conf.new && mv $conf.new $conf" < "$1"; }
-put() { compose cp "$1" "php:$conf" >>"$dir/cp.log" 2>&1; }
-# The layer2 net audit lines php-fpm logged since <time>.
-audit() { compose logs --no-log-prefix --since "$1" php 2>&1 | sed -n 's/.*securecore: //p' | grep '^layer2 .* net '; }
+# The layer2 net audit lines php-fpm logged since <mark>.
+audit() { phplog "$1" | sed -n 's/.*securecore: //p' | grep '^layer2 .* net '; }
 has() { if audit "$1" | grep -qF "$2"; then pass "$3"; else fail "$3" "no net audit line matching '$2'"; fi; }
 hasnt() { if audit "$1" | grep -qF "$2"; then fail "$3" "unexpected line '$2'"; else pass "$3"; fi; }
+# has_hop: a redirect hop's line, which needs the first request answered by the helper.
+has_hop() { if on_microvm; then na "$3" "the redirect comes from the helper, which the guest never reaches, so there is no hop"; else has "$@"; fi; }
 
 # --- stack ------------------------------------------------------------------------------------
-echo "building and starting the hosts stack (project $project, $base)"
-compose build php > "$dir/build.log" 2>&1 || { echo "FAIL docker build (see $dir/build.log)"; exit 1; }
-compose up -d db php web > "$dir/up.log" 2>&1 || { echo "FAIL compose up (see $dir/up.log)"; exit 1; }
-i=0
-until [ "$(php_state)" = running ] && compose exec -T php sh -c 'grep -q "^php-fpm" /proc/1/comm' >/dev/null 2>&1; do
-  i=$((i + 1)); [ "$i" -lt 120 ] || { echo "FAIL php-fpm did not start"; exit 1; }
-  sleep 1
-done
-i=0
-until compose exec -T db mariadb -uwordpress -pwordpress-db-password -e 'select 1' wordpress >/dev/null 2>&1; do
-  i=$((i + 1)); [ "$i" -lt 60 ] || { echo "FAIL database did not start"; exit 1; }
-  sleep 1
-done
-# Install, and retry until the front page actually serves 200 (is-installed can report a
-# half-initialised fresh volume as installed, so gate on the real page, not on its exit code).
-i=0
-until [ "$(code /)" = 200 ]; do
-  wp core install --url="$base" --title=SecureCore --admin_user=admin \
-    --admin_password=securecore-demo --admin_email=admin@example.com --skip-email >>"$dir/wp.err" 2>&1 || true
-  i=$((i + 1)); [ "$i" -lt 12 ] || { echo "FAIL WordPress did not install (see $dir/wp.err)"; exit 1; }
-  sleep 2
-done
+stack_up
 
 # --- the no-internet helper (nginx under several aliases) -------------------------------------
 net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$(compose ps -q php)" | awk '{print $1}')
@@ -115,8 +92,8 @@ cleanup() {
   wp plugin deactivate securecore-hosts-probe >/dev/null 2>&1
   in_php "rm -rf $plugindir $mudir/securecore-loader.php"
   docker rm -f "$helper" >/dev/null 2>&1
-  compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
-  compose restart php >/dev/null 2>&1
+  put ext/examples/wordpress.json
+  php_restart >/dev/null 2>&1
 }
 trap cleanup EXIT
 
@@ -142,7 +119,7 @@ cfg log     log
 cfg off     off
 
 put "$dir/enforce.json"
-compose restart php >/dev/null 2>&1
+php_restart >/dev/null 2>&1
 wait_200 || { echo "FAIL front page never served 200"; exit 1; }
 
 # run <config> : apply, fetch the report, return the log window start in $T.
@@ -155,6 +132,12 @@ run() {
 }
 verdict() { sed -n "s/^$2=//p" "$dir/out.$1"; }
 want() { # $1 config $2 case $3 expected
+  if on_microvm && [ "$3" = OK ]; then
+    case $2 in
+      own-mysqli-dbhost | wpdb-reconnect) ;; # the database: through MariaDB's socket in the guest too
+      *) na "$1: $2 is OK" "the target is the helper on the stack's private network; the guest has no network device and its egress reaches only public addresses (#72)"; return ;;
+    esac
+  fi
   v=$(verdict "$1" "$2")
   if [ "$v" = SKIP ]; then echo "skip $1: $2 (extension not built)"; return; fi
   if [ "$v" = "$3" ]; then pass "$1: $2 is $3"; else fail "$1: $2 is $3" "got '$v'"; fi
@@ -185,7 +168,7 @@ has "$T" "layer2 enforce plugin:securecore-hosts-probe net open host disallowed.
 has "$T" "layer2 enforce plugin:securecore-hosts-probe net open host disallowed.test http://allowed.test@disallowed.test/" "enforce: the userinfo URL is attributed to its real host"
 has "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_exec host disallowed.test" "enforce: curl to disallowed is a net refusal"
 has "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_exec host $ip" "enforce: the CURLOPT_RESOLVE override to a disallowed IP is refused"
-has "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_redirect host disallowed.test" "enforce: a curl FOLLOWLOCATION redirect is refused at the hop"
+has_hop "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_redirect host disallowed.test" "enforce: a curl FOLLOWLOCATION redirect is refused at the hop"
 has "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_exec scheme file" "enforce: a curl file:// URL is refused by the scheme restriction"
 has "$T" "layer2 enforce plugin:securecore-hosts-probe net curl_exec no-url" "enforce: a handle with no recorded URL fails closed"
 has "$T" "layer2 enforce core net open host allowed.test" "enforce: core is restricted to core.hosts"
@@ -197,7 +180,7 @@ for c in $GROUP_B; do want log "$c" OK; done
 want log core-allowed OK
 want log core-disallowed OK
 has "$T" "layer2 log plugin:securecore-hosts-probe net open host disallowed.test" "log: the refusal is recorded"
-has "$T" "layer2 log plugin:securecore-hosts-probe net curl_redirect host disallowed.test" "log: the curl redirect hop is recorded and then followed"
+has_hop "$T" "layer2 log plugin:securecore-hosts-probe net curl_redirect host disallowed.test" "log: the curl redirect hop is recorded and then followed"
 has "$T" "layer2 log core net open host allowed.test" "log: core's refusal is recorded"
 
 echo "# off (nothing checked, nothing logged)"
@@ -212,5 +195,6 @@ echo "# enforce-mode refusals (each flipped to OK in log mode above):"
 sed -n 's/\(.*\)=BLOCKED/  \1/p' "$dir/out.enforce"
 
 echo
+na_summary
 if [ "$fails" -eq 0 ]; then echo "ext-hosts: all checks passed"; else echo "ext-hosts: $fails checks FAILED"; fi
 exit "$([ "$fails" -eq 0 ] && echo 0 || echo 1)"
