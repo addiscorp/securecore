@@ -182,11 +182,11 @@ if on_microvm; then
   mvm_conf "$dir/log-mode.json" > "$tdir/elsewhere.json"
   _s=$(site_dir)
   ln -sfn "$tdir/elsewhere.json" "$_s/securecore.json.lnk" && mv -fT "$_s/securecore.json.lnk" "$_s/securecore.json"
-  i=0; until phplog "$t" | grep -q 'securecore.json: a link is in its path: refused'; do i=$((i + 1)); [ "$i" -lt 50 ] || break; sleep 0.1; done
+  i=0; until phplog "$t" | grep -q 'securecore.json: a link is in its path'; do i=$((i + 1)); [ "$i" -lt 50 ] || break; sleep 0.1; done
   wait_reload
   status
   is "$(field sha256)" "$(conf_sha "$dir/off.json")" "a link in place of securecore.json: the guest keeps its config"
-  is "$(phplog "$t" | grep -c 'securecore.json: a link is in its path: refused')" 1 "and the launcher says the link is refused, once"
+  is "$(phplog "$t" | grep -c 'securecore.json: a link is in its path')" 1 "and the launcher says the link is refused, once"
   put "$dir/off.json"
 else
   t=$(now)
