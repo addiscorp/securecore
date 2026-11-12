@@ -130,6 +130,16 @@ done
 wp plugin install classic-editor wordpress-seo contact-form-7 --activate >/dev/null || die "plugin install"
 site=$(docker volume inspect -f '{{.Mountpoint}}' "${project}_wp")
 [ -f "$site/wp-load.php" ] || die "the site volume is not at $site"
+# Layer 3's database gateway (#94) in the guest: test/ext-layer3.sh's database probe, isolated
+# beside Contact Form 7, on a page of its own.
+cp test/ext/layer3-plugin/sc-l3db.php "$site/wp-content/plugins/sc-l3db.php"
+compose exec -T db mariadb -uwordpress -pwordpress-db-password wordpress \
+  -e "DROP TABLE IF EXISTS wp_sc_l3db_items; DELETE FROM wp_options WHERE option_name LIKE 'sc\\_l3db\\_%' OR option_name LIKE '\\_transient\\_%sc\\_l3db%'" 2>/dev/null
+wp option add sc_l3db_greeting hello-from-wp --autoload=no >/dev/null
+wp plugin activate sc-l3db >/dev/null || die "activating the database probe"
+for p in $(wp post list --post_type=page --title="L3 db rw" --field=ID); do wp post delete "$p" --force >/dev/null; done
+d_rw=$(wp post create --post_type=page --post_status=publish --post_title="L3 db rw" --post_content='[sc_l3db_rw]' --porcelain)
+[ -n "$d_rw" ] || die "the database probe's page"
 # MariaDB's root by unix_socket (as Debian's packages set it up): whoever connects to the socket
 # as uid 0 is the database's root, with no password.
 db_root "ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket OR mysql_native_password USING PASSWORD('root-db-password')" > /dev/null \
@@ -183,6 +193,7 @@ conf() {
   sed -e "s|{ \"port\": 3306 }|{ \"port\": 3306, \"socket\": \"$mysqld/mysqld.sock\" }, { \"port\": 4444, \"socket\": \"$peer/peer.sock\" }|" \
       -e "s/\"isolation\": \"auto\"/\"isolation\": \"$1\"/" \
       -e 's#"hosts": \["api.wordpress.org", "downloads.wordpress.org"\]#"hosts": ["api.wordpress.org", "downloads.wordpress.org", "127.0.0.1"]#' \
+      -e 's#"isolate": \["contact-form-7"\]#"isolate": ["contact-form-7", "sc-l3db"]#' \
       ext/examples/wordpress.json
 }
 peer=$sockdir/peer
@@ -664,11 +675,21 @@ if [ "$started" = 1 ]; then
   vget /sc-status.php > "$dir/status.first"
   is "$(sed -n 's/^loaded=//p;s/^layer2_mode=//p' "$dir/status.first" | tr '\n' /)" "1/enforce/" "the extension is loaded in the guest, layer 2 enforcing"
   is "$(sed -n 's/^layer1=//p;s/^layer2=//p;s/^layer3=//p' "$dir/status.first" | tr '\n' /)" "1/1/1/" "all three layers on in the guest's config"
-  # Contact Form 7's isolated child runs (its database calls are refused, as on the host); on a
-  # kernel without Landlock the child fails closed instead ("child refused to start").
-  has "$dir/first.log" "securecore: layer3 plugin:contact-form-7 database refused (not yet available to an isolated plugin)" \
-    "layer 3's isolated child runs in the guest (Landlock in the guest kernel)"
+  # Layer 3 in the guest: the database probe's isolated child creates its table and writes and
+  # reads it through the gateway (the guest's php-fpm runs each query on its own connection, to
+  # MariaDB through the host's socket); on a kernel without Landlock the child fails closed
+  # instead ("child refused to start").
+  vget "/?page_id=$d_rw" > "$dir/db.first"
+  dbv() { sed -n "s/^$1=//p" "$dir/db.first" | head -1; }
+  is "$(dbv isolated)" 1 "layer 3's isolated child runs in the guest (Landlock in the guest kernel)"
+  for c in dbdelta insert get_row update replace get_var get_col get_results transaction delete counter_written; do
+    is "$(dbv "$c")" OK "the guest's isolated plugin: $c through the database gateway"
+  done
+  is "$(dbv greeting)" hello-from-wp "the guest's isolated plugin reads the site's option"
+  is "$(compose exec -T db mariadb -uwordpress -pwordpress-db-password -N wordpress -e 'SELECT name FROM wp_sc_l3db_items' 2>/dev/null)" replaced \
+    "its table, made by dbDelta in the guest, holds its row in the host's MariaDB"
   lacks "$dir/first.log" "child refused to start" "no isolated child failed closed"
+  lacks "$dir/first.log" "layer3 plugin:sc-l3db database refused" "the gateway refused none of its queries"
   has "$dir/first.log" "securecore: layer2 enforce plugin:wordpress-seo" "layer 2 refuses in the guest as on the host (Yoast's tables)"
   is "$(grep -c '^NOTICE\|^\[' "$dir/first.log")" 0 "every line from the guest is marked 'guest: ' in the launcher's log"
   # A second start message, straight to the guest's control port: refused.

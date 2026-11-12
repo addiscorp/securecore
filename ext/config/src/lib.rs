@@ -446,13 +446,30 @@ pub struct Limits {
     /// Memory limit for one isolated child.
     #[serde(default = "default_memory_mb")]
     pub memory_mb: NonZeroU32,
+    /// Database queries one isolated component may send through the gateway in one request
+    /// (its load and every call together). Past it each query fails, with a line.
+    #[serde(default = "default_db_queries")]
+    pub db_queries: NonZeroU32,
+    /// The largest answer to one gateway query that crosses back to the child (its rows,
+    /// serialized), in bytes; at most 16777216 (16 MiB). A larger one fails, with a line.
+    #[serde(default = "default_db_result_bytes")]
+    #[schemars(range(min = 1, max = 16_777_216))]
+    pub db_result_bytes: NonZeroU32,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { timeout_ms: default_timeout_ms(), memory_mb: default_memory_mb() }
+        Limits {
+            timeout_ms: default_timeout_ms(),
+            memory_mb: default_memory_mb(),
+            db_queries: default_db_queries(),
+            db_result_bytes: default_db_result_bytes(),
+        }
     }
 }
+
+/// The ceiling on `layer3.limits.dbResultBytes`: half a wire frame, so an answer always fits.
+pub const MAX_DB_RESULT_BYTES: u32 = 16 << 20;
 
 impl Layer2 {
     /// The vault in force (E3): `vault`, when layer 2 is enabled. The vault isn't a policy, so
@@ -468,6 +485,14 @@ fn default_timeout_ms() -> NonZeroU32 {
 
 fn default_memory_mb() -> NonZeroU32 {
     NonZeroU32::new(256).unwrap_or(NonZeroU32::MIN)
+}
+
+fn default_db_queries() -> NonZeroU32 {
+    NonZeroU32::new(1000).unwrap_or(NonZeroU32::MIN)
+}
+
+fn default_db_result_bytes() -> NonZeroU32 {
+    NonZeroU32::new(4 << 20).unwrap_or(NonZeroU32::MIN)
 }
 
 impl Config {
@@ -494,6 +519,12 @@ impl Config {
                  (securecore-fpm --migrate-config <file> does this, keeping a backup; the installer runs it)"
                     .into(),
             ));
+        }
+        if self.layer3.limits.db_result_bytes.get() > MAX_DB_RESULT_BYTES {
+            return Err(Problem::Invalid(format!(
+                "layer3.limits.dbResultBytes is {}: at most {MAX_DB_RESULT_BYTES}",
+                self.layer3.limits.db_result_bytes
+            )));
         }
         for c in &self.layer1.network.connect {
             if c.socket.is_some() && c.address.is_some() {

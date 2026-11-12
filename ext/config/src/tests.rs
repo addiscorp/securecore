@@ -56,6 +56,19 @@ fn wordpress_example_parses_with_every_field() {
     assert_eq!(c.layer3.isolate, ["contact-form-7"]);
     assert_eq!(c.layer3.limits.timeout_ms.get(), 5000);
     assert_eq!(c.layer3.limits.memory_mb.get(), 256);
+    assert_eq!(c.layer3.limits.db_queries.get(), 1000);
+    assert_eq!(c.layer3.limits.db_result_bytes.get(), 4 << 20);
+}
+
+#[test]
+fn the_database_gateway_caps_parse_and_are_bounded() {
+    let l3 = |limits: &str| format!(r#"{{"layer1":{{"isolation":"off"}},"layer2":{{"enabled":false}},"layer3":{{"enabled":true,"limits":{limits}}}}}"#);
+    let c = parse(&l3(r#"{"dbQueries":20,"dbResultBytes":65536}"#)).expect("caps");
+    assert_eq!((c.layer3.limits.db_queries.get(), c.layer3.limits.db_result_bytes.get()), (20, 65536));
+    assert!(parse(&l3(r#"{"dbResultBytes":16777216}"#)).is_ok());
+    let e = rejected(&l3(r#"{"dbResultBytes":16777217}"#));
+    assert!(e.contains("dbResultBytes is 16777217: at most 16777216"), "{e}");
+    assert!(rejected(&l3(r#"{"dbQueries":0}"#)).contains("nonzero"));
 }
 
 #[test]

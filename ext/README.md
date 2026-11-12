@@ -390,7 +390,9 @@ by `mysqli_query`. `select_db` and `change_user` are refused for a component (`U
 re-login), except `select_db` of the site's own `DB_NAME` (exactly): `wpdb::db_connect()` runs it on
 every reconnect, so refusing it killed a `$wpdb->check_connection()` a plugin's call triggered;
 `set_charset` to an unsafe charset is refused for everyone. Every connection is checked,
-not just `$wpdb`'s.
+not just `$wpdb`'s. The text is read as UTF-8 with any invalid byte replaced (such a byte is
+never ASCII, so the statement's structure reads as the server reads it); until #94 a query with
+one such byte anywhere, a comment included, was not checked at all.
 
 ### What a refusal does
 
@@ -1072,6 +1074,110 @@ extension. The wiring is [`php/src/layer3.rs`](php/src/layer3.rs); the parts tha
    caller rule) return `plugin:<slug>` for everything in the child, whatever the stack shows, so
    layer 2's checks there all charge the isolated plugin.
 
+### The database (#94)
+
+The child has no database: no connection, no credential (no host, user, password or database
+name; its environment is empty and the helper never reads the vault). Its `$wpdb` is a gateway to
+the php-fpm worker, which runs each query on its own connection, under layer 2:
+
+1. **In the child,** `$wpdb->query()` runs the plugin's own `query` filters, then sends the SQL
+   on the request socket ([`gateway.rs`](layer3/src/gateway.rs): a `Q\n<sql>` frame) in place
+   of the answer the worker is waiting for (to the plugin's load or to a call). Everything else
+   is wpdb's own code on top of `query()`: `get_results`, `get_row`, `get_var`, `get_col`,
+   `insert`, `update`, `delete`, `replace`, `prepare` (escaped exactly as `mysqli_real_escape_string`
+   escapes on a utf8mb4 connection, so the worker receives the text the plugin would send
+   unisolated), `dbDelta`, `get_charset_collate()`. The answer sets `last_result`, `num_rows`,
+   `rows_affected`, `insert_id`, `last_error` and the column names (`get_col_info('name')`). The
+   prefix and table names are wpdb's (`set_prefix`); the charset, collation, `db_version()` and
+   `db_server_info()` come from the worker's `$wpdb` with the hello.
+2. **In the worker,** the extension reads the frame and decides first what only layer 3 decides
+   (`gateway::admit`): the request's query cap, the text's size (16 MiB) and UTF-8, and no change to
+   the statement time cap. Then the stand-in takes the text (`securecore_layer3_db_begin`) and
+   runs it as `$wpdb->query()` does: the worker's `query` filters, then `mysqli_query()` on
+   `$wpdb`'s own connection (the route and text layer 2 sees for the plugin's `$wpdb->query()`
+   unisolated), but unbuffered, so the rows are read one at a time (below; `$wpdb`'s own state,
+   `num_queries` and `SAVEQUERIES` don't see these queries, and a `db.php` drop-in's own routing
+   is not used). While it does, the stand-in's own frames
+   (compiled under the name `securecore-layer3:<slug>`, which only the extension uses) are
+   `plugin:<slug>`, so **layer 2's own caller rule** (`attribution::db_caller`, then `db::check`)
+   charges the query to the plugin exactly as it charges that plugin's `$wpdb->query()` in the
+   worker: the same function, the same verdict, the same line
+   (`layer2 enforce plugin:<slug> mysqli_query core-table select wp_users`). The slug is the one
+   the worker opened the channel for; nothing the child sends names a plugin. Other plugins'
+   `query` filters run as they would, and SQL they run is charged to them.
+3. The worker answers with what its `$wpdb` saw (PHP-serialized) and goes back to waiting.
+
+A refusal is the native failure: `false`, with layer 2's error in `last_error`. What the child's
+core code does on the plugin's behalf (`get_option()` of an option missing from the snapshot,
+`update_option()`, transients) is charged to the plugin, never to core: the child can't prove
+which of its frames are core's. So a non-autoloaded core option needs `options:read` from an
+isolated plugin, where the same `get_option()` in the worker is core's.
+
+| cap | where | what happens |
+|---|---|---|
+| `limits.dbQueries` (default 1000) | the worker, per request and plugin (its load and its calls) | each query past it fails (`last_error`: `over the dbQueries cap`); one line per request |
+| `limits.dbResultBytes` (default 4 MiB, at most 16 MiB) | the worker, per answer | the result is read unbuffered (`MYSQLI_USE_RESULT`) and the stand-in counts the bytes as it copies each row (each row ~200 bytes, each value ~16 more plus its text: what it costs the worker, not only its serialized size, so a million one-byte rows count 200 MB): past the cap the rest is drained unread and the answer fails (the query ran), with a line, so a result far over the cap never sits in the worker's memory. The serialized answer is checked again on the way out |
+| `limits.timeoutMs` | the worker, per call, queries included | the time left before the call's deadline caps each statement on the server (`SET SESSION max_statement_time` on MariaDB; `max_execution_time` on MySQL, which covers SELECTs only, #99), re-set before a query whenever the last setting is over 50 ms old (so no statement runs more than 50 ms past the deadline there), and the session's own value restored after; past the deadline the child is killed as for any call. A plugin's query naming either variable is refused |
+
+**Transactions.** The plugin's statements run on the worker's connection, as unisolated. After
+every exchange that queried (the load or a call, however it ended: an answer, a timeout, a
+crash, an exception in the worker, in a `finally`), the stand-in puts the connection back:
+- **MariaDB:** it asks the server for `@@autocommit` and `@@in_transaction` (never the SQL text,
+  which a comment would hide). If the plugin left a transaction open, or the state can't be read,
+  it runs `ROLLBACK AND NO CHAIN`, turns autocommit on, reads the state again, and replaces the
+  connection if it still isn't clean; with the line `layer3 plugin:<slug> left a transaction open
+  on the worker's connection: rolled back`.
+- **MySQL (and anything else that isn't MariaDB): the gateway refuses.** An open transaction
+  can't be seen there without the PROCESS privilege (InnoDB starts one lazily, and `START
+  TRANSACTION` leaves `@@autocommit` as it was), so the worker couldn't put the connection back
+  without risking a transaction core itself opened around the call (WooCommerce does). Until
+  there's a MySQL test leg, every isolated plugin's query fails closed when the worker's
+  `db_server_info()` isn't MariaDB (read once per request, with the hello), with one line per
+  request: `layer3 plugin:<slug> database refused: the database gateway supports MariaDB only for
+  now (#99)`. The stand-in's MySQL rollback path stays, unreached, for that leg.
+
+So core's later writes in the request never join what the plugin left, and no row lock outlives
+the call. A transaction the plugin opens and ends within one call is its own, as unisolated. XA
+transactions never open (layer 2 refuses `XA`).
+
+**Bookkeeping never goes through filters.** The cap, the state reads, the rollback and `SET
+autocommit` are `mysqli_query()` calls on the exchange's own connection, never `$wpdb->query()`,
+whose `query` filters a plugin could use to answer "nothing open".
+
+**SQL-shaping hooks are never mirrored.** An isolated plugin's callbacks on hooks whose value is
+SQL the worker runs (`query`, `dbdelta_*`, `incompatible_sql_modes`, WP_Query's `posts_*` and
+`post_limits*`, the query classes' `*_clauses`, `*_pre_query`, `found_*_query`, `comment_feed_*`,
+`getarchives_*`, `get_terms_fields`/`_orderby`, `get_meta_sql`, `get_date_sql`, `split_the_query`;
+`gateway::shapes_sql`) are not mirrored into the worker, with a line (`layer3 plugin:<slug> hook
+<name> not mirrored: it shapes SQL the worker runs`). Mirrored, they would rewrite core's queries
+from the child. They still run on the plugin's own queries in the child.
+
+**Session state is an allowlist.** Every `SET` persists into core's later queries on the
+worker's connection, so the gateway refuses all but `SET NAMES` / `SET CHARACTER SET` to the
+connection's own charset (with a collation of it), `SET [SESSION] group_concat_max_len = <n>` and
+`SET [SESSION] sql_big_selects = 1|ON`. Refused: every other `SET` (`autocommit`,
+`completion_type`, `sql_select_limit`, `transaction_read_only`, `sql_mode`, `time_zone`, `SET
+TRANSACTION`, `SET @@…`, several assignments at once), also behind a comment, plus `COMMIT` /
+`ROLLBACK … AND CHAIN` or `RELEASE`. Each refusal logs `layer3 plugin:<slug> database refused: it
+changes the worker connection's session state`.
+
+**db.php drop-ins.** The gateway uses `$wpdb->dbh`, the drop-in's current connection for HyperDB
+or LudicrousDB, for the plugin's query and for all bookkeeping after it. A drop-in whose `dbh`
+isn't a mysqli (SQLite) gets a refusal: `the worker's $wpdb has no mysqli connection`.
+
+**Errors.** The child gets the server's error code and text with the connection's database name,
+user and host taken out (`[1146] Table 'wp_x' doesn't exist`, not `'<database>.wp_x'`; a user
+and host read `'<user>'@'<host>'`); layer 2's and layer 3's own refusals come through as they are.
+
+**Cost.** One query is one round trip on the request socket plus PHP serialize/unserialize of the
+answer, on top of the query itself. `test/ext-layer3.sh` times a one-row `get_row(prepare(…))` 50
+times in the plugin, median of 7 pages: on a 4-thread Linux box shared with other builds, ~317 µs
+isolated against ~155 µs unisolated in a quiet run, so **about +160 µs per query** (the isolated
+figure held at 316 µs in a second run; the unisolated one swung to 551 µs with other builds
+running, so treat the delta as rough until `bench/` measures it). A call that queries adds the two
+`SET SESSION` statements and, once per request, the read of the session's value. Not yet tuned
+(the column names are fetched for every SELECT; rows cross PHP-serialized).
+
 ### Limits
 
 | | where | what happens |
@@ -1088,9 +1194,12 @@ renders empty, an action does nothing.
 The first part covers what it proves end to end (`test/ext-layer3.sh`): a plugin that adds content
 through filters, actions and shortcodes, on the front end and the dashboard (Hello Dolly). Not yet:
 
-- **The database.** An isolated plugin's queries are refused (`layer3 plugin:<slug> database
-  refused …`, once per query text). It sees core's options from the snapshot; its own options read
-  as unset. Next: the #42 gateway, the child's queries run by the worker under E4's policy.
+- **The database's edges** ([above](#the-database-94)). Column metadata other than names
+  (`get_col_info('type')`, …) does not cross. Escaping assumes backslash escapes on an
+  ASCII-compatible connection (layer 2 refuses the charsets and `sql_mode`s where that differs,
+  but not a server whose global `sql_mode` has `NO_BACKSLASH_ESCAPES`). A plugin's own mysqli or
+  PDO connection still fails in the child (no network). An isolated plugin's `query` filter does
+  not see its own queries in the worker (a re-entered call passes through, with a line).
 - **Request state.** The child does not see the request: no current user, main query, `$post` or
   `$_GET`/`$_POST`/cookies. Next: replay them, as the spike's `setup_request_state` did.
 - **Objects across the socket.** Arguments and return values cross PHP-serialized with objects
@@ -1211,7 +1320,19 @@ WordPress boot in a new zygote, on the request that brings it.
   `timeoutMs` is killed (logged) and too much memory ends the child (logged), while each page still
   renders. With layer 2 off the kernel alone still stops the write and the reads. The revert proof:
   with layer 3 off the probe runs in the worker, every probe case goes through, the loop holds the
-  page and the memory probe kills it.
+  page and the memory probe kills it. The database gateway (#94), with a database probe
+  (`test/ext/layer3-plugin/sc-l3db.php`, isolated): it makes its own table with `dbDelta` and uses
+  it through every `$wpdb` method (escaping, `insert_id`, `rows_affected`, a rolled-back
+  transaction, column names, a failing query's `last_error`), keeps a counter in its own option
+  that persists across requests and lands in the site's database, and reads the site's and core's
+  options, at load and in a call; layer 2 refuses a core table without a grant, a refused
+  statement and another plugin's table, and its lines are exactly those the same plugin gets
+  unisolated; the gateway refuses SQL that isn't UTF-8 and a change to the time cap; the caps trip
+  (dbQueries once-logged, dbResultBytes, a 5 s statement cut at timeoutMs and gone from the
+  server); the child's environment is empty and a dump of its memory holds no DB password and no
+  salt. Revert proofs: with layer 2 off the refused queries run through the gateway; unisolated,
+  nothing caps the queries and the statement holds the page for 5 s; in the worker the same memory
+  dump does hold the password. It also times a one-row query isolated and unisolated.
 - `DOCKER_CONTEXT=colima bench/layer3.sh` (after ext-config.sh): time to first byte of a post
   through the probe's filter and shortcode, isolated vs in the worker, alternating, 7 rounds.
 - `DOCKER_CONTEXT=colima research/db/compat.sh` (after ext-config.sh): Classic Editor, Yoast and

@@ -2,7 +2,7 @@
 # na_summary fails a suite whose count differs. Change a number only with the checks it counts.
 config 5
 attribution 0
-layer3 4
+layer3 6
 layer1 18
 hosts 59
 enforce 18
