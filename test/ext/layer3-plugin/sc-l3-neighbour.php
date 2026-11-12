@@ -32,7 +32,9 @@ add_filter('the_content', static function ($content) {
     if (isset($_GET['sc_l3_session'])) {
         global $wpdb;
         $s = $wpdb->get_row('SELECT @@sql_select_limit AS l, @@completion_type AS c, @@transaction_read_only AS r, @@autocommit AS a, @@time_zone AS z, @@sql_mode AS m', ARRAY_A);
-        $n = count((array) $wpdb->get_col("SELECT option_id FROM {$wpdb->options} LIMIT 5"));
+        // Its own table (test/ext-layer3.sh puts six rows in it): LIMIT 5 is 5 rows unless a
+        // session sql_select_limit cut it.
+        $n = count((array) $wpdb->get_col("SELECT id FROM {$wpdb->prefix}sc_l3_neighbour_data LIMIT 5"));
         $content .= "\n<pre>\nsession=" . esc_html(implode('|', (array) $s)) . "\ncore_rows=$n\n</pre>";
     }
     return $content;

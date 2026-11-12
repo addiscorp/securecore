@@ -83,7 +83,7 @@ in_php "rm -rf $content/plugins/sc-l3db.php $content/uploads/sc-l3db && mkdir -p
 compose cp test/ext/layer3-plugin/sc-l3db.php "php:$content/plugins/sc-l3db.php" >>"$dir/cp.log" 2>&1
 # db_exec <sql>: as the site's database user, on the db container.
 db_exec() { compose exec -T db mariadb -uwordpress -pwordpress-db-password -N wordpress -e "$1" 2>>"$dir/db.err"; }
-db_exec "DROP TABLE IF EXISTS wp_sc_l3db_items; CREATE TABLE IF NOT EXISTS wp_sc_l3_neighbour_data (id int); DELETE FROM wp_options WHERE option_name LIKE 'sc\\_l3db\\_%' OR option_name LIKE '\\_transient\\_%sc\\_l3db%'"
+db_exec "DROP TABLE IF EXISTS wp_sc_l3db_items; DROP TABLE IF EXISTS wp_sc_l3_neighbour_data; CREATE TABLE wp_sc_l3_neighbour_data (id int); INSERT INTO wp_sc_l3_neighbour_data VALUES (1), (2), (3), (4), (5), (6); DELETE FROM wp_options WHERE option_name LIKE 'sc\\_l3db\\_%' OR option_name LIKE '\\_transient\\_%sc\\_l3db%'"
 wp option add sc_l3db_greeting hello-from-wp --autoload=no >/dev/null
 wp plugin activate sc-l3probe sc-l3-neighbour hello sc-l3db >/dev/null
 post() { wp post create --post_status=publish --post_title="$1" --post_content="$2" --porcelain; }
@@ -325,8 +325,8 @@ get sbase "/?page_id=$d_err&sc_l3_session=1"
 get session "/?page_id=$d_session&sc_l3_session=1"
 for c in names group_concat big_selects; do want session "$c" OK "session: allowed"; done
 for c in completion_type select_limit read_only sql_mode autocommit time_zone isolation hidden names_other chain; do want session "$c" BLOCKED "session: refused"; done
-base=$(verdict sbase session)
-is "$(verdict session session)" "$base" "session: core's next query sees the session unchanged ($base)"
+sess=$(verdict sbase session)
+is "$(verdict session session)" "$sess" "session: core's next query sees the session unchanged ($sess)"
 is "$(verdict session core_rows)" 5 "session: core's LIMIT 5 query returns 5 rows (no sql_select_limit)"
 # dbResultBytes against a result far over it (40 MiB, cap 64 KiB): refused while the rows are
 # copied, and the worker stays within memory_limit.
