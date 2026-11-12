@@ -778,7 +778,9 @@ if [ "$started" = 1 ]; then
   is "$STOPPED" 0 "SIGTERM during a slow reload: the launcher exits 0"
   lacks "$dir/first.log" "did not sync" "and the guest synced its disks first"
   has "$dir/first.log" "stopped by signal 15" "and says so"
-  is "$(pgrep -fc "api-sock /fc.sock")" 0 "no Firecracker left running"
+  # This site's VM only (its jail id is sc- and 16 hex digits of the app root's sha256): another
+  # launcher on this host (a suite's, another agent's) may run a VM of its own.
+  is "$(pgrep -fc -- "--id sc-$(printf %s "$site" | sha256sum | cut -c1-16) ")" 0 "no Firecracker left running"
   is "$(grep -c " $state/jail" /proc/self/mountinfo)" 0 "and nothing mounted in its jail"
 else
   fail "microvm: the first start serves"
@@ -1183,7 +1185,7 @@ in_php "rm -f /usr/local/etc/php/conf.d/zz-sc101-db.ini"
 # One microVM per pool (#100 review): each listens where its pool says (with its allowed_clients
 # and ACLs, #102 review), the launcher tells systemd once both serve, and a stop stops both. Each
 # pool names this site (chdir).
-in_php "printf '[www]\nchdir = /var/www/html\nlisten = $run/www.sock\nlisten.acl_users = www-data\n[second]\nchdir = /var/www/html\nuser = www-data\ngroup = www-data\nlisten = 127.0.0.1:9339\nlisten.allowed_clients = 192.0.2.1\npm = static\npm.max_children = 2\nenv[SC_POOL] = second\n' > /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"
+in_php "printf '[www]\nchdir = /var/www/html\nlisten = $sockdir/www.sock\nlisten.acl_users = www-data\n[second]\nchdir = /var/www/html\nuser = www-data\ngroup = www-data\nlisten = 127.0.0.1:9339\nlisten.allowed_clients = 192.0.2.1\npm = static\npm.max_children = 2\nenv[SC_POOL] = second\n' > /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"
 cp "$dir/microvm.json" "$site/securecore.json"
 rm -f "$dir/notify-pools.sock" "$dir/notify-pools.msg"
 python3 "$sockpy" recv "$dir/notify-pools.sock" "$dir/notify-pools.msg" &
@@ -1195,9 +1197,13 @@ PID=$!
 eventually 1800 "grep -q 'every pool.s microVM serves' \"$dir/pools.log\" || ! kill -0 $PID 2>/dev/null" || true
 has "$dir/pools.log" "one microVM per pool: www, second" "two pools: a microVM each"
 has "$dir/pools.log" "every pool's microVM serves (www, second)" "both serve"
-is "$(python3 test/ext/microvm/fcgi-ping.py "unix:$run/www.sock")" pong "the www pool's php-fpm answers where its pool listens (root: always)"
-is "$(setpriv --reuid 33 --regid 33 --clear-groups python3 test/ext/microvm/fcgi-ping.py "unix:$run/www.sock" 2>/dev/null)" pong "www-data, in its listen.acl_users: answered"
-is "$(setpriv --reuid 65534 --regid 65534 --clear-groups python3 test/ext/microvm/fcgi-ping.py "unix:$run/www.sock" 2>/dev/null)" "" "nobody, not in its ACLs: refused (the socket is 0666, the launcher checks the peer)"
+is "$(python3 test/ext/microvm/fcgi-ping.py "unix:$sockdir/www.sock")" pong "the www pool's php-fpm answers where its pool listens (root: always)"
+# As other users: the ping and the socket where they can reach them (the test's own folders are
+# root's alone), so a refusal is the launcher's, not a path's.
+cp test/ext/microvm/fcgi-ping.py "$sockdir/fcgi-ping.py" && chmod 644 "$sockdir/fcgi-ping.py"
+as_ping() { setpriv --reuid "$1" --regid "$1" --clear-groups python3 "$sockdir/fcgi-ping.py" "unix:$sockdir/www.sock" 2>/dev/null; }
+is "$(as_ping 33)" pong "www-data, in its listen.acl_users: answered"
+is "$(as_ping 65534)" "" "nobody, not in its ACLs: refused (the socket is 0666, the launcher checks the peer)"
 has "$dir/pools.log" "refused a FastCGI connection: uid 65534 gid 65534 isn't in the pool's listen.acl_users" "and the launcher says so"
 is "$(python3 test/ext/microvm/fcgi-ping.py "127.0.0.1:9339" 2>/dev/null)" "" "the second pool (TCP) refuses 127.0.0.1, which its listen.allowed_clients doesn't list"
 has "$dir/pools.log" "refused a FastCGI connection: 127.0.0.1 isn't in the pool's listen.allowed_clients" "and the launcher says so"
@@ -1212,7 +1218,7 @@ kill "$npid" 2>/dev/null
 in_php "printf '[www]\nchdir = /var/www/html\nlisten = $run/www.sock\n[other]\nchdir = /srv/other-site\nuser = www-data\nlisten = $run/other.sock\n' > /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"
 refuses other-site "" "pool [other] serves another site (/srv/other-site)" "$dir/microvm.json" nolisten
 in_php "rm -f /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"
-rm -f "$run/www.sock" "$run/second.sock" "$run/other.sock"
+rm -f "$run/www.sock" "$run/second.sock" "$run/other.sock" "$sockdir/www.sock" "$sockdir/fcgi-ping.py"
 
 echo "# a site change, and a larger --write-disk-mib"
 date > "$site/sc-mvm-changed.txt"

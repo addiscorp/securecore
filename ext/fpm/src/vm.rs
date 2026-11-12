@@ -3537,17 +3537,25 @@ mod tests {
         if unsafe { libc::geteuid() } != 0 {
             return;
         }
-        let dir = scratch("dbsock");
+        // Below / itself: the system temp folder is 1777, and the rule refuses anything under it.
+        let dir = Path::new("/").join(format!("sc-dbsock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
         let d = dir.join("mysqld");
         fs::create_dir_all(&d).expect("dir");
-        let sock = d.join("mysqld.sock");
-        let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         let chown = |p: &Path, u: u32, g: u32| std::os::unix::fs::chown(p, Some(u), Some(g)).expect("chown");
         let chmod = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).expect("chmod");
-        // The folders above the scratch folder must pass too: scratch is under the system temp.
-        let up_ok = trusted_db_socket(&sock, Some((999, 999)));
-        if up_ok.as_ref().is_err_and(|e| !e.contains("mysqld")) {
-            return; // a temp folder (1777) above: nothing here can be trusted, by design
+        chown(&dir, 0, 0);
+        chmod(&dir, 0o755);
+        let sock = d.join("mysqld.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        // Control: the same socket under the system temp folder (1777 above it) is refused.
+        let tmp = std::env::temp_dir();
+        if fs::metadata(&tmp).is_ok_and(|m| m.mode() & 0o002 != 0) {
+            let t = tmp.join(format!("sc-dbsock-{}.sock", std::process::id()));
+            let _ = fs::remove_file(&t);
+            let _lt = std::os::unix::net::UnixListener::bind(&t).expect("bind");
+            assert!(trusted_db_socket(&t, None).is_err(), "a socket in a folder anyone may write");
+            let _ = fs::remove_file(&t);
         }
         chown(&d, 999, 999);
         chmod(&d, 0o755);

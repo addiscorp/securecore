@@ -194,12 +194,17 @@ pub struct Request {
 /// Where the installer records the unpackaged files' sha256s.
 pub const DEFAULT_RECORD: &str = "/var/lib/securecore/unpackaged.json";
 
-/// The record's entries: path → sha256, for every captured file no package's checksum covers.
+/// The record's entries: path → sha256, for every captured file no package's checksum covers,
+/// but what lives in `/etc` (a host's own settings and data, `/etc/hostname`, `/etc/hosts`,
+/// generated certificate bundles: held to the ownership rules, as configs are, since they differ
+/// from host to host and change in normal use).
 pub fn unpackaged(items: &[Item]) -> BTreeMap<String, String> {
     items
         .iter()
         .filter_map(|i| match i {
-            Item::File { path, sha256, source, .. } if source.starts_with("unpackaged") || source.contains("no checksum") => Some((path.clone(), sha256.clone())),
+            Item::File { path, sha256, source, .. } if (source.starts_with("unpackaged") || source.contains("no checksum")) && !path.starts_with("/etc/") => {
+                Some((path.clone(), sha256.clone()))
+            }
             _ => None,
         })
         .collect()
@@ -1448,6 +1453,18 @@ mod tests {
             source: "unpackaged (root-owned)".into(),
         }];
         assert_eq!(check_record(&rec, &items), Ok(false), "no record yet");
+        let mut with_etc = items.clone();
+        with_etc.push(Item::File {
+            path: "/etc/hostname".into(),
+            from: "/etc/hostname".into(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: 4,
+            sha256: "c".repeat(64),
+            source: "unpackaged (root-owned)".into(),
+        });
+        assert_eq!(unpackaged(&with_etc).len(), 1, "/etc is the host's own (it differs per host), never recorded");
         assert_eq!(write_record(&rec, &items), Ok(1));
         assert_eq!(fs::metadata(&rec).expect("record").mode() & 0o777, 0o600);
         assert_eq!(check_record(&rec, &items), Ok(true));
