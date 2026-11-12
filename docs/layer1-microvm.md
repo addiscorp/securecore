@@ -871,6 +871,86 @@ site's settings (`WORDPRESS_DB_HOST`, …). Until #72 the test image baked them 
   the snapshot's `vm.mem` (as text or hex) and `vm.snap`, `console.log`, the launcher's log. It
   also checks that a restored guest still reaches the database.
 
+## Density: N sites on one host (#72)
+
+`test/ext-microvm.sh density` runs N sites' microVMs at once on [xps] (4 cores, 7.5 GiB; other
+agents' stacks running beside them), for N = 1, 4, 8 and 16. Each site is a copy of the test site
+(WordPress, Classic Editor, Yoast SEO, Contact Form 7, `examples/wordpress.json`: all three
+layers, Contact Form 7 isolated) in its own volume and state folder, one VM per site, as the
+product runs them.
+- **VM 1 serves a load** (oha, 2 concurrent) while the others restore one after another.
+- **The others are idle once started.**
+- **PSS and RSS** are Firecracker's (`/proc/<pid>/smaps_rollup`), summed over the N VMs.
+- **"KSM on"** is the same VMs after 30 s of ksmd (`/sys/kernel/mm/ksm/run` = 1, then unmerged and
+  set back to 0).
+- **Restore** is each start's "load and php-fpm ping" and "ready" from the launcher's log.
+- **p50** is VM 1's front page (bench's method: 20 warm-up, then 100 sequential requests, all
+  200s) with all N up.
+
+Guest memory 512 MiB (the default):
+
+| N | total PSS | per VM | RSS | PSS with KSM on | restores while the others run (ping / ready, ms) | VM 1 p50 | MemAvailable after |
+|---|---|---|---|---|---|---|---|
+| 1 | 289 MiB | 289 MiB | 289 MiB | 289 MiB (0 shared) | – | 136.5 ms | 5433 MiB |
+| 4 | 567 MiB | 141 MiB | 567 MiB | 569 MiB (0 shared) | 122–173 / 273–331 | 136.5 ms | 5142 MiB |
+| 8 | 971 MiB | 121 MiB | 971 MiB | 975 MiB (0 shared) | 28–141 / 82–240 | 136.9 ms | 4957 MiB |
+| 16 | 1383 MiB | 86 MiB | 1383 MiB | 1367 MiB (0 shared) | 58–155 / 116–251 | 137.8 ms | 4792 MiB |
+
+Guest memory 256 MiB (`DENSITY_MEM=256`), the same way:
+
+| N | total PSS | per VM | RSS | PSS with KSM on | restores (ping / ready, ms) | VM 1 p50 | MemAvailable after |
+|---|---|---|---|---|---|---|---|
+| 1 | 245 MiB | 245 MiB | 245 MiB | 245 MiB (0 shared) | – | 135.7 ms | 5414 MiB |
+| 8 | 920 MiB | 115 MiB | 920 MiB | 920 MiB (0 shared) | 109–132 / 186–231 | 136.0 ms | 5110 MiB |
+| 16 | 1397 MiB | 87 MiB | 1397 MiB | 1375 MiB (0 shared) | 36–171 / 105–287 | 137.1 ms | 4794 MiB |
+
+What this shows:
+- **PSS equals RSS: restored VMs share nothing.**
+  - Each site restores its own snapshot (the key holds the site's tree), so each VM maps its own
+    `vm.mem`, and the page cache holds N copies of nearly the same pages.
+  - The cost is what each guest touches. The loaded VM 1 is about 290 MiB, and an idle restored
+    VM 60 to 75 MiB (16 VMs: 1383 MiB, with VM 1 the 290 of it).
+- **KSM does nothing here.** ksmd merged 0 pages: it merges only memory marked `MADV_MERGEABLE`,
+  and Firecracker doesn't mark guest memory. A host-wide `prctl(PR_SET_MEMORY_MERGE)` on each
+  Firecracker would be the switch to try. That is a product change, so it isn't measured here.
+- **"N VMs from one snapshot" is not something the launcher does.** The run also tried a "shared"
+  layout: every site's `vm.mem` a hard link to site 1's.
+  - Each launcher made a new snapshot instead: its start took 2.1–4.0 s to "ready", the time to
+    make a snapshot. The PSS was the same as with each site's own snapshot (16 VMs: 1916 MiB,
+    with the extra snapshot work in it).
+  - Sharing pages across sites needs a snapshot that doesn't hold the site: one per root image and
+    config, with the site disk attached after the restore, as the writable disks already are.
+    That is a design change (follow-up below), not a default to flip.
+- **Restores stay fast under load**: 82–331 ms to "ready" while VM 1 serves its load and up to
+  15 others run. The php-fpm ping is 28–173 ms. Four CPUs are shared by all of it.
+- **Density doesn't slow a served site.** VM 1's p50 is 136.5 ms with 1 VM and 137.8 ms with 16.
+  (That p50 is with all three layers and Contact Form 7's isolated child on every request; #70's
+  +5 ms figure is the extension off.)
+- **The memory a host needs is the busy sites', not the count.** At about 290 MiB a busy site
+  and 70 MiB an idle one, [xps]'s 7.5 GiB holds about 20 busy sites or 60 mostly idle ones, beside
+  its other work.
+
+### Recommendation
+
+- **Keep 512 MiB of guest memory and php-fpm's pool of 5 workers (`pm = dynamic`, the defaults).**
+  - A guest is charged only for the pages it touches, so its size costs an idle site nothing:
+    16 VMs took 1383 MiB at 512 and 1397 MiB at 256.
+  - What 256 saves is on a busy site: 245 against 289 MiB for VM 1 under this load. But that is
+    96 % of a 256 MiB guest with 5 workers, against 56 % of 512. A heavier site (WooCommerce, image
+    work) would hit the guest's limit there first, and its php-fpm workers would be killed instead
+    of the page slowing down.
+  - 256 MiB would want a smaller pool (3 workers, say), which wasn't measured. No default
+    changes.
+- **Size a host by its busy sites:**
+  - about 300 MiB each for a busy site and 75 MiB each for an idle one, plus the launchers and the
+    page cache;
+  - restores stay under about 0.3 s to "ready" while the others run.
+- **Next, if density matters more:**
+  - a site-independent snapshot, so restored VMs share their clean pages through one `vm.mem`;
+  - or marking guest memory mergeable for KSM.
+
+  Either is a launcher change (follow-up 13 below).
+
 ## The guest's log: what it guarantees, and against whom (#86)
 
 php-fpm's lines (layer 2's audit lines among them) and the init's own come to the launcher on
@@ -930,10 +1010,15 @@ logs are the launcher's own.
    takes 0.3 s rather than 80 ms.
 10. **Run the `test/ext-*.sh` suites against a microVM target.** Their harness needs to
     reach php-fpm in the guest, not only through `docker compose exec php`.
-11. **Density.** Run N restored VMs from one snapshot and measure PSS sharing. Pick the guest
-    memory and pool size: 512 MiB and 5 workers here, and 256 MiB is probably enough.
+11. **Density.** Measured (#72, "Density" above): restored VMs share nothing, KSM merges
+    nothing, keep 512 MiB and 5 workers.
 12. **arm64 hosts.** mirab pins Firecracker for x86_64 only. arm64 needs its own pin and kernel
     (mirab has `kernel-arm64-vz.config` for vz only).
+13. **A snapshot that sites share.** Snapshot the guest before its site disk is attached (one per
+    root image and config), attach the site's disk after the restore as the writable disks are,
+    and key the snapshot without the site tree. Restored VMs would then share their clean pages
+    through one `vm.mem`. Or have the launcher mark guest memory mergeable
+    (`prctl(PR_SET_MEMORY_MERGE)` on Firecracker) and measure KSM again.
 
 ## Needs a decision
 
