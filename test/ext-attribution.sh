@@ -14,49 +14,50 @@
 #   5. layer2 mode off records nothing; an invalid debug value refuses to start.
 # Exits non-zero on any failure. Writes .tmp/ext-attribution/. Leaves the stack as it found it
 # (examples/wordpress.json, no debug ini, fixtures removed).
+# On the microVM target (SC_TARGET=microvm, test/lib/target.sh) 1 runs in the guest; 2–5 switch
+# the debug settings in php.ini, which in the guest is on the read-only root image (php-fpm there
+# takes no per-site ini), so each of their checks is n/a, with that reason.
 #   DOCKER_CONTEXT=colima test/ext-config.sh && DOCKER_CONTEXT=colima test/ext-attribution.sh
 set -u
 cd "$(dirname "$0")/.." || exit 1
 project=${SECURECORE_EXT_PROJECT:-securecore-ext}
 port=${SECURECORE_EXT_PORT:-8089}
-base=http://127.0.0.1:$port
 dir=.tmp/ext-attribution
 mkdir -p "$dir"
 find "$dir" -mindepth 1 -delete 2>/dev/null
-html=/var/www/html
-conf=$html/securecore.json
+. test/lib/target.sh
 content=$html/wp-content
 data=$content/uploads/sc-attr
 plugin=$content/plugins/securecore-attr
 shared=$content/sc-attr-shared/securecore-attr-linked
 ini=/usr/local/etc/php/conf.d/securecore-debug.ini
 fails=0
-pass() { echo "ok   $1"; }
-fail() { echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
+# (n/a while NA_WHY is set: the checks that need a debug ini on the microVM.)
+pass() { na_now "$1" && return; echo "ok   $1"; }
+fail() { na_now "$1" && return; echo "FAIL $1${2:+ ($2)}"; fails=$((fails + 1)); }
 is() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$3" "got '$1', want '$2'"; fi; }
-compose() { SECURECORE_PORT=$port docker compose -f docker/compose.yml -f docker/compose.ext.yml -p "$project" "$@"; }
 wp() { compose run --rm -T cli wp "$@" 2>>"$dir/wp.err"; }
 in_php() { compose exec -T php sh -c "$1"; }
-code() { curl -s -o /dev/null -w '%{http_code}' "$base$1"; }
 case_() { curl -s "$base/?sc_attr=$1"; }
 status() { curl -s "$base/securecore-status.php" > "$dir/status"; }
 field() { sed -n "s/^$1=//p" "$dir/status"; }
-now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-php_state() { docker inspect -f '{{.State.Status}}' "$(compose ps -aq php)"; }
-wait_200() { i=0; until [ "$(code /)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 60 ] || return 1; sleep 1; done; }
-wait_exited() { i=0; until [ "$(php_state)" = exited ]; do i=$((i + 1)); [ "$i" -lt 30 ] || return 1; sleep 1; done; }
-# The attribution lines php-fpm logged since <time>, without the prefix: "<rule> <component> <op> <path>".
-attr() { compose logs --no-log-prefix --since "$1" php 2>&1 | sed -n 's/.*securecore: attribution //p'; }
+# The attribution lines php-fpm logged since <mark>, without the prefix: "<rule> <component> <op> <path>".
+attr() { phplog "$1" | sed -n 's/.*securecore: attribution //p'; }
 # has <since> <line> <label>
 has() { if attr "$1" | grep -qxF "$2"; then pass "$3"; else fail "$3" "no line '$2'"; fi; }
-# debug <ini lines>: write the debug ini (empty: remove it) and restart php-fpm.
+# debug <ini lines>: write the debug ini (empty: remove it) and restart php-fpm. On the microVM a
+# debug setting can't reach the guest's php-fpm: from then on the checks are n/a.
 debug() {
+  if on_microvm; then
+    [ -z "$1" ] || NA_WHY="it sets securecore.debug_* in php.ini, and the guest's php.ini is on its read-only root image (no per-site ini)"
+    [ -n "$NA_WHY" ] || php_restart > /dev/null 2>&1
+    return 0
+  fi
   if [ -z "$1" ]; then in_php "rm -f $ini"; else printf '%s\n' "$1" | compose exec -T php sh -c "cat > $ini"; fi
   compose restart php >/dev/null 2>&1
 }
-put_live() { compose exec -T php sh -c "cat > $conf.new && mv $conf.new $conf" < "$1"; }
 
-[ "$(code /)" = 200 ] || { echo "FAIL the extension stack is not up on $base: run test/ext-config.sh first"; exit 1; }
+stack_is_up
 
 # --- fixtures --------------------------------------------------------------------------------
 sed 's/"mode": "enforce"/"mode": "log"/' ext/examples/wordpress.json > "$dir/log.json"
@@ -74,8 +75,8 @@ theme=$(wp option get stylesheet | tr -d '\r')
 cleanup() {
   wp plugin deactivate securecore-attr securecore-attr-linked >/dev/null
   in_php "rm -rf $plugin $content/plugins/securecore-attr-linked $(dirname "$shared") $content/mu-plugins/securecore-attr-mu.php $data $ini"
-  compose cp ext/examples/wordpress.json "php:$conf" >/dev/null 2>&1
-  compose restart php >/dev/null 2>&1
+  put ext/examples/wordpress.json
+  php_restart >/dev/null 2>&1
   wait_200 || echo "FAIL php-fpm did not come back after cleanup"
 }
 trap cleanup EXIT
@@ -148,18 +149,20 @@ is "$(attr "$t" | grep -c '^frame ')" 0 "logging component: no frame lines"
 since=$(now)
 # (Not "yes": PHP's ini parser turns yes/on/true into "1" before the extension sees it.)
 debug "securecore.debug_attribution_log=everything"
-if wait_exited; then pass "invalid debug_attribution_log: php-fpm refuses to start"; else fail "invalid debug_attribution_log: php-fpm refuses to start" "$(php_state)"; fi
-if compose logs --no-log-prefix --since "$since" php 2>&1 | grep -qF 'securecore: securecore.debug_attribution_log = "everything": expected off, frame, component or both; refusing to start'; then
+if [ -z "$NA_WHY" ] && wait_exited; then pass "invalid debug_attribution_log: php-fpm refuses to start"; else fail "invalid debug_attribution_log: php-fpm refuses to start" "$(php_state)"; fi
+if phplog "$since" | grep -qF 'securecore: securecore.debug_attribution_log = "everything": expected off, frame, component or both; refusing to start'; then
   pass "invalid debug_attribution_log: the log says why"
 else
   fail "invalid debug_attribution_log: the log says why"
 fi
 in_php_stopped() { compose cp "$1" "php:$2" >>"$dir/cp.log" 2>&1; }
 printf '' > "$dir/empty.ini"
-in_php_stopped "$dir/empty.ini" "$ini"
-compose start php >/dev/null 2>&1
+[ -n "$NA_WHY" ] || in_php_stopped "$dir/empty.ini" "$ini"
+php_start
 if wait_200; then pass "fixed: php-fpm starts again"; else fail "fixed: php-fpm starts again"; fi
+NA_WHY=
 
 echo
+na_summary
 if [ "$fails" -eq 0 ]; then echo "all ext-attribution checks passed"; else echo "$fails check(s) failed"; fi
 [ "$fails" -eq 0 ]

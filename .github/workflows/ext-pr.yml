@@ -16,8 +16,9 @@ on:
       - 'test/release-check.sh'
       - 'test/release/**'
       - 'test/ext/securecore-status.php'
-      - 'test/ext/microvm/**'
-      - 'test/ext-microvm.sh'
+      - 'test/ext/**'
+      - 'test/ext-*.sh'
+      - 'test/lib/**'
       - 'test/promote-check.sh'
       - 'scripts/mirab-vm.sh'
       - 'scripts/guest-image.sh'
@@ -142,3 +143,17 @@ jobs:
           sudo -E env PATH="$PATH" TMPDIR="$PWD/.tmp" bench/microvm/kernel.sh .tmp/mirab-kernel-x86_64.config
       - name: test/ext-microvm.sh
         run: sudo -E env PATH="$PATH" TMPDIR="$PWD/.tmp" test/ext-microvm.sh
+      # The ext-* suites on the microVM target (#72, test/lib/target.sh): php-fpm in the guest,
+      # behind the stack's nginx. Each check that can't apply in a guest says n/a and why. Not
+      # here yet: ext-enforce, ext-db and ext-vault, whose audit-line checks intermittently miss
+      # lines the guest's php-fpm logged (#86); they run on this target by hand until it's fixed.
+      - name: The ext-* suites on the microVM target (SC_TARGET=microvm)
+        run: |
+          set -u
+          rc=0
+          for s in config attribution layer3 layer1 hosts; do
+            echo "::group::test/ext-$s.sh (microvm)"
+            sudo -E env PATH="$PATH" TMPDIR="$PWD/.tmp" SC_TARGET=microvm "test/ext-$s.sh" || { echo "::error::test/ext-$s.sh failed on the microVM target"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit "$rc"

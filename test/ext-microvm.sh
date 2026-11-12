@@ -48,10 +48,14 @@
 # or mirab's newest canary while stable has no vm/.
 set -u
 cd "$(dirname "$0")/.." || exit 1
-what=${1:-check}
-rounds=${2:-5}
+# The guest's files (mvm_files, record) are the ext-* suites' microVM target's too. Sourced first:
+# this file's own helpers below replace the library's same-named ones.
 project=${SECURECORE_EXT_PROJECT:-sc-mvm}
 port=${SECURECORE_EXT_PORT:-8095}
+SC_TARGET=docker # (the switch is for the ext-* suites; this one drives the launcher itself)
+. test/lib/target.sh
+what=${1:-check}
+rounds=${2:-5}
 vport=$((port + 1))
 dir=$PWD/.tmp/ext-microvm
 vm=$dir/vm
@@ -127,26 +131,11 @@ db_root "ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket OR mysql_nativ
   || die "root@localhost by unix_socket"
 
 # --- the guest's files -------------------------------------------------------------------------
-# Firecracker, its jailer and mirab's kernel the way a release resolves them (scripts/mirab-vm.sh):
-# mirab's newest stable release, or MIRAB_MANIFEST, or, while stable has no vm/ (mirab#89), its
-# newest canary.
-if [ -n "${MIRAB_MANIFEST:-}" ]; then
-  scripts/mirab-vm.sh --files "$vm" "$dir" "$MIRAB_MANIFEST" > "$dir/mirab.log" 2>&1; rc=$?
-else
-  scripts/mirab-vm.sh --files "$vm" "$dir" > "$dir/mirab.log" 2>&1; rc=$?
-  if [ "$rc" = 3 ]; then
-    canary=$(curl -fsSL https://mirab-releases.addis.gg/canary.json | jq -r .version)
-    scripts/mirab-vm.sh --files "$vm" "$dir" "https://mirab-releases.addis.gg/$canary/vm/manifest.json" >> "$dir/mirab.log" 2>&1; rc=$?
-  fi
-fi
-[ "$rc" = 0 ] || die "mirab's VM files (see $dir/mirab.log)"
-tail -1 "$dir/mirab.log"
-[ -x "$vm/jailer" ] || die "no jailer from Firecracker's tarball"
-cp "$vm/vmlinux" "$dir/vmlinux-mirab"
-# The guest kernel: mirab's, unless KERNEL names one with Landlock and seccomp (layer 3).
-[ "$kernel" = "$vm/vmlinux" ] || cp "$kernel" "$vm/vmlinux"
-docker build -q -f docker/ext.Dockerfile --target guest -t "$project-guest" . > "$dir/guest-build.log" 2>&1 \
-  || die "the guest image (see $dir/guest-build.log)"
+# Firecracker, its jailer and mirab's kernel the way a release resolves them, the guest kernel,
+# the root image and installed.json (test/lib/target.sh's mvm_files; mirab's kernel kept as
+# $dir/vmlinux-mirab).
+w=$(mvm_files "$vm" "$dir" "$project-guest") || die "$w"
+echo "$w"
 # The test site's environment for the guest's php-fpm (database settings and the vault's env
 # sources, the stack's fixed test values), with the database on the guest's loopback. The
 # launcher gets it as its own environment and delivers it in each start message (#72); no image
@@ -154,22 +143,6 @@ docker build -q -f docker/ext.Dockerfile --target guest -t "$project-guest" . > 
 docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$(compose ps -q php)" | grep '^WORDPRESS_' \
   | sed 's|^WORDPRESS_DB_HOST=.*|WORDPRESS_DB_HOST=127.0.0.1:3306|' > "$dir/guest.env"
 grep -q '^WORDPRESS_DB_HOST=127.0.0.1:3306$' "$dir/guest.env" || die "the guest's env file"
-rootfs_built=$dir/rootfs.stamp
-img=$(docker image inspect -f '{{.Id}}' "$project-guest")
-if [ ! -s "$vm/rootfs.ext4" ] || [ "$(cat "$rootfs_built" 2>/dev/null)" != "$img" ]; then
-  scripts/guest-image.sh "$project-guest" "$vm/rootfs.ext4" > "$dir/rootfs.log" 2>&1 || die "rootfs.ext4 (see $dir/rootfs.log)"
-  echo "$img" > "$rootfs_built"
-fi
-# installed.json, as the installer writes it, with the rootfs too (this test built it; no
-# release ships one yet). record <vm-dir> [no-rootfs].
-sum() { sha256sum "$1" | cut -d' ' -f1; }
-record() {
-  r=""
-  [ "${2:-}" = no-rootfs ] || r=", \"rootfs_sha256\": \"$(sum "$1/rootfs.ext4")\""
-  printf '{ "firecracker_sha256": "%s", "jailer_sha256": "%s", "kernel_sha256": "%s"%s }\n' \
-    "$(sum "$1/firecracker")" "$(sum "$1/jailer")" "$(sum "$1/vmlinux")" "$r" > "$1/installed.json"
-}
-record "$vm"
 # Variants for the refusals: nothing verified for the rootfs; a kernel without Landlock and
 # seccomp filters. (mirab's own kernel had neither until mirab 0.2.1; the kernel here is the
 # kernel's bytes with both symbols renamed, recorded like any other, so it is refused by the
