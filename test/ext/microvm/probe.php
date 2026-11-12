@@ -12,7 +12,30 @@ if (isset($_GET['sleep'])) {
         usleep(0);
     }
 }
+// The guest's log (#86): ?log=<n>&id=<id> writes n numbered lines to php-fpm's log, as layer 2's
+// audit lines go; the test finds every one in the launcher's log.
+if (isset($_GET['log'])) {
+    $id = preg_replace('/[^a-z0-9-]/', '', (string) ($_GET['id'] ?? 'x'));
+    for ($i = 0, $n = min(1000, (int) $_GET['log']); $i < $n; $i++) {
+        error_log(sprintf('sc86 %s %03d %s', $id, $i, str_repeat('.', 80)));
+    }
+}
 echo 'kernel=', php_uname('r'), "\n";
+// What a program this script starts would inherit (#86 review): neither the preload nor its ports.
+echo 'child_env=', (string) getenv('LD_PRELOAD'), (string) getenv('SC_VSOCK_PORTS'), "\n";
+// Whether /tmp runs programs (#86 review: it is noexec).
+@file_put_contents('/tmp/sc-mvm-exec.sh', "#!/bin/sh\necho ran\n");
+@chmod('/tmp/sc-mvm-exec.sh', 0755);
+echo 'tmp_exec=', trim((string) @shell_exec('/tmp/sc-mvm-exec.sh 2>/dev/null')) === 'ran' ? 'RAN' : 'BLOCKED', "\n";
+// The same through /bin/sh, so a BLOCKED above means /tmp, not "no shell_exec".
+echo 'sh_exec=', trim((string) @shell_exec('/bin/sh /tmp/sc-mvm-exec.sh 2>/dev/null')), "\n";
+// The same on an uploads disk, and from the site disk (the test put an executable script there).
+@file_put_contents("$root/wp-content/uploads/sc-mvm-exec.sh", "#!/bin/sh\necho ran\n");
+@chmod("$root/wp-content/uploads/sc-mvm-exec.sh", 0755);
+echo 'uploads_exec=', trim((string) @shell_exec(escapeshellarg("$root/wp-content/uploads/sc-mvm-exec.sh") . ' 2>/dev/null')) === 'ran' ? 'RAN' : 'BLOCKED', "\n";
+echo 'site_exec=', trim((string) @shell_exec(escapeshellarg("$root/sc-mvm-exec.sh") . ' 2>/dev/null')) === 'ran' ? 'RAN' : 'BLOCKED', "\n";
+echo 'site_sh_exec=', trim((string) @shell_exec('/bin/sh ' . escapeshellarg("$root/sc-mvm-exec.sh") . ' 2>/dev/null')), "\n";
+echo 'child_sees=', trim((string) @shell_exec('printf "%s%s" "$LD_PRELOAD" "$SC_VSOCK_PORTS"; echo .')), "\n";
 // The worker's effective uid, from the kernel (no posix extension needed).
 echo 'euid=', preg_match('/^Uid:\s+\d+\s+(\d+)/m', (string) @file_get_contents('/proc/self/status'), $u) ? $u[1] : '?', "\n";
 echo 'time=', time(), "\n";

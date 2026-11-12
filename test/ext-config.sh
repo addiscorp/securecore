@@ -11,10 +11,12 @@
 #      the file and the problem;
 #   4. php-fpm (re)started with an invalid, a missing or no config → it refuses to start, and
 #      its log names the file and the problem; a fixed file starts it again.
-# On the microVM target (SC_TARGET=microvm, test/lib/target.sh) php-fpm runs in the guest: 2 and
-# 3 become "a changed config reaches the guest at its next start" (the guest's site disk is a copy
-# made at each start, so an in-place edit can't reach a running guest), and 4's refusals are the
-# launcher's (exit 125, its log), the ini cases n/a (php.ini is on the guest's read-only root).
+# On the microVM target (SC_TARGET=microvm, test/lib/target.sh) php-fpm runs in the guest: in 2
+# the launcher delivers each edit into the running guest, whose extension reloads it (#90), and
+# also a layer1 edit the VM can run (restart_needed) and one it can't (refused); in 3 the launcher
+# refuses the invalid file and keeps the guest's; 4's refusals are the launcher's (exit 125, its
+# log), the ini cases n/a (the launcher passes the config path; the guest's securecore.ini is the
+# image's).
 # Exits non-zero on any failure. Writes .tmp/ext-config/. Leaves the stack up on a valid config.
 #   DOCKER_CONTEXT=colima test/ext-config.sh
 #   sudo SC_TARGET=microvm test/ext-config.sh      (a KVM host, as root)
@@ -83,30 +85,57 @@ compose exec -T php rm -f /var/www/html/securecore-probe.json
 sed 's/"mode": "enforce"/"mode": "log"/' ext/examples/wordpress.json > "$dir/log-mode.json"
 cp ext/examples/off.json "$dir/off.json"
 if on_microvm; then
-  # The guest's site disk is a copy made at each start: the edit reaches it at the next one.
-  reason="the guest's site disk is a copy made at each start, so a config edit reaches the guest only when the launcher starts it again"
-  na "edited to mode=log: every worker reports the new file without a restart" "$reason"
-  na "no restart: same php-fpm master and container start" "$reason"
-  na "the php-fpm log records the reload and the new sha256" "$reason"
-  t=$(now)
-  put_live "$dir/log-mode.json"
+  # The launcher follows the file and delivers each valid edit into the running guest, whose
+  # extension reloads it as on a host (#90): no restart.
+  before=$(launcher_pid)
+  t=$(now); t0=$(date +%s%N)
+  put_delivered "$dir/log-mode.json" || fail "the launcher delivered the edit" "$(phplog "$t" | tail -3 | tr '\n' ' ')"
   want=$(conf_sha "$dir/log-mode.json")
-  good=0
+  # Until the guest's workers report it (each re-checks the file every RELOAD_INTERVAL).
+  i=0; until status && [ "$(field sha256)" = "$want" ]; do i=$((i + 1)); [ "$i" -lt 100 ] || break; sleep 0.05; done
+  live_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  wait_reload
+  good=0 pids=""
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     status
+    pids="$pids $(field pid)"
     [ "$(field sha256)/$(field layer2_mode)" = "$want/log" ] && good=$((good + 1))
   done
-  is "$good" 10 "edited to mode=log, the launcher started again: 10/10 requests report the new sha256 and mode"
+  workers=$(echo "$pids" | tr ' ' '\n' | sort -u | grep -c .)
+  is "$good" 10 "edited to mode=log: 10/10 requests ($workers php-fpm workers in the guest) report the new sha256 and mode (edit to the first request on it: $live_ms ms; launcher delivery $delivered_ms ms)"
+  is "$(launcher_pid)/$(phplog "$t" | grep -c 'microVM restored from snapshot\|microVM cold-booted\|reloaded the guest.s php-fpm')" "$before/0" \
+    "no restart: the same launcher, no new boot and no php-fpm restart in the guest"
   is "$(field restart_needed)" 0 "a layer2 edit does not need a restart"
-  is "$(phplog "$t" | grep -c 'microVM restored from snapshot\|made the snapshot' | grep -c '^[1-9]')" 1 "the launcher started the guest on the new site (its log)"
-  put_live "$dir/off.json"
+  is "$(phplog "$t" | grep -cF "securecore: reloaded $conf (sha256 $want)" | grep -c '^[1-9]')" 1 "the php-fpm log records the reload and the new sha256"
+
+  put_delivered "$dir/off.json"
+  wait_reload
   status
   # layer1 stays on: the target's config is always isolation microvm (an off config runs php-fpm on
   # the host); layers 2 and 3 are the file's.
   is "$(field sha256)/$(layers)" "$(conf_sha "$dir/off.json")/100" "edited to off.json: layers 2 and 3 disabled, layer 1 the microVM"
   na "edited to off.json: status reports off" "the target keeps layer 1 on (isolation microvm), so the config is never all off"
-  na "layer1 changed (enabled → disabled): restart_needed" "the target keeps layer 1 on; restart_needed is about an edit a running php-fpm can't apply, and the guest is always started again"
   is "$(code /)" 200 "front page 200 with layers 2 and 3 off"
+  # A layer1 edit the microVM can run: delivered, and it applies at the next start (restart_needed).
+  jq '.layer1.network.connect += [{ "port": 8443 }]' "$tdir/conf.json" > "$dir/l1-port.json"
+  t=$(now)
+  put_delivered "$dir/l1-port.json"
+  wait_reload
+  status
+  is "$(field sha256)/$(field restart_needed)" "$(conf_sha "$dir/l1-port.json")/1" "layer1 changed (a connect port added): delivered, restart_needed"
+  is "$(phplog "$t" | grep -c 'layer1 differs from the one this VM started with: it applies at the next start (restart_needed)')" 1 \
+    "the launcher says the layer1 change applies at the next start"
+  # A layer1 edit the microVM can't run (a unix socket outside connect): refused, the guest keeps its config.
+  jq '.layer1.network.unixSockets = ["/run/sc-other.sock"]' "$dir/l1-port.json" > "$dir/l1-unix.json"
+  t=$(now)
+  put_delivered "$dir/l1-unix.json"
+  wait_reload
+  status
+  is "$(field sha256)" "$(conf_sha "$dir/l1-port.json")" "an edit the microVM can't run: the guest keeps the last config it could"
+  is "$(phplog "$t" | grep -F 'refused for the running guest: the microVM can'"'"'t run it' | grep -c 'keeping the last valid config in the guest')" 1 \
+    "the launcher's log says why and that the guest keeps its config"
+  put_delivered "$dir/off.json"
+  wait_reload
 else
   before="$(started_at) $(master_pid)"
   t=$(now)
@@ -136,12 +165,29 @@ fi
 # --- 3. an invalid edit while running keeps the last valid config ----------------------------
 printf '{"layer1":{"isolation":"off"},"layer2":{"enabled":true,"app":"wordpress","mode":"block"},"layer3":{"enabled":false}}\n' > "$dir/bad-mode.json"
 if on_microvm; then
-  reason="a running guest never sees an edit (its site disk is a copy made at start); an invalid file at a start is section 4"
-  for l in "invalid edit: the last valid config stays live" "invalid edit: reload_error names the file and the problem" \
-    "invalid edit: still serving on the last valid config" "invalid edit: the php-fpm log says why and that the last valid config is kept"; do
-    na "$l" "$reason"
-  done
-  put "$dir/bad-mode.json"
+  # The launcher refuses it before the guest sees it (#90), as the extension does on a host.
+  t=$(now)
+  put_delivered "$dir/bad-mode.json"
+  wait_reload
+  status
+  is "$(field sha256)" "$(conf_sha "$dir/off.json")" "invalid edit: the last valid config stays live"
+  na "invalid edit: reload_error names the file and the problem" "the launcher refuses the file before the guest's extension sees it; its log names the file and the problem (next check)"
+  is "$(code /)" 200 "invalid edit: still serving on the last valid config"
+  # Where and what kind, never the file's own words (#90 review).
+  is "$(phplog "$t" | grep -F "securecore-fpm: $(site_dir)/securecore.json: invalid at line " | grep -cF 'keeping the last valid config in the guest' | grep -c '^[1-9]')" 1 \
+    "invalid edit: the launcher's log says why and that the last valid config is kept"
+  is "$(phplog "$t" | grep '^securecore-fpm: ' | grep -c 'block')" 0 "invalid edit: the launcher's log doesn't quote the file's value"
+  # A link in place of the file (#90 review): never read through, whatever it points at.
+  t=$(now)
+  mvm_conf "$dir/log-mode.json" > "$tdir/elsewhere.json"
+  _s=$(site_dir)
+  ln -sfn "$tdir/elsewhere.json" "$_s/securecore.json.lnk" && mv -fT "$_s/securecore.json.lnk" "$_s/securecore.json"
+  i=0; until phplog "$t" | grep -q 'securecore.json: a link is in its path'; do i=$((i + 1)); [ "$i" -lt 50 ] || break; sleep 0.1; done
+  wait_reload
+  status
+  is "$(field sha256)" "$(conf_sha "$dir/off.json")" "a link in place of securecore.json: the guest keeps its config"
+  is "$(phplog "$t" | grep -c 'securecore.json: a link is in its path')" 1 "and the launcher says the link is refused, once"
+  put "$dir/off.json"
 else
   t=$(now)
   put_live "$dir/bad-mode.json"
@@ -171,7 +217,9 @@ refuses() {
   problem=$2
   if on_microvm; then
     is "$(php_state)" "exited 125" "$1: the launcher exits 125"
-    if grep -qF "securecore-fpm: $(site_dir)/securecore.json: ${problem#\$conf: }" "$dir/refuse.log"; then
+    # The launcher's words, when they differ (<the launcher's problem>, a third argument): it
+    # never quotes the file, so a JSON or schema error says where and what kind (#90 review).
+    if grep -qF "securecore-fpm: $(site_dir)/securecore.json: ${3:-${problem#\$conf: }}" "$dir/refuse.log"; then
       pass "$1: the log says why: $(grep -F 'securecore-fpm' "$dir/refuse.log" | head -1 | cut -c1-200)"
     else
       fail "$1: the log names the file and the problem" "$(tr '\n' ' ' < "$dir/refuse.log" | cut -c1-400)"
@@ -187,11 +235,12 @@ refuses() {
 }
 # (Single quotes: '$conf' is the literal placeholder refuses() fills in.)
 put "$dir/bad-mode.json"
-refuses "invalid mode" '$conf: invalid: unknown variant `block`'
+refuses "invalid mode" '$conf: invalid: unknown variant `block`' "invalid at line "
+! on_microvm || is "$(grep -c 'block' "$dir/refuse.log")" 0 "invalid mode: the launcher's log doesn't quote the file's value"
 
 printf '{"layer1":{"isolation":"off"},"layer2":{"enabled":false},"layer3":{"enabled":false},"layer4":{}}\n' > "$dir/unknown-key.json"
 put "$dir/unknown-key.json"
-refuses "unknown key" '$conf: invalid: unknown field `layer4`'
+refuses "unknown key" '$conf: invalid: unknown field `layer4`' "invalid at line "
 
 # layer1.enabled is retired: the extension refuses a file that still sets it, saying why.
 printf '{"layer1":{"enabled":false},"layer2":{"enabled":false},"layer3":{"enabled":false}}\n' > "$dir/retired.json"
@@ -200,7 +249,7 @@ refuses "the retired layer1.enabled" "\$conf: invalid: layer1.enabled is retired
 
 ini=/usr/local/etc/php/conf.d/securecore.ini
 if on_microvm; then
-  reason="php.ini is on the guest's read-only root image, the same for every site; the launcher passes the config path itself"
+  reason="securecore.config is the guest image's own (the launcher puts the site's config at that path); a site's php.ini settings for the guest (--guest-ini) may set only securecore.debug_*"
   for l in "missing file: php-fpm refuses to start" "securecore.config unset: php-fpm refuses to start"; do na "$l" "$reason"; done
 else
   compose cp "php:$ini" "$dir/securecore.ini" >>"$dir/cp.log" 2>&1

@@ -14,9 +14,8 @@
 #   5. layer2 mode off records nothing; an invalid debug value refuses to start.
 # Exits non-zero on any failure. Writes .tmp/ext-attribution/. Leaves the stack as it found it
 # (examples/wordpress.json, no debug ini, fixtures removed).
-# On the microVM target (SC_TARGET=microvm, test/lib/target.sh) 1 runs in the guest; 2–5 switch
-# the debug settings in php.ini, which in the guest is on the read-only root image (php-fpm there
-# takes no per-site ini), so each of their checks is n/a, with that reason.
+# On the microVM target (SC_TARGET=microvm, test/lib/target.sh) everything runs in the guest: the
+# debug settings are the launcher's --guest-ini file, delivered to the running guest (#90).
 #   DOCKER_CONTEXT=colima test/ext-config.sh && DOCKER_CONTEXT=colima test/ext-attribution.sh
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -45,12 +44,27 @@ field() { sed -n "s/^$1=//p" "$dir/status"; }
 attr() { phplog "$1" | sed -n 's/.*securecore: attribution //p'; }
 # has <since> <line> <label>
 has() { if attr "$1" | grep -qxF "$2"; then pass "$3"; else fail "$3" "no line '$2'"; fi; }
-# debug <ini lines>: write the debug ini (empty: remove it) and restart php-fpm. On the microVM a
-# debug setting can't reach the guest's php-fpm: from then on the checks are n/a.
+# debug <ini lines>: write the debug ini (empty: remove it) and restart php-fpm. On the microVM
+# the site's php.ini settings are the launcher's --guest-ini file: it delivers them to the running
+# guest and starts its php-fpm again gracefully (#90); this waits for that, or for the launcher
+# to stop (a value the extension refuses stops the guest's php-fpm, as on a host).
 debug() {
   if on_microvm; then
-    [ -z "$1" ] || NA_WHY="it sets securecore.debug_* in php.ini, and the guest's php.ini is on its read-only root image (no per-site ini)"
-    [ -n "$NA_WHY" ] || php_restart > /dev/null 2>&1
+    _m=$(now)
+    # Nothing changes: nothing to deliver (and nothing to wait for).
+    if [ -z "$1" ]; then
+      [ -e "$tdir/guest.ini" ] || return 0
+      rm -f "$tdir/guest.ini"
+    else
+      [ "$(cat "$tdir/guest.ini" 2>/dev/null)" != "$1" ] || return 0
+      printf '%s\n' "$1" > "$tdir/guest.ini"
+    fi
+    _i=0
+    until phplog "$_m" | grep -q "delivered the site's php.ini settings\|the guest refused them\|Firecracker exited"; do
+      launcher_alive || return 0
+      _i=$((_i + 1)); [ "$_i" -lt 600 ] || { echo "  the launcher did not deliver the php.ini settings in 60 s"; return 0; }
+      sleep 0.1
+    done
     return 0
   fi
   if [ -z "$1" ]; then in_php "rm -f $ini"; else printf '%s\n' "$1" | compose exec -T php sh -c "cat > $ini"; fi
@@ -76,10 +90,13 @@ cleanup() {
   wp plugin deactivate securecore-attr securecore-attr-linked >/dev/null
   in_php "rm -rf $plugin $content/plugins/securecore-attr-linked $(dirname "$shared") $content/mu-plugins/securecore-attr-mu.php $data $ini"
   put ext/examples/wordpress.json
+  ! on_microvm || rm -f "$tdir/guest.ini"
   php_restart >/dev/null 2>&1
   wait_200 || echo "FAIL php-fpm did not come back after cleanup"
 }
 trap cleanup EXIT
+# The fixtures reach the guest at its next start (microvm; nothing on docker).
+site_sync
 debug ""
 wait_200 || { echo "FAIL php-fpm did not start"; exit 1; }
 
@@ -157,7 +174,7 @@ else
 fi
 in_php_stopped() { compose cp "$1" "php:$2" >>"$dir/cp.log" 2>&1; }
 printf '' > "$dir/empty.ini"
-[ -n "$NA_WHY" ] || in_php_stopped "$dir/empty.ini" "$ini"
+if on_microvm; then cp "$dir/empty.ini" "$tdir/guest.ini"; else in_php_stopped "$dir/empty.ini" "$ini"; fi
 php_start
 if wait_200; then pass "fixed: php-fpm starts again"; else fail "fixed: php-fpm starts again"; fi
 NA_WHY=

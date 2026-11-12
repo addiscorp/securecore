@@ -9,7 +9,8 @@
 //!         folder bind-mounted into the jail (Firecracker connects as the jailed user), or a
 //!         thread that connects to its TCP `address`. A port with neither is an egress port:
 //!         the guest reaches named hosts on it through `<jail>/v.sock_1517` ([`crate::egress`]).
-//!   log   guest port 1514 → this process's stderr, each line marked `guest: ` (read only)
+//!   log   guest port 1514 → this process's stderr, each line marked `guest: `: numbered frames,
+//!         each logged once and acknowledged; a lost line is counted ([`crate::guestlog`], #86)
 //!   ctl   guest port 1515 ← one start message after each boot or restore (clock, fresh
 //!         randomness, the workers' refresh after a restore, then the disks); later `sync`
 //!         before a stop and `reload` on SIGUSR2/SIGHUP
@@ -44,6 +45,7 @@ use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -52,6 +54,7 @@ use securecore_config::Loaded;
 use sha2::{Digest as _, Sha256};
 
 use crate::fcgi;
+use crate::guestlog;
 use crate::guest::{CTL_PORT, Ctl, FPM_PORT, LOG_PORT};
 use crate::jail::{self, Jail, User};
 use crate::vsock;
@@ -66,7 +69,8 @@ pub const DEFAULT_VM_USER: &str = "securecore-vm";
 /// message, the sync), so old snapshots are never restored into a new driver. The guest's init
 /// is the same binary: it boots with `sc.proto=<this>`, answers the handshake only when it is
 /// its own, and takes no start message otherwise ([`handshake`]).
-pub const PROTOCOL: u32 = 4;
+/// 5: the log port's numbered, acknowledged frames ([`guestlog`], #86).
+pub const PROTOCOL: u32 = 5;
 /// KVM_GET_API_VERSION, and the only value every KVM since Linux 2.6.22 returns.
 const KVM_GET_API_VERSION: libc::c_ulong = 0xAE00;
 const KVM_API_VERSION: i32 = 12;
@@ -168,7 +172,31 @@ pub struct Options {
     /// Variables of the launcher's environment the guest's php-fpm gets, besides the vault's
     /// own (`layer2.vault.secrets[].env`), which it always gets ([`guest_env`]).
     pub guest_env: Vec<String>,
+    /// The site's php.ini settings for the guest's php-fpm (#90): a file of `securecore.debug_*`
+    /// lines ([`crate::guest::site_ini`]), delivered at each start and again whenever it changes.
+    /// A missing file is no settings.
+    pub guest_ini: Option<PathBuf>,
 }
+
+/// The site's php.ini settings as the guest gets them: `None` without `--guest-ini` or while the
+/// file is missing; refused with the reason when it sets anything else. The file is the
+/// operator's (a launcher flag names it, as with `--config`), read the way `securecore.json` is
+/// ([`crate::sitefile::read`]: no link anywhere in its path, as its folder's owner, regular
+/// only), within [`MAX_SITE_INI`].
+pub fn read_site_ini(path: Option<&Path>) -> Result<Option<String>, String> {
+    let Some(path) = path else { return Ok(None) };
+    match crate::sitefile::read(path, MAX_SITE_INI) {
+        Ok(None) => Ok(None),
+        Ok(Some(b)) => {
+            let text = String::from_utf8(b).map_err(|_| format!("{}: not UTF-8", path.display()))?;
+            crate::guest::site_ini(&text).map(Some).map_err(|e| format!("{}: {e}", path.display()))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The largest `--guest-ini` file read.
+pub const MAX_SITE_INI: usize = 16 * 1024;
 
 /// php-fpm's environment in the guest: each name in `--guest-env` and each vault secret's `env`,
 /// with its value from the launcher's own environment (as php-fpm on the host would have it).
@@ -1080,6 +1108,19 @@ struct Vm {
     _root: fs::File,
     /// Emptied (bind mounts unmounted first) when the VM is dropped, on every path out.
     jail: Jail,
+    /// Its log, as the launcher received it: quoted when the VM stops on its own (#87).
+    log: &'static Mutex<guestlog::Inbox>,
+    /// The key only its init's log connections present ([`guestlog`]).
+    log_key: guestlog::Key,
+    /// Its log port's server: what it hasn't said yet is said when the VM goes ([`Drop`]).
+    log_server: &'static guestlog::LogServer,
+}
+
+/// A VM's log key, and the old one a restored snapshot's init still holds for a moment.
+#[derive(Clone, Copy)]
+struct LogKeys {
+    key: guestlog::Key,
+    stale: Option<guestlog::Key>,
 }
 
 /// An `O_PATH` handle on `dir` and the short path prefix that reaches into it.
@@ -1096,6 +1137,8 @@ fn short_dir(dir: &Path) -> Result<(fs::File, PathBuf), String> {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        // The last second's refusals on its log port (#86 verification review).
+        self.log_server.flush();
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
@@ -1121,7 +1164,7 @@ struct Machine {
     /// The `connect[].socket` folders, checked and held ([`open_sockets`]).
     sockets: Vec<(u16, jail::SocketDir)>,
     /// What the guest may reach by name.
-    egress: crate::egress::Egress,
+    egress: &'static std::sync::RwLock<crate::egress::Egress>,
 }
 
 /// What a jail holds for one spawn: the host ends of the guest's ports come with it.
@@ -1136,14 +1179,16 @@ enum Wiring {
 impl Vm {
     /// A fresh jail with this machine's files (and `snap`'s, to restore it), then the jailer.
     /// A spawn that fails leaves no jail behind (nothing stays mounted).
-    fn spawn(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>) -> Result<Vm, String> {
+    /// `keys`: this VM's log key, and a restored snapshot's old one, which is refused quietly.
+    fn spawn(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>, keys: LogKeys) -> Result<Vm, String> {
         let j = Jail::new(&plan.state, &plan.id, m.user);
-        Vm::spawn_in(&j, plan, opts, m, wiring, snap).inspect_err(|_| {
+        Vm::spawn_in(&j, plan, opts, m, wiring, snap, keys).inspect_err(|_| {
             let _ = j.clear();
         })
     }
 
-    fn spawn_in(j: &Jail, plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>) -> Result<Vm, String> {
+    fn spawn_in(j: &Jail, plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>, keys: LogKeys) -> Result<Vm, String> {
+        let key = keys.key;
         j.prepare()?;
         j.place(&opts.assets.kernel, IN_KERNEL)?;
         j.place(&opts.assets.rootfs, IN_ROOTFS)?;
@@ -1162,7 +1207,8 @@ impl Vm {
             j.user_dir(IN_SNAP_NEW)?;
         }
         let (root, short) = short_dir(&j.root)?;
-        wire(plan, m, j, &short, wiring)?;
+        let log_server = wire(plan, m, j, &short, wiring, keys)?;
+        let log = log_server.inbox();
         let mut cmd = j.command(&opts.assets.jailer, &opts.assets.firecracker, opts.vcpus, opts.mem_mib, &["--api-sock", IN_API]);
         // stdout and stderr together, through a pipe, into a capped console.log.
         let (rd, wr) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
@@ -1175,7 +1221,7 @@ impl Vm {
         let pid = child.id() as i32;
         let _ = fs::write(j.base.join("firecracker.pid"), pid.to_string());
         let inside = |p: &str| short.join(p.trim_start_matches('/'));
-        let mut vm = Vm { child: Some(child), pid, api: inside(IN_API), vsock: inside(IN_VSOCK), _root: root, jail: j.clone() };
+        let mut vm = Vm { child: Some(child), pid, api: inside(IN_API), vsock: inside(IN_VSOCK), _root: root, jail: j.clone(), log, log_key: key, log_server };
         let t = Instant::now();
         while UnixStream::connect(&vm.api).is_err() {
             if let Some(st) = vm.exited() {
@@ -1212,7 +1258,7 @@ impl Vm {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if let Some(st) = self.exited() {
-                        return Err(format!("Firecracker exited ({st}) before php-fpm answered; see {}", state.join("console.log").display()));
+                        return Err(exited_before_ready(&st, &self.log.lock().unwrap_or_else(|p| p.into_inner()).recent(), state));
                     }
                     if t.elapsed() > timeout {
                         return Err(format!("php-fpm did not answer over vsock in {} s: {e}", timeout.as_secs()));
@@ -1224,13 +1270,52 @@ impl Vm {
     }
 }
 
+/// Why the launcher stops when Firecracker exits before php-fpm answered: the guest's own last
+/// lines (php-fpm's reason and init's exit status, which the guest delivers before it stops,
+/// #87), or, when it said nothing, where to look.
+/// The guest's last lines inside a launcher line: last in it, after a label that says they are
+/// the guest's words, each quoted and escaped ([`guestlog::Inbox::recent`]).
+pub fn quoted_guest(recent: &str) -> String {
+    if recent.is_empty() { "the guest logged nothing".to_owned() } else { format!("the guest's last log lines, as the guest wrote them (quoted): {recent}") }
+}
+
+pub fn exited_before_ready(st: &str, recent: &str, state: &Path) -> String {
+    let console = state.join("console.log");
+    if recent.is_empty() {
+        format!("Firecracker exited ({st}) before php-fpm answered, and the guest logged nothing; see {}", console.display())
+    } else {
+        format!("Firecracker exited ({st}) before php-fpm answered; see {}; {}", console.display(), quoted_guest(recent))
+    }
+}
+
 fn now() -> (i64, u32) {
     let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     (d.as_secs() as i64, d.subsec_nanos())
 }
 
+/// The file beside a snapshot that holds its VM's log key (the init in the snapshot has it).
+const SNAP_LOG_KEY: &str = "log.key";
+
+fn random_key() -> Result<guestlog::Key, String> {
+    let r = random64()?;
+    let mut k = [0u8; guestlog::KEY_LEN];
+    k.copy_from_slice(&r[..guestlog::KEY_LEN]);
+    Ok(k)
+}
+
+/// Gives a booting guest's init its log key, on a thread of its own (the boot goes on meanwhile):
+/// the init sends its log, its boot's own lines included, only once it has it.
+fn give_log_key(vm: &Vm) {
+    let (uds, hex) = (vm.vsock.clone(), hex(&vm.log_key));
+    thread::spawn(move || {
+        if let Err(e) = tell_guest(&uds, &[Ctl::LogKey { hex }, Ctl::Done], START_TIMEOUT) {
+            log(&format!("could not give the guest's init its log key ({e}): the guest's log is refused"));
+        }
+    });
+}
+
 fn cold_boot(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring) -> Result<Vm, String> {
-    let vm = Vm::spawn(plan, opts, m, wiring, None)?;
+    let vm = Vm::spawn(plan, opts, m, wiring, None, LogKeys { key: random_key()?, stale: None })?;
     vm.api("PUT", "/machine-config", &format!(r#"{{"vcpu_count":{},"mem_size_mib":{},"smt":false}}"#, opts.vcpus, opts.mem_mib))?;
     let args = format!("{} sc.time={}", m.args, now().0);
     vm.api("PUT", "/boot-source", &format!(r#"{{"kernel_image_path":{},"boot_args":{}}}"#, json_str(IN_KERNEL), json_str(&args)))?;
@@ -1251,11 +1336,27 @@ fn cold_boot(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring) -> Result
     }
     vm.api("PUT", "/vsock", &format!(r#"{{"guest_cid":3,"uds_path":{}}}"#, json_str(IN_VSOCK)))?;
     vm.api("PUT", "/actions", r#"{"action_type":"InstanceStart"}"#)?;
+    give_log_key(&vm);
     Ok(vm)
 }
 
+/// A snapshot's log key: its init already holds it, so a restore's log is taken with it.
+fn snap_key(snap: &Path) -> Result<guestlog::Key, String> {
+    let path = snap.join(SNAP_LOG_KEY);
+    let b = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    b.try_into().map_err(|_| format!("{}: not a log key", path.display()))
+}
+
+/// A restore's log keys: a fresh one of its own, and the snapshot's as the stale one.
+fn restore_keys(snap: &Path) -> Result<LogKeys, String> {
+    Ok(LogKeys { key: random_key()?, stale: Some(snap_key(snap)?) })
+}
+
+/// A restore: a fresh log key of its own, given to the restored init at once (#86 verification
+/// review, K2). The snapshot's key, which every restore of it starts with, is only ever refused
+/// (quietly): whoever learned it in one restored guest has nothing in the next.
 fn restore(plan: &Plan, opts: &Options, m: &Machine, snap: &Path) -> Result<Vm, String> {
-    let vm = Vm::spawn(plan, opts, m, Wiring::Full, Some(snap))?;
+    let vm = Vm::spawn(plan, opts, m, Wiring::Full, Some(snap), restore_keys(snap)?)?;
     vm.api(
         "PUT",
         "/snapshot/load",
@@ -1265,6 +1366,7 @@ fn restore(plan: &Plan, opts: &Options, m: &Machine, snap: &Path) -> Result<Vm, 
             json_str(&format!("{IN_SNAP}/vm.mem"))
         ),
     )?;
+    give_log_key(&vm);
     Ok(vm)
 }
 
@@ -1291,6 +1393,14 @@ fn snapshot(vm: &Vm, plan: &Plan, user: User, snap: &Path) -> Result<(), String>
     fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     for f in ["vm.snap", "vm.mem"] {
         take_out(&inside.join(f), &tmp.join(f), user).map_err(|e| format!("{f}: {e}"))?;
+    }
+    // The init in the snapshot has this VM's log key: every restore's log is taken with it.
+    // Root's alone (the state folder is root's, 0700).
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let p = tmp.join(SNAP_LOG_KEY);
+        let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        f.write_all(&vm.log_key).map_err(|e| format!("{}: {e}", p.display()))?;
     }
     fs::rename(&tmp, snap).map_err(|e| format!("{}: {e}", snap.display()))
 }
@@ -1324,10 +1434,12 @@ fn take_out(inside: &Path, out: &Path, user: User) -> Result<(), String> {
 
 /// The start message: the clock, fresh randomness, the workers' refresh after a restore, then
 /// the writable disks and tmpfs folders.
-fn start_message(plan: &Plan, restored: bool, entropy: [u8; 64], env: &[(String, String)]) -> Vec<Ctl> {
+fn start_message(plan: &Plan, restored: bool, entropy: [u8; 64], env: &[(String, String)], ini: Option<&str>) -> Vec<Ctl> {
     let (secs, nanos) = now();
     let mut lines = vec![Ctl::Time { secs, nanos }, Ctl::Entropy { hex: hex(&entropy) }];
     lines.extend(env.iter().map(|(name, value)| Ctl::Env { name: name.clone(), hex: hex(value.as_bytes()) }));
+    // The site's php.ini settings (#90): php-fpm starts again with them, as with `env`.
+    lines.extend(ini.map(|text| Ctl::Ini { hex: hex(text.as_bytes()) }));
     if restored {
         lines.push(Ctl::Refresh);
     }
@@ -1370,6 +1482,16 @@ fn tell_guest(uds: &Path, lines: &[Ctl], timeout: Duration) -> Result<(), String
     refused(lines, reply.trim_end())
 }
 
+/// What the launcher says when the guest's sync before a stop fails: the guest syncs its disks
+/// first and reports log lines it couldn't get acknowledged after, so a reply naming those is a
+/// count of lost log lines, not a failed disk sync.
+pub fn stop_sync_failed(e: &str) -> String {
+    match e.split_once("error ") {
+        Some((_, why)) if why.contains(guestlog::UNACKED_AT_STOP) => format!("the guest synced its disks before the stop, but {why}"),
+        _ => format!("the guest did not sync its disks before the stop: {e}"),
+    }
+}
+
 /// The guest's reply to `lines` as a result. Its text is shown only when `lines` carried no
 /// `env` line: an older init echoes a line it doesn't know, and that line could be a secret
 /// (a current init never echoes one, and logs its reason on the log port).
@@ -1378,10 +1500,224 @@ fn refused(lines: &[Ctl], reply: &str) -> Result<(), String> {
         return Ok(());
     }
     let kinds: Vec<String> = lines.iter().map(|c| c.line().trim_end().split(' ').next().unwrap_or("").to_owned()).collect();
-    if lines.iter().any(|c| matches!(c, Ctl::Env { .. })) {
+    if lines.iter().any(|c| matches!(c, Ctl::Env { .. } | Ctl::LogKey { .. })) {
         return Err(format!("the guest refused {kinds:?} (its reply isn't shown: the message carried secrets; the guest's own log line says why)"));
     }
     Err(format!("the guest refused {kinds:?}: {reply}"))
+}
+
+/// How often the launcher looks at the config and the site's php.ini settings: the extension's
+/// own reload interval, so an edit reaches the guest's workers about as soon as a host's.
+pub const WATCH_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// How [`live_change`]'s refusal starts.
+const VM_CANT_RUN: &str = "the microVM can't run it";
+
+/// Whether a running guest can take `new` (#90), the config it started with being `started`:
+/// `Err(why)` when the microVM can't express it (the same check a start makes, [`plan`]), so the
+/// guest keeps what it has; else what the launcher says about it. As on a host, a change to
+/// `layer1` or to the vault takes effect only at the next start (the extension in the guest
+/// reports `restart_needed`); layers 2 and 3 reload in place.
+pub fn live_change(started: &Loaded, new: &Loaded, opts: &Options) -> Result<Vec<String>, String> {
+    plan(new, opts).map_err(|e| format!("{VM_CANT_RUN} ({e})"))?;
+    let mut notes = Vec::new();
+    if new.config.layer1 != started.config.layer1 {
+        notes.push("layer1 differs from the one this VM started with: it applies at the next start (restart_needed)".to_owned());
+    }
+    if securecore_config::started_vault(&new.config) != securecore_config::started_vault(&started.config) {
+        notes.push("layer2.vault differs from the one this VM started with: it applies at the next start (restart_needed)".to_owned());
+    }
+    Ok(notes)
+}
+
+/// Follows the config file and the site's php.ini settings for the running guest (#90), every
+/// [`WATCH_INTERVAL`], with the extension's own [`securecore_config::Reloader`]: an invalid file
+/// or one the microVM can't run is refused with the reason, and the guest keeps what it has; a
+/// valid one is put in place in the guest, where the extension reloads it as on a host (and the
+/// host's egress takes its layer 2 hosts). A changed php.ini is delivered and php-fpm started
+/// again gracefully with it.
+fn watch_live(started: &Loaded, opts: &Options, uds: &Path, egress: &std::sync::RwLock<crate::egress::Egress>, ports: &[u16], mut ini: Option<String>) {
+    let mut in_guest = started.sha256.clone();
+    // The file's bytes last looked at (by sha256), and what was said about them: each version is
+    // judged once, as the extension's Reloader does.
+    let mut seen = started.sha256.clone();
+    let mut refused: Option<String> = None;
+    let mut read_error: Option<String> = None;
+    let mut ini_refused: Option<String> = None;
+    let mut unsure: Option<(Loaded, u8)> = None;
+    loop {
+        thread::sleep(WATCH_INTERVAL);
+        // The launcher's start reads it the same way (#90 review): no link anywhere in its path,
+        // as its folder's owner, regular only, at most MAX_CONFIG bytes.
+        let bytes = match crate::sitefile::read(&started.path, crate::guest::MAX_CONFIG) {
+            Ok(Some(b)) => {
+                read_error = None;
+                Some(b)
+            }
+            other => {
+                let e = other.err().unwrap_or_else(|| format!("{}: missing", started.path.display()));
+                if read_error.as_deref() != Some(&e) {
+                    log(&format!("{e}; keeping the last valid config in the guest (sha256 {})", short_sha(&in_guest)));
+                    read_error = Some(e);
+                }
+                None
+            }
+        };
+        let live = match bytes {
+            Some(b) if securecore_config::sha256_hex(&b) != seen => {
+                let sha = securecore_config::sha256_hex(&b);
+                seen = sha.clone();
+                match securecore_config::Config::from_slice(&b) {
+                    Ok(config) => Some((Loaded { path: started.path.clone(), config, sha256: sha, root: started.root.clone() }, b)),
+                    Err(problem) => {
+                        // Never quoting the file (#90 review), as at the start.
+                        let e = securecore_config::LoadError { path: started.path.clone(), problem }.without_contents();
+                        log(&format!("{e}; keeping the last valid config in the guest (sha256 {})", short_sha(&in_guest)));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some((live, b)) = live
+            && live.sha256 != in_guest
+            && refused.as_deref() != Some(&live.sha256)
+        {
+            let t = Instant::now();
+            let result = live_change(started, &live, opts).and_then(|notes| deliver_config(uds, &b, &live.sha256).map(|how| (notes, how)));
+            match result {
+                Ok((mut notes, how)) => {
+                    notes.extend(how);
+                    log(&format!(
+                        "delivered {} (sha256 {}) to the running guest in {:.0} ms; its extension reloads it",
+                        live.path.display(),
+                        short_sha(&live.sha256),
+                        ms(t)
+                    ));
+                    for n in notes {
+                        log(&n);
+                    }
+                    *egress.write().unwrap_or_else(|p| p.into_inner()) = crate::egress::Egress::new(&live, ports.to_vec());
+                    in_guest = live.sha256.clone();
+                    refused = None;
+                }
+                Err(e) => {
+                    log(&format!(
+                        "{}: refused for the running guest: {e}; keeping the last valid config in the guest (sha256 {})",
+                        live.path.display(),
+                        short_sha(&in_guest)
+                    ));
+                    // No answer from the guest (not its own refusal, not ours): it may still put
+                    // it in place late, so its answer is asked for again on the next looks.
+                    if !guest_answered(&e) && !e.starts_with(VM_CANT_RUN) {
+                        unsure = Some((live.clone(), 0));
+                    }
+                    refused = Some(live.sha256.clone());
+                }
+            }
+        } else if let Some((live, tries)) = unsure.take() {
+            // N4 (#90 verification review): the guest's own answer decides a delivery whose
+            // reply was lost, on the next looks too.
+            match ask_config_sha(uds) {
+                Ok(now) if now == live.sha256 => {
+                    log(&format!(
+                        "the running guest reads {} (sha256 {}) after all (it answered late): delivered",
+                        live.path.display(),
+                        short_sha(&live.sha256)
+                    ));
+                    *egress.write().unwrap_or_else(|p| p.into_inner()) = crate::egress::Egress::new(&live, ports.to_vec());
+                    in_guest = live.sha256.clone();
+                    refused = None;
+                }
+                Ok(_) => {}
+                Err(_) if tries < 10 => unsure = Some((live, tries + 1)),
+                Err(e) => log(&format!("the guest never said which config it reads ({e}); it is taken to keep sha256 {}", short_sha(&in_guest))),
+            }
+        }
+        if let Some(path) = &opts.guest_ini {
+            // As the pool user, never through a link, capped; a refusal never quotes the file.
+            match read_site_ini(Some(path)) {
+                Ok(text) if text != ini => {
+                    ini_refused = None;
+                    let t = Instant::now();
+                    let body = text.clone().unwrap_or_default();
+                    match tell_guest(uds, &[Ctl::Ini { hex: hex(body.as_bytes()) }, Ctl::Done], crate::guest::RELOAD_TIMEOUT) {
+                        Ok(()) => log(&format!(
+                            "delivered the site's php.ini settings from {} ({} lines) to the running guest and started its php-fpm again gracefully in {:.0} ms",
+                            path.display(),
+                            body.lines().count(),
+                            ms(t)
+                        )),
+                        // No answer at all (N4, #90 verification review): the next look delivers
+                        // them again; the guest's own refusal stands.
+                        Err(e) if !guest_answered(&e) => {
+                            log(&format!("the site's php.ini settings from {}: no answer from the guest ({e}); sending them again", path.display()));
+                            continue;
+                        }
+                        Err(e) => log(&format!("the site's php.ini settings from {}: the guest refused them: {e}", path.display())),
+                    }
+                    ini = text;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if ini_refused.as_deref() != Some(e.as_str()) {
+                        log(&format!("{e}; the guest keeps its php.ini settings"));
+                    }
+                    ini_refused = Some(e);
+                }
+            }
+        }
+    }
+}
+
+/// How long a live config delivery waits for the guest's `ok`.
+const SYNC_TIMEOUT_LIVE: Duration = Duration::from_secs(10);
+
+/// Puts `bytes` (whose sha256 is `sha`) in the running guest. The guest's answer decides (#90
+/// review): an `error` reply is a refusal; when no answer came (a timeout, a broken connection)
+/// the guest is asked which config it reads now, and if that is `sha` the delivery stands. `Ok`
+/// carries a note when it was decided that way.
+fn deliver_config(uds: &Path, bytes: &[u8], sha: &str) -> Result<Option<String>, String> {
+    let sent = tell_guest(uds, &[Ctl::Config { hex: hex(bytes) }, Ctl::Done], SYNC_TIMEOUT_LIVE);
+    let asked = match &sent {
+        Err(e) if !guest_answered(e) => Some(ask_config_sha(uds)),
+        _ => None,
+    };
+    delivery_outcome(sent, asked, sha)
+}
+
+/// Whether a [`tell_guest`] error is the guest's own `error` reply (as opposed to no reply).
+fn guest_answered(e: &str) -> bool {
+    e.starts_with("the guest refused ")
+}
+
+/// [`deliver_config`]'s decision, given the delivery's result and, when it had no answer, the
+/// guest's answer to "which config do you read now".
+pub fn delivery_outcome(sent: Result<(), String>, asked: Option<Result<String, String>>, sha: &str) -> Result<Option<String>, String> {
+    match (sent, asked) {
+        (Ok(()), _) => Ok(None),
+        (Err(e), Some(Ok(now))) if now == sha => Ok(Some(format!("its reply was lost ({e}), but it reads that config now: delivered"))),
+        (Err(e), Some(Ok(now))) => Err(format!("{e}; the guest reads sha256 {} now", short_sha(&now))),
+        (Err(e), Some(Err(q))) => Err(format!("{e}; asking the guest which config it reads failed too ({q})")),
+        (Err(e), None) => Err(e),
+    }
+}
+
+/// The sha256 of the config the guest's extension reads now ([`Ctl::ConfigSha`]).
+fn ask_config_sha(uds: &Path) -> Result<String, String> {
+    let mut s = vsock::connect_through(uds, CTL_PORT, Duration::from_secs(2)).map_err(|e| format!("the guest's control port: {e}"))?;
+    let message: String = [Ctl::ConfigSha, Ctl::Done].iter().map(Ctl::line).collect();
+    s.write_all(message.as_bytes()).map_err(|e| format!("the guest's control port: {e}"))?;
+    s.set_read_timeout(Some(SYNC_TIMEOUT_LIVE)).map_err(|e| e.to_string())?;
+    let reply = read_reply(s)?;
+    match reply.trim_end().split_once(' ') {
+        Some(("sha", sha)) if sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(sha.to_owned()),
+        _ => Err(format!("the guest answered {:?}", reply.trim_end())),
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(16)]
 }
 
 /// The protocol handshake, alone on its connection before any start message: `proto <N>`. The
@@ -1510,6 +1846,7 @@ struct Real<'a> {
     opts: &'a Options,
     m: &'a Machine,
     env: &'a [(String, String)],
+    ini: Option<&'a str>,
 }
 
 impl Lifecycle for Real<'_> {
@@ -1556,7 +1893,7 @@ impl Lifecycle for Real<'_> {
 
     fn tell(&mut self, vm: &Vm, restored: bool) -> Result<(), String> {
         handshake(&vm.vsock)?;
-        tell_guest(&vm.vsock, &start_message(self.plan, restored, random64()?, self.env), START_TIMEOUT)
+        tell_guest(&vm.vsock, &start_message(self.plan, restored, random64()?, self.env, self.ini), START_TIMEOUT)
     }
 }
 
@@ -1580,7 +1917,7 @@ fn bind_unix(path: &Path, mode: SocketMode) -> Result<UnixListener, String> {
 /// The host ends of the guest's ports, in the jail: each `connect[].socket` as a link into its
 /// folder bind-mounted read-only, each `address` as a listener here, and the log listener. The
 /// jail was emptied first, so nothing from an earlier config is left.
-fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Result<(), String> {
+fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, keys: LogKeys) -> Result<&'static guestlog::LogServer, String> {
     let user = m.user;
     let owned = SocketMode { owner: Some(user.uid), group: Some(user.gid), mode: 0o600 };
     if wiring == Wiring::Full {
@@ -1616,9 +1953,10 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
             });
         }
         // Named hosts on the egress ports (#72): each connection's request line is checked here.
-        if !m.egress.ports.is_empty() {
+        // The rules are read per connection: a delivered config changes layer 2's hosts (#90).
+        let egress = m.egress;
+        if !egress.read().unwrap_or_else(|p| p.into_inner()).ports.is_empty() {
             let l = bind_unix(&short.join(format!("v.sock_{}", crate::egress::EGRESS_PORT)), owned)?;
-            let egress: &'static crate::egress::Egress = Box::leak(Box::new(m.egress.clone()));
             let slots: &'static Slots = Box::leak(Box::new(Slots::new(FORWARD_SLOTS)));
             let pool = plan.pool;
             thread::spawn(move || {
@@ -1632,7 +1970,8 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
                         // The host's addresses now (an interface may have come up since the start).
                         let own = crate::egress::host_addresses();
                         let connect = |conn: UnixStream, addrs: &[std::net::SocketAddr]| egress_as_pool(conn, addrs, pool);
-                        match crate::egress::serve(c, egress, &own, &connect) {
+                        let rules = egress.read().unwrap_or_else(|p| p.into_inner()).clone();
+                        match crate::egress::serve(c, &rules, &own, &connect) {
                             Ok(what) => log(&format!("egress: {what} closed")),
                             Err(why) => log(&format!("egress refused: {why}")),
                         }
@@ -1641,70 +1980,22 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
             });
         }
     }
-    // php-fpm's log, to this process's stderr: read only, and every line marked as the guest's,
-    // so nothing the guest writes can pass for the launcher's own lines.
+    // php-fpm's log, to this process's stderr (#86): only connections that present this VM's log
+    // key, numbered frames, each logged once and acknowledged once written, every line marked as
+    // the guest's, so nothing the guest writes can pass for the launcher's own lines
+    // ([`crate::guestlog`]). Never shut for writing: Firecracker turns a host's half-close into a
+    // full close and drops whatever the guest sends after it.
     let l = bind_unix(&short.join(format!("v.sock_{LOG_PORT}")), owned)?;
+    // Each write whole: a guest line never interleaves with another thread's.
+    let emit = Box::new(|s: &str| io::stderr().lock().write_all(s.as_bytes()));
+    let server: &'static guestlog::LogServer = Box::leak(Box::new(guestlog::LogServer::new(keys.key, keys.stale, emit)));
     thread::spawn(move || {
         for c in l.incoming().flatten() {
-            let Some(slot) = LOG_SLOTS.take() else { continue };
-            thread::spawn(move || {
-                let _slot = slot;
-                let _ = c.shutdown(std::net::Shutdown::Write);
-                mark_guest_lines(c, &mut io::stderr());
-            });
+            thread::spawn(move || server.take(c));
         }
     });
-    Ok(())
+    Ok(server)
 }
-
-/// Copies the guest's log to `to`, every line marked `guest: `, so no line the guest writes
-/// reads as the launcher's own (`securecore-fpm: …`).
-/// A line longer than [`MAX_LINE`] bytes is cut there (and marked), so the guest can't make the
-/// launcher buffer without bound.
-pub fn mark_guest_lines(from: impl Read, to: &mut impl Write) {
-    let mut r = BufReader::new(from);
-    let mut line: Vec<u8> = Vec::with_capacity(256);
-    loop {
-        line.clear();
-        let mut cut = false;
-        let mut eof = false;
-        loop {
-            let buf = match r.fill_buf() {
-                Ok([]) => {
-                    eof = true;
-                    break;
-                }
-                Ok(b) => b,
-                Err(_) => {
-                    eof = true;
-                    break;
-                }
-            };
-            let (take, done) = match buf.iter().position(|&b| b == b'\n') {
-                Some(i) => (i, true),
-                None => (buf.len(), false),
-            };
-            let room = MAX_LINE.saturating_sub(line.len());
-            line.extend_from_slice(&buf[..take.min(room)]);
-            cut |= take > room;
-            r.consume(if done { take + 1 } else { take });
-            if done {
-                break;
-            }
-        }
-        if eof && line.is_empty() {
-            return;
-        }
-        let text = String::from_utf8_lossy(&line);
-        let _ = writeln!(to, "guest: {}{}", text.trim_end_matches('\r'), if cut { " …[cut]" } else { "" });
-        if eof {
-            return;
-        }
-    }
-}
-
-/// The longest guest log line kept whole.
-pub const MAX_LINE: usize = 8 * 1024;
 
 /// A fixed number of slots: a connection takes one or is turned away.
 pub struct Slots(std::sync::atomic::AtomicUsize, usize);
@@ -1768,8 +2059,6 @@ impl Default for Coalesce {
     }
 }
 
-/// The guest's log connections at once (its php-fpm stream, and the init's short reports).
-static LOG_SLOTS: Slots = Slots::new(4);
 /// Connections through one `address` forward at once.
 const FORWARD_SLOTS: usize = 64;
 
@@ -2235,8 +2524,13 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
             sizes.join(",")
         ),
     };
+    let egress: &'static std::sync::RwLock<crate::egress::Egress> = Box::leak(Box::new(std::sync::RwLock::new(egress)));
+    let ini = read_site_ini(opts.guest_ini.as_deref())?;
+    if let (Some(path), Some(text)) = (&opts.guest_ini, &ini) {
+        log(&format!("the guest's php-fpm gets the site's php.ini settings from {} ({} lines), in each start message", path.display(), text.lines().count()));
+    }
     let m = Machine { site: site_path, disks, args, key: key.sha256(), user, sockets, egress };
-    let (mut vm, how, ready) = bring_up(&mut Real { plan: &plan, opts, m: &m, env: &env }, opts.snapshot)?;
+    let (mut vm, how, ready) = bring_up(&mut Real { plan: &plan, opts, m: &m, env: &env, ini: ini.as_deref() }, opts.snapshot)?;
     let t_ready = ready.duration_since(t0).as_secs_f64() * 1000.0;
     let t_started = ms(t0);
     match how {
@@ -2277,10 +2571,12 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     }
     let mut child = vm.child.take().ok_or("no Firecracker")?;
     let state = plan.state.clone();
+    let guest_log = vm.log;
     thread::spawn(move || {
         let st = child.wait();
         if !QUITTING.load(Ordering::SeqCst) {
-            log(&format!("Firecracker exited ({st:?}); see {}; stopping", state.join("console.log").display()));
+            let recent = guest_log.lock().unwrap_or_else(|p| p.into_inner()).recent();
+            log(&format!("Firecracker exited ({st:?}); stopping; see {}; {}", state.join("console.log").display(), quoted_guest(&recent)));
             // The main thread stops as for a signal, so the jail is cleared on the way out.
             FIRECRACKER_EXITED.store(true, Ordering::SeqCst);
             // SAFETY: kill(2) to this process, whose main thread waits for SIGTERM.
@@ -2301,6 +2597,12 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
             }
         }
     });
+    // An edited securecore.json and php.ini settings reach the running guest (#90).
+    {
+        let (loaded, opts, uds) = (loaded.clone(), opts.clone(), vm.vsock.clone());
+        let ports = plan.egress.clone();
+        thread::spawn(move || watch_live(&loaded, &opts, &uds, egress, &ports, ini));
+    }
     let sig = loop {
         let sig = wait_for_signal(&set);
         match sig {
@@ -2320,7 +2622,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     }
     // The guest's writes to the writable disks reach the host's images before the VM stops.
     if let Err(e) = tell_guest(&vm.vsock, &[Ctl::Sync, Ctl::Done], crate::guest::SYNC_TIMEOUT) {
-        log(&format!("the guest did not sync its disks before the stop: {e}"));
+        log(&stop_sync_failed(&e));
     }
     // Stops Firecracker (still unreaped, so its pid is still its own) and empties the jail.
     drop(vm);
@@ -2368,6 +2670,7 @@ mod tests {
             snapshot: true,
             guest_args: vec![],
             guest_env: vec![],
+            guest_ini: None,
         }
     }
 
@@ -2431,7 +2734,7 @@ mod tests {
         assert!(args.contains(" sc.sock=3306:/run/mysqld/mysqld.sock"), "{args}");
         assert!(!args.contains("sc.time"), "the clock is in no key: {args}");
         let env = [("WORDPRESS_DB_PASSWORD".to_owned(), "s3cret".to_owned())];
-        let msg = start_message(&p, true, [7; 64], &env);
+        let msg = start_message(&p, true, [7; 64], &env, None);
         assert!(matches!(msg[0], Ctl::Time { .. }), "the clock first");
         assert_eq!(msg[1], Ctl::Entropy { hex: "07".repeat(64) }, "then fresh randomness");
         assert_eq!(msg[2], Ctl::Env { name: "WORDPRESS_DB_PASSWORD".into(), hex: hex(b"s3cret") }, "then php-fpm's environment");
@@ -2439,7 +2742,11 @@ mod tests {
         assert_eq!(msg[4], Ctl::Mount { device: "/dev/vdc".into(), path: "/var/www/html/wp-content/uploads".into() });
         assert_eq!(msg[5], Ctl::Tmpfs { path: "/var/cache/sc".into() });
         assert_eq!(msg.last(), Some(&Ctl::Done));
-        assert!(!start_message(&p, false, [7; 64], &env).contains(&Ctl::Refresh), "a cold boot's workers are fresh");
+        assert!(!start_message(&p, false, [7; 64], &env, None).contains(&Ctl::Refresh), "a cold boot's workers are fresh");
+        // The site's php.ini settings (#90), after the environment.
+        let ini = "securecore.debug_attribution_log = both\n";
+        let msg = start_message(&p, false, [7; 64], &env, Some(ini));
+        assert_eq!(msg[3], Ctl::Ini { hex: hex(ini.as_bytes()) });
         assert!(!args.contains("s3cret") && !args.contains(&hex(b"s3cret")), "never a boot argument");
         assert_ne!(random64().expect("random"), random64().expect("random"), "every start message gets its own");
         let _ = fs::remove_dir_all(&dir);
@@ -2463,6 +2770,24 @@ mod tests {
         o.guest_root = Some("/var/www/my site".into());
         let e = plan(&loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}]}}"#), &o).expect_err("space");
         assert!(e.contains("holds a space"), "{e}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A live edit (#90): refused when the microVM can't run it; else delivered, with layer1 and
+    /// vault changes flagged for the next start (restart_needed), as on a host.
+    #[test]
+    fn a_live_edit_is_refused_when_the_vm_cant_run_it_and_flags_what_needs_a_start() {
+        let dir = scratch("live");
+        let base = r#"{"isolation":"microvm","network":{"bind":[{"port":9000}]}}"#;
+        let started = loaded(&dir, base);
+        let same_l1 = started.clone();
+        assert_eq!(live_change(&started, &same_l1, &opts()), Ok(vec![]), "layers 2 and 3 only: delivered, nothing for the next start");
+        let more = loaded(&dir, r#"{"isolation":"microvm","write":["wp-content/uploads"],"network":{"bind":[{"port":9000}]}}"#);
+        let notes = live_change(&started, &more, &opts()).expect("the VM can run it");
+        assert!(notes.len() == 1 && notes[0].contains("restart_needed"), "{notes:?}");
+        let socks = loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"unixSockets":["/run/x.sock"]}}"#);
+        let e = live_change(&started, &socks, &opts()).expect_err("unixSockets");
+        assert!(e.starts_with("the microVM can't run it"), "{e}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2720,14 +3045,20 @@ mod tests {
 
     #[test]
     fn guest_lines_are_capped_and_connections_counted() {
-        let long = format!("{}\nnext\n", "x".repeat(MAX_LINE * 3));
-        let mut out = Vec::new();
-        mark_guest_lines(long.as_bytes(), &mut out);
-        let text = String::from_utf8(out).expect("utf8");
+        let long = format!("L 1 {}\nL 2 next\n", "x".repeat(guestlog::MAX_LINE * 3));
+        let out = Mutex::new(String::new());
+        let mut acks = Vec::new();
+        let emit = |s: &str| -> io::Result<()> {
+            out.lock().expect("out").push_str(s);
+            Ok(())
+        };
+        guestlog::serve(long.as_bytes(), &mut acks, &Mutex::new(guestlog::Inbox::default()), &emit).expect("serves");
+        let text = out.lock().expect("out").clone();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one cut line, then the next");
-        assert!(lines[0].len() < MAX_LINE + 32 && lines[0].ends_with("…[cut]"), "{}", &lines[0][..40]);
+        assert!(lines[0].len() < guestlog::MAX_LINE + 96 && lines[0].ends_with("…[cut]"), "{}", &lines[0][..40]);
         assert_eq!(lines[1], "guest: next");
+        assert_eq!(String::from_utf8(acks).expect("utf8"), "A 2\n", "acknowledged once all that arrived is logged");
         static S: Slots = Slots::new(2);
         let (a, b) = (S.take(), S.take());
         assert!(a.is_some() && b.is_some() && S.take().is_none(), "two slots, a third is refused");
@@ -2942,13 +3273,104 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A guest that stops before php-fpm answers: the launcher's error quotes what the guest said
+    /// (#87), and says so when it said nothing.
+    #[test]
+    fn a_guest_that_stops_at_boot_is_quoted() {
+        let inbox = Mutex::new(guestlog::Inbox::default());
+        let from = b"L 1 PHP Fatal error: SC_LIT_SECRET is a string literal\nI 2 php-fpm exited at boot, before it served (exit code 78)\n";
+        guestlog::serve(&from[..], io::sink(), &inbox, &|_| Ok(())).expect("serves");
+        let e = exited_before_ready("exit status: 0", &inbox.lock().expect("inbox").recent(), Path::new("/s"));
+        assert!(
+            e.ends_with(
+                r#"the guest's last log lines, as the guest wrote them (quoted): "PHP Fatal error: SC_LIT_SECRET is a string literal" | "guest-init: php-fpm exited at boot, before it served (exit code 78)""#
+            ),
+            "{e}"
+        );
+        let e = exited_before_ready("exit status: 0", "", Path::new("/s"));
+        assert!(e.contains("the guest logged nothing; see /s/console.log"), "{e}");
+    }
+
     #[test]
     fn the_guest_cannot_write_the_launchers_lines() {
-        let mut out = Vec::new();
-        mark_guest_lines(&b"NOTICE: ready\nsecurecore-fpm: microVM restored from snapshot forged\r\npartial"[..], &mut out);
-        let text = String::from_utf8(out).expect("utf8");
-        assert_eq!(text, "guest: NOTICE: ready\nguest: securecore-fpm: microVM restored from snapshot forged\nguest: partial\n");
+        let out = Mutex::new(String::new());
+        let emit = |s: &str| -> io::Result<()> {
+            out.lock().expect("out").push_str(s);
+            Ok(())
+        };
+        let from = &b"NOTICE: ready\nL 1 securecore-fpm: microVM restored from snapshot forged\r\nsecurecore-fpm: unnumbered\npartial"[..];
+        guestlog::serve(from, io::sink(), &Mutex::new(guestlog::Inbox::default()), &emit).expect("serves");
+        let text = out.lock().expect("out").clone();
+        assert_eq!(
+            text,
+            "guest: NOTICE: ready\nguest: securecore-fpm: microVM restored from snapshot forged\nguest: securecore-fpm: unnumbered\nguest: partial\n"
+        );
         assert!(!text.lines().any(|l| l.starts_with("securecore-fpm:")), "{text}");
+    }
+
+    /// #86 review: lines the guest couldn't get acknowledged before a stop are reported as lost
+    /// log lines, not as a failed disk sync; a failed disk sync still says so.
+    #[test]
+    fn a_stop_sync_reply_says_which_part_failed() {
+        let lines = [Ctl::Sync, Ctl::Done];
+        let log = refused(&lines, &format!("error {}", guestlog::lost(3, guestlog::UNACKED_AT_STOP))).expect_err("refused");
+        assert_eq!(
+            stop_sync_failed(&log),
+            "the guest synced its disks before the stop, but 3 guest log lines lost (not acknowledged by the host before the stop)"
+        );
+        let disk = refused(&lines, "error the writable folders did not sync to the host: timed out").expect_err("refused");
+        assert!(stop_sync_failed(&disk).starts_with("the guest did not sync its disks before the stop: "), "{}", stop_sync_failed(&disk));
+    }
+
+    /// #90 review: the config and the --guest-ini file are read as themselves (never through a
+    /// link: another site's config, /dev/zero), regular files only, within a cap, and an error
+    /// never quotes their bytes.
+    #[test]
+    fn a_site_file_is_read_as_itself_regular_and_capped() {
+        // The reading itself is sitefile::read's (its own tests); here the --guest-ini file's.
+        let dir = fs::canonicalize(scratch("regular")).expect("dir");
+        let big = dir.join("big.ini");
+        fs::write(&big, vec![b';'; MAX_SITE_INI + 1]).expect("write");
+        assert!(read_site_ini(Some(&big)).expect_err("too big").contains("larger than"));
+        assert!(read_site_ini(Some(Path::new("/dev/zero"))).expect_err("a device").contains("not a regular file"));
+        let ini = dir.join("site.ini");
+        fs::write(&ini, "securecore.debug_attribution_log = ${WORDPRESS_DB_PASSWORD}\n").expect("write");
+        let e = read_site_ini(Some(&ini)).expect_err("a ${} value");
+        assert!(!e.contains("WORDPRESS_DB_PASSWORD"), "{e}");
+        let ini_link = dir.join("ini-link.ini");
+        std::os::unix::fs::symlink(&ini, &ini_link).expect("link");
+        assert!(read_site_ini(Some(&ini_link)).expect_err("a link").contains("a link is in its path"));
+        assert_eq!(read_site_ini(Some(&dir.join("absent.ini"))), Ok(None), "no file: no settings");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #90 review: the guest's answer decides a delivery. An `error` reply is a refusal; a lost
+    /// reply is settled by asking which config the guest reads now.
+    #[test]
+    fn a_delivery_whose_reply_was_lost_is_decided_by_the_guests_config() {
+        let sha = "ab".repeat(32);
+        assert_eq!(delivery_outcome(Ok(()), None, &sha), Ok(None));
+        let timeout = Err("the guest's control port: timed out".to_owned());
+        let ok = delivery_outcome(timeout.clone(), Some(Ok(sha.clone())), &sha).expect("it runs it");
+        assert!(ok.is_some_and(|n| n.contains("delivered")));
+        assert!(delivery_outcome(timeout.clone(), Some(Ok("cd".repeat(32))), &sha).is_err(), "it runs another one");
+        assert!(delivery_outcome(timeout, Some(Err("no answer".into())), &sha).is_err());
+        assert!(guest_answered("the guest refused [\"config\", \"done\"]: error mount …"));
+        assert!(!guest_answered("the guest's control port: timed out"));
+    }
+
+    /// K2: every restore of a snapshot takes the log with a key of its own, never the snapshot's,
+    /// which it only knows as the one to refuse.
+    #[test]
+    fn each_restore_gets_a_log_key_of_its_own() {
+        let dir = scratch("keys");
+        fs::write(dir.join(SNAP_LOG_KEY), [4u8; guestlog::KEY_LEN]).expect("write");
+        let (a, b) = (restore_keys(&dir).expect("keys"), restore_keys(&dir).expect("keys"));
+        assert_eq!(a.stale, Some([4u8; guestlog::KEY_LEN]), "the snapshot's key is the stale one");
+        assert!(a.key != [4u8; guestlog::KEY_LEN] && b.key != a.key, "each restore's own, fresh");
+        fs::write(dir.join(SNAP_LOG_KEY), b"short").expect("write");
+        assert!(restore_keys(&dir).is_err(), "a broken key file fails the restore (it cold-boots)");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

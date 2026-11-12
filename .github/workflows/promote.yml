@@ -22,6 +22,10 @@ permissions:
 
 env:
   R2_BUCKET_RELEASES: securecore-releases
+  # aws-cli 2.23+ adds CRC checksums R2 doesn't accept on multipart copies and uploads; only
+  # send/verify them when required (release.yml has the same).
+  AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+  AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
 
 jobs:
   promote:
@@ -105,7 +109,7 @@ jobs:
           sum() { sha256sum "$1" | cut -d' ' -f1; }
           for host in securecore-releases.addis.gg; do
             for f in securecore.zip securecore.zip.sha256 release.json $(jq -r '(.files // {}) | keys[]' "stable/${V}/release.json"); do
-              curl -fsSL "https://${host}/${V}/${f}" -o served
+              curl -fsSL --retry 5 --retry-all-errors "https://${host}/${V}/${f}" -o served
               [ "$(sum served)" = "$(sum "stable/${V}/${f}")" ] || { echo "::error::https://${host}/${V}/${f} does not match"; exit 1; }
               echo "ok https://${host}/${V}/${f}"
             done
@@ -114,11 +118,11 @@ jobs:
           # the same check as before the copy (scripts/promote-check.sh: the image gzipped and
           # unpacked against release.json and vm/manifest.json), on the bytes read back.
           mkdir -p "readback/${V}"
-          curl -fsSL "https://securecore-releases.addis.gg/${V}/release.json" -o "readback/${V}/release.json"
+          curl -fsSL --retry 5 --retry-all-errors "https://securecore-releases.addis.gg/${V}/release.json" -o "readback/${V}/release.json"
           for f in vm/linux-x86_64/rootfs.ext4.gz vm/manifest.json ext/mirab-vm.json; do
             if jq -e --arg f "$f" '(.files // {})[$f]' "stable/${V}/release.json" > /dev/null; then
               mkdir -p "readback/${V}/$(dirname "$f")"
-              curl -fsSL "https://securecore-releases.addis.gg/${V}/${f}" -o "readback/${V}/${f}"
+              curl -fsSL --retry 5 --retry-all-errors "https://securecore-releases.addis.gg/${V}/${f}" -o "readback/${V}/${f}"
             fi
           done
           scripts/promote-check.sh "readback/${V}"
@@ -129,7 +133,7 @@ jobs:
           sum() { sha256sum "$1" | cut -d' ' -f1; }
           aws s3 cp "stable/${V}/release.json" "s3://${R2_BUCKET_RELEASES}/latest.json" --endpoint-url="${R2_ENDPOINT}" \
             --content-type "application/json" --cache-control "no-cache"
-          curl -fsSL "https://securecore-releases.addis.gg/latest.json?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -o served
+          curl -fsSL --retry 5 --retry-all-errors "https://securecore-releases.addis.gg/latest.json?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -o served
           [ "$(sum served)" = "$(sum "stable/${V}/release.json")" ] || { echo "::error::https://securecore-releases.addis.gg/latest.json does not match"; exit 1; }
           echo "ok https://securecore-releases.addis.gg/latest.json"
       - name: Tag vX.Y.Z and make the GitHub release

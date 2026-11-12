@@ -902,6 +902,35 @@ What this shows:
 
   Either is a launcher change (follow-up 13 below).
 
+## The guest's log: what it guarantees, and against whom (#86)
+
+php-fpm's lines (layer 2's audit lines among them) and the init's own come to the launcher on
+vsock 1514, numbered and acknowledged. A line that can't be delivered is counted in the
+launcher's own log ("N guest log lines lost"), never dropped in silence.
+
+- **Only the init writes the log.** The launcher makes a fresh 32-byte log key for every boot
+  and every restore, and gives it to the init over the control port, which only the host can
+  reach. A connection to 1514 that doesn't present that key first, within a second, is refused,
+  and the refusals are counted in the launcher's log. A restored init's old key (the
+  snapshot's) is refused too. It is never let in, and is only counted apart.
+- **Labels.** php-fpm's output (master and workers) is logged as `guest: …`. The init's own lines
+  go in a frame of their own and are logged as `guest-init: …`, which nothing php-fpm writes can
+  produce.
+- **Reserved room for the init.** The init's lines have the last 256 KiB of the guest's 4 MiB
+  buffer to themselves, so php-fpm's lines can't crowd them out.
+- **Escaping.** Control characters and the Unicode line separators in a guest line are escaped,
+  so one guest line is one launcher line.
+
+**This holds against code that isn't root in the guest: PHP, plugins, and anything they run as
+the pool user. It does not hold against root in the guest.** The lines are produced inside the
+guest, by php-fpm's master and the init, and the key is in the init's memory. Code that becomes
+root in the guest (a kernel exploit, say) can forge lines, drop them before they are numbered,
+or send nothing at all. What the launcher still guarantees then is that such lines are marked
+as the guest's (`guest:`/`guest-init:`) and never read as its own (`securecore-fpm:`), and
+that a key learned in one restored guest is worthless in the next. An audit trail that must
+survive a compromised guest has to be kept outside it: the host's egress, sync and database
+logs are the launcher's own.
+
 ## Follow-up issues (not filed)
 
 1. **mirab: Landlock and seccomp in the x86_64 guest kernel.** Add `SECURITY`,

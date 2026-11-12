@@ -398,14 +398,19 @@ php_restart >/dev/null 2>&1
 # not serve.
 if wait_exited; then pass "opcache: php-fpm refuses to start on a literal wpConfig secret"; else fail "opcache: php-fpm refuses to start" "$(php_state)"; fi
 refuse_log=$(phplog "$since" 2>&1)
-# On the microVM the guest's php-fpm refuses during the boot, before its log reaches the launcher:
-# its words are on the guest's console (the launcher's error points there).
-on_microvm && refuse_log="$refuse_log
-$(cat "$mvm_state/console.log" 2>/dev/null)"
+# On the microVM too, from the launcher's log alone (#87): the guest delivers php-fpm's words and
+# its exit status before it stops, and the launcher's own last line quotes them.
 if echo "$refuse_log" | grep -q "SC_LIT_SECRET is a string literal" && echo "$refuse_log" | grep -q "DECLARE_CONST"; then
   pass "opcache: the log names the secret and says to move it to a vault file or the env"
 else
   fail "opcache: the log explains the refusal" "$(echo "$refuse_log" | grep -i securecore | tail -1)"
+fi
+if on_microvm; then
+  if echo "$refuse_log" | grep '^securecore-fpm: ' | grep 'before php-fpm answered' | grep -q 'php-fpm exited at boot, before it served (exit code'; then
+    pass "opcache: the launcher's own stop line quotes php-fpm's exit at boot and its exit code"
+  else
+    fail "opcache: the launcher's stop line quotes the guest's reason" "$(echo "$refuse_log" | grep '^securecore-fpm: ' | tail -1 | cut -c1-300)"
+  fi
 fi
 # Restore and restart.
 in_php "rm -f $html/sc-lit-config.php"
