@@ -7,7 +7,9 @@
 //!   out   php-fpm's connect to 127.0.0.1:<port> is a vsock connect to the host on that port
 //!         (libsc-vsock-connect.so, #70), for each port the host forwards (sc.ports); a unix
 //!         socket under /run (sc.sock) reaches the same port through a forwarder here
-//!   log   php-fpm's stdout and stderr → vsock host:1514 (the serial console is too slow)
+//!   log   php-fpm's stdout and stderr, and this init's own lines → vsock host:1514 (the serial
+//!         console is too slow), numbered and held until the host acknowledges them (#86,
+//!         [`crate::guestlog`])
 //!   ctl   vsock 1515: the host's start message, sent after every cold boot and every restore:
 //!         the clock, then the writable disks to mount; and `sync` before it stops the VM
 //!         (see [`Ctl`])
@@ -21,7 +23,7 @@
 
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
@@ -169,6 +171,10 @@ pub enum Ctl {
     /// The handshake, alone on its connection before the start message: the host's protocol.
     /// `ok` only when it is this init's own and the one it booted with (`sc.proto`).
     Proto { version: u32 },
+    /// This VM's log key (hex, [`crate::guestlog::KEY_LEN`] bytes): the host takes the log only
+    /// from connections that present it (#86). Alone on its connection, at any time; only the
+    /// host can reach this port, and no other process in the guest learns the key.
+    LogKey { hex: String },
     Done,
 }
 
@@ -184,6 +190,7 @@ impl Ctl {
             Ctl::Sync => "sync\n".into(),
             Ctl::Reload => "reload\n".into(),
             Ctl::Proto { version } => format!("proto {version}\n"),
+            Ctl::LogKey { hex } => format!("logkey {hex}\n"),
             Ctl::Done => "done\n".into(),
         }
     }
@@ -206,6 +213,9 @@ impl Ctl {
             ["sync"] => Ok(Ctl::Sync),
             ["reload"] => Ok(Ctl::Reload),
             ["proto", v] => Ok(Ctl::Proto { version: v.parse().map_err(|_| format!("proto: {v}"))? }),
+            ["logkey", hex] if hex.len() == 2 * crate::guestlog::KEY_LEN && hex.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(Ctl::LogKey { hex: (*hex).into() }),
+            // Never echo it: it is a secret.
+            ["logkey", ..] => Err("a malformed logkey line".into()),
             ["done"] => Ok(Ctl::Done),
             // Never echo an env line: it carries a secret.
             ["env", ..] => Err("a malformed env line".into()),
@@ -229,7 +239,7 @@ pub fn env_name_ok(name: &str) -> bool {
 /// Exactly one start message per boot (a snapshot is taken before it, so each restore takes its
 /// own); after it only `sync` and `reload`, and nothing at all before it but a start.
 pub fn allowed(lines: &[Ctl], started: bool) -> Result<(), String> {
-    if lines.iter().any(|c| matches!(c, Ctl::Proto { .. })) && lines.len() > 1 {
+    if lines.iter().any(|c| matches!(c, Ctl::Proto { .. } | Ctl::LogKey { .. })) && lines.len() > 1 {
         return Err("the handshake comes alone".into());
     }
     let starts = lines.iter().any(Ctl::starts);
@@ -476,7 +486,8 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
                 return Err(io::Error::new(e.kind(), format!("{device}: BLKFLSBUF: {e}")));
             }
             drop(dev);
-            mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV, WRITABLE_MOUNT_DATA)?;
+            // noexec (#86 verification review): nothing written to a writable folder runs.
+            mount(device, path, "ext4", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, WRITABLE_MOUNT_DATA)?;
             WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).push(path.clone());
             // Every file closed after writing is made durable at once, whatever the host's sync
             // is doing (it may be stuck behind a host that doesn't answer).
@@ -488,18 +499,25 @@ fn apply(ctl: &Ctl) -> io::Result<()> {
             });
             Ok(())
         }
-        Ctl::Tmpfs { path } => mount("tmpfs", path, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777"),
+        Ctl::Tmpfs { path } => mount("tmpfs", path, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, "mode=1777"),
         Ctl::Sync => {
             // SAFETY: sync(2) takes nothing and can't fail.
             unsafe { libc::sync() };
             // And every change to a writable folder is on the host's copy of it (#72).
-            if WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
-                return Ok(());
+            if !WRITABLE.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
+                let drain = DRAIN.get().ok_or_else(|| io::Error::other("the folder sync never started"))?;
+                drain.wait(SYNC_DRAIN).map_err(|e| io::Error::other(format!("the writable folders did not sync to the host: {e}")))?;
             }
-            let drain = DRAIN.get().ok_or_else(|| io::Error::other("the folder sync never started"))?;
-            drain.wait(SYNC_DRAIN).map_err(|e| io::Error::other(format!("the writable folders did not sync to the host: {e}")))
+            // The host stops the VM after a sync: every log line must be in its log by then, or
+            // counted there as lost (the reply is the launcher's to log).
+            LOG.drain(LOG_DRAIN).map_err(|n| io::Error::other(crate::guestlog::lost(n as u64, crate::guestlog::UNACKED_AT_STOP)))
         }
         // Checked before anything is applied ([`protocol_ok`]).
+        Ctl::LogKey { hex } => {
+            let key: crate::guestlog::Key = unhex(hex).try_into().map_err(|_| io::Error::other("logkey: not a key"))?;
+            LOG.set_key(key);
+            Ok(())
+        }
         Ctl::Proto { .. } | Ctl::Done => Ok(()),
     }
 }
@@ -561,6 +579,11 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
         } else if !fpm_listening(Duration::from_secs(10)) {
             failed = Some(format!("php-fpm with the delivered environment isn't listening on 127.0.0.1:{FPM_PORT}"));
         }
+    } else if failed.is_none() && lines.contains(&Ctl::Reload) && !fpm_listening(Duration::from_secs(10)) {
+        // A reload is done once the fresh php-fpm takes requests, not once it is started: the
+        // host says "reloaded" on this answer, and sends requests on (found by #86's stress on
+        // GitHub's runners, where requests right after a reload met no listener).
+        failed = Some(format!("the reloaded php-fpm isn't listening on 127.0.0.1:{FPM_PORT}"));
     }
     // The host never shows a reply to a message that carried secrets, so the reason is logged
     // here too (no message here ever holds a value: refused env lines are never echoed).
@@ -569,15 +592,30 @@ fn serve_ctl(conn: Vsock, peer_cid: u32) {
     {
         report(&format!("ctl: the start message was refused: {e}"));
     }
+    // A refusal may end the launcher: the lines that explain it reach its log first.
+    if failed.is_some() {
+        let _ = LOG.drain(LOG_DRAIN);
+    }
     let reply = failed.map_or_else(|| "ok\n".to_owned(), |e| format!("error {e}\n"));
     let _ = out.write_all(reply.as_bytes());
 }
 
+/// Every line for the host's log (php-fpm's output and this init's own), held until the host
+/// acknowledges it (#86): one numbered stream on one connection ([`crate::guestlog`]).
+static LOG: crate::guestlog::Outbox = crate::guestlog::Outbox::new(crate::guestlog::OUTBOX_BYTES);
+/// How long a `sync` waits for the host to have every log line (inside [`SYNC_TIMEOUT`]).
+const LOG_DRAIN: Duration = Duration::from_secs(1);
+
+/// The log's sender, once per boot (a restore resumes it with the snapshot).
+fn start_log() {
+    thread::spawn(|| crate::guestlog::send(&LOG, || Vsock::connect(HOST_CID, LOG_PORT)));
+}
+
 /// One line to the host's log, from this init (the host marks every guest line as the guest's).
 fn report(message: &str) {
-    if let Ok(mut c) = Vsock::connect(HOST_CID, LOG_PORT) {
-        let _ = c.write_all(format!("securecore-init: {message}\n").as_bytes());
-    }
+    // Its own kind of frame: the launcher logs it as `guest-init: `, which php-fpm's lines can't
+    // be (#86 verification review).
+    LOG.init_line(message.as_bytes());
 }
 
 /// Warns once a writable disk passes 90 % (and again past 98 %): beyond it, php-fpm's writes
@@ -608,28 +646,16 @@ fn watch_space() {
     }
 }
 
-/// php-fpm's output to the host, reconnecting when the connection breaks (every restore
-/// resets the guest's vsock connections).
-fn pump_log(mut from: fs::File) {
-    let mut conn: Option<Vsock> = None;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match from.read(&mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
-        };
-        for _ in 0..50 {
-            if conn.is_none() {
-                conn = Vsock::connect(HOST_CID, LOG_PORT).ok();
-            }
-            match conn.as_mut().map(|c| c.write_all(&buf[..n])) {
-                Some(Ok(())) => break,
-                _ => {
-                    conn = None;
-                    thread::sleep(Duration::from_millis(20));
-                }
-            }
+/// php-fpm's output to the host's log, a line at a time ([`LOG`] delivers it). Never blocks on
+/// the host: php-fpm's master writes every worker's lines to this pipe.
+fn pump_log(from: fs::File) {
+    let mut r = BufReader::with_capacity(64 << 10, from);
+    let mut line = Vec::with_capacity(256);
+    while let Some(cut) = crate::guestlog::read_capped(&mut r, &mut line, crate::guestlog::MAX_LINE) {
+        if cut {
+            line.extend_from_slice(" …[cut]".as_bytes());
         }
+        LOG.line(&line);
     }
 }
 
@@ -802,13 +828,15 @@ fn boot_guest() -> io::Result<u32> {
     mount("proc", "/proc", "proc", flags | libc::MS_NOEXEC, "")?;
     mount("sysfs", "/sys", "sysfs", flags | libc::MS_NOEXEC, "")?;
     mount("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, "")?;
-    mount("tmpfs", "/tmp", "tmpfs", flags, "mode=1777")?;
+    // noexec: nothing a site writes there runs (#86 review).
+    mount("tmpfs", "/tmp", "tmpfs", flags | libc::MS_NOEXEC, "mode=1777")?;
     mount("tmpfs", "/run", "tmpfs", flags, "mode=755")?;
     let boot = parse_cmdline(&fs::read_to_string("/proc/cmdline")?).map_err(io::Error::other)?;
     if let Some(t) = boot.time {
         set_clock(t, 0)?;
     }
-    mount("/dev/vdb", &boot.root, "ext4", libc::MS_RDONLY | flags, "noload")?;
+    // noexec too: php-fpm reads the site's PHP, nothing on the site disk ever runs as a program.
+    mount("/dev/vdb", &boot.root, "ext4", libc::MS_RDONLY | flags | libc::MS_NOEXEC, "noload")?;
     loopback_up()?;
     // The folder sync watches every folder of the writable disks (8192 by default here).
     let _ = fs::write("/proc/sys/fs/inotify/max_user_watches", "65536");
@@ -818,6 +846,7 @@ fn boot_guest() -> io::Result<u32> {
     // (`commit=1` on the mount). The defaults are 30 s and 5 s.
     fs::write("/proc/sys/vm/dirty_expire_centisecs", "100")?;
     fs::write("/proc/sys/vm/dirty_writeback_centisecs", "50")?;
+    start_log();
     listen_forwards(&boot)?;
     let pid = start_php_fpm(&boot)?;
     FPM_MASTER.store(pid as i32, Ordering::SeqCst);
@@ -957,6 +986,14 @@ mod tests {
         assert_eq!(allowed(&[Ctl::Sync], true), Ok(()));
         assert_eq!(allowed(&[Ctl::Reload], true), Ok(()));
         assert!(allowed(&[Ctl::Sync], false).is_err(), "nothing before the start");
+        // The log key (#86 review): at any time, alone, and never echoed when malformed.
+        let key = Ctl::LogKey { hex: "ab".repeat(crate::guestlog::KEY_LEN) };
+        assert_eq!(Ctl::parse(key.line().trim_end()), Ok(key.clone()));
+        assert_eq!(allowed(std::slice::from_ref(&key), false), Ok(()));
+        assert_eq!(allowed(std::slice::from_ref(&key), true), Ok(()));
+        assert!(allowed(&[key, Ctl::Sync], true).is_err(), "alone on its connection");
+        let e = Ctl::parse(&format!("logkey {}", "5ec7".repeat(8))).expect_err("short");
+        assert!(!e.contains("5ec7"), "{e}");
         assert!(allowed(&[Ctl::Time { secs: 1, nanos: 0 }, Ctl::Reload], false).is_err());
     }
 }

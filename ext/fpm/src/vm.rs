@@ -9,7 +9,8 @@
 //!         folder bind-mounted into the jail (Firecracker connects as the jailed user), or a
 //!         thread that connects to its TCP `address`. A port with neither is an egress port:
 //!         the guest reaches named hosts on it through `<jail>/v.sock_1517` ([`crate::egress`]).
-//!   log   guest port 1514 → this process's stderr, each line marked `guest: ` (read only)
+//!   log   guest port 1514 → this process's stderr, each line marked `guest: `: numbered frames,
+//!         each logged once and acknowledged; a lost line is counted ([`crate::guestlog`], #86)
 //!   ctl   guest port 1515 ← one start message after each boot or restore (clock, fresh
 //!         randomness, the workers' refresh after a restore, then the disks); later `sync`
 //!         before a stop and `reload` on SIGUSR2/SIGHUP
@@ -52,6 +53,7 @@ use securecore_config::Loaded;
 use sha2::{Digest as _, Sha256};
 
 use crate::fcgi;
+use crate::guestlog;
 use crate::guest::{CTL_PORT, Ctl, FPM_PORT, LOG_PORT};
 use crate::jail::{self, Jail, User};
 use crate::vsock;
@@ -66,7 +68,8 @@ pub const DEFAULT_VM_USER: &str = "securecore-vm";
 /// message, the sync), so old snapshots are never restored into a new driver. The guest's init
 /// is the same binary: it boots with `sc.proto=<this>`, answers the handshake only when it is
 /// its own, and takes no start message otherwise ([`handshake`]).
-pub const PROTOCOL: u32 = 4;
+/// 5: the log port's numbered, acknowledged frames ([`guestlog`], #86).
+pub const PROTOCOL: u32 = 5;
 /// KVM_GET_API_VERSION, and the only value every KVM since Linux 2.6.22 returns.
 const KVM_GET_API_VERSION: libc::c_ulong = 0xAE00;
 const KVM_API_VERSION: i32 = 12;
@@ -1080,6 +1083,17 @@ struct Vm {
     _root: fs::File,
     /// Emptied (bind mounts unmounted first) when the VM is dropped, on every path out.
     jail: Jail,
+    /// The key only its init's log connections present ([`guestlog`]).
+    log_key: guestlog::Key,
+    /// Its log port's server: what it hasn't said yet is said when the VM goes ([`Drop`]).
+    log_server: &'static guestlog::LogServer,
+}
+
+/// A VM's log key, and the old one a restored snapshot's init still holds for a moment.
+#[derive(Clone, Copy)]
+struct LogKeys {
+    key: guestlog::Key,
+    stale: Option<guestlog::Key>,
 }
 
 /// An `O_PATH` handle on `dir` and the short path prefix that reaches into it.
@@ -1096,6 +1110,8 @@ fn short_dir(dir: &Path) -> Result<(fs::File, PathBuf), String> {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        // The last second's refusals on its log port (#86 verification review).
+        self.log_server.flush();
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
@@ -1136,14 +1152,16 @@ enum Wiring {
 impl Vm {
     /// A fresh jail with this machine's files (and `snap`'s, to restore it), then the jailer.
     /// A spawn that fails leaves no jail behind (nothing stays mounted).
-    fn spawn(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>) -> Result<Vm, String> {
+    /// `keys`: this VM's log key, and a restored snapshot's old one, which is refused quietly.
+    fn spawn(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>, keys: LogKeys) -> Result<Vm, String> {
         let j = Jail::new(&plan.state, &plan.id, m.user);
-        Vm::spawn_in(&j, plan, opts, m, wiring, snap).inspect_err(|_| {
+        Vm::spawn_in(&j, plan, opts, m, wiring, snap, keys).inspect_err(|_| {
             let _ = j.clear();
         })
     }
 
-    fn spawn_in(j: &Jail, plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>) -> Result<Vm, String> {
+    fn spawn_in(j: &Jail, plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring, snap: Option<&Path>, keys: LogKeys) -> Result<Vm, String> {
+        let key = keys.key;
         j.prepare()?;
         j.place(&opts.assets.kernel, IN_KERNEL)?;
         j.place(&opts.assets.rootfs, IN_ROOTFS)?;
@@ -1162,7 +1180,7 @@ impl Vm {
             j.user_dir(IN_SNAP_NEW)?;
         }
         let (root, short) = short_dir(&j.root)?;
-        wire(plan, m, j, &short, wiring)?;
+        let log_server = wire(plan, m, j, &short, wiring, keys)?;
         let mut cmd = j.command(&opts.assets.jailer, &opts.assets.firecracker, opts.vcpus, opts.mem_mib, &["--api-sock", IN_API]);
         // stdout and stderr together, through a pipe, into a capped console.log.
         let (rd, wr) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
@@ -1175,7 +1193,7 @@ impl Vm {
         let pid = child.id() as i32;
         let _ = fs::write(j.base.join("firecracker.pid"), pid.to_string());
         let inside = |p: &str| short.join(p.trim_start_matches('/'));
-        let mut vm = Vm { child: Some(child), pid, api: inside(IN_API), vsock: inside(IN_VSOCK), _root: root, jail: j.clone() };
+        let mut vm = Vm { child: Some(child), pid, api: inside(IN_API), vsock: inside(IN_VSOCK), _root: root, jail: j.clone(), log_key: key, log_server };
         let t = Instant::now();
         while UnixStream::connect(&vm.api).is_err() {
             if let Some(st) = vm.exited() {
@@ -1229,8 +1247,29 @@ fn now() -> (i64, u32) {
     (d.as_secs() as i64, d.subsec_nanos())
 }
 
+/// The file beside a snapshot that holds its VM's log key (the init in the snapshot has it).
+const SNAP_LOG_KEY: &str = "log.key";
+
+fn random_key() -> Result<guestlog::Key, String> {
+    let r = random64()?;
+    let mut k = [0u8; guestlog::KEY_LEN];
+    k.copy_from_slice(&r[..guestlog::KEY_LEN]);
+    Ok(k)
+}
+
+/// Gives a booting guest's init its log key, on a thread of its own (the boot goes on meanwhile):
+/// the init sends its log, its boot's own lines included, only once it has it.
+fn give_log_key(vm: &Vm) {
+    let (uds, hex) = (vm.vsock.clone(), hex(&vm.log_key));
+    thread::spawn(move || {
+        if let Err(e) = tell_guest(&uds, &[Ctl::LogKey { hex }, Ctl::Done], START_TIMEOUT) {
+            log(&format!("could not give the guest's init its log key ({e}): the guest's log is refused"));
+        }
+    });
+}
+
 fn cold_boot(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring) -> Result<Vm, String> {
-    let vm = Vm::spawn(plan, opts, m, wiring, None)?;
+    let vm = Vm::spawn(plan, opts, m, wiring, None, LogKeys { key: random_key()?, stale: None })?;
     vm.api("PUT", "/machine-config", &format!(r#"{{"vcpu_count":{},"mem_size_mib":{},"smt":false}}"#, opts.vcpus, opts.mem_mib))?;
     let args = format!("{} sc.time={}", m.args, now().0);
     vm.api("PUT", "/boot-source", &format!(r#"{{"kernel_image_path":{},"boot_args":{}}}"#, json_str(IN_KERNEL), json_str(&args)))?;
@@ -1251,11 +1290,27 @@ fn cold_boot(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring) -> Result
     }
     vm.api("PUT", "/vsock", &format!(r#"{{"guest_cid":3,"uds_path":{}}}"#, json_str(IN_VSOCK)))?;
     vm.api("PUT", "/actions", r#"{"action_type":"InstanceStart"}"#)?;
+    give_log_key(&vm);
     Ok(vm)
 }
 
+/// A snapshot's log key: its init already holds it, so a restore's log is taken with it.
+fn snap_key(snap: &Path) -> Result<guestlog::Key, String> {
+    let path = snap.join(SNAP_LOG_KEY);
+    let b = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    b.try_into().map_err(|_| format!("{}: not a log key", path.display()))
+}
+
+/// A restore's log keys: a fresh one of its own, and the snapshot's as the stale one.
+fn restore_keys(snap: &Path) -> Result<LogKeys, String> {
+    Ok(LogKeys { key: random_key()?, stale: Some(snap_key(snap)?) })
+}
+
+/// A restore: a fresh log key of its own, given to the restored init at once (#86 verification
+/// review, K2). The snapshot's key, which every restore of it starts with, is only ever refused
+/// (quietly): whoever learned it in one restored guest has nothing in the next.
 fn restore(plan: &Plan, opts: &Options, m: &Machine, snap: &Path) -> Result<Vm, String> {
-    let vm = Vm::spawn(plan, opts, m, Wiring::Full, Some(snap))?;
+    let vm = Vm::spawn(plan, opts, m, Wiring::Full, Some(snap), restore_keys(snap)?)?;
     vm.api(
         "PUT",
         "/snapshot/load",
@@ -1265,6 +1320,7 @@ fn restore(plan: &Plan, opts: &Options, m: &Machine, snap: &Path) -> Result<Vm, 
             json_str(&format!("{IN_SNAP}/vm.mem"))
         ),
     )?;
+    give_log_key(&vm);
     Ok(vm)
 }
 
@@ -1291,6 +1347,14 @@ fn snapshot(vm: &Vm, plan: &Plan, user: User, snap: &Path) -> Result<(), String>
     fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     for f in ["vm.snap", "vm.mem"] {
         take_out(&inside.join(f), &tmp.join(f), user).map_err(|e| format!("{f}: {e}"))?;
+    }
+    // The init in the snapshot has this VM's log key: every restore's log is taken with it.
+    // Root's alone (the state folder is root's, 0700).
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let p = tmp.join(SNAP_LOG_KEY);
+        let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        f.write_all(&vm.log_key).map_err(|e| format!("{}: {e}", p.display()))?;
     }
     fs::rename(&tmp, snap).map_err(|e| format!("{}: {e}", snap.display()))
 }
@@ -1370,6 +1434,16 @@ fn tell_guest(uds: &Path, lines: &[Ctl], timeout: Duration) -> Result<(), String
     refused(lines, reply.trim_end())
 }
 
+/// What the launcher says when the guest's sync before a stop fails: the guest syncs its disks
+/// first and reports log lines it couldn't get acknowledged after, so a reply naming those is a
+/// count of lost log lines, not a failed disk sync.
+pub fn stop_sync_failed(e: &str) -> String {
+    match e.split_once("error ") {
+        Some((_, why)) if why.contains(guestlog::UNACKED_AT_STOP) => format!("the guest synced its disks before the stop, but {why}"),
+        _ => format!("the guest did not sync its disks before the stop: {e}"),
+    }
+}
+
 /// The guest's reply to `lines` as a result. Its text is shown only when `lines` carried no
 /// `env` line: an older init echoes a line it doesn't know, and that line could be a secret
 /// (a current init never echoes one, and logs its reason on the log port).
@@ -1378,7 +1452,7 @@ fn refused(lines: &[Ctl], reply: &str) -> Result<(), String> {
         return Ok(());
     }
     let kinds: Vec<String> = lines.iter().map(|c| c.line().trim_end().split(' ').next().unwrap_or("").to_owned()).collect();
-    if lines.iter().any(|c| matches!(c, Ctl::Env { .. })) {
+    if lines.iter().any(|c| matches!(c, Ctl::Env { .. } | Ctl::LogKey { .. })) {
         return Err(format!("the guest refused {kinds:?} (its reply isn't shown: the message carried secrets; the guest's own log line says why)"));
     }
     Err(format!("the guest refused {kinds:?}: {reply}"))
@@ -1580,7 +1654,7 @@ fn bind_unix(path: &Path, mode: SocketMode) -> Result<UnixListener, String> {
 /// The host ends of the guest's ports, in the jail: each `connect[].socket` as a link into its
 /// folder bind-mounted read-only, each `address` as a listener here, and the log listener. The
 /// jail was emptied first, so nothing from an earlier config is left.
-fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Result<(), String> {
+fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, keys: LogKeys) -> Result<&'static guestlog::LogServer, String> {
     let user = m.user;
     let owned = SocketMode { owner: Some(user.uid), group: Some(user.gid), mode: 0o600 };
     if wiring == Wiring::Full {
@@ -1641,70 +1715,22 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring) -> Res
             });
         }
     }
-    // php-fpm's log, to this process's stderr: read only, and every line marked as the guest's,
-    // so nothing the guest writes can pass for the launcher's own lines.
+    // php-fpm's log, to this process's stderr (#86): only connections that present this VM's log
+    // key, numbered frames, each logged once and acknowledged once written, every line marked as
+    // the guest's, so nothing the guest writes can pass for the launcher's own lines
+    // ([`crate::guestlog`]). Never shut for writing: Firecracker turns a host's half-close into a
+    // full close and drops whatever the guest sends after it.
     let l = bind_unix(&short.join(format!("v.sock_{LOG_PORT}")), owned)?;
+    // Each write whole: a guest line never interleaves with another thread's.
+    let emit = Box::new(|s: &str| io::stderr().lock().write_all(s.as_bytes()));
+    let server: &'static guestlog::LogServer = Box::leak(Box::new(guestlog::LogServer::new(keys.key, keys.stale, emit)));
     thread::spawn(move || {
         for c in l.incoming().flatten() {
-            let Some(slot) = LOG_SLOTS.take() else { continue };
-            thread::spawn(move || {
-                let _slot = slot;
-                let _ = c.shutdown(std::net::Shutdown::Write);
-                mark_guest_lines(c, &mut io::stderr());
-            });
+            thread::spawn(move || server.take(c));
         }
     });
-    Ok(())
+    Ok(server)
 }
-
-/// Copies the guest's log to `to`, every line marked `guest: `, so no line the guest writes
-/// reads as the launcher's own (`securecore-fpm: …`).
-/// A line longer than [`MAX_LINE`] bytes is cut there (and marked), so the guest can't make the
-/// launcher buffer without bound.
-pub fn mark_guest_lines(from: impl Read, to: &mut impl Write) {
-    let mut r = BufReader::new(from);
-    let mut line: Vec<u8> = Vec::with_capacity(256);
-    loop {
-        line.clear();
-        let mut cut = false;
-        let mut eof = false;
-        loop {
-            let buf = match r.fill_buf() {
-                Ok([]) => {
-                    eof = true;
-                    break;
-                }
-                Ok(b) => b,
-                Err(_) => {
-                    eof = true;
-                    break;
-                }
-            };
-            let (take, done) = match buf.iter().position(|&b| b == b'\n') {
-                Some(i) => (i, true),
-                None => (buf.len(), false),
-            };
-            let room = MAX_LINE.saturating_sub(line.len());
-            line.extend_from_slice(&buf[..take.min(room)]);
-            cut |= take > room;
-            r.consume(if done { take + 1 } else { take });
-            if done {
-                break;
-            }
-        }
-        if eof && line.is_empty() {
-            return;
-        }
-        let text = String::from_utf8_lossy(&line);
-        let _ = writeln!(to, "guest: {}{}", text.trim_end_matches('\r'), if cut { " …[cut]" } else { "" });
-        if eof {
-            return;
-        }
-    }
-}
-
-/// The longest guest log line kept whole.
-pub const MAX_LINE: usize = 8 * 1024;
 
 /// A fixed number of slots: a connection takes one or is turned away.
 pub struct Slots(std::sync::atomic::AtomicUsize, usize);
@@ -1768,8 +1794,6 @@ impl Default for Coalesce {
     }
 }
 
-/// The guest's log connections at once (its php-fpm stream, and the init's short reports).
-static LOG_SLOTS: Slots = Slots::new(4);
 /// Connections through one `address` forward at once.
 const FORWARD_SLOTS: usize = 64;
 
@@ -2320,7 +2344,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     }
     // The guest's writes to the writable disks reach the host's images before the VM stops.
     if let Err(e) = tell_guest(&vm.vsock, &[Ctl::Sync, Ctl::Done], crate::guest::SYNC_TIMEOUT) {
-        log(&format!("the guest did not sync its disks before the stop: {e}"));
+        log(&stop_sync_failed(&e));
     }
     // Stops Firecracker (still unreaped, so its pid is still its own) and empties the jail.
     drop(vm);
@@ -2334,6 +2358,7 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use securecore_config::Config;
 
     fn loaded(dir: &Path, layer1: &str) -> Loaded {
@@ -2720,14 +2745,20 @@ mod tests {
 
     #[test]
     fn guest_lines_are_capped_and_connections_counted() {
-        let long = format!("{}\nnext\n", "x".repeat(MAX_LINE * 3));
-        let mut out = Vec::new();
-        mark_guest_lines(long.as_bytes(), &mut out);
-        let text = String::from_utf8(out).expect("utf8");
+        let long = format!("L 1 {}\nL 2 next\n", "x".repeat(guestlog::MAX_LINE * 3));
+        let out = Mutex::new(String::new());
+        let mut acks = Vec::new();
+        let emit = |s: &str| -> io::Result<()> {
+            out.lock().expect("out").push_str(s);
+            Ok(())
+        };
+        guestlog::serve(long.as_bytes(), &mut acks, &Mutex::new(guestlog::Inbox::default()), &emit).expect("serves");
+        let text = out.lock().expect("out").clone();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one cut line, then the next");
-        assert!(lines[0].len() < MAX_LINE + 32 && lines[0].ends_with("…[cut]"), "{}", &lines[0][..40]);
+        assert!(lines[0].len() < guestlog::MAX_LINE + 96 && lines[0].ends_with("…[cut]"), "{}", &lines[0][..40]);
         assert_eq!(lines[1], "guest: next");
+        assert_eq!(String::from_utf8(acks).expect("utf8"), "A 2\n", "acknowledged once all that arrived is logged");
         static S: Slots = Slots::new(2);
         let (a, b) = (S.take(), S.take());
         assert!(a.is_some() && b.is_some() && S.take().is_none(), "two slots, a third is refused");
@@ -2944,11 +2975,47 @@ mod tests {
 
     #[test]
     fn the_guest_cannot_write_the_launchers_lines() {
-        let mut out = Vec::new();
-        mark_guest_lines(&b"NOTICE: ready\nsecurecore-fpm: microVM restored from snapshot forged\r\npartial"[..], &mut out);
-        let text = String::from_utf8(out).expect("utf8");
-        assert_eq!(text, "guest: NOTICE: ready\nguest: securecore-fpm: microVM restored from snapshot forged\nguest: partial\n");
+        let out = Mutex::new(String::new());
+        let emit = |s: &str| -> io::Result<()> {
+            out.lock().expect("out").push_str(s);
+            Ok(())
+        };
+        let from = &b"NOTICE: ready\nL 1 securecore-fpm: microVM restored from snapshot forged\r\nsecurecore-fpm: unnumbered\npartial"[..];
+        guestlog::serve(from, io::sink(), &Mutex::new(guestlog::Inbox::default()), &emit).expect("serves");
+        let text = out.lock().expect("out").clone();
+        assert_eq!(
+            text,
+            "guest: NOTICE: ready\nguest: securecore-fpm: microVM restored from snapshot forged\nguest: securecore-fpm: unnumbered\nguest: partial\n"
+        );
         assert!(!text.lines().any(|l| l.starts_with("securecore-fpm:")), "{text}");
+    }
+
+    /// #86 review: lines the guest couldn't get acknowledged before a stop are reported as lost
+    /// log lines, not as a failed disk sync; a failed disk sync still says so.
+    #[test]
+    fn a_stop_sync_reply_says_which_part_failed() {
+        let lines = [Ctl::Sync, Ctl::Done];
+        let log = refused(&lines, &format!("error {}", guestlog::lost(3, guestlog::UNACKED_AT_STOP))).expect_err("refused");
+        assert_eq!(
+            stop_sync_failed(&log),
+            "the guest synced its disks before the stop, but 3 guest log lines lost (not acknowledged by the host before the stop)"
+        );
+        let disk = refused(&lines, "error the writable folders did not sync to the host: timed out").expect_err("refused");
+        assert!(stop_sync_failed(&disk).starts_with("the guest did not sync its disks before the stop: "), "{}", stop_sync_failed(&disk));
+    }
+
+    /// K2: every restore of a snapshot takes the log with a key of its own, never the snapshot's,
+    /// which it only knows as the one to refuse.
+    #[test]
+    fn each_restore_gets_a_log_key_of_its_own() {
+        let dir = scratch("keys");
+        fs::write(dir.join(SNAP_LOG_KEY), [4u8; guestlog::KEY_LEN]).expect("write");
+        let (a, b) = (restore_keys(&dir).expect("keys"), restore_keys(&dir).expect("keys"));
+        assert_eq!(a.stale, Some([4u8; guestlog::KEY_LEN]), "the snapshot's key is the stale one");
+        assert!(a.key != [4u8; guestlog::KEY_LEN] && b.key != a.key, "each restore's own, fresh");
+        fs::write(dir.join(SNAP_LOG_KEY), b"short").expect("write");
+        assert!(restore_keys(&dir).is_err(), "a broken key file fails the restore (it cold-boots)");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

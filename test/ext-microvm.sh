@@ -34,6 +34,8 @@
 #   3c. egress (#72): curl and PHP's https stream in the guest reach api.wordpress.org on 443 by
 #      name through the host (TLS end to end); an IP the guest picks is unreachable; a host layer 2
 #      doesn't list is refused in the guest, and by the host too when the guest has no extension;
+#   3d. the guest's log (#86): 6000 numbered php-fpm log lines from 240 requests on a restored
+#      guest, with sync refusals and a reload among them, all reach the launcher's log, each once;
 #   4. SIGTERM stops the VM and the launcher exits 0.
 # Exits non-zero on any failure (and at once without /dev/kvm: never a skip). Writes
 # .tmp/ext-microvm/. Leaves the stack up.
@@ -41,6 +43,7 @@
 #   test/ext-microvm.sh bench [n]  front-page p50, host php-fpm vs the microVM, extension off on
 #                                  both (bench/layer1.sh's method, #70's numbers), n rounds
 #   test/ext-microvm.sh restore [n]  the requests after a restore, timed
+#   test/ext-microvm.sh log        only the guest's log under load (3d, #86)
 # Needs: the guest kernel (KERNEL=, default .tmp/mvm/vmlinux-sc from bench/microvm/kernel.sh:
 # mirab's kernel plus Landlock and seccomp, until mirab#89 ships them); a host securecore-fpm
 # (SECURECORE_FPM=, default .target/release/securecore-fpm); docker, mke2fs, e2fsck, resize2fs,
@@ -161,6 +164,9 @@ vmuser=${SC_VM_USER:-64000:64000}
 
 # The site's files the VM sees: the probe, the status page, writable folders owned by www-data.
 cp test/ext/microvm/probe.php "$site/sc-mvm-probe.php"
+# An executable script on the site disk: the guest mounts it noexec, so it never runs (#86 review).
+printf '#!/bin/sh\necho ran\n' > "$site/sc-mvm-exec.sh"
+chmod 755 "$site/sc-mvm-exec.sh"
 cp test/ext/securecore-status.php "$site/sc-status.php"
 mkdir -p "$site/wp-content/uploads" "$site/wp-content/cache"
 chown 33:33 "$site/wp-content/plugins" "$site"
@@ -248,6 +254,62 @@ once() {
   wait $!
   echo "exit=$?" >> "$dir/value-$name.log"
 }
+# eventually <tenths> <shell test>: until the test holds, or the time is up.
+eventually() { n=0; until eval "$2"; do n=$((n + 1)); [ "$n" -lt "$1" ] || return 1; sleep 0.1; done; }
+
+# The guest's log under load (#86): a restored guest; 240 requests, 8 at a time, each writing 25
+# numbered lines to php-fpm's log (6000 lines, as layer 2's audit lines go); 20 of them write an
+# upload over a link the owner put in the host's folder, which the host's sync refuses (each
+# refusal is a line the guest's init logs); a graceful reload between the two halves. Every line
+# must be in the launcher's log, once. (`test/ext-microvm.sh log` runs only this.)
+log_stress() {
+  echo "# the guest's log under load: every line php-fpm writes reaches the launcher's log (#86)"
+  # A folder of this run's own: the uploads disk keeps what an earlier run's guest wrote, and the
+  # next start syncs that back to the host.
+  ln86=sc86-$(date +%s)
+  lg=$site/wp-content/uploads/$ln86
+  mkdir -p "$lg"
+  find "$lg" -mindepth 1 -delete
+  chown "$pool" "$lg"
+  if start log86 "$dir/microvm.json"; then
+    has "$dir/log86.log" "microVM restored from snapshot" "the stress runs on a restored guest (a restore resets the guest's vsock connections)"
+    # The links appear on the host after the start: the guest never sees them, the sync refuses them.
+    for i in $(seq 0 19); do ln -s /nonexistent "$lg/r-$i"; done
+    burst() {
+      seq "$1" "$2" | xargs -P 8 -I{} sh -c '
+        i={}; q="?log=25&id=r$i"; [ "$i" -lt 20 ] && q="$q&put=$3/r-$i&size=10"
+        curl -s -o /dev/null -w "%{http_code}\n" -H "Host: 127.0.0.1:$1" "http://127.0.0.1:$2/sc-mvm-probe.php$q"' sh "$port" "$vport" "$ln86"
+    }
+    burst 0 119 > "$dir/log86.codes"
+    # The second half from the php-fpm a graceful reload started (its own log pipe).
+    kill -USR2 "$PID"
+    eventually 400 "grep -q \"reloaded the guest's php-fpm gracefully\" \"$dir/log86.log\"" || true
+    burst 120 239 >> "$dir/log86.codes"
+    is "$(grep -c '^200$' "$dir/log86.codes")" 240 "240 requests answered 200"
+    # The lines reach the log after the answers: wait for the last ones, then stop (its sync
+    # drains what the guest still holds).
+    got() { grep -oE 'sc86 r[0-9]+ [0-9]{3}' "$dir/log86.log" | sort -u | wc -l; }
+    eventually 300 '[ "$(got)" -ge 6000 ]' || true
+    eventually 300 '[ "$(grep -c "the host refused \"$ln86/r-" "$dir/log86.log")" -ge 20 ]' || true
+    stop
+    is "$(got)" 6000 "all 6000 numbered lines are in the launcher's log"
+    is "$(grep -oE 'sc86 r[0-9]+ [0-9]{3}' "$dir/log86.log" | sort | uniq -d | wc -l)" 0 "and each once"
+    is "$(grep -oE "the host refused \"$ln86/r-[0-9]+\"" "$dir/log86.log" | sort -u | wc -l)" 20 "all 20 sync refusals are in the launcher's log"
+    has "$dir/log86.log" "reloaded the guest's php-fpm gracefully" "a reload ran during the stress"
+    lacks "$dir/log86.log" "guest log line" "no line was lost or counted as lost"
+    is "$(find "$lg" -maxdepth 1 -name 'r-*' -type l | wc -l)" 20 "the owner's 20 links are still links"
+  else
+    fail "the guest's log under load: the start serves"
+  fi
+  find "$lg" -mindepth 1 -delete
+  rmdir "$lg"
+}
+if [ "$what" = log ]; then
+  log_stress
+  if [ "$fails" -eq 0 ]; then echo "all log checks passed"; else echo "$fails check(s) failed"; fi
+  [ "$fails" -eq 0 ]
+  exit
+fi
 
 if [ "$what" = restore ]; then
   # Where the first page after a restore spends its time (#71's snapshot question): n restores of
@@ -461,6 +523,12 @@ if [ "$started" = 1 ]; then
   is "$(val first guest_init)" 1 "PID 1 is securecore-init"
   is "$(val first euid)" 1234 "the guest's php-fpm workers run as the host's pool user (1234), not the image's www-data"
   is "$(val first netdev)" lo "the guest has loopback only, no network device"
+  # #86 review: a program PHP starts gets neither the vsock preload nor its ports, and /tmp runs
+  # nothing (the same script runs through /bin/sh, so it is /tmp's noexec that stops it).
+  is "$(val first child_env)/$(val first child_sees)" "/." "neither PHP nor a program it starts sees LD_PRELOAD or SC_VSOCK_PORTS"
+  is "$(val first tmp_exec)/$(val first sh_exec)" "BLOCKED/ran" "/tmp is noexec in the guest"
+  is "$(val first uploads_exec)" BLOCKED "an uploads disk is noexec in the guest"
+  is "$(val first site_exec)/$(val first site_sh_exec)" "BLOCKED/ran" "the site disk is noexec in the guest (its script runs only through /bin/sh)"
   is "$(val first write_uploads)" OK "uploads are writable (their own disk)"
   is "$(val first write_root)/$(val first write_plugins)" BLOCKED/BLOCKED "the site itself is read-only"
   is "$(val first write_tmp)" OK "/tmp is writable (tmpfs)"
@@ -574,8 +642,6 @@ chown "$pool" "$outside"
 # A link the site owner put in the host's folder while the VM was stopped: the host's, so the
 # listing keeps it (never follows, removes or pushes it).
 ln -sfn "$outside" "$up/sc-evil2"
-# eventually <tenths> <shell test>: until the test holds, or the time is up.
-eventually() { n=0; until eval "$2"; do n=$((n + 1)); [ "$n" -lt "$1" ] || return 1; sleep 0.1; done; }
 # synced <rel> <size> <sha256>: waits (60 s at most) for the host's copy, then prints the ms.
 synced() {
   t0=$(date +%s%N)
@@ -773,6 +839,8 @@ else
   fail "egress in log mode: the start serves"
 fi
 
+log_stress
+
 echo "# a guest booted for another protocol gets no start message, so no secret (#72)"
 # What an older root image's init is to this launcher: the handshake fails before any env line.
 if start oldproto "$dir/microvm.json" --guest-arg sc.proto=3 --no-snapshot; then
@@ -889,7 +957,7 @@ has "$dir/moved.log" "holds the writable disks (uploads) of the site that was at
 has "$dir/moved.log" "--state-dir $moved/old" "and how to keep it"
 find "$moved" -mindepth 1 -delete
 
-for f in sc-mvm-probe.php sc-status.php sc-mvm-changed.txt wp-content/uploads/sc-big.bin; do rm -f "$site/$f"; done
+for f in sc-mvm-probe.php sc-mvm-exec.sh sc-status.php sc-mvm-changed.txt wp-content/uploads/sc-big.bin; do rm -f "$site/$f"; done
 cp ext/examples/wordpress.json "$site/securecore.json"
 echo
 if [ "$fails" -eq 0 ]; then echo "all ext-microvm checks passed"; else echo "$fails check(s) failed"; fi
