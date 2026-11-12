@@ -28,7 +28,7 @@ const USAGE: &str = "usage: securecore-fpm --config <securecore.json> [--php-fpm
 [--vm-dir <dir>] [--vm-user <name>|<uid>:<gid>] [--pool-user <name>|<uid>:<gid>] [--kvm <device>] [--state-dir <dir>] \
 [--listen unix:<path>|<host>:<port>] [--listen-owner <user>] [--listen-group <group>] [--listen-mode <octal>] \
 [--guest-root <path>] [--mem <MiB>] [--vcpus <n>] [--write-disk-mib <MiB>] [--no-snapshot] \
-[--guest-arg <word>]... [--guest-env <NAME>]... [--] [php-fpm args...] | securecore-fpm --migrate-config <securecore.json>";
+[--guest-arg <word>]... [--guest-env <NAME>]... [--guest-ini <file>] [--] [php-fpm args...] | securecore-fpm --migrate-config <securecore.json>";
 
 struct Args {
     config: PathBuf,
@@ -49,6 +49,7 @@ struct Args {
     snapshot: bool,
     guest_args: Vec<String>,
     guest_env: Vec<String>,
+    guest_ini: Option<PathBuf>,
     rest: Vec<OsString>,
 }
 
@@ -75,6 +76,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
         snapshot: true,
         guest_args: Vec::new(),
         guest_env: Vec::new(),
+        guest_ini: None,
         rest: Vec::new(),
     };
     let mut config = None;
@@ -91,7 +93,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
                 a.snapshot = false;
             }
             "--config" | "--php-fpm" | "--vm-dir" | "--vm-user" | "--pool-user" | "--kvm" | "--state-dir" | "--listen" | "--listen-owner"
-            | "--listen-group" | "--listen-mode" | "--guest-root" | "--mem" | "--vcpus" | "--write-disk-mib" | "--guest-arg" | "--guest-env" => {
+            | "--listen-group" | "--listen-mode" | "--guest-root" | "--mem" | "--vcpus" | "--write-disk-mib" | "--guest-arg" | "--guest-env" | "--guest-ini" => {
                 args.next();
                 let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
                 let text = || value.to_str().map(str::to_owned).ok_or_else(|| format!("{flag}: not UTF-8"));
@@ -118,6 +120,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
                     "--vcpus" => a.vcpus = number()?,
                     "--write-disk-mib" => a.write_disk_mib = u64::from(number()?),
                     "--guest-env" => a.guest_env.push(text()?),
+                    "--guest-ini" => a.guest_ini = Some(PathBuf::from(&value)),
                     _ => a.guest_args.push(text()?),
                 }
             }
@@ -183,6 +186,7 @@ mod microvm {
             snapshot: a.snapshot,
             guest_args: a.guest_args.clone(),
             guest_env: a.guest_env.clone(),
+            guest_ini: a.guest_ini.clone(),
         })
     }
 

@@ -1,7 +1,7 @@
 # <suite> <how many of its checks are n/a on the microVM target>: test/lib/target.sh's
 # na_summary fails a suite whose count differs. Change a number only with the checks it counts.
-config 12
-attribution 34
+config 5
+attribution 0
 layer3 4
 layer1 18
 hosts 59
