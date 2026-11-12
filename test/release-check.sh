@@ -434,9 +434,11 @@ if [ -n "$guest" ]; then
     is "$(field privs euid)/$(field privs su)/$(field privs mount)" "33/refused/refused" \
       "microVM: a worker (uid 33) running su or mount stays unprivileged"
     # The installer's free-space check (#80): a share folder too small for the image is refused,
-    # saying how much is needed, with nothing placed. (This container is privileged: a 64 MiB
-    # tmpfs stands in for a full disk.)
-    in_root 'mkdir -p /tmp/small && mount -t tmpfs -o size=64m tmpfs /tmp/small'
+    # saying how much is needed, with nothing placed. (This container is privileged: a tmpfs of half
+    # the unpacked image stands in for a full disk; the image is only the SecureCore base since
+    # #101, a few tens of MiB, so the size comes from it.)
+    small_kib=$(( $(gzip -dc "$src/rootfs-linux-x86_64.ext4.gz" | wc -c) / 2048 ))
+    in_root "mkdir -p /tmp/small && mount -t tmpfs -o size=${small_kib}k tmpfs /tmp/small"
     in_root "sh /release/install-ext.sh --from file:///release --canary --wordpress /var/www/html --share-dir /tmp/small/share" > "$dir/install-small.log" 2>&1; rc=$?
     if [ "$rc" != 0 ] && grep -q "the microVM's guest image needs [0-9]* MiB there" "$dir/install-small.log"; then
       pass "a share folder without room for the guest image is refused, saying how much it needs"

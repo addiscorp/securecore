@@ -41,8 +41,13 @@ impl Kind {
 pub enum Algo {
     Md5,
     Sha1,
+    Sha224,
     Sha256,
+    Sha384,
     Sha512,
+    /// An algorithm the capture can't compute (rpm's number): the file is refused, never let
+    /// through on its ownership alone.
+    Unknown(u16),
 }
 
 /// What the package manager recorded for one path.
@@ -58,7 +63,11 @@ pub struct Entry {
 #[derive(Debug, Clone, Default)]
 pub struct PkgDb {
     pub kind: Option<Kind>,
-    files: HashMap<String, Entry>,
+    /// Every package's record of a path (a diverted path has two: dpkg's diversions).
+    files: HashMap<String, Vec<Entry>>,
+    /// dpkg's diversions: the path a package's file was moved away from, where it went, and the
+    /// package that diverted it (`:` for the administrator).
+    diversions: Vec<(String, String, String)>,
 }
 
 /// The checksums of one file's bytes, in every algorithm a database may hold.
@@ -81,24 +90,28 @@ impl Sums {
         }
     }
 
-    fn get(&self, algo: Algo) -> &str {
+    fn get(&self, algo: Algo) -> String {
         match algo {
-            Algo::Md5 => &self.md5,
-            Algo::Sha1 => &self.sha1,
-            Algo::Sha256 => &self.sha256,
-            Algo::Sha512 => &self.sha512,
+            Algo::Md5 => self.md5.clone(),
+            Algo::Sha1 => self.sha1.clone(),
+            Algo::Sha256 => self.sha256.clone(),
+            Algo::Sha512 => self.sha512.clone(),
+            Algo::Sha224 | Algo::Sha384 | Algo::Unknown(_) => String::new(),
         }
     }
 }
 
-/// `bytes` hashed with `algo`, lowercase hex.
+/// `bytes` hashed with `algo`, lowercase hex (empty for an algorithm it can't compute).
 pub fn digest_of(algo: Algo, bytes: &[u8]) -> String {
     use sha2::Digest as _;
     match algo {
         Algo::Md5 => hex(&md5::Md5::digest(bytes)),
         Algo::Sha1 => hex(&sha1::Sha1::digest(bytes)),
+        Algo::Sha224 => hex(&sha2::Sha224::digest(bytes)),
         Algo::Sha256 => hex(&sha2::Sha256::digest(bytes)),
+        Algo::Sha384 => hex(&sha2::Sha384::digest(bytes)),
         Algo::Sha512 => hex(&sha2::Sha512::digest(bytes)),
+        Algo::Unknown(_) => String::new(),
     }
 }
 
@@ -121,6 +134,8 @@ pub enum Verdict {
     Differs { pkg: String, recorded: String, algo: Algo },
     /// A package owns the path but recorded no checksum for it.
     NoChecksum { pkg: String },
+    /// A package recorded a checksum in an algorithm the capture can't compute.
+    Unverifiable { pkg: String, algo: Algo },
     /// No package owns the path.
     Unpackaged,
 }
@@ -129,9 +144,27 @@ impl PkgDb {
     /// The database of the system under `root`: dpkg, apk or rpm, whichever it has (none: an
     /// empty database, so every file is unpackaged).
     pub fn open(root: &Path) -> Result<PkgDb, String> {
+        PkgDb::open_with(root, "rpm")
+    }
+
+    /// Whether the system under `root` keeps an rpm database (and no dpkg or apk one).
+    pub fn is_rpm(root: &Path) -> bool {
+        !root.join("var/lib/dpkg/info").is_dir()
+            && !root.join("lib/apk/db/installed").is_file()
+            && (root.join("var/lib/rpm").is_dir() || root.join("usr/lib/sysimage/rpm").is_dir())
+    }
+
+    /// [`PkgDb::open`], running `rpm` (a path the caller checked) for an rpm database.
+    pub fn open_with(root: &Path, rpm: &str) -> Result<PkgDb, String> {
         let dpkg = root.join("var/lib/dpkg/info");
         if dpkg.is_dir() {
-            return PkgDb::read_dpkg(&dpkg).map_err(|e| format!("{}: {e}", dpkg.display()));
+            let mut db = PkgDb::read_dpkg(&dpkg).map_err(|e| format!("{}: {e}", dpkg.display()))?;
+            let div = root.join("var/lib/dpkg/diversions");
+            if div.is_file() {
+                let text = fs::read_to_string(&div).map_err(|e| format!("{}: {e}", div.display()))?;
+                db.add_dpkg_diversions(&text);
+            }
+            return Ok(db);
         }
         let apk = root.join("lib/apk/db/installed");
         if apk.is_file() {
@@ -139,14 +172,14 @@ impl PkgDb {
             return Ok(PkgDb::parse_apk(&text));
         }
         if root.join("var/lib/rpm").is_dir() || root.join("usr/lib/sysimage/rpm").is_dir() {
-            return rpm_query(root).map(|out| PkgDb::parse_rpm(&out));
+            return rpm_query(root, rpm).map(|out| PkgDb::parse_rpm(&out));
         }
         Ok(PkgDb::default())
     }
 
     /// dpkg's `info` folder: every `<pkg>.list` and `<pkg>.md5sums`.
     pub fn read_dpkg(info: &Path) -> io::Result<PkgDb> {
-        let mut db = PkgDb { kind: Some(Kind::Dpkg), files: HashMap::new() };
+        let mut db = PkgDb { kind: Some(Kind::Dpkg), ..PkgDb::default() };
         let mut names: Vec<_> = fs::read_dir(info)?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         // The lists first, so a file's checksum replaces its bare entry.
         names.sort_by_key(|n| (!n.ends_with(".list"), n.clone()));
@@ -166,7 +199,28 @@ impl PkgDb {
     pub fn add_dpkg_list(&mut self, pkg: &str, text: &str) {
         let pkg = pkg.split(':').next().unwrap_or(pkg);
         for line in text.lines().filter(|l| l.starts_with('/')) {
-            self.files.entry(line.to_owned()).or_insert_with(|| Entry { pkg: pkg.to_owned(), digest: None });
+            self.add(line, Entry { pkg: pkg.to_owned(), digest: None });
+        }
+    }
+
+    /// A package's record of `path`: one per package, a checksum replacing a bare entry.
+    fn add(&mut self, path: &str, e: Entry) {
+        let v = self.files.entry(path.to_owned()).or_default();
+        match v.iter_mut().find(|x| x.pkg == e.pkg) {
+            Some(x) if e.digest.is_some() || x.digest.is_none() => *x = e,
+            Some(_) => {}
+            None => v.push(e),
+        }
+    }
+
+    /// dpkg's `diversions`: three lines each, the path a package's file was moved away from,
+    /// where it went, and the diverting package (`:` for the administrator).
+    pub fn add_dpkg_diversions(&mut self, text: &str) {
+        let lines: Vec<&str> = text.lines().collect();
+        for d in lines.chunks(3) {
+            if let [from, to, by] = d {
+                self.diversions.push(((*from).to_owned(), (*to).to_owned(), (*by).to_owned()));
+            }
         }
     }
 
@@ -179,13 +233,13 @@ impl PkgDb {
                 continue;
             }
             let path = format!("/{}", path.trim_start_matches('/'));
-            self.files.insert(path, Entry { pkg: pkg.to_owned(), digest: Some((Algo::Md5, sum.to_ascii_lowercase())) });
+            self.add(&path, Entry { pkg: pkg.to_owned(), digest: Some((Algo::Md5, sum.to_ascii_lowercase())) });
         }
     }
 
     /// apk's `installed` database.
     pub fn parse_apk(text: &str) -> PkgDb {
-        let mut db = PkgDb { kind: Some(Kind::Apk), files: HashMap::new() };
+        let mut db = PkgDb { kind: Some(Kind::Apk), ..PkgDb::default() };
         let (mut pkg, mut dir, mut last): (String, String, Option<String>) = (String::new(), String::new(), None);
         for line in text.lines() {
             if line.is_empty() {
@@ -197,12 +251,12 @@ impl PkgDb {
                 "P" => pkg = value.to_owned(),
                 "F" => {
                     dir = value.trim_matches('/').to_owned();
-                    db.files.entry(format!("/{dir}")).or_insert_with(|| Entry { pkg: pkg.clone(), digest: None });
+                    db.add(&format!("/{dir}"), Entry { pkg: pkg.clone(), digest: None });
                     last = None;
                 }
                 "R" => {
                     let path = if dir.is_empty() { format!("/{value}") } else { format!("/{dir}/{value}") };
-                    db.files.insert(path.clone(), Entry { pkg: pkg.clone(), digest: None });
+                    db.add(&path, Entry { pkg: pkg.clone(), digest: None });
                     last = Some(path);
                 }
                 // A file's checksum follows its R: line. Q1 is base64 of the SHA-1.
@@ -210,9 +264,8 @@ impl PkgDb {
                     if let (Some(path), Some(b64)) = (&last, value.strip_prefix("Q1"))
                         && let Some(raw) = base64_decode(b64)
                         && raw.len() == 20
-                        && let Some(e) = db.files.get_mut(path)
                     {
-                        e.digest = Some((Algo::Sha1, hex(&raw)));
+                        db.add(path, Entry { pkg: pkg.clone(), digest: Some((Algo::Sha1, hex(&raw))) });
                     }
                 }
                 _ => {}
@@ -223,32 +276,26 @@ impl PkgDb {
 
     /// `rpm -qa --qf '[%{FILENAMES}\t%{FILEDIGESTS}\t%{FILEDIGESTALGO}\t%{NAME}\n]'`'s output.
     pub fn parse_rpm(text: &str) -> PkgDb {
-        let mut db = PkgDb { kind: Some(Kind::Rpm), files: HashMap::new() };
+        let mut db = PkgDb { kind: Some(Kind::Rpm), ..PkgDb::default() };
         for line in text.lines() {
             let mut f = line.split('\t');
             let (Some(path), Some(digest), Some(algo), Some(pkg)) = (f.next(), f.next(), f.next(), f.next()) else { continue };
             if !path.starts_with('/') {
                 continue;
             }
-            // rpm's PGPHASHALGO numbers; a package without the tag is MD5.
+            // rpm's PGPHASHALGO numbers; a package without the tag is MD5. Any other number is
+            // kept as unknown, so the file is refused rather than let through unchecked.
             let algo = match algo.trim() {
-                "8" => Some(Algo::Sha256),
-                "10" => Some(Algo::Sha512),
-                "2" => Some(Algo::Sha1),
-                "1" | "(none)" | "" => Some(Algo::Md5),
-                _ => None,
+                "1" | "(none)" | "" => Algo::Md5,
+                "2" => Algo::Sha1,
+                "8" => Algo::Sha256,
+                "9" => Algo::Sha384,
+                "10" => Algo::Sha512,
+                "11" => Algo::Sha224,
+                n => Algo::Unknown(n.parse().unwrap_or(0)),
             };
-            let digest = match algo {
-                Some(a) if !digest.is_empty() && digest.bytes().all(|b| b.is_ascii_hexdigit()) => Some((a, digest.to_ascii_lowercase())),
-                _ => None,
-            };
-            // A path two packages share keeps the one with a checksum.
-            match db.files.get(path) {
-                Some(e) if e.digest.is_some() && digest.is_none() => {}
-                _ => {
-                    db.files.insert(path.to_owned(), Entry { pkg: pkg.to_owned(), digest });
-                }
-            }
+            let digest = (!digest.is_empty()).then(|| (algo, digest.to_ascii_lowercase()));
+            db.add(path, Entry { pkg: pkg.to_owned(), digest });
         }
         db
     }
@@ -264,22 +311,39 @@ impl PkgDb {
     /// The entry for `path` (absolute, with no link in it), or for its other merged-`/usr`
     /// form: `/usr/lib/x` is also looked up as `/lib/x`, and the other way round.
     pub fn lookup(&self, path: &str) -> Option<&Entry> {
-        if let Some(e) = self.files.get(path) {
-            return Some(e);
+        self.records(path).and_then(|(p, v)| self.chosen(&p, v))
+    }
+
+    /// Every package's record of `path` (or of its other merged-`/usr` form), and the form found.
+    fn records(&self, path: &str) -> Option<(String, &Vec<Entry>)> {
+        if let Some(v) = self.files.get(path) {
+            return Some((path.to_owned(), v));
         }
         const MERGED: [&str; 6] = ["lib", "lib32", "lib64", "libx32", "bin", "sbin"];
-        if let Some(rest) = path.strip_prefix("/usr/") {
-            let top = rest.split('/').next().unwrap_or("");
-            if MERGED.contains(&top) {
-                return self.files.get(&format!("/{rest}"));
-            }
+        let other = if let Some(rest) = path.strip_prefix("/usr/") {
+            MERGED.contains(&rest.split('/').next().unwrap_or("")).then(|| format!("/{rest}"))
         } else {
-            let top = path.trim_start_matches('/').split('/').next().unwrap_or("");
-            if MERGED.contains(&top) {
-                return self.files.get(&format!("/usr{path}"));
-            }
+            MERGED.contains(&path.trim_start_matches('/').split('/').next().unwrap_or("")).then(|| format!("/usr{path}"))
+        }?;
+        self.files.get(&other).map(|v| (other, v))
+    }
+
+    /// Which package's record holds for the file at `path`, dpkg's diversions applied: at a
+    /// diverted path the diverting package's (none when the administrator diverted it); the
+    /// file the diversion moved away keeps its own package's record, at the path it came from.
+    fn chosen<'a>(&'a self, path: &str, v: &'a [Entry]) -> Option<&'a Entry> {
+        if let Some((_, _, by)) = self.diversions.iter().find(|(from, _, _)| from == path) {
+            return v.iter().find(|e| e.pkg == by.split(':').next().unwrap_or(by));
         }
-        None
+        // Several packages listing one path (folders): the one with a checksum.
+        v.iter().find(|e| e.digest.is_some()).or(v.first())
+    }
+
+    /// For a file a diversion moved here: its own package's record, from the path it came from.
+    fn diverted_here(&self, path: &str) -> Option<&Entry> {
+        let (from, _, by) = self.diversions.iter().find(|(_, to, _)| to == path)?;
+        let by = by.split(':').next().unwrap_or(by);
+        self.files.get(from)?.iter().find(|e| e.pkg != by && e.digest.is_some())
     }
 
     /// Whether a link at `path` is one a package installed.
@@ -299,9 +363,10 @@ impl PkgDb {
     }
 
     fn check_with(&self, path: &str, got: impl Fn(Algo) -> String) -> Verdict {
-        match self.lookup(path) {
+        match self.diverted_here(path).or_else(|| self.lookup(path)) {
             None => Verdict::Unpackaged,
             Some(Entry { pkg, digest: None }) => Verdict::NoChecksum { pkg: pkg.clone() },
+            Some(Entry { pkg, digest: Some((algo @ Algo::Unknown(_), _)) }) => Verdict::Unverifiable { pkg: pkg.clone(), algo: *algo },
             Some(Entry { pkg, digest: Some((algo, want)) }) => {
                 if got(*algo) == *want {
                     Verdict::Matches { pkg: pkg.clone() }
@@ -343,8 +408,8 @@ pub const RPM_QUERY: &str = "[%{FILENAMES}\\t%{FILEDIGESTS}\\t%{=FILEDIGESTALGO}
 
 /// `rpm -qa` with [`RPM_QUERY`], run inside `root` as nobody with no environment.
 #[cfg(target_os = "linux")]
-fn rpm_query(root: &Path) -> Result<String, String> {
-    let out = crate::capture::run_in_root(root, &["rpm", "-qa", "--qf", RPM_QUERY], std::time::Duration::from_secs(60))?;
+fn rpm_query(root: &Path, rpm: &str) -> Result<String, String> {
+    let out = crate::capture::run_in_root(root, &[rpm, "-qa", "--qf", RPM_QUERY], std::time::Duration::from_secs(60))?;
     if out.is_empty() {
         return Err("rpm -qa listed no files".into());
     }
@@ -352,7 +417,7 @@ fn rpm_query(root: &Path) -> Result<String, String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rpm_query(_: &Path) -> Result<String, String> {
+fn rpm_query(_: &Path, _: &str) -> Result<String, String> {
     Err("reading rpm's database needs Linux".into())
 }
 
@@ -362,7 +427,7 @@ mod tests {
 
     #[test]
     fn dpkg_md5sums_and_lists() {
-        let mut db = PkgDb { kind: Some(Kind::Dpkg), files: HashMap::new() };
+        let mut db = PkgDb { kind: Some(Kind::Dpkg), ..PkgDb::default() };
         db.add_dpkg_list("libxml2:amd64", "/.\n/usr\n/usr/lib/x86_64-linux-gnu/libxml2.so.2\n/usr/lib/x86_64-linux-gnu/libxml2.so.2.9.14\n");
         let sums = Sums::of(b"libxml2 bytes");
         db.add_dpkg_md5sums("libxml2:amd64", &format!("{}  usr/lib/x86_64-linux-gnu/libxml2.so.2.9.14\n", sums.md5));
@@ -376,12 +441,49 @@ mod tests {
     }
 
     #[test]
+    fn dpkg_diversions_pick_the_package_whose_file_is_there() {
+        let (orig, local) = (Sums::of(b"the package's own php.so"), Sums::of(b"the diverter's php.so"));
+        let mut db = PkgDb { kind: Some(Kind::Dpkg), ..PkgDb::default() };
+        db.add_dpkg_md5sums("php8.3-common", &format!("{}  usr/lib/php/x.so\n", orig.md5));
+        db.add_dpkg_md5sums("sc-divert", &format!("{}  usr/lib/php/x.so\n", local.md5));
+        db.add_dpkg_diversions("/usr/lib/php/x.so\n/usr/lib/php/x.so.distrib\nsc-divert\n");
+        // At the diverted path: the diverting package's file, checked against its record.
+        assert_eq!(db.check("/usr/lib/php/x.so", &local), Verdict::Matches { pkg: "sc-divert".into() });
+        assert!(matches!(db.check("/usr/lib/php/x.so", &orig), Verdict::Differs { .. }), "the original's bytes aren't the diverter's file");
+        // Where the original went: its own package's record.
+        assert_eq!(db.check("/usr/lib/php/x.so.distrib", &orig), Verdict::Matches { pkg: "php8.3-common".into() });
+        assert!(matches!(db.check("/usr/lib/php/x.so.distrib", &local), Verdict::Differs { .. }));
+        // The administrator's diversion (":"): no package's file is at the path.
+        let mut db2 = PkgDb { kind: Some(Kind::Dpkg), ..PkgDb::default() };
+        db2.add_dpkg_md5sums("php8.3-common", &format!("{}  usr/lib/php/y.so\n", orig.md5));
+        db2.add_dpkg_diversions("/usr/lib/php/y.so\n/usr/lib/php/y.so.orig\n:\n");
+        assert_eq!(db2.check("/usr/lib/php/y.so", &orig), Verdict::Unpackaged);
+        assert_eq!(db2.check("/usr/lib/php/y.so.orig", &orig), Verdict::Matches { pkg: "php8.3-common".into() });
+    }
+
+    #[test]
+    fn rpm_sha384_and_sha224_are_checked_and_unknown_algorithms_refused() {
+        let b = b"rpm file";
+        let text = format!(
+            "/a\t{}\t9\tp384\n/b\t{}\t11\tp224\n/c\tabcd\t99\tpx\n",
+            digest_of(Algo::Sha384, b),
+            digest_of(Algo::Sha224, b)
+        );
+        let db = PkgDb::parse_rpm(&text);
+        assert_eq!(db.check_bytes("/a", b), Verdict::Matches { pkg: "p384".into() });
+        assert_eq!(db.check_bytes("/b", b), Verdict::Matches { pkg: "p224".into() });
+        assert!(matches!(db.check_bytes("/a", b"other"), Verdict::Differs { algo: Algo::Sha384, .. }));
+        assert!(matches!(db.check_bytes("/b", b"other"), Verdict::Differs { algo: Algo::Sha224, .. }));
+        assert_eq!(db.check_bytes("/c", b), Verdict::Unverifiable { pkg: "px".into(), algo: Algo::Unknown(99) });
+    }
+
+    #[test]
     fn merged_usr_is_looked_up_both_ways() {
-        let mut db = PkgDb { kind: Some(Kind::Dpkg), files: HashMap::new() };
+        let mut db = PkgDb { kind: Some(Kind::Dpkg), ..PkgDb::default() };
         let sums = Sums::of(b"libc");
         db.add_dpkg_md5sums("libc6", &format!("{}  lib/x86_64-linux-gnu/libc.so.6\n", sums.md5));
         assert_eq!(db.check("/usr/lib/x86_64-linux-gnu/libc.so.6", &sums), Verdict::Matches { pkg: "libc6".into() });
-        let mut db2 = PkgDb { kind: Some(Kind::Dpkg), files: HashMap::new() };
+        let mut db2 = PkgDb { kind: Some(Kind::Dpkg), ..PkgDb::default() };
         db2.add_dpkg_md5sums("dash", &format!("{}  usr/bin/dash\n", sums.md5));
         assert_eq!(db2.check("/bin/dash", &sums), Verdict::Matches { pkg: "dash".into() });
         // Not for folders outside the merged set.
@@ -450,10 +552,11 @@ mod tests {
         let Some(kind) = db.kind else { return };
         // Some packaged file with a checksum, read and checked.
         let mut checked = 0;
-        for (path, e) in db.files.iter().filter(|(p, e)| e.digest.is_some() && p.starts_with("/usr/bin/")).take(20) {
+        let diverted = |p: &str| db.diversions.iter().any(|(f, t, _)| f == p || t == p);
+        for (path, v) in db.files.iter().filter(|(p, v)| v.len() == 1 && v[0].digest.is_some() && p.starts_with("/usr/bin/") && !diverted(p)).take(20) {
             let Ok(bytes) = fs::read(path) else { continue };
-            let v = db.check(path, &Sums::of(&bytes));
-            assert_eq!(v, Verdict::Matches { pkg: e.pkg.clone() }, "{} {path}", kind.as_str());
+            let got = db.check_bytes(path, &bytes);
+            assert_eq!(got, Verdict::Matches { pkg: v[0].pkg.clone() }, "{} {path}", kind.as_str());
             checked += 1;
         }
         assert!(checked > 0, "no file of {} checked", kind.as_str());

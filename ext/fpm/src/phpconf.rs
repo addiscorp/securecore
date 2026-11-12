@@ -13,6 +13,13 @@ pub struct Setting {
     pub key: String,
     pub value: String,
     pub line: usize,
+    /// The value's text exactly as written after `=` (trimmed), quotes and all: what the
+    /// guest's config gets, byte for byte.
+    pub raw: String,
+    /// A value whose meaning to PHP this parser doesn't reproduce: more than one quoted string,
+    /// or a quoted string with anything but a comment after it (PHP concatenates those). The
+    /// capture refuses the file rather than guess.
+    pub ambiguous: bool,
 }
 
 /// PHP's ini syntax, as php.ini and php-fpm's config use it: `[section]`, `key = value`, `;` and
@@ -33,21 +40,49 @@ pub fn parse_ini(text: &str) -> Vec<Setting> {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else { continue };
-        out.push(Setting { section: section.clone(), key: key.trim().to_owned(), value: unquote(value.trim()), line: n + 1 });
+        let raw = value.trim();
+        let (value, ambiguous) = unquote(raw);
+        out.push(Setting { section: section.clone(), key: key.trim().to_owned(), value, line: n + 1, raw: raw.to_owned(), ambiguous });
     }
     out
 }
 
-/// A value without its quotes, or up to an unquoted `;`.
-fn unquote(v: &str) -> String {
-    for q in ['"', '\''] {
-        if let Some(rest) = v.strip_prefix(q)
-            && let Some(end) = rest.find(q)
-        {
-            return rest[..end].to_owned();
+/// A value as PHP's ini scanner reads the simple forms: one double-quoted string (`\"` and
+/// `\\` unescaped), one single-quoted string (as written), or bare text up to an unquoted `;`.
+/// Anything else (two quoted strings, which PHP joins; a quote that doesn't open the value;
+/// text after the closing quote other than a comment) is `ambiguous`.
+fn unquote(v: &str) -> (String, bool) {
+    let comment_or_end = |rest: &str| {
+        let r = rest.trim_start();
+        r.is_empty() || r.starts_with(';')
+    };
+    if let Some(rest) = v.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = rest.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some((_, e @ ('"' | '\\'))) => out.push(e),
+                    Some((_, e)) => {
+                        out.push('\\');
+                        out.push(e);
+                    }
+                    None => return (out, true),
+                },
+                '"' => return (out, !comment_or_end(&rest[i + 1..])),
+                _ => out.push(c),
+            }
         }
+        return (out, true);
     }
-    v.split(';').next().unwrap_or("").trim().to_owned()
+    if let Some(rest) = v.strip_prefix('\'') {
+        return match rest.find('\'') {
+            Some(end) => (rest[..end].to_owned(), !comment_or_end(&rest[end + 1..])),
+            None => (rest.to_owned(), true),
+        };
+    }
+    let bare = v.split(';').next().unwrap_or("").trim();
+    (bare.to_owned(), bare.contains('"') || bare.contains('\''))
 }
 
 /// php.ini keys that make PHP load native code: their value is a file or a name in the
@@ -81,6 +116,16 @@ pub fn code_refusal(key: &str, value: &str, ext_dir: &str, root: &str, captured:
     }
     if value.contains("${") && (NATIVE_KEYS.contains(&key.as_str()) || SCRIPT_KEYS.contains(&key.as_str())) {
         return Some(format!("{key} = {value} takes its path from the environment, which the capture can't check"));
+    }
+    // FFI's preload: C declarations and the libraries they name, loaded at startup (each path,
+    // `:`-separated, may be a glob). Only files the capture holds, each named exactly.
+    if key == "ffi.preload" {
+        for p in value.split(':').filter(|p| !p.is_empty()) {
+            if p.contains(['*', '?', '[']) || !captured(p) {
+                return Some(format!("ffi.preload = {value} loads native declarations from outside the captured set ({p})"));
+            }
+        }
+        return None;
     }
     if NATIVE_KEYS.contains(&key.as_str()) {
         let c = extension_candidates(value, ext_dir);
@@ -121,6 +166,9 @@ pub struct Pool {
     pub file: String,
     /// Every setting in order (a later one with the same key replaces the earlier).
     pub settings: Vec<(String, String)>,
+    /// The same settings as written (the text after `=`), which the guest's config carries byte
+    /// for byte, and where each was set (file:line) for a refusal.
+    pub raw: Vec<(String, String, String)>,
 }
 
 impl Pool {
@@ -128,9 +176,16 @@ impl Pool {
         self.settings.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
-    fn set(&mut self, key: &str, value: &str) {
+    fn set(&mut self, key: &str, value: &str, raw: &str, at: String) {
         self.settings.retain(|(k, _)| k != key);
         self.settings.push((key.to_owned(), value.to_owned()));
+        self.raw.retain(|(k, _, _)| k != key);
+        self.raw.push((key.to_owned(), raw.to_owned(), at));
+    }
+
+    /// Where `key` was set, `file:line`.
+    pub fn at(&self, key: &str) -> String {
+        self.raw.iter().find(|(k, _, _)| k == key).map_or_else(|| self.file.clone(), |(_, _, a)| a.clone())
     }
 
     /// `listen`, with php-fpm's `$pool` replaced.
@@ -154,6 +209,8 @@ impl Pool {
 pub struct FpmConfig {
     pub global: Vec<(String, String)>,
     pub pools: Vec<Pool>,
+    /// Settings whose value this parser can't read as PHP would (`file:line`).
+    pub ambiguous: Vec<String>,
 }
 
 impl FpmConfig {
@@ -162,6 +219,9 @@ impl FpmConfig {
     pub fn add(&mut self, file: &str, text: &str) -> Vec<String> {
         let mut includes = Vec::new();
         for s in parse_ini(text) {
+            if s.ambiguous {
+                self.ambiguous.push(format!("{file}:{}", s.line));
+            }
             if s.section.eq_ignore_ascii_case("global") || s.section.is_empty() {
                 if s.key == "include" {
                     includes.push(s.value);
@@ -178,11 +238,11 @@ impl FpmConfig {
             let pool = match self.pools.iter_mut().position(|p| p.name == s.section) {
                 Some(i) => &mut self.pools[i],
                 None => {
-                    self.pools.push(Pool { name: s.section.clone(), file: file.to_owned(), settings: Vec::new() });
+                    self.pools.push(Pool { name: s.section.clone(), file: file.to_owned(), ..Pool::default() });
                     self.pools.last_mut().expect("just pushed")
                 }
             };
-            pool.set(&s.key, &s.value);
+            pool.set(&s.key, &s.value, &s.raw, format!("{file}:{}", s.line));
         }
         includes
     }
@@ -216,11 +276,6 @@ pub fn carried(key: &str) -> bool {
 /// Keys the launcher sets itself in the guest's pool.
 const OURS: [&str; 7] = ["user", "group", "listen", "ping.path", "access.log", "catch_workers_output", "decorate_workers_output"];
 
-/// A value in double quotes, as php-fpm's ini parser reads it back unchanged.
-fn quoted(v: &str) -> String {
-    format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 /// The guest's php-fpm config for one host pool: our `[global]`, then the pool with its user and
 /// group as numbers, listening on the guest's loopback (the host listens where the pool says),
 /// with `env[]`, `php_*_value`/`php_*_flag` and `pm.*` as the host has them. Also the host
@@ -238,12 +293,14 @@ pub fn guest_fpm_conf(pool: &Pool, uid: u32, gid: u32, fpm_port: u32) -> (String
     // said there (the preload's line, #101).
     s.push_str("catch_workers_output = yes\ndecorate_workers_output = no\n");
     let mut dropped = Vec::new();
-    for (k, v) in &pool.settings {
+    for (k, raw, _) in &pool.raw {
         if OURS.contains(&k.as_str()) {
             continue;
         }
         if carried(k) {
-            let _ = writeln!(s, "{k} = {}", quoted(v));
+            // As the host's file has it, byte for byte: php-fpm in the guest reads what the
+            // host's php-fpm reads, never this parser's idea of it.
+            let _ = writeln!(s, "{k} = {raw}");
         } else {
             dropped.push(k.clone());
         }
@@ -258,18 +315,35 @@ pub enum PoolListen {
     Tcp(String),
 }
 
-/// php-fpm's `listen` forms: a path, `port` (every address), `addr:port`, `[v6]:port`.
+/// php-fpm's `listen` forms: a path, `port`, `addr:port`, `[v6]:port`. A bare port is
+/// loopback only (`127.0.0.1:<port>`): php-fpm itself takes every address, but a launcher that
+/// serves a guest never listens beyond the host unless the pool names an address.
 pub fn pool_listen(v: &str) -> Result<PoolListen, String> {
     if v.starts_with('/') {
         return Ok(PoolListen::Unix(v.to_owned()));
     }
     if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
         v.parse::<u16>().map_err(|_| format!("listen = {v}: not a port"))?;
-        return Ok(PoolListen::Tcp(format!("0.0.0.0:{v}")));
+        return Ok(PoolListen::Tcp(format!("127.0.0.1:{v}")));
     }
     let (_, port) = v.rsplit_once(':').ok_or_else(|| format!("listen = {v}: want a path, a port or address:port"))?;
     port.parse::<u16>().map_err(|_| format!("listen = {v}: {port} is not a port"))?;
     Ok(PoolListen::Tcp(v.to_owned()))
+}
+
+/// `listen.allowed_clients`: the addresses a TCP pool takes connections from (php-fpm's own
+/// rule: a comma-separated list of IPs; unset, any). `None` when unset.
+pub fn allowed_clients(v: Option<&str>) -> Result<Option<Vec<std::net::IpAddr>>, String> {
+    let Some(v) = v.filter(|v| !v.trim().is_empty()) else { return Ok(None) };
+    v.split(',')
+        .map(|a| a.trim().parse::<std::net::IpAddr>().map_err(|_| format!("listen.allowed_clients = {v}: {a} is not an IP address")))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// `listen.acl_users` / `listen.acl_groups`: comma-separated names or numbers.
+pub fn acl_list(v: Option<&str>) -> Vec<String> {
+    v.map(|v| v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
 }
 
 /// `listen.mode` (octal), php-fpm's default 0660.
@@ -380,6 +454,48 @@ pub fn parse_phpinfo(text: &str) -> BTreeMap<String, String> {
     m
 }
 
+/// WordPress's `DB_HOST` as `wp-config.php` defines it, the way the launcher can know it without
+/// running PHP: a string literal, or the official image's `getenv_docker('NAME', 'default')` /
+/// a plain `getenv('NAME')`, read from `env` (the launcher's environment, which the guest's
+/// php-fpm gets too). `None` for anything else: the database is then where an explicit
+/// `connect` entry says, or reached by name.
+pub fn wp_db_host(text: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let lit = |s: &str| {
+        let s = s.trim();
+        let q = s.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+        let body = &s[1..];
+        let end = body.find(q)?;
+        Some(body[..end].to_owned())
+    };
+    for (i, _) in text.match_indices("define") {
+        let rest = text[i + 6..].trim_start();
+        let Some(args) = rest.strip_prefix('(') else { continue };
+        let args = args.trim_start();
+        let name_ok = args.starts_with("'DB_HOST'") || args.starts_with("\"DB_HOST\"");
+        if !name_ok {
+            continue;
+        }
+        let expr = args[9..].trim_start().strip_prefix(',')?.trim_start();
+        // The expression up to the define's closing parenthesis on this line.
+        let line = expr.lines().next().unwrap_or("");
+        if let Some(v) = lit(line).filter(|_| line.starts_with(['\'', '"'])) {
+            return Some(v);
+        }
+        for f in ["getenv_docker(", "getenv("] {
+            if let Some(call) = line.strip_prefix(f) {
+                let mut parts = call.splitn(2, ',');
+                let name = lit(parts.next().unwrap_or(""))?;
+                if let Some(v) = env(&name).filter(|v| !v.is_empty()) {
+                    return Some(v);
+                }
+                return parts.next().and_then(lit);
+            }
+        }
+        return None;
+    }
+    None
+}
+
 /// The MySQL default sockets PHP's own settings name (where `localhost` goes for mysqli, PDO
 /// and mysqlnd), in order, without duplicates.
 pub fn mysql_default_sockets(settings: &[Setting]) -> Vec<String> {
@@ -414,6 +530,46 @@ mod tests {
             ]
         );
         assert_eq!(s[1].line, 4);
+    }
+
+    #[test]
+    fn values_are_read_as_php_reads_them_or_refused() {
+        let s = parse_ini("a = \"x\\\"y\\\\z\" ; c\nb = 'raw\\n'\nc = \"one\" \"two\"\nd = \"one\"tail\ne = bare ; c\nf = x\"y\ng = \"open\n");
+        let v: Vec<(&str, &str, bool)> = s.iter().map(|s| (s.key.as_str(), s.value.as_str(), s.ambiguous)).collect();
+        assert_eq!(v[0], ("a", "x\"y\\z", false), "escapes in double quotes");
+        assert_eq!(v[1], ("b", "raw\\n", false), "single quotes: as written");
+        assert!(v[2].2, "two quoted strings (PHP joins them): ambiguous");
+        assert!(v[3].2, "a quoted string with text after it: ambiguous");
+        assert_eq!(v[4], ("e", "bare", false));
+        assert!(v[5].2 && v[6].2, "a stray or unclosed quote: ambiguous");
+        assert_eq!(s[0].raw, "\"x\\\"y\\\\z\" ; c", "the raw text is kept as written");
+        let mut c = FpmConfig::default();
+        c.add("/p.conf", "[www]\nphp_admin_value[x] = \"a\" \"b\"\nenv[A] = \"q;r\" ; comment\n");
+        assert_eq!(c.ambiguous, vec!["/p.conf:2"]);
+        let (conf, _) = guest_fpm_conf(&c.pools[0], 1, 1, 9000);
+        assert!(conf.contains("env[A] = \"q;r\" ; comment\n"), "passed through byte for byte: {conf}");
+    }
+
+    #[test]
+    fn wordpress_db_host_from_wp_config() {
+        let none = |_: &str| None;
+        assert_eq!(wp_db_host("<?php\ndefine( 'DB_HOST', 'localhost:/run/mysqld/mysqld.sock' );\n", &none).as_deref(), Some("localhost:/run/mysqld/mysqld.sock"));
+        assert_eq!(wp_db_host("define(\"DB_HOST\", \"127.0.0.1:3306\");", &none).as_deref(), Some("127.0.0.1:3306"));
+        let docker = "define( 'DB_HOST', getenv_docker('WORDPRESS_DB_HOST', 'mysql') );";
+        assert_eq!(wp_db_host(docker, &none).as_deref(), Some("mysql"), "the image's default");
+        let env = |n: &str| (n == "WORDPRESS_DB_HOST").then(|| "localhost".to_owned());
+        assert_eq!(wp_db_host(docker, &env).as_deref(), Some("localhost"), "the launcher's environment");
+        assert_eq!(wp_db_host("define('DB_HOST', $cfg['host']);", &none), None, "anything else: unknown");
+        assert_eq!(wp_db_host("define('DB_NAME', 'wp');", &none), None);
+    }
+
+    #[test]
+    fn ffi_preload_must_be_captured_files() {
+        let cap: &dyn Fn(&str) -> bool = &|p| p == "/usr/lib/php/ffi/ok.h";
+        assert_eq!(code_refusal("ffi.preload", "/usr/lib/php/ffi/ok.h", "/x", "/var/www/html", cap), None);
+        assert!(code_refusal("ffi.preload", "/usr/lib/php/ffi/ok.h:/opt/evil.h", "/x", "/var/www/html", cap).is_some());
+        assert!(code_refusal("ffi.preload", "/usr/lib/php/ffi/*.h", "/x", "/var/www/html", cap).is_some(), "a glob is never matched");
+        assert_eq!(code_refusal("ffi.preload", "", "/x", "/var/www/html", cap), None);
     }
 
     #[test]
@@ -457,17 +613,21 @@ mod tests {
         assert!(c.global.iter().any(|(k, v)| k == "daemonize" && v == "no"));
         let (conf, dropped) = guest_fpm_conf(www, 33, 33, 9000);
         assert!(conf.contains("[www]\nuser = 33\ngroup = 33\nlisten = 127.0.0.1:9000\n"), "{conf}");
-        assert!(conf.contains("pm = \"dynamic\"\n") && conf.contains("pm.max_children = \"5\"\n"), "{conf}");
-        assert!(conf.contains("env[DB] = \"$WORDPRESS_DB_PASSWORD\"\n"), "{conf}");
-        assert!(conf.contains("php_admin_value[memory_limit] = \"256M\"\n"), "{conf}");
-        assert!(!conf.contains("slowlog") && !conf.contains("www-data") && !conf.contains("listen = \"9000\""), "{conf}");
+        assert!(conf.contains("pm = dynamic\n") && conf.contains("pm.max_children = 5\n"), "{conf}");
+        assert!(conf.contains("env[DB] = $WORDPRESS_DB_PASSWORD\n"), "{conf}");
+        assert!(conf.contains("php_admin_value[memory_limit] = 256M\n"), "{conf}");
+        assert!(!conf.contains("slowlog") && !conf.contains("www-data") && !conf.contains("listen = 9000"), "{conf}");
         assert_eq!(dropped, vec!["slowlog"]);
     }
 
     #[test]
     fn listen_forms() {
         assert_eq!(pool_listen("/run/php/php8.3-fpm.sock"), Ok(PoolListen::Unix("/run/php/php8.3-fpm.sock".into())));
-        assert_eq!(pool_listen("9000"), Ok(PoolListen::Tcp("0.0.0.0:9000".into())));
+        assert_eq!(pool_listen("9000"), Ok(PoolListen::Tcp("127.0.0.1:9000".into())), "a bare port: loopback only, never 0.0.0.0");
+        assert_eq!(pool_listen("0.0.0.0:9000"), Ok(PoolListen::Tcp("0.0.0.0:9000".into())), "every address only when the pool says so");
+        assert_eq!(allowed_clients(Some("127.0.0.1, 10.0.0.5")), Ok(Some(vec!["127.0.0.1".parse().unwrap(), "10.0.0.5".parse().unwrap()])));
+        assert_eq!(allowed_clients(None), Ok(None));
+        assert!(allowed_clients(Some("not-an-ip")).is_err());
         assert_eq!(pool_listen("127.0.0.1:9001"), Ok(PoolListen::Tcp("127.0.0.1:9001".into())));
         assert_eq!(pool_listen("[::1]:9002"), Ok(PoolListen::Tcp("[::1]:9002".into())));
         assert!(pool_listen("nope").is_err());

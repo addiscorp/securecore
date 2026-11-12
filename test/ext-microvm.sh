@@ -222,7 +222,9 @@ fi
 fpm_env() {
   while IFS= read -r l; do export "$l"; done < "$dir/guest.env"
   # shellcheck disable=SC2046 # the names are plain words
-  exec "$fpm" $(sed 's/=.*//; s/^/--guest-env /' "$dir/guest.env") "$@"
+  # This run's own record of the unpackaged files (#101: trust on first use), and MariaDB's uid in
+  # the stack (999) as the database's user, whose socket a bare 3306 may reach.
+  exec "$fpm" $(sed 's/=.*//; s/^/--guest-env /' "$dir/guest.env") --unpackaged-record "$dir/unpackaged.json" --db-user 999 "$@"
 }
 dbpass=$(sed -n 's/^WORDPRESS_DB_PASSWORD=//p' "$dir/guest.env")
 [ -n "$dbpass" ] || die "the test site's DB password"
@@ -733,7 +735,7 @@ if [ "$started" = 1 ]; then
     | (cd "$(jail_root)" && python3 "$sockpy" connect v.sock) > "$dir/second-start.out" 2>&1
   has "$dir/second-start.out" "error this boot's start message was already taken" "the guest refuses a second start message"
   # A second launcher on the same state folder.
-  "$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" --php-root "$(php_root)" --listen "unix:$run/other.sock" > "$dir/second-launcher.log" 2>&1
+  "$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" --php-root "$(php_root)" --unpackaged-record "$dir/unpackaged.json" --listen "unix:$run/other.sock" > "$dir/second-launcher.log" 2>&1
   is "$?" 125 "a second launcher on the same state exits 125"
   has "$dir/second-launcher.log" "is locked" "because the state folder is locked"
   # USR1 and USR2 don't stop it.
@@ -1111,9 +1113,12 @@ fi
 in_php "rm -f /usr/local/etc/php/conf.d/zz-sc101.ini"
 # refuses <name> <expected file> <why>: microvm refuses (exit 125) with the capture's line naming the
 # file, and php-fpm never runs.
+# refuses <name> <file|""> <why> [config] [nolisten]: as above; with "" the refusal is the launcher's
+# own (not the capture's) and only <why> is checked; nolisten: no --listen (several pools).
 refuses() {
-  cp "$dir/microvm.json" "$site/securecore.json"
-  fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --listen "unix:$run/fpm.sock" \
+  cp "${4:-$dir/microvm.json}" "$site/securecore.json"
+  if [ "${5:-}" = nolisten ]; then rl=""; else rl="unix:$run/fpm.sock"; fi
+  fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" ${rl:+--listen "$rl"} \
     --vm-user "$vmuser" --pool-user "$pool" --guest-root "$html" --php-root "$(php_root)" > "$dir/$1.log" 2>&1 &
   rp=$!
   # Never a hang: a launcher that starts serving instead is stopped.
@@ -1121,7 +1126,7 @@ refuses() {
   kill -0 "$rp" 2>/dev/null && kill -TERM "$rp"
   wait "$rp"
   is "$?" 125 "$1: microvm refuses to start (exit 125)"
-  has "$dir/$1.log" "the host's PHP can't be captured: $2" "$1: naming $2"
+  [ -z "$2" ] || has "$dir/$1.log" "the host's PHP can't be captured: $2" "$1: naming $2"
   has "$dir/$1.log" "$3" "$1: $3"
   lacks "$dir/$1.log" "serving FastCGI" "$1: nothing served"
 }
@@ -1135,9 +1140,13 @@ ext=$(jq -r '[.[] | select(.sha256 and (.path | endswith("/sockets.so")))][0].pa
 in_php "chown ${pool%%:*} $ext"
 refuses writable-ext "$ext" "everything captured must be root's and writable by no one else"
 in_php "chown 0:0 $ext"
-# An extension changed in place (a distro's are dpkg's: its record catches it; this image compiles
-# its own, so the bytes are its record's only once captured): a dpkg-packaged one is in
-# test/ext-capture.sh. A config that loads native code from outside PHP's folders.
+# An extension changed in place, still root's 0644: this image compiles its own, so no package
+# records it; the install's record (trust on first use, written at this run's first start) does.
+# (A dpkg-packaged one is in test/ext-capture.sh.)
+in_php "cp -p $ext /tmp/sc101-ext && printf x >> $ext"
+refuses tampered-ext "$ext" "recorded at install"
+in_php "cat /tmp/sc101-ext > $ext && touch -r /tmp/sc101-ext $ext && rm -f /tmp/sc101-ext"
+# A config that loads native code from outside PHP's folders.
 in_php "mkdir -p /opt/sc101 && cp $ext /opt/sc101/evil.so && printf 'extension=/opt/sc101/evil.so\n' > /usr/local/etc/php/conf.d/zz-sc101-evil.ini"
 refuses outside-so "/usr/local/etc/php/conf.d/zz-sc101-evil.ini:1" "extension = /opt/sc101/evil.so loads native code from outside the captured set"
 in_php "rm -rf /opt/sc101 /usr/local/etc/php/conf.d/zz-sc101-evil.ini"
@@ -1156,18 +1165,25 @@ in_php "printf 'mysqli.default_socket = $mysqld/mysqld.sock\n' > /usr/local/etc/
 cp "$dir/guest.env" "$dir/guest.env.keep"
 sed 's|^WORDPRESS_DB_HOST=.*|WORDPRESS_DB_HOST=localhost|' "$dir/guest.env.keep" > "$dir/guest.env"
 if start bare "$dir/bare.json"; then
-  has "$dir/bare.log" "port 3306 has no socket or address: it goes to the host's MySQL socket $mysqld/mysqld.sock" "a bare 3306 goes to the host's MySQL socket"
+  has "$dir/bare.log" "port 3306 has no socket or address: DB_HOST is localhost, so it goes to the host's MySQL socket $mysqld/mysqld.sock" \
+    "a bare 3306 goes where the site's DB_HOST says: the host's MySQL socket (the database's own, uid 999)"
   is "$(vcode /)" 200 "and WordPress reaches its database at localhost (the front page: 200)"
   is "$(vget / | grep -c yoast-schema-graph)" 1 "with its content"
   stop
 else
   fail "a bare 3306: the start serves"
 fi
+# A socket any local user could have put there is never the database (#102 review): the same
+# start with the socket another user's refuses, naming it.
+chown 1234:1234 "$mysqld/mysqld.sock"
+refuses untrusted-db "" "the MySQL socket $mysqld/mysqld.sock is owned by uid 1234" "$dir/bare.json"
+chown 999:999 "$mysqld/mysqld.sock"
 cp "$dir/guest.env.keep" "$dir/guest.env"
 in_php "rm -f /usr/local/etc/php/conf.d/zz-sc101-db.ini"
-# One microVM per pool (#100 review): each listens where its pool says, the launcher tells systemd
-# once both serve, and a stop stops both.
-in_php "printf '[www]\nlisten = $run/www.sock\nlisten.mode = 0666\n[second]\nuser = www-data\ngroup = www-data\nlisten = $run/second.sock\nlisten.mode = 0666\npm = static\npm.max_children = 2\nenv[SC_POOL] = second\n' > /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"
+# One microVM per pool (#100 review): each listens where its pool says (with its allowed_clients
+# and ACLs, #102 review), the launcher tells systemd once both serve, and a stop stops both. Each
+# pool names this site (chdir).
+in_php "printf '[www]\nchdir = /var/www/html\nlisten = $run/www.sock\nlisten.acl_users = www-data\n[second]\nchdir = /var/www/html\nuser = www-data\ngroup = www-data\nlisten = 127.0.0.1:9339\nlisten.allowed_clients = 192.0.2.1\npm = static\npm.max_children = 2\nenv[SC_POOL] = second\n' > /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"
 cp "$dir/microvm.json" "$site/securecore.json"
 rm -f "$dir/notify-pools.sock" "$dir/notify-pools.msg"
 python3 "$sockpy" recv "$dir/notify-pools.sock" "$dir/notify-pools.msg" &
@@ -1179,17 +1195,24 @@ PID=$!
 eventually 1800 "grep -q 'every pool.s microVM serves' \"$dir/pools.log\" || ! kill -0 $PID 2>/dev/null" || true
 has "$dir/pools.log" "one microVM per pool: www, second" "two pools: a microVM each"
 has "$dir/pools.log" "every pool's microVM serves (www, second)" "both serve"
-is "$(python3 test/ext/microvm/fcgi-ping.py "unix:$run/www.sock")/$(python3 test/ext/microvm/fcgi-ping.py "unix:$run/second.sock")" pong/pong \
-  "each pool's php-fpm answers where its pool listens"
-is "$(stat -c %a "$run/second.sock")" 666 "with the pool's listen.mode"
+is "$(python3 test/ext/microvm/fcgi-ping.py "unix:$run/www.sock")" pong "the www pool's php-fpm answers where its pool listens (root: always)"
+is "$(setpriv --reuid 33 --regid 33 --clear-groups python3 test/ext/microvm/fcgi-ping.py "unix:$run/www.sock" 2>/dev/null)" pong "www-data, in its listen.acl_users: answered"
+is "$(setpriv --reuid 65534 --regid 65534 --clear-groups python3 test/ext/microvm/fcgi-ping.py "unix:$run/www.sock" 2>/dev/null)" "" "nobody, not in its ACLs: refused (the socket is 0666, the launcher checks the peer)"
+has "$dir/pools.log" "refused a FastCGI connection: uid 65534 gid 65534 isn't in the pool's listen.acl_users" "and the launcher says so"
+is "$(python3 test/ext/microvm/fcgi-ping.py "127.0.0.1:9339" 2>/dev/null)" "" "the second pool (TCP) refuses 127.0.0.1, which its listen.allowed_clients doesn't list"
+has "$dir/pools.log" "refused a FastCGI connection: 127.0.0.1 isn't in the pool's listen.allowed_clients" "and the launcher says so"
 is "$(find "$state/pool-www" "$state/pool-second" -maxdepth 1 -name 'conf-*.ext4' | wc -l)" 2 "each pool has its own config layer and state folder"
 is "$(grep -c '^READY=1$' "$dir/notify-pools.msg")" 1 "systemd is told once, when both serve"
 stop
 is "$STOPPED" 0 "SIGTERM stops both pools' microVMs, exit 0"
 is "$(pgrep -f -- "--id sc-[0-9a-f]*-[0-9a-f]\{6\}" | wc -l)" 0 "no pool's Firecracker is left running"
 kill "$npid" 2>/dev/null
+# A pool of another site (#102 review, Sami's decision): microvm refuses the whole config, naming
+# it (auto falls back to gelada once, with the same reason).
+in_php "printf '[www]\nchdir = /var/www/html\nlisten = $run/www.sock\n[other]\nchdir = /srv/other-site\nuser = www-data\nlisten = $run/other.sock\n' > /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"
+refuses other-site "" "pool [other] serves another site (/srv/other-site)" "$dir/microvm.json" nolisten
 in_php "rm -f /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"
-rm -f "$run/www.sock" "$run/second.sock"
+rm -f "$run/www.sock" "$run/second.sock" "$run/other.sock"
 
 echo "# a site change, and a larger --write-disk-mib"
 date > "$site/sc-mvm-changed.txt"
@@ -1237,7 +1260,7 @@ find "$moved" -mindepth 2 -delete
 printf '{"root":"/srv/a-site-that-moved"}\n' > "$moved/old/site.json"
 cp "$state"/w*.ext4 "$moved/old/"
 cp "$dir/microvm.json" "$site/securecore.json"
-"$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$moved/new" --vm-user "$vmuser" --php-root "$(php_root)" --listen "unix:$run/moved.sock" --guest-root "$html" > "$dir/moved.log" 2>&1
+"$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$moved/new" --vm-user "$vmuser" --php-root "$(php_root)" --unpackaged-record "$dir/unpackaged.json" --listen "unix:$run/moved.sock" --guest-root "$html" > "$dir/moved.log" 2>&1
 is "$?" 125 "a new state beside an orphaned uploads disk: the launcher exits 125"
 has "$dir/moved.log" "holds the writable disks (uploads) of the site that was at /srv/a-site-that-moved" "naming the orphan"
 has "$dir/moved.log" "--state-dir $moved/old" "and how to keep it"

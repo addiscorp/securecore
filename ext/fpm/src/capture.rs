@@ -54,7 +54,9 @@ pub const PHP_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 pub const HELPERS: [&str; 5] = ["/bin/sh", "sendmail", "convert", "magick", "gs"];
 /// Data the libraries read by path, captured when present (never anything under
 /// `/etc/ssl/private`, never `/etc/shadow`).
-pub const DATA_FILES: [&str; 8] = [
+pub const DATA_FILES: [&str; 10] = [
+    "/etc/hostname",
+    "/etc/hosts",
     "/etc/ld.so.cache",
     "/etc/passwd",
     "/etc/group",
@@ -184,11 +186,69 @@ pub struct Request {
     pub scan_dir_env: Option<String>,
     /// The app root as the guest sees it: a PHP file that runs at every request must be there.
     pub app_root: String,
+    /// The installer's record of the unpackaged files' sha256s (Sami: trust on first use, root's
+    /// alone): an unpackaged file must match it. Absent: this capture writes it.
+    pub record: Option<PathBuf>,
+}
+
+/// Where the installer records the unpackaged files' sha256s.
+pub const DEFAULT_RECORD: &str = "/var/lib/securecore/unpackaged.json";
+
+/// The record's entries: path → sha256, for every captured file no package's checksum covers.
+pub fn unpackaged(items: &[Item]) -> BTreeMap<String, String> {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            Item::File { path, sha256, source, .. } if source.starts_with("unpackaged") || source.contains("no checksum") => Some((path.clone(), sha256.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Writes the record (root's, 0600), with the folder above it root's 0700 when it makes it.
+pub fn write_record(path: &Path, items: &[Item]) -> Result<usize, Refused> {
+    let at = |e: io::Error| refused(path.display().to_string(), e.to_string());
+    if let Some(d) = path.parent()
+        && !d.exists()
+    {
+        fs::create_dir_all(d).map_err(at)?;
+        fs::set_permissions(d, fs::Permissions::from_mode(0o700)).map_err(at)?;
+    }
+    let map = unpackaged(items);
+    write_private(path, serde_json::to_vec_pretty(&map).unwrap_or_default().as_slice()).map_err(at)?;
+    Ok(map.len())
+}
+
+/// Every unpackaged file against the record: one it doesn't hold, or whose bytes differ, is
+/// refused, naming the file. `Ok(false)`: there was no record (the caller writes one).
+pub fn check_record(path: &Path, items: &[Item]) -> Result<bool, Refused> {
+    let text = match fs::read(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(refused(path.display().to_string(), e.to_string())),
+    };
+    let m = fs::metadata(path).map_err(|e| refused(path.display().to_string(), e.to_string()))?;
+    if m.uid() != 0 || m.mode() & 0o077 != 0 {
+        return Err(refused(path.display().to_string(), owner_why(&m, "the install's record of unpackaged files (it must be root's alone, 0600)")));
+    }
+    let rec: BTreeMap<String, String> = serde_json::from_slice(&text).map_err(|e| refused(path.display().to_string(), e.to_string()))?;
+    for (p, sha) in unpackaged(items) {
+        match rec.get(&p) {
+            Some(want) if *want == sha => {}
+            Some(want) => {
+                return Err(refused(&p, format!("its sha256 is {sha}, not the {want} recorded at install in {}: it changed since (run the installer again if that was an upgrade)", path.display())));
+            }
+            None => {
+                return Err(refused(&p, format!("no package installed it and it isn't in the install's record ({}): run the installer again to record it", path.display())));
+            }
+        }
+    }
+    Ok(true)
 }
 
 impl Request {
     fn asked(&self) -> String {
-        format!("root {} php-fpm {} args {:?} scan {:?} app {}", self.root.display(), self.php_fpm, self.fpm_args, self.scan_dir_env, self.app_root)
+        format!("root {} php-fpm {} args {:?} scan {:?} app {} record {:?}", self.root.display(), self.php_fpm, self.fpm_args, self.scan_dir_env, self.app_root, self.record)
     }
 
     fn arg(&self, short: &str, long: &str) -> Option<String> {
@@ -249,6 +309,8 @@ struct Walker<'a> {
     loader: Option<String>,
     /// The first link no package installed on the path being resolved (and its target).
     unpackaged_link: Option<(String, String)>,
+    /// Data files left out because not everyone may read them.
+    skipped: Vec<String>,
 }
 
 fn join(dir: &str, name: &str) -> String {
@@ -384,6 +446,7 @@ impl Walker<'_> {
             Verdict::Matches { pkg } => Ok(format!("{kind}:{pkg}")),
             Verdict::NoChecksum { pkg } => Ok(format!("{kind}:{pkg} (no checksum recorded; root-owned)")),
             Verdict::Unpackaged => Ok("unpackaged (root-owned)".to_owned()),
+            Verdict::Unverifiable { pkg, algo } => Err(refused(path, format!("{kind} records {pkg}'s checksum in an algorithm the capture can't compute ({algo:?}), so it isn't let through unchecked"))),
             Verdict::Differs { pkg, recorded, algo } => Err(refused(
                 path,
                 format!(
@@ -473,6 +536,12 @@ impl Walker<'_> {
         }
         if !file_ok(&m) {
             return Err(refused(&real, owner_why(&m, "the file")));
+        }
+        // Data is what anyone on the host may read: a file only some may read (a private key
+        // beside the certificates, 0600) never goes into the guest.
+        if m.mode() & 0o004 == 0 {
+            self.skipped.push(path.to_owned());
+            return Ok(());
         }
         let bytes = self.read(&real, &m, MAX_FILE)?;
         // A file under /etc is a config (rpm records /etc/passwd's checksum as installed; adding a
@@ -611,8 +680,23 @@ fn compiled<'c>(w: &mut Walker<'_>, fpm_bytes: &[u8], candidates: &'c [String]) 
 
 /// Captures and validates the host's PHP for `req` ([module docs](self)).
 pub fn capture(req: &Request) -> Result<Capture, Refused> {
-    let db = PkgDb::open(&req.root).map_err(|e| refused(req.root.join("var/lib").display().to_string(), e))?;
-    let mut w = Walker { root: &req.root, db: &db, items: BTreeMap::new(), watch: BTreeMap::new(), listed: BTreeSet::new(), loader: None, unpackaged_link: None };
+    // rpm's database is read by running the host's rpm: before it runs, it and the folders to it
+    // must pass the ownership rules (its libraries too, as listed by the loader, nothing run
+    // yet); after, it must match its own package's record like any captured binary.
+    let rpm = if PkgDb::is_rpm(&req.root) {
+        let none = PkgDb::default();
+        let mut pre = Walker { root: &req.root, db: &none, items: BTreeMap::new(), watch: BTreeMap::new(), listed: BTreeSet::new(), loader: None, unpackaged_link: None, skipped: Vec::new() };
+        let p = pre.which("rpm").ok_or_else(|| refused("rpm", format!("an rpm database, but no rpm on {PHP_PATH}")))?;
+        let (real, m) = pre.resolve(&p, Links::Follow)?;
+        if !m.is_file() || !file_ok(&m) {
+            return Err(refused(&real, owner_why(&m, "rpm")));
+        }
+        Some(real)
+    } else {
+        None
+    };
+    let db = PkgDb::open_with(&req.root, rpm.as_deref().unwrap_or("rpm")).map_err(|e| refused(req.root.join("var/lib").display().to_string(), e))?;
+    let mut w = Walker { root: &req.root, db: &db, items: BTreeMap::new(), watch: BTreeMap::new(), listed: BTreeSet::new(), loader: None, unpackaged_link: None, skipped: Vec::new() };
     // The top-level links of a merged /usr (/bin → usr/bin, /lib64 → usr/lib64…): the guest has
     // them as the host does, so a program named by either path is there (PHP runs /bin/sh).
     for top in TOPS {
@@ -620,6 +704,9 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
         if w.lstat(&p).is_ok_and(|m| m.file_type().is_symlink()) {
             w.resolve(&p, Links::Strict)?;
         }
+    }
+    if let Some(rpm) = &rpm {
+        w.object(rpm, true).map_err(|e| refused(e.file, format!("{} (rpm, which read the package database)", e.why)))?;
     }
     let fpm = w.which(&req.php_fpm).ok_or_else(|| refused(&req.php_fpm, format!("no such program on {PHP_PATH}")))?;
     let fpm = w.object(&fpm, true)?;
@@ -704,11 +791,7 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
         }
     }
     // A config may load only what was captured, and run only PHP files on the site disk.
-    for (file, s) in &settings {
-        if let Some(why) = phpconf::code_refusal(&s.key, &s.value, &ext_dir, &req.app_root, &|p| captured_ro(&w, p)) {
-            return Err(refused(format!("{file}:{}", s.line), why));
-        }
-    }
+    check_settings(&settings, &ext_dir, &req.app_root, &|p| captured_ro(&w, p))?;
     // php-fpm's config: -y, else php-fpm.conf beside php.ini's folder or above it (the compiled
     // one is a string in the binary). Relative includes are under its prefix (-p, else the
     // folder above php-fpm's own).
@@ -740,15 +823,7 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
     if fc.pools.is_empty() {
         return Err(refused(&fpm_files[0].path, "php-fpm's config defines no pool"));
     }
-    for p in &fc.pools {
-        for (k, v) in &p.settings {
-            if let Some(key) = phpconf::php_value_key(k)
-                && let Some(why) = phpconf::code_refusal(key, v, &ext_dir, &req.app_root, &|x| captured_ro(&w, x))
-            {
-                return Err(refused(&p.file, format!("pool [{}]: {k}: {why}", p.name)));
-            }
-        }
-    }
+    check_pools(&fc, &ext_dir, &req.app_root, &|x| captured_ro(&w, x))?;
     // The programs PHP runs, when the host has them.
     let sendmail = settings
         .iter()
@@ -818,6 +893,12 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
     }
     let mysql_sockets = phpconf::mysql_default_sockets(&settings.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>());
     let items: Vec<Item> = w.items.values().cloned().collect();
+    // Trust on first use: the install's record of what no package's checksum covers.
+    if let Some(rec) = &req.record
+        && !check_record(rec, &items)?
+    {
+        write_record(rec, &items)?;
+    }
     let php_key = items_key(&items);
     Ok(Capture {
         fpm,
@@ -841,10 +922,44 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
 
 /// Whether `p` (or what it resolves to) is a captured file, without recording anything.
 fn captured_ro(w: &Walker<'_>, p: &str) -> bool {
-    if w.items.get(p).is_some_and(|i| matches!(i, Item::File { .. })) {
+    let file = |k: &str| w.items.get(k).is_some_and(|i| matches!(i, Item::File { .. }));
+    if file(p) {
         return true;
     }
-    fs::canonicalize(w.host(p)).ok().and_then(|c| c.strip_prefix(w.root).ok().map(|r| format!("/{}", r.display()))).is_some_and(|r| w.items.contains_key(&r))
+    // A path through a captured link: what it resolves to must be a captured file, never a folder.
+    fs::canonicalize(w.host(p)).ok().and_then(|c| c.strip_prefix(w.root).ok().map(|r| format!("/{}", r.display()))).is_some_and(|r| file(&r))
+}
+
+/// The settings that load code, against the captured set: the first refusal, naming the file
+/// and line. Settings this parser can't read as PHP does are refused too.
+pub fn check_settings(settings: &[(String, Setting)], ext_dir: &str, app_root: &str, captured: &dyn Fn(&str) -> bool) -> Result<(), Refused> {
+    for (file, s) in settings {
+        if s.ambiguous {
+            return Err(refused(format!("{file}:{}", s.line), format!("{} = {}: a value PHP reads differently from a single string (two quoted strings, or text after one); write it as one", s.key, s.raw)));
+        }
+        if let Some(why) = phpconf::code_refusal(&s.key, &s.value, ext_dir, app_root, captured) {
+            return Err(refused(format!("{file}:{}", s.line), why));
+        }
+    }
+    Ok(())
+}
+
+/// The pools' `php_value`/`php_admin_value`/`php_flag`/`php_admin_flag` settings against the
+/// captured set, as [`check_settings`]; and any pool setting this parser can't read as PHP does.
+pub fn check_pools(fc: &FpmConfig, ext_dir: &str, app_root: &str, captured: &dyn Fn(&str) -> bool) -> Result<(), Refused> {
+    if let Some(at) = fc.ambiguous.first() {
+        return Err(refused(at, "a value PHP reads differently from a single string (two quoted strings, or text after one); write it as one"));
+    }
+    for p in &fc.pools {
+        for (k, v) in &p.settings {
+            if let Some(key) = phpconf::php_value_key(k)
+                && let Some(why) = phpconf::code_refusal(key, v, ext_dir, app_root, captured)
+            {
+                return Err(refused(p.at(k), format!("pool [{}]: {k}: {why}", p.name)));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The PHP layer's key: every item, in path order.
@@ -1142,4 +1257,210 @@ pub fn image(stage: &Path, out: &Path) -> Result<u64, String> {
 /// Empties and removes a staging folder this process made (never across a mount).
 pub fn remove_stage(stage: &Path) {
     let _ = fs::remove_dir_all(stage);
+}
+
+/// The validation rules against a fake host root (#102 review). They set owners, so they run as
+/// root (the `check` target does); elsewhere each returns at once.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn root_user() -> bool {
+        // SAFETY: geteuid(2) takes nothing.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// A fresh fake root, root's 0755, with `/usr/lib` and `/etc`.
+    fn fake(name: &str) -> PathBuf {
+        let r = std::env::temp_dir().join(format!("sc-capture-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&r);
+        for d in ["usr/lib", "etc/ssl/private", "etc/ssl/certs"] {
+            fs::create_dir_all(r.join(d)).expect("dirs");
+        }
+        let mut stack = vec![r.clone()];
+        while let Some(d) = stack.pop() {
+            std::os::unix::fs::chown(&d, Some(0), Some(0)).expect("chown");
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).expect("chmod");
+            for e in fs::read_dir(&d).expect("ls").flatten() {
+                if e.file_type().expect("type").is_dir() {
+                    stack.push(e.path());
+                }
+            }
+        }
+        r
+    }
+
+    fn file(r: &Path, p: &str, body: &[u8], mode: u32) {
+        let at = r.join(p.trim_start_matches('/'));
+        fs::write(&at, body).expect("write");
+        std::os::unix::fs::chown(&at, Some(0), Some(0)).expect("chown");
+        fs::set_permissions(&at, fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    fn walker<'a>(r: &'a Path, db: &'a PkgDb) -> Walker<'a> {
+        Walker { root: r, db, items: BTreeMap::new(), watch: BTreeMap::new(), listed: BTreeSet::new(), loader: None, unpackaged_link: None, skipped: Vec::new() }
+    }
+
+    #[test]
+    fn a_folder_anyone_else_may_write_is_refused() {
+        if !root_user() {
+            return;
+        }
+        let r = fake("folders");
+        file(&r, "/usr/lib/x.so", b"not elf", 0o644);
+        let db = PkgDb::default();
+        assert!(walker(&r, &db).object("/usr/lib/x.so", false).is_ok(), "root's 0755 folders");
+        fs::set_permissions(r.join("usr/lib"), fs::Permissions::from_mode(0o777)).expect("chmod");
+        let e = walker(&r, &db).object("/usr/lib/x.so", false).expect_err("a 0777 folder");
+        assert_eq!(e.file, "/usr/lib");
+        assert!(e.why.contains("a folder is owned by 0:0 with mode 777"), "{e}");
+        fs::set_permissions(r.join("usr/lib"), fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::os::unix::fs::chown(r.join("usr"), Some(1234), Some(0)).expect("chown");
+        assert!(walker(&r, &db).object("/usr/lib/x.so", false).is_err(), "a folder another user owns, anywhere on the way");
+        std::os::unix::fs::chown(r.join("usr"), Some(0), Some(0)).expect("chown");
+        file(&r, "/usr/lib/x.so", b"not elf", 0o666);
+        assert!(walker(&r, &db).object("/usr/lib/x.so", false).expect_err("a 0666 file").why.contains("the file is owned by 0:0 with mode 666"));
+        let _ = fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn links_are_followed_only_where_the_rules_allow() {
+        if !root_user() {
+            return;
+        }
+        let r = fake("links");
+        file(&r, "/usr/lib/libx.so.1.0", b"libx", 0o644);
+        symlink("libx.so.1.0", r.join("usr/lib/libx.so.1")).expect("link");
+        symlink("usr/lib", r.join("lib")).expect("top link");
+        let none = PkgDb::default();
+        // A top-level link (a merged /usr) is fine on the way.
+        let mut w = walker(&r, &none);
+        assert_eq!(w.object("/lib/libx.so.1.0", false).expect("top-level link"), "/usr/lib/libx.so.1.0");
+        assert!(matches!(w.items.get("/lib"), Some(Item::Link { .. })), "the guest gets the link too");
+        // A link no package installed, to a file no package installed: refused.
+        let e = walker(&r, &none).object("/usr/lib/libx.so.1", false).expect_err("unpackaged link to an unpackaged file");
+        assert_eq!(e.file, "/usr/lib/libx.so.1");
+        assert!(e.why.contains("an unpackaged file is never reached through a link"), "{e}");
+        // The same link to a file a package installed, whose checksum matches: allowed.
+        let mut db = PkgDb::default();
+        db.kind = Some(crate::pkgdb::Kind::Dpkg);
+        db.add_dpkg_md5sums("libx1", &format!("{}  usr/lib/libx.so.1.0\n", crate::pkgdb::digest_of(crate::pkgdb::Algo::Md5, b"libx")));
+        assert_eq!(walker(&r, &db).object("/usr/lib/libx.so.1", false).expect("to a packaged file"), "/usr/lib/libx.so.1.0");
+        // A link not root's: refused even at the top.
+        symlink("usr/lib", r.join("lib64")).expect("link");
+        // SAFETY: lchown(2) on a path made here.
+        let c = std::ffi::CString::new(r.join("lib64").as_os_str().as_encoded_bytes()).expect("path");
+        unsafe { libc::lchown(c.as_ptr(), 1234, 1234) };
+        assert!(walker(&r, &none).object("/lib64/libx.so.1.0", false).expect_err("another user's link").why.contains("a link is owned by 1234"));
+        let _ = fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn secrets_are_never_captured_and_data_is_what_anyone_may_read() {
+        if !root_user() {
+            return;
+        }
+        let r = fake("never");
+        file(&r, "/etc/ssl/private/key.pem", b"KEY", 0o600);
+        file(&r, "/etc/ssl/certs/ca.pem", b"CA", 0o644);
+        file(&r, "/etc/ssl/certs/local-key.pem", b"KEY2", 0o600);
+        symlink("/etc/ssl/private/key.pem", r.join("etc/ssl/certs/linked-key.pem")).expect("link");
+        let db = PkgDb::default();
+        let mut w = walker(&r, &db);
+        assert!(w.resolve("/etc/ssl/private/key.pem", Links::Follow).expect_err("never").why.contains("never captured"));
+        // A link into a never-captured folder is refused too, wherever it sits.
+        assert!(w.tree("/etc/ssl/certs", 0).expect_err("a link to a key").why.contains("never captured"));
+        std::fs::remove_file(r.join("etc/ssl/certs/linked-key.pem")).expect("rm");
+        let mut w = walker(&r, &db);
+        w.tree("/etc/ssl/certs", 0).expect("certs");
+        assert!(w.items.contains_key("/etc/ssl/certs/ca.pem"), "a certificate anyone may read");
+        assert!(!w.items.contains_key("/etc/ssl/certs/local-key.pem"), "a 0600 file beside it is left out");
+        assert_eq!(w.skipped, vec!["/etc/ssl/certs/local-key.pem"]);
+        let _ = fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn the_copy_is_hashed_again_and_loses_setuid() {
+        if !root_user() {
+            return;
+        }
+        let r = fake("copy");
+        file(&r, "/usr/lib/a.so", b"checked bytes", 0o4755);
+        let sha = pkgdb::hex(&Sha256::digest(b"checked bytes"));
+        let item = |sha256: &str| Item::File {
+            path: "/usr/lib/a.so".into(),
+            from: "/usr/lib/a.so".into(),
+            mode: 0o4755,
+            uid: 0,
+            gid: 0,
+            size: 13,
+            sha256: sha256.into(),
+            source: "unpackaged (root-owned)".into(),
+        };
+        let stage = r.join("stage");
+        stage_php(&r, &[item(&sha)], &[], &[], &stage).expect("staged");
+        let m = fs::metadata(stage.join("usr/lib/a.so")).expect("staged file");
+        assert_eq!(m.mode() & 0o7777, 0o755, "no setuid bit in the guest");
+        // Bytes that changed after the check: refused at the copy.
+        let stage2 = r.join("stage2");
+        let e = stage_php(&r, &[item(&"0".repeat(64))], &[], &[], &stage2).expect_err("changed");
+        assert!(e.why.contains("changed between its check"), "{e}");
+        let _ = fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn code_loading_settings_are_refused_with_the_file_and_line() {
+        let none = |_: &str| false;
+        let mut c = FpmConfig::default();
+        c.add("/etc/php-fpm.d/www.conf", "[www]\npm = static\nphp_admin_value[auto_prepend_file] = /etc/evil.php\n");
+        let e = check_pools(&c, "/ext", "/var/www/html", &none).expect_err("prepend outside the root");
+        assert_eq!(e.file, "/etc/php-fpm.d/www.conf:3");
+        assert!(e.why.contains("php_admin_value[auto_prepend_file]"), "{e}");
+        let mut c = FpmConfig::default();
+        c.add("/etc/php-fpm.d/www.conf", "[www]\nphp_admin_value[extension] = /opt/x.so\n");
+        assert!(check_pools(&c, "/ext", "/var/www/html", &none).is_err(), "an extension from a pool");
+        let mut c = FpmConfig::default();
+        c.add("/etc/php-fpm.d/www.conf", "[www]\nphp_admin_value[auto_prepend_file] = /var/www/html/waf.php\n");
+        assert!(check_pools(&c, "/ext", "/var/www/html", &none).is_ok(), "inside the root");
+        let s = |k: &str, v: &str| ("/etc/php/conf.d/x.ini".to_owned(), phpconf::parse_ini(&format!("{k} = {v}\n")).remove(0));
+        assert!(check_settings(&[s("auto_prepend_file", "/tmp/p.php")], "/ext", "/var/www/html", &none).expect_err("outside").file.ends_with("x.ini:1"));
+        assert!(check_settings(&[s("ffi.preload", "/opt/x.h")], "/ext", "/var/www/html", &none).is_err());
+        assert!(check_settings(&[s("extension", "\"a\" \"b\"")], "/ext", "/var/www/html", &none).expect_err("ambiguous").why.contains("two quoted strings"));
+        assert!(check_settings(&[s("memory_limit", "256M")], "/ext", "/var/www/html", &none).is_ok());
+    }
+
+    #[test]
+    fn unpackaged_files_must_match_the_install_record() {
+        if !root_user() {
+            return;
+        }
+        let r = fake("record");
+        let rec = r.join("rec/unpackaged.json");
+        let items = vec![Item::File {
+            path: "/usr/local/sbin/php-fpm".into(),
+            from: "/usr/local/sbin/php-fpm".into(),
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            size: 1,
+            sha256: "a".repeat(64),
+            source: "unpackaged (root-owned)".into(),
+        }];
+        assert_eq!(check_record(&rec, &items), Ok(false), "no record yet");
+        assert_eq!(write_record(&rec, &items), Ok(1));
+        assert_eq!(fs::metadata(&rec).expect("record").mode() & 0o777, 0o600);
+        assert_eq!(check_record(&rec, &items), Ok(true));
+        let mut changed = items.clone();
+        if let Item::File { sha256, .. } = &mut changed[0] {
+            *sha256 = "b".repeat(64);
+        }
+        assert!(check_record(&rec, &changed).expect_err("changed").why.contains("recorded at install"));
+        let mut extra = items.clone();
+        if let Item::File { path, .. } = &mut extra[0] {
+            *path = "/usr/local/lib/php/extensions/new.so".into();
+        }
+        assert!(check_record(&rec, &extra).expect_err("not recorded").why.contains("isn't in the install's record"));
+        let _ = fs::remove_dir_all(&r);
+    }
 }

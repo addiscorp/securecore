@@ -114,6 +114,10 @@ compose() {
   fi
 }
 site_dir() { docker volume inspect -f '{{.Mountpoint}}' "${project}_wp"; }
+# php_put <file> <path>: a file into the php container's own config (php.ini's scan folder…),
+# root's and 0644 as a host's is: `docker cp` keeps the copying user's owner, and the microVM's
+# capture of the host's PHP refuses a config anyone but root owns (#101).
+php_put() { compose cp "$1" "php:$2" && compose exec -T php sh -c "chown 0:0 '$2' && chmod 644 '$2'"; }
 
 # --- the site's config -----------------------------------------------------------------------------
 # mvm_conf <json>: the config as the guest needs it (above). A file jq can't read goes as it is.
@@ -197,7 +201,8 @@ launcher_start() {
     "$mvm_fpm" $(sed 's/=.*//; s/^/--guest-env /' "$tdir/guest.env") \
     --config "$_site/securecore.json" --vm-dir "$mvm_vm" --state-dir "$mvm_state" --listen "unix:$mvm_run/fpm.sock" \
     --listen-owner 0 --listen-group 101 --listen-mode 0660 --vm-user "$mvm_vmuser" --pool-user "$mvm_pool" \
-    --guest-root "$html" --guest-ini "$tdir/guest.ini" --php-root "$(mvm_php_root)" "$@" >> "$mvm_log" 2>&1 < /dev/null &
+    --guest-root "$html" --guest-ini "$tdir/guest.ini" --php-root "$(mvm_php_root)" \
+    --unpackaged-record "$tdir/unpackaged.json" --db-user 999 "$@" >> "$mvm_log" 2>&1 < /dev/null &
   _i=0
   until phplog "$_mark" | grep -q 'securecore-fpm: serving FastCGI'; do
     [ -s "$tdir/launcher.exit" ] && return 1
@@ -297,6 +302,9 @@ stack_up() {
     : > "$mvm_log"
     # The site's php.ini settings for the guest (--guest-ini, #90): none until a suite sets some.
     rm -f "$tdir/guest.ini"
+    # The record of the php container's unpackaged files (#101): the image may have been rebuilt,
+    # so this stack's first start records it again (trust on first use).
+    rm -f "$tdir/unpackaged.json"
     builds="php mvmweb" services="db php web mvmweb"
   else
     builds=php services="db php web"

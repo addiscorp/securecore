@@ -28,7 +28,8 @@ const USAGE: &str = "usage: securecore-fpm --config <securecore.json> [--php-fpm
 [--vm-dir <dir>] [--vm-user <name>|<uid>:<gid>] [--pool-user <name>|<uid>:<gid>] [--kvm <device>] [--state-dir <dir>] \
 [--listen unix:<path>|<host>:<port>] [--listen-owner <user>] [--listen-group <group>] [--listen-mode <octal>] \
 [--guest-root <path>] [--mem <MiB>] [--vcpus <n>] [--write-disk-mib <MiB>] [--no-snapshot] \
-[--guest-arg <word>]... [--guest-env <NAME>]... [--guest-ini <file>] [--php-root <dir>] [--pool <name>] [--] [php-fpm args...] \
+[--guest-arg <word>]... [--guest-env <NAME>]... [--guest-ini <file>] [--php-root <dir>] [--pool <name>] \
+[--unpackaged-record <file>] [--db-user <name>|<uid>] [--] [php-fpm args...] \
 | securecore-fpm --migrate-config <securecore.json>";
 
 struct Args {
@@ -56,6 +57,10 @@ struct Args {
     /// The one pool this launcher runs as a microVM (the launcher passes it to its own children
     /// for a php-fpm with several pools).
     pool: Option<String>,
+    /// The install's record of the unpackaged files' sha256s (#101).
+    record: PathBuf,
+    /// The database server's user, who may own the MySQL socket a bare 3306 reaches.
+    db_user: String,
     rest: Vec<OsString>,
 }
 
@@ -85,6 +90,8 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
         guest_ini: None,
         php_root: PathBuf::from("/"),
         pool: None,
+        record: PathBuf::from("/var/lib/securecore/unpackaged.json"),
+        db_user: "mysql".into(),
         rest: Vec::new(),
     };
     let mut config = None;
@@ -102,7 +109,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
             }
             "--config" | "--php-fpm" | "--vm-dir" | "--vm-user" | "--pool-user" | "--kvm" | "--state-dir" | "--listen" | "--listen-owner"
             | "--listen-group" | "--listen-mode" | "--guest-root" | "--mem" | "--vcpus" | "--write-disk-mib" | "--guest-arg" | "--guest-env" | "--guest-ini"
-            | "--php-root" | "--pool" => {
+            | "--php-root" | "--pool" | "--unpackaged-record" | "--db-user" => {
                 args.next();
                 let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
                 let text = || value.to_str().map(str::to_owned).ok_or_else(|| format!("{flag}: not UTF-8"));
@@ -132,6 +139,8 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
                     "--guest-ini" => a.guest_ini = Some(PathBuf::from(&value)),
                     "--php-root" => a.php_root = PathBuf::from(&value),
                     "--pool" => a.pool = Some(text()?),
+                    "--unpackaged-record" => a.record = PathBuf::from(&value),
+                    "--db-user" => a.db_user = text()?,
                     _ => a.guest_args.push(text()?),
                 }
             }
@@ -208,10 +217,19 @@ mod microvm {
             php_fpm: a.php_fpm.to_string_lossy().into_owned(),
             fpm_args: a.rest.iter().map(|s| s.to_string_lossy().into_owned()).collect(),
             pool: a.pool.clone(),
+            record: a.record.clone(),
+            db_user: a.db_user.clone(),
         })
     }
 
     pub struct Ready(vm::Ready);
+
+    /// How long the pools' launchers get to all serve.
+    const POOLS_READY_WITHIN: std::time::Duration = std::time::Duration::from_secs(300);
+
+    pub fn stop_extending() {
+        vm::stop_extending();
+    }
 
     /// Everything before the boot (#100 review: before `auto` commits). Signals are blocked
     /// first, so no thread it starts can take a stop signal's default action.
@@ -284,7 +302,20 @@ mod microvm {
         }
         super::log(&format!("one microVM per pool: {}", names.join(", ")));
         let mut buf = [0u8; 4096];
+        // Every pool was prepared before the choice: what is left is the boot (and, with no
+        // snapshot yet, the warm-up VM and the snapshot), so this is a generous ceiling. Past it
+        // the pools that serve are stopped too, and `auto` runs gelada (#102 review: never a
+        // wait without end).
+        let deadline = std::time::Instant::now() + POOLS_READY_WITHIN;
         loop {
+            if std::time::Instant::now() > deadline {
+                let waiting: Vec<&str> = kids.iter().filter(|(_, _, r)| !r).map(|(n, _, _)| n.as_str()).collect();
+                let waiting = waiting.join(", ");
+                stop_all(&mut kids);
+                vm::stop_extending();
+                vm::unblock_signals();
+                return Outcome::Fallback(format!("pool(s) {waiting} didn't serve within {} s", POOLS_READY_WITHIN.as_secs()));
+            }
             if let Ok(n) = d.recv(&mut buf) {
                 let msg = String::from_utf8_lossy(&buf[..n]).into_owned();
                 if let Some(pid) = msg.lines().find_map(|l| l.strip_prefix("MAINPID=")).and_then(|p| p.parse::<u32>().ok())
@@ -300,6 +331,7 @@ mod microvm {
             if let Some(i) = kids.iter_mut().position(|(_, c, _)| matches!(c.try_wait(), Ok(Some(_)))) {
                 let name = kids[i].0.clone();
                 stop_all(&mut kids);
+                vm::stop_extending();
                 vm::unblock_signals();
                 return Outcome::Fallback(format!("pool [{name}]'s microVM stopped before every pool served (its lines above say why)"));
             }
@@ -307,6 +339,7 @@ mod microvm {
                 break;
             }
         }
+        vm::stop_extending();
         super::log(&format!("every pool's microVM serves ({})", names.join(", ")));
         let _ = vm::notify_ready(std::env::var("NOTIFY_SOCKET").ok().as_deref(), std::process::id());
         loop {
@@ -357,6 +390,8 @@ mod microvm {
     pub fn run(_: &Loaded, _: &Args, _: Ready, _: &[std::ffi::OsString], _: Instant) -> Outcome {
         Outcome::Done(Err("the microVM needs Linux with KVM".into()))
     }
+
+    pub fn stop_extending() {}
 }
 
 #[cfg(target_os = "linux")]
@@ -416,10 +451,18 @@ fn check_capture(args: &[OsString]) -> ExitCode {
         fpm_args: Vec::new(),
         scan_dir_env: std::env::var("PHP_INI_SCAN_DIR").ok(),
         app_root: "/var/www/html".into(),
+        record: None,
     };
+    let mut write = None;
     let mut it = args.iter().map(|a| a.to_string_lossy().into_owned());
     while let Some(a) = it.next() {
         match a.as_str() {
+            // Checked against the install's record (an unpackaged file it lacks or that differs
+            // is refused); written there first when it doesn't exist.
+            "--record" => req.record = Some(PathBuf::from(it.next().unwrap_or_default())),
+            // The installer: (re)records the unpackaged files' sha256s, after the capture's own
+            // checks pass (trust on first use, again on every install).
+            "--write-record" => write = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--php-root" => req.root = PathBuf::from(it.next().unwrap_or_default()),
             "--php-fpm" => req.php_fpm = it.next().unwrap_or_default(),
             "--app-root" => req.app_root = it.next().unwrap_or_default(),
@@ -435,6 +478,15 @@ fn check_capture(args: &[OsString]) -> ExitCode {
     }
     match securecore_fpm::capture::capture(&req) {
         Ok(c) => {
+            if let Some(w) = &write {
+                match securecore_fpm::capture::write_record(w, &c.items) {
+                    Ok(n) => println!("recorded {n} unpackaged files' sha256s in {}", w.display()),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             let files: Vec<&securecore_fpm::capture::Item> = c.items.iter().filter(|i| matches!(i, securecore_fpm::capture::Item::File { .. })).collect();
             let packaged = files.iter().filter(|i| matches!(i, securecore_fpm::capture::Item::File { source, .. } if !source.starts_with("unpackaged"))).count();
             let bytes: u64 = files.iter().map(|i| if let securecore_fpm::capture::Item::File { size, .. } = i { *size } else { 0 }).sum();
@@ -511,8 +563,21 @@ fn main() -> ExitCode {
     let mut ready = None;
     let choice = match choose(layer1, || microvm::prepare(&loaded, &args).map(|r| ready = Some(r))) {
         Ok(choice) => choice,
-        Err(refusal) => return failed(&format!("{path}: {refusal}")),
+        Err(refusal) => {
+            microvm::stop_extending();
+            return failed(&format!("{path}: {refusal}"));
+        }
     };
+    // A pool's own launcher (`--pool`, started by the one that runs every pool) never falls back
+    // by itself: it exits, and the first launcher decides for the whole config (#102 review).
+    let child = args.pool.is_some();
+    if child && choice != Choice::Microvm {
+        microvm::stop_extending();
+        return failed(&format!("{path}: pool [{}]: {choice}", args.pool.as_deref().unwrap_or("")));
+    }
+    if choice != Choice::Microvm {
+        microvm::stop_extending();
+    }
     if layer1.enabled() {
         log(&format!("layer 1 isolation {}: {choice}", layer1.isolation().as_str()));
     }
@@ -523,8 +588,10 @@ fn main() -> ExitCode {
         match microvm::run(&loaded, &args, ready, &argv, t0) {
             microvm::Outcome::Done(Ok(())) => return ExitCode::SUCCESS,
             microvm::Outcome::Done(Err(err)) => return failed(&format!("{path}: the microVM: {err}")),
-            // Nothing was served yet: `auto` still has gelada (#100 review); `microvm` refuses.
-            microvm::Outcome::Fallback(err) if layer1.isolation() == securecore_config::Isolation::Auto => {
+            // Nothing was served yet: `auto` still has gelada (#100 review); `microvm` refuses, and
+            // so does a pool's own launcher (its parent decides).
+            microvm::Outcome::Fallback(err) if layer1.isolation() == securecore_config::Isolation::Auto && !child => {
+                microvm::stop_extending();
                 log(&format!("layer 1 isolation auto: gelada, because the microVM failed before it served ({})", one_line(&err)));
             }
             microvm::Outcome::Fallback(err) => return failed(&format!("{path}: the microVM: {err}")),

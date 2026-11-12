@@ -16,8 +16,32 @@ foreach (file('/proc/self/mounts') ?: [] as $line) {
 }
 echo 'root_opts=', $opts, "\n";
 echo 'root_nosuid=', in_array('nosuid', explode(',', $opts), true) ? 1 : 0, "\n";
-// Every setuid or setgid file on the root image (it is read-only and the worker can list it).
-echo 'setid_files=', trim((string) shell_exec('find / -xdev -type f -perm /6000 2>/dev/null | wc -l')), "\n";
+// Every setuid or setgid file the guest's PHP can see (#101: the guest is the base plus the host's
+// PHP layer; it has no find or wc, so PHP walks it). /proc, /sys and /dev aren't files.
+$setid = 0;
+$walk = function (string $dir, int $depth) use (&$walk, &$setid): void {
+    if ($depth > 24 || in_array($dir, ['/proc', '/sys', '/dev'], true)) {
+        return;
+    }
+    foreach (@scandir($dir) ?: [] as $n) {
+        if ($n === '.' || $n === '..') {
+            continue;
+        }
+        $p = rtrim($dir, '/') . '/' . $n;
+        $st = @lstat($p);
+        if ($st === false) {
+            continue;
+        }
+        $type = $st['mode'] & 0170000;
+        if ($type === 0040000) {
+            $walk($p, $depth + 1);
+        } elseif ($type === 0100000 && ($st['mode'] & 06000) !== 0) {
+            $setid++;
+        }
+    }
+};
+$walk('/', 0);
+echo 'setid_files=', $setid, "\n";
 // su to root and a mount: either would need privileges a worker must not get back.
 $su = (string) shell_exec("su root -c 'id -u' < /dev/null 2>&1");
 echo 'su=', preg_match('/^0$/m', $su) ? 'ROOT' : 'refused', "\n";

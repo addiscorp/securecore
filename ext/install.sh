@@ -360,6 +360,23 @@ if [ -n "$VM" ]; then
   fi
   # What is installed, and from which mirab release: nobody edits a version by hand.
   put installed.json "$SHARE_DIR/vm/installed.json" 644 "microVM record"
+  # The microVM's guest is this host's own PHP (#101): what no package's checksum covers
+  # (a compiled php-fpm, PECL extensions, securecore.so) is recorded now, root's alone, and each
+  # start checks it against this record (trust on first use; every install records again, so an
+  # upgrade done through it is taken). Needs root, as the microVM does.
+  FPM_BIN=$(command -v php-fpm 2>/dev/null || :)
+  if [ -z "$FPM_BIN" ]; then
+    for f in /usr/local/sbin/php-fpm /usr/sbin/php-fpm*; do
+      if [ -x "$f" ]; then FPM_BIN=$f; break; fi
+    done
+  fi
+  if [ "$(id -u)" = 0 ] && [ -n "$FPM_BIN" ]; then
+    if out=$("$BIN_DIR/securecore-fpm" --check-capture --php-fpm "$FPM_BIN" --write-record /var/lib/securecore/unpackaged.json 2>&1); then
+      step "$OK" "PHP record" "$(printf '%s' "$out" | tail -n 1)"
+    else
+      step "$NOTE" "PHP record" "this PHP can't be the microVM's guest yet, so layer 1's auto stays gelada: $(printf '%s' "$out" | tail -n 1)"
+    fi
+  fi
   if [ -z "$GUEST" ]; then
     step "$NOTE" "microVM" "SecureCore $REL ships no guest image, so nothing verified boots: layer 1's auto is gelada and microvm refuses"
   fi

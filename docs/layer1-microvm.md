@@ -1027,12 +1027,48 @@ that then fails before it serves anything (its boot, its listening socket) falls
 too (`layer 1 isolation auto: gelada, because the microVM failed before it served (…)`);
 `microvm` still exits 125.
 
-**A bare 3306 and `localhost`** (#100 review). A `{ "port": 3306 }` with no socket or address no
-longer means egress only: it reaches the host's MySQL socket where PHP's own settings
-(`mysqli.default_socket`, `pdo_mysql.default_socket`) or the standard places say, else
-`127.0.0.1:3306` when something listens there. Only with neither is it an egress port. Whatever
-3306 reaches, the guest has a unix socket at each of PHP's default sockets, `/run/mysqld/mysqld.sock`
-and `/tmp/mysql.sock`, so `DB_HOST=localhost` works as on the host.
+**A bare 3306 and `localhost`** (#100 and #102 reviews). A `{ "port": 3306 }` with no socket or
+address goes where the site's own `DB_HOST` says, never to whatever happens to listen. The
+launcher reads `DB_HOST` from `wp-config.php` (a literal, or the official image's
+`getenv_docker('WORDPRESS_DB_HOST', …)` from its own environment):
+- `localhost` (or `localhost:/path`): that socket, PHP's default socket
+  (`mysqli.default_socket`, `pdo_mysql.default_socket`), or MySQL's standard places, never `/tmp`.
+  The socket must be root's or the database user's (`--db-user`, `mysql`), in folders only they
+  may write; any other socket refuses the start with the reason (`auto` falls back);
+- `127.0.0.1` or `::1`: that address and port on the host;
+- another host, or a `DB_HOST` the launcher can't read: an egress port (reached by name), said so.
+
+Whatever 3306 reaches, the guest has a unix socket at each of PHP's default sockets, the host
+socket's own path and `/run/mysqld/mysqld.sock`, so `DB_HOST=localhost` works as on the host.
+
+**Who may connect** (#102 review). A pool's `listen = 9000` binds `127.0.0.1:9000`, never every
+address (only a pool that names one, `0.0.0.0:9000`, gets that). `listen.allowed_clients` is
+enforced on every TCP connection; `listen.acl_users` and `listen.acl_groups` on a unix socket
+(the socket is then 0666 and each connection's peer credentials are checked, root always
+admitted). Refusals are logged (the first five, then every thousandth).
+
+**Only this site's pools** (#102 review, Sami's decision). A microVM holds one site's files, so
+only pools whose `chdir`, `doc_root` or `prefix` is this app root (or inside it, on the host or as
+the guest sees it) run here; php-fpm's only pool may name none. Any other pool refuses the whole
+config (`pool [X] serves another site (…)`), and `auto` falls back to gelada once. All pools of
+one site share its writable folders (each VM syncs its own disk with them), so they must be of one
+trust level.
+
+**Unpackaged files** (#102 review, Sami's decision: trust on first use). The installer records the
+sha256 of every captured file no package's checksum covers (a compiled php-fpm, PECL extensions,
+`securecore.so`) in `/var/lib/securecore/unpackaged.json` (root's, 0600;
+`securecore-fpm --check-capture --write-record`), and every capture checks them against it: one
+that differs or isn't recorded is refused, naming it (`run the installer again` after an
+upgrade). Without a record, the first capture writes it. `--unpackaged-record` names another.
+
+**Parsing as PHP does** (#102 review). A value with two quoted strings (PHP joins them), or text
+after a quoted string other than a comment, is refused with its file and line rather than
+guessed; `\"` and `\\` in double quotes are read as PHP reads them. Pool settings go into the
+guest's config byte for byte as the host's file has them. `ffi.preload` is refused unless every
+file it names is captured. Data files are captured only when everyone may read them (a 0600 key
+beside the certificates stays out). dpkg's diversions are followed; rpm's SHA-224 and SHA-384
+digests are checked, and an algorithm the capture can't compute refuses the file. rpm itself must
+pass the ownership rules before it runs, and its package's checksum after.
 
 **A long first start** (#100 review). Under systemd (`NOTIFY_SOCKET`), the launcher sends
 `EXTEND_TIMEOUT_USEC=30000000` every 10 s from the moment it starts preparing until the VM serves,
