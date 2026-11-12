@@ -338,7 +338,8 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
 
 /// The rpm query's format: every file of every package, its digest, the package's digest
 /// algorithm and its name, tab-separated.
-pub const RPM_QUERY: &str = "[%{FILENAMES}\\t%{FILEDIGESTS}\\t%{FILEDIGESTALGO}\\t%{NAME}\\n]";
+/// (`%{=TAG}` repeats a package's single value on each file's line.)
+pub const RPM_QUERY: &str = "[%{FILENAMES}\\t%{FILEDIGESTS}\\t%{=FILEDIGESTALGO}\\t%{=NAME}\\n]";
 
 /// `rpm -qa` with [`RPM_QUERY`], run inside `root` as nobody with no environment.
 #[cfg(target_os = "linux")]

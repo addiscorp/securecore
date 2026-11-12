@@ -108,6 +108,10 @@ pub struct Boot {
     pub user: Option<(u32, u32)>,
     /// `sc.fpm=<path>`: the host's php-fpm, at its own path on the PHP layer (#101).
     pub fpm: String,
+    /// `sc.inidir=` / `sc.inifile=`: the host's scan folder and php.ini, where the config
+    /// layer's are bound too (the CLI layer 3's helper runs reads its compiled-in ones).
+    pub ini_dir: Option<String>,
+    pub ini_file: Option<String>,
 }
 
 /// Parses the guest's kernel command line. Paths may not hold spaces (the command line is
@@ -143,6 +147,8 @@ pub fn parse_cmdline(line: &str) -> Result<Boot, String> {
                 boot.socks.push((port, path.to_owned()));
             }
             "sc.ext" => boot.ext = value != "0",
+            "sc.inidir" if value.starts_with('/') => boot.ini_dir = Some(value.to_owned()),
+            "sc.inifile" if value.starts_with('/') => boot.ini_file = Some(value.to_owned()),
             "sc.fpm" => {
                 if !value.starts_with('/') {
                     return Err(format!("sc.fpm={value}: want php-fpm's absolute path"));
@@ -855,12 +861,32 @@ fn pump_log(from: fs::File) {
             line.extend_from_slice(" …[cut]".as_bytes());
         }
         LOG.line(&line);
+        // A program PHP ran through a shell that the guest doesn't have (#101): said once per
+        // name, in the init's own words (the line itself is php-fpm's, so it is only quoted).
+        if let Some(name) = missing_program(&String::from_utf8_lossy(&line)) {
+            static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
+            let mut said = SAID.lock().unwrap_or_else(|p| p.into_inner());
+            if !said.contains(&name) && said.len() < 64 {
+                said.push(name.clone());
+                report(&format!("{name:?} isn't in the guest: the host had no such program to capture (php-fpm's output says a shell PHP started couldn't find it)"));
+            }
+        }
         let mut last = LAST_WORDS.lock().unwrap_or_else(|p| p.into_inner());
         if last.len() == LAST_WORDS_N {
             last.pop_front();
         }
         last.push_back(String::from_utf8_lossy(&line).into_owned());
     }
+}
+
+/// The program a shell's "not found" line names: dash's `sh: 1: convert: not found`, bash's
+/// `sh: line 1: convert: command not found` and `sh: convert: command not found` (anywhere in
+/// the line: php-fpm prefixes a worker's stderr).
+pub fn missing_program(line: &str) -> Option<String> {
+    let rest = &line[line.find("sh: ")? + 4..];
+    let rest = rest.strip_suffix(": command not found").or_else(|| rest.strip_suffix(": not found"))?;
+    let name = rest.rsplit(": ").next()?.trim();
+    (!name.is_empty() && name.len() <= 128 && !name.contains(' ')).then(|| name.to_owned())
 }
 
 /// php-fpm's last lines, for the console when it exits (#87): the log port may be what failed.
@@ -1152,6 +1178,14 @@ fn boot_guest() -> io::Result<u32> {
     // The host's PHP over the base (#101), then its settings.
     let tops = mount_php_layer()?;
     mount(CONF_DEV, CONF_LAYER, "ext4", libc::MS_RDONLY | flags | libc::MS_NOEXEC, "noload")?;
+    for (from, to) in [(format!("{CONF_LAYER}/conf.d"), &boot.ini_dir), (format!("{CONF_LAYER}/php.ini"), &boot.ini_file)] {
+        if let Some(to) = to
+            && Path::new(&from).exists()
+        {
+            mount(&from, to, "", libc::MS_BIND, "").map_err(|e| io::Error::new(e.kind(), format!("{to}: {e}")))?;
+            mount("", to, "", libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | flags | libc::MS_NOEXEC, "")?;
+        }
+    }
     // noexec too: php-fpm reads the site's PHP, nothing on the site disk ever runs as a program.
     mount(SITE_DEV, &boot.root, "ext4", libc::MS_RDONLY | flags | libc::MS_NOEXEC, "noload")?;
     say(&format!("the host's PHP is mounted over the base: {}", tops.join(" ")));
@@ -1226,6 +1260,11 @@ mod tests {
         assert_eq!(parse_cmdline("sc.root=/srv sc.fpm=/usr/sbin/php-fpm8.3").expect("parses").fpm, "/usr/sbin/php-fpm8.3");
         assert_eq!(parse_cmdline("sc.root=/srv").expect("parses").fpm, "/usr/local/sbin/php-fpm");
         assert!(parse_cmdline("sc.root=/srv sc.fpm=php-fpm").is_err(), "php-fpm's path, never a name to look up");
+        assert_eq!(missing_program("sh: 1: convert: not found").as_deref(), Some("convert"));
+        assert_eq!(missing_program("WARNING: [pool www] child 9 said into stderr: \"sh: line 1: gs: command not found\"\"").as_deref(), None);
+        assert_eq!(missing_program("sh: line 1: gs: command not found").as_deref(), Some("gs"));
+        assert_eq!(missing_program("sh: magick: command not found").as_deref(), Some("magick"));
+        assert_eq!(missing_program("PHP Warning: something else"), None);
         assert_eq!(fpm_args(true), ["-F", "-y", "/sc/conf/php-fpm.conf", "-c", "/sc/conf/php.ini"]);
         assert_eq!(fpm_args(false), ["-F", "-y", "/sc/conf/php-fpm.conf", "-c", "/sc/conf"]);
         assert!(parse_cmdline("sc.root=/srv sc.ports=99999").is_err());

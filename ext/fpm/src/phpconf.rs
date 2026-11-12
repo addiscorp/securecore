@@ -343,6 +343,34 @@ pub fn is_elf(b: &[u8]) -> bool {
 /// local value), by name.
 pub fn parse_phpinfo(text: &str) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
+    // php-fpm's `-i` is a CGI SAPI's: HTML, a table row per setting.
+    if text.contains("<td") {
+        let plain = |s: &str| {
+            let mut out = String::new();
+            let mut tag = false;
+            for c in s.chars() {
+                match c {
+                    '<' => tag = true,
+                    '>' => tag = false,
+                    _ if !tag => out.push(c),
+                    _ => {}
+                }
+            }
+            out.replace("&nbsp;", " ").replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").trim().to_owned()
+        };
+        for row in text.split("<tr>").skip(1) {
+            let cells: Vec<String> = row.split("<td").skip(1).map(|c| plain(&format!("<td{c}"))).collect();
+            if let (Some(k), Some(v)) = (cells.first(), cells.get(1)) {
+                m.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        if let Some(h) = text.split("<h1 class=\"p\">").nth(1).and_then(|h| h.split("</h1>").next())
+            && let Some(v) = plain(h).strip_prefix("PHP Version ")
+        {
+            m.entry("PHP Version".to_owned()).or_insert_with(|| v.trim().to_owned());
+        }
+        return m;
+    }
     for line in text.lines() {
         let mut parts = line.splitn(3, " => ");
         if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
@@ -488,6 +516,11 @@ mod tests {
         assert_eq!(m["PHP Version"], "8.3.14");
         assert_eq!(m["extension_dir"], "/usr/local/lib/php/extensions/no-debug-non-zts-20230831");
         assert_eq!(m["Configuration File (php.ini) Path"], "/usr/local/etc/php");
+        // php-fpm's own -i: HTML.
+        let h = parse_phpinfo("<html><body><div class=\"center\"><table>\n<tr class=\"h\"><td>\n<h1 class=\"p\">PHP Version 8.3.14</h1>\n</td></tr>\n</table>\n<table>\n<tr><td class=\"e\">Configuration File (php.ini) Path </td><td class=\"v\">/usr/local/etc/php </td></tr>\n<tr><td class=\"e\">extension_dir</td><td class=\"v\">/usr/local/lib/php/extensions/no-debug-non-zts-20230831</td><td class=\"v\">/usr/local/lib/php/extensions/no-debug-non-zts-20230831</td></tr>\n</table></div></body></html>");
+        assert_eq!(h["PHP Version"], "8.3.14");
+        assert_eq!(h["Configuration File (php.ini) Path"], "/usr/local/etc/php");
+        assert_eq!(h["extension_dir"], "/usr/local/lib/php/extensions/no-debug-non-zts-20230831");
         let s = parse_ini("mysqli.default_socket = /run/mysqld/mysqld.sock\npdo_mysql.default_socket=/run/mysqld/mysqld.sock\nmysql.default_socket = \n");
         assert_eq!(mysql_default_sockets(&s), vec!["/run/mysqld/mysqld.sock"]);
     }

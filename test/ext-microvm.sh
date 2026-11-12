@@ -91,7 +91,9 @@ compose() {
     -p "$project" "$@"
 }
 wp() { compose run --rm -T cli wp "$@" 2>>"$dir/wp.err" | tr -d '\r'; }
-in_php() { compose exec -T php sh -c "$1"; }
+# (umask 022: a file the tests put in the php container's config is root's 0644, as a host's is;
+# the capture refuses one anyone else may write.)
+in_php() { compose exec -T php sh -c "umask 022; $1"; }
 db_root() { compose exec -T db mariadb -uroot -proot-db-password -N -e "$1" 2>/dev/null; }
 # Through the microVM's nginx, with the site's own Host so WordPress doesn't redirect.
 vget() { curl -s -H "Host: 127.0.0.1:$port" "http://127.0.0.1:$vport$1"; }
@@ -224,12 +226,16 @@ fpm_env() {
 }
 dbpass=$(sed -n 's/^WORDPRESS_DB_PASSWORD=//p' "$dir/guest.env")
 [ -n "$dbpass" ] || die "the test site's DB password"
+# The host's PHP the guest is built from (#101): the stack's php container's (Debian: its
+# libraries are dpkg's, php-fpm and the extensions are compiled and root's), read through its root.
+php_root() { echo "/proc/$(docker inspect -f '{{.State.Pid}}' "$(compose ps -q php)")/root"; }
+[ -x "$(php_root)/usr/local/sbin/php-fpm" ] || die "no php-fpm in the php container at $(php_root)"
 start() {
   name=$1 config=$2; shift 2
   cp "$config" "$site/securecore.json"
   fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --listen "unix:$run/fpm.sock" \
     --listen-owner 0 --listen-group 101 --listen-mode 0660 --vm-user "$vmuser" --pool-user "$pool" \
-    --guest-root "$html" "$@" > "$dir/$name.log" 2>&1 &
+    --guest-root "$html" --php-root "$(php_root)" "$@" > "$dir/$name.log" 2>&1 &
   PID=$!
   i=0
   until grep -q 'securecore-fpm: serving FastCGI' "$dir/$name.log"; do
@@ -263,7 +269,13 @@ standin="grep -E '^(NoNewPrivs|Seccomp_filters):' /proc/self/status | tr -s '\t 
 once() {
   name=$1 config=$2; shift 2
   cp "$config" "$site/securecore.json"
-  fpm_env --config "$site/securecore.json" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" "$@" --php-fpm /bin/sh -- -c "$standin" > "$dir/value-$name.log" 2>&1 &
+  # A "microvm" start never execs a php-fpm (it boots the host's, captured, or refuses): the
+  # stand-in is only for the values that exec one on the host (#101: --php-fpm is also what the
+  # microVM captures, so it is the container's real one there).
+  case $name in
+    microvm*) fpm_env --config "$site/securecore.json" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" --php-root "$(php_root)" "$@" > "$dir/value-$name.log" 2>&1 & ;;
+    *) fpm_env --config "$site/securecore.json" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" --php-root "$(php_root)" "$@" --php-fpm /bin/sh -- -c "$standin" > "$dir/value-$name.log" 2>&1 & ;;
+  esac
   wait $!
   echo "exit=$?" >> "$dir/value-$name.log"
 }
@@ -385,7 +397,7 @@ if [ "$what" = density ]; then
     [ "$1" = 1 ] && l=$run/fpm.sock
     fpm_env --config "$s/securecore.json" --vm-dir "$vm" --state-dir "$dd/state-$1" --listen "unix:$l" \
       --listen-owner 0 --listen-group 101 --listen-mode 0660 --vm-user "$vmuser" --pool-user "$pool" \
-      --guest-root "$html" --mem "$mem" > "$2" 2>&1 &
+      --guest-root "$html" --php-root "$(php_root)" --mem "$mem" > "$2" 2>&1 &
     echo $! > "$dd/pid-$1"
     i=0
     until grep -q 'securecore-fpm: serving FastCGI' "$2"; do
@@ -646,7 +658,22 @@ if [ "$started" = 1 ]; then
   cg=$(cut -d: -f3 "/proc/$fcpid/cgroup")
   is "$(cat "/sys/fs/cgroup$cg/memory.max")/$(cat "/sys/fs/cgroup$cg/cpu.max")" "$(((512 + 256) << 20))/200000 100000" "in a cgroup with memory.max and cpu.max set ($cg)"
   is "$(stat -c '%a %u %g' "$run/fpm.sock")" "660 0 101" "fpm.sock is 0660 root:101 (--listen-mode/owner/group), not 0666"
-  is "$(cat "$dir/notify.msg" 2>/dev/null | head -1)" "READY=1" "NOTIFY_SOCKET got READY=1 (systemd Type=notify)"
+  is "$(grep -c '^READY=1$' "$dir/notify.msg" 2>/dev/null)" 1 "NOTIFY_SOCKET got READY=1 (systemd Type=notify)"
+  # A first start (capture, disks, snapshot) asks systemd for more time before it is ready (#100 review).
+  is "$(awk '/^EXTEND_TIMEOUT_USEC=30000000$/ && !r { e = 1 } /^READY=1$/ { r = 1 } END { print (e && r) ? "before" : "no" }' "$dir/notify.msg")" before \
+    "and EXTEND_TIMEOUT_USEC=30000000 before it"
+  # The guest is the host's own PHP (#101): captured from the php container, checked, layered.
+  has "$dir/first.log" "captured the host's PHP 8.3" "the start captures the host's PHP"
+  has "$dir/first.log" "checked against dpkg (" "checked against dpkg's records"
+  has "$dir/first.log" "built the PHP layer" "and builds the PHP layer"
+  has "$dir/first.log" "built the config layer" "and the config layer"
+  man=$state/capture-manifest.json
+  is "$(stat -c '%a %u' "$man")" "600 0" "the capture's manifest is root's alone"
+  is "$(jq -r '[.[] | select(.path | endswith("/securecore.so"))][0].source' "$man")" "unpackaged (root-owned)" "the manifest: securecore.so is unpackaged and root-owned"
+  is "$(jq -r '[.[] | select(.source // "" | startswith("dpkg:libxml2"))] | length > 0' "$man")" true "the manifest: libxml2 is checked against dpkg"
+  is "$(jq -r '[.[] | select(.sha256 and (.sha256 | length) == 64)] | length > 100' "$man")" true "every file with its sha256 ($(jq length "$man") entries)"
+  printf '%s\n' "$(jq -r '[.[] | select(.sha256)] | length' "$man") files, $(jq -r '[.[] | select(.link)] | length' "$man") links, $(jq -r '[.[] | select(.source == "config")] | length' "$man") configs; PHP layer $(du -m "$(find "$state" -maxdepth 1 -name 'php-*.ext4' | head -1)" | cut -f1) MiB on disk ($(stat -c %s "$(find "$state" -maxdepth 1 -name 'php-*.ext4' | head -1)") bytes)" > "$dir/capture-sizes.txt"
+  echo "  capture: $(cat "$dir/capture-sizes.txt")"
   r=$(first_page)
   is "${r% *}" 200 "the front page through the jailed microVM: 200 (first page after the restore: ${r#* } ms)"
   is "$(vget / | grep -c yoast-schema-graph)" 1 "it carries Yoast's output"
@@ -654,6 +681,13 @@ if [ "$started" = 1 ]; then
   is "$(val first kernel | cut -d. -f1-2)/$( [ "$(val first kernel)" != "$(uname -r)" ] && echo other)" 6.12/other \
     "PHP runs on the guest's kernel, mirab's Linux 6.12 ($(val first kernel); this host is $(uname -r))"
   is "$(val first guest_init)" 1 "PID 1 is securecore-init"
+  is "$(val first guest_fpm)" /usr/local/sbin/php-fpm "the guest runs the host's own php-fpm, at its own path"
+  is "$(val first php_ini_scan)" /sc/conf/conf.d "with the host's scan folder, from the config layer"
+  is "$(val first ini_files | grep -c 'securecore.ini')" 1 "whose files are the host's (securecore.ini among them)"
+  probe "?missing=1" missing
+  is "$(val missing missing_rc)" 127 "a program the guest lacks isn't there (exit 127)"
+  eventually 50 "grep -q 'guest-init: \"sc-no-such-program-101\" isn.t in the guest' \"$dir/first.log\"" || true
+  has "$dir/first.log" "guest-init: \"sc-no-such-program-101\" isn't in the guest: the host had no such program to capture" "and the guest's init says which program PHP tried to run"
   is "$(val first euid)" 1234 "the guest's php-fpm workers run as the host's pool user (1234), not the image's www-data"
   is "$(val first netdev)" lo "the guest has loopback only, no network device"
   # #86 review: a program PHP starts gets neither the vsock preload nor its ports, and /tmp runs
@@ -699,7 +733,7 @@ if [ "$started" = 1 ]; then
     | (cd "$(jail_root)" && python3 "$sockpy" connect v.sock) > "$dir/second-start.out" 2>&1
   has "$dir/second-start.out" "error this boot's start message was already taken" "the guest refuses a second start message"
   # A second launcher on the same state folder.
-  "$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" --listen "unix:$run/other.sock" > "$dir/second-launcher.log" 2>&1
+  "$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" --php-root "$(php_root)" --listen "unix:$run/other.sock" > "$dir/second-launcher.log" 2>&1
   is "$?" 125 "a second launcher on the same state exits 125"
   has "$dir/second-launcher.log" "is locked" "because the state folder is locked"
   # USR1 and USR2 don't stop it.
@@ -1048,6 +1082,115 @@ else
   fail "a bad snapshot: the first start serves"
 fi
 
+echo "# the host's own PHP (#101): cached by what it holds, validated, refused with the file named"
+# ms_to_ready <log>: the launcher's own "ready … ms" or "started … ms after launch" figure.
+ready_ms() { sed -n 's/.*ready \([0-9]*\) ms, started \([0-9]*\) ms after launch.*/\2/p' "$1" | tail -1; }
+# A normal restore: nothing changed, so nothing is captured, hashed or built.
+if start same "$dir/microvm.json"; then
+  has "$dir/same.log" "is as captured before" "a start with nothing changed reuses the capture (no hashing, no loader)"
+  lacks "$dir/same.log" "built the PHP layer" "and builds no layer"
+  has "$dir/same.log" "microVM restored from snapshot" "and restores"
+  echo "  time to ready, a normal restore: $(ready_ms "$dir/same.log") ms" | tee -a "$dir/measure.txt"
+  stop
+else
+  fail "a start with nothing changed serves"
+fi
+# A php.ini-only change: only the (small) config layer is rebuilt, then a new snapshot.
+in_php "printf 'memory_limit = 201M\n' > /usr/local/etc/php/conf.d/zz-sc101.ini"
+if start ini "$dir/microvm.json"; then
+  has "$dir/ini.log" "built the config layer" "a php.ini change rebuilds the config layer"
+  lacks "$dir/ini.log" "built the PHP layer" "and not the PHP layer"
+  has "$dir/ini.log" "capture: " "and the change is logged"
+  probe "" ini
+  is "$(val ini memory_limit)" 201M "the guest's PHP has the host's new setting"
+  echo "  time to ready, a php.ini-only change: $(ready_ms "$dir/ini.log") ms" | tee -a "$dir/measure.txt"
+  stop
+else
+  fail "a php.ini change: the start serves"
+fi
+in_php "rm -f /usr/local/etc/php/conf.d/zz-sc101.ini"
+# refuses <name> <expected file> <why>: microvm refuses (exit 125) with the capture's line naming the
+# file, and php-fpm never runs.
+refuses() {
+  cp "$dir/microvm.json" "$site/securecore.json"
+  fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --listen "unix:$run/fpm.sock" \
+    --vm-user "$vmuser" --pool-user "$pool" --guest-root "$html" --php-root "$(php_root)" > "$dir/$1.log" 2>&1 &
+  rp=$!
+  # Never a hang: a launcher that starts serving instead is stopped.
+  eventually 900 "! kill -0 $rp 2>/dev/null || grep -q 'serving FastCGI' \"$dir/$1.log\"" || true
+  kill -0 "$rp" 2>/dev/null && kill -TERM "$rp"
+  wait "$rp"
+  is "$?" 125 "$1: microvm refuses to start (exit 125)"
+  has "$dir/$1.log" "the host's PHP can't be captured: $2" "$1: naming $2"
+  has "$dir/$1.log" "$3" "$1: $3"
+  lacks "$dir/$1.log" "serving FastCGI" "$1: nothing served"
+}
+# A library a package installed, changed after: its bytes don't match dpkg's record.
+lib=$(jq -r '[.[] | select(.sha256 and (.source // "" | startswith("dpkg:libxml2")))][0].from' "$man")
+in_php "cp -p $lib /tmp/sc101-lib && printf x >> $lib"
+refuses tampered-lib "$lib" "don't match what dpkg recorded for libxml2"
+in_php "cat /tmp/sc101-lib > $lib && touch -r /tmp/sc101-lib $lib && rm -f /tmp/sc101-lib"
+# An extension the pool user may write (any file not root's alone).
+ext=$(jq -r '[.[] | select(.sha256 and (.path | endswith("/sockets.so")))][0].path' "$man")
+in_php "chown ${pool%%:*} $ext"
+refuses writable-ext "$ext" "everything captured must be root's and writable by no one else"
+in_php "chown 0:0 $ext"
+# An extension changed in place (a distro's are dpkg's: its record catches it; this image compiles
+# its own, so the bytes are its record's only once captured): a dpkg-packaged one is in
+# test/ext-capture.sh. A config that loads native code from outside PHP's folders.
+in_php "mkdir -p /opt/sc101 && cp $ext /opt/sc101/evil.so && printf 'extension=/opt/sc101/evil.so\n' > /usr/local/etc/php/conf.d/zz-sc101-evil.ini"
+refuses outside-so "/usr/local/etc/php/conf.d/zz-sc101-evil.ini:1" "extension = /opt/sc101/evil.so loads native code from outside the captured set"
+in_php "rm -rf /opt/sc101 /usr/local/etc/php/conf.d/zz-sc101-evil.ini"
+# After each refusal the host is as it was: the next start serves (and recaptures).
+if start after-tamper "$dir/microvm.json"; then
+  is "$(vcode /)" 200 "with the host restored, the microVM serves again"
+  stop
+else
+  fail "after the refusals: the start serves"
+fi
+# A bare 3306 and PHP's localhost (#100 review): the database through the host's MySQL socket,
+# which PHP's own setting names (mysqli.default_socket), with WordPress's DB_HOST=localhost.
+sed "s|{ \"port\": 3306, \"socket\": \"$mysqld/mysqld.sock\" }|{ \"port\": 3306 }|" "$dir/microvm.json" > "$dir/bare.json"
+grep -q '{ "port": 3306 }' "$dir/bare.json" || die "the bare-3306 fixture"
+in_php "printf 'mysqli.default_socket = $mysqld/mysqld.sock\n' > /usr/local/etc/php/conf.d/zz-sc101-db.ini"
+cp "$dir/guest.env" "$dir/guest.env.keep"
+sed 's|^WORDPRESS_DB_HOST=.*|WORDPRESS_DB_HOST=localhost|' "$dir/guest.env.keep" > "$dir/guest.env"
+if start bare "$dir/bare.json"; then
+  has "$dir/bare.log" "port 3306 has no socket or address: it goes to the host's MySQL socket $mysqld/mysqld.sock" "a bare 3306 goes to the host's MySQL socket"
+  is "$(vcode /)" 200 "and WordPress reaches its database at localhost (the front page: 200)"
+  is "$(vget / | grep -c yoast-schema-graph)" 1 "with its content"
+  stop
+else
+  fail "a bare 3306: the start serves"
+fi
+cp "$dir/guest.env.keep" "$dir/guest.env"
+in_php "rm -f /usr/local/etc/php/conf.d/zz-sc101-db.ini"
+# One microVM per pool (#100 review): each listens where its pool says, the launcher tells systemd
+# once both serve, and a stop stops both.
+in_php "printf '[www]\nlisten = $run/www.sock\nlisten.mode = 0666\n[second]\nuser = www-data\ngroup = www-data\nlisten = $run/second.sock\nlisten.mode = 0666\npm = static\npm.max_children = 2\nenv[SC_POOL] = second\n' > /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"
+cp "$dir/microvm.json" "$site/securecore.json"
+rm -f "$dir/notify-pools.sock" "$dir/notify-pools.msg"
+python3 "$sockpy" recv "$dir/notify-pools.sock" "$dir/notify-pools.msg" &
+npid=$!
+sleep 0.3
+NOTIFY_SOCKET=$dir/notify-pools.sock fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" \
+  --guest-root "$html" --php-root "$(php_root)" > "$dir/pools.log" 2>&1 &
+PID=$!
+eventually 1800 "grep -q 'every pool.s microVM serves' \"$dir/pools.log\" || ! kill -0 $PID 2>/dev/null" || true
+has "$dir/pools.log" "one microVM per pool: www, second" "two pools: a microVM each"
+has "$dir/pools.log" "every pool's microVM serves (www, second)" "both serve"
+is "$(python3 test/ext/microvm/fcgi-ping.py "unix:$run/www.sock")/$(python3 test/ext/microvm/fcgi-ping.py "unix:$run/second.sock")" pong/pong \
+  "each pool's php-fpm answers where its pool listens"
+is "$(stat -c %a "$run/second.sock")" 666 "with the pool's listen.mode"
+is "$(find "$state/pool-www" "$state/pool-second" -maxdepth 1 -name 'conf-*.ext4' | wc -l)" 2 "each pool has its own config layer and state folder"
+is "$(grep -c '^READY=1$' "$dir/notify-pools.msg")" 1 "systemd is told once, when both serve"
+stop
+is "$STOPPED" 0 "SIGTERM stops both pools' microVMs, exit 0"
+is "$(pgrep -f -- "--id sc-[0-9a-f]*-[0-9a-f]\{6\}" | wc -l)" 0 "no pool's Firecracker is left running"
+kill "$npid" 2>/dev/null
+in_php "rm -f /usr/local/etc/php-fpm.d/zz-sc101-pools.conf"
+rm -f "$run/www.sock" "$run/second.sock"
+
 echo "# a site change, and a larger --write-disk-mib"
 date > "$site/sc-mvm-changed.txt"
 if start third "$dir/microvm.json" --write-disk-mib 1500; then
@@ -1094,7 +1237,7 @@ find "$moved" -mindepth 2 -delete
 printf '{"root":"/srv/a-site-that-moved"}\n' > "$moved/old/site.json"
 cp "$state"/w*.ext4 "$moved/old/"
 cp "$dir/microvm.json" "$site/securecore.json"
-"$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$moved/new" --vm-user "$vmuser" --listen "unix:$run/moved.sock" --guest-root "$html" > "$dir/moved.log" 2>&1
+"$fpm" --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$moved/new" --vm-user "$vmuser" --php-root "$(php_root)" --listen "unix:$run/moved.sock" --guest-root "$html" > "$dir/moved.log" 2>&1
 is "$?" 125 "a new state beside an orphaned uploads disk: the launcher exits 125"
 has "$dir/moved.log" "holds the writable disks (uploads) of the site that was at /srv/a-site-that-moved" "naming the orphan"
 has "$dir/moved.log" "--state-dir $moved/old" "and how to keep it"

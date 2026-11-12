@@ -329,7 +329,7 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     if (!real) real = (int (*)(const char *, char *const[], char *const[]))dlsym(RTLD_NEXT, "execve");
     int r = real(path, argv, envp);
     int e = errno;
-    if (e == ENOENT && path) say_missing(path);
+    if (e == ENOENT) say_missing(path);
     errno = e;
     return r;
 }
@@ -339,7 +339,7 @@ int execv(const char *path, char *const argv[]) {
     if (!real) real = (int (*)(const char *, char *const[]))dlsym(RTLD_NEXT, "execv");
     int r = real(path, argv);
     int e = errno;
-    if (e == ENOENT && path) say_missing(path);
+    if (e == ENOENT) say_missing(path);
     errno = e;
     return r;
 }
@@ -349,7 +349,7 @@ int execvp(const char *file, char *const argv[]) {
     if (!real) real = (int (*)(const char *, char *const[]))dlsym(RTLD_NEXT, "execvp");
     int r = real(file, argv);
     int e = errno;
-    if (e == ENOENT && file) say_missing(file);
+    if (e == ENOENT) say_missing(file);
     errno = e;
     return r;
 }

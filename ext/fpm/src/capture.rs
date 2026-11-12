@@ -51,7 +51,7 @@ pub const PHP_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 /// The programs PHP itself runs, captured when the host has them: the shell (exec, popen,
 /// proc_open), sendmail (mail()), ImageMagick and ghostscript (WordPress's image editors and PDF
 /// previews).
-pub const HELPERS: [&str; 5] = ["sh", "sendmail", "convert", "magick", "gs"];
+pub const HELPERS: [&str; 5] = ["/bin/sh", "sendmail", "convert", "magick", "gs"];
 /// Data the libraries read by path, captured when present (never anything under
 /// `/etc/ssl/private`, never `/etc/shadow`).
 pub const DATA_FILES: [&str; 8] = [
@@ -149,6 +149,9 @@ pub struct Capture {
     pub ini: Option<ConfFile>,
     /// The scan folder's files, in PHP's order.
     pub conf_d: Vec<ConfFile>,
+    /// The scan folders, as the host has them: the guest binds the config layer's there too,
+    /// for a PHP that reads its compiled-in ones (the CLI layer 3's helper runs).
+    pub scan_dirs: Vec<String>,
     /// php-fpm's config files (the main one and its includes), for the manifest.
     pub fpm_files: Vec<ConfFile>,
     pub pools: Vec<phpconf::Pool>,
@@ -242,6 +245,10 @@ struct Walker<'a> {
     watch: BTreeMap<String, String>,
     /// Objects whose libraries were listed already.
     listed: BTreeSet<String>,
+    /// php-fpm's own loader: a shared library (an extension) names none of its own.
+    loader: Option<String>,
+    /// The first link no package installed on the path being resolved (and its target).
+    unpackaged_link: Option<(String, String)>,
 }
 
 fn join(dir: &str, name: &str) -> String {
@@ -306,18 +313,23 @@ impl Walker<'_> {
                 let target = fs::read_link(self.host(&next)).map_err(|e| refused(&next, e.to_string()))?;
                 let target = target.to_str().ok_or_else(|| refused(&next, "a link whose target isn't UTF-8"))?.to_owned();
                 if links == Links::Strict {
-                    let top = cur == "/";
+                    // The top, and a merged /usr's own links (Fedora 42: /usr/sbin → bin).
+                    const MERGED: [&str; 4] = ["/usr/sbin", "/usr/lib64", "/usr/lib32", "/usr/libx32"];
+                    let top = cur == "/" || (MERGED.contains(&next.as_str()) && !target.contains('/'));
                     // The package manager's alternatives (/usr/bin/convert → /etc/alternatives/
                     // convert → …) are its own links, though no package lists them.
                     let alternative = next.starts_with("/etc/alternatives/") || target.starts_with("/etc/alternatives/");
                     let pkg = self.db.owns(&next).map(str::to_owned).or_else(|| alternative.then(|| "alternatives".to_owned()));
-                    if !top && pkg.is_none() {
-                        return Err(refused(
-                            &next,
-                            format!("a link to {target} that no package installed, below {}; an unpackaged file is never reached through a link", top_of(&next)),
-                        ));
+                    // A link no package installed (ldconfig's soname links, busybox's applets):
+                    // allowed only on the way to a file a package installed, whose checksum
+                    // matches ([`Walker::object`] checks; an unpackaged file is refused).
+                    if !top && pkg.is_none() && self.unpackaged_link.is_none() {
+                        self.unpackaged_link = Some((next.clone(), target.clone()));
                     }
-                    let source = pkg.map_or_else(|| "top-level link".to_owned(), |p| format!("{}:{p}", self.db.kind.map_or("pkg", |k| k.as_str())));
+                    let source = pkg.map_or_else(
+                        || if top { "top-level link".to_owned() } else { "link no package installed (to a package's file)".to_owned() },
+                        |p| format!("{}:{p}", self.db.kind.map_or("pkg", |k| k.as_str())),
+                    );
                     self.items.insert(next.clone(), Item::Link { path: next.clone(), target: target.clone(), source });
                 }
                 todo.extend(target.split('/').filter(|c| !c.is_empty()).rev().map(str::to_owned));
@@ -384,16 +396,30 @@ impl Walker<'_> {
 
     /// A binary or library: validated, recorded, and with `closure` the libraries it loads too.
     fn object(&mut self, path: &str, closure: bool) -> Result<String, Refused> {
+        self.unpackaged_link = None;
         let (real, m) = self.resolve(path, Links::Strict)?;
+        let via = self.unpackaged_link.take();
         if !m.is_file() {
             return Err(refused(&real, "is not a regular file"));
         }
         if !file_ok(&m) {
             return Err(refused(&real, owner_why(&m, "the file")));
         }
+        let packaged = |s: &str| !s.starts_with("unpackaged") && !s.contains("no checksum");
+        if let Some(Item::File { source, .. }) = self.items.get(&real)
+            && let Some((link, target)) = &via
+            && !packaged(source)
+        {
+            return Err(refused(link, format!("a link to {target} that no package installed, below {}, to a file no package installed; an unpackaged file is never reached through a link", top_of(link))));
+        }
         if !self.items.get(&real).is_some_and(|i| matches!(i, Item::File { .. })) {
             let bytes = self.read(&real, &m, MAX_FILE)?;
             let source = self.source(&real, &bytes)?;
+            if let Some((link, target)) = &via
+                && !packaged(&source)
+            {
+                return Err(refused(link, format!("a link to {target} that no package installed, below {}, to a file no package installed; an unpackaged file is never reached through a link", top_of(link))));
+            }
             let sha256 = pkgdb::hex(&Sha256::digest(&bytes));
             self.items.insert(
                 real.clone(),
@@ -402,10 +428,21 @@ impl Walker<'_> {
             if closure
                 && phpconf::is_elf(&bytes)
                 && self.listed.insert(real.clone())
-                && let Some(interp) = phpconf::elf_interp(&bytes)
+                && let Some(interp) = phpconf::elf_interp(&bytes).or_else(|| self.loader.clone())
             {
+                if self.loader.is_none() {
+                    self.loader = Some(interp.clone());
+                }
                 self.object(&interp, false)?;
-                let out = run_in_root(self.root, &[&interp, "--list", &real], Duration::from_secs(30)).map_err(|e| refused(&real, format!("listing its libraries: {e}")))?;
+                // musl's loader exits 127 on an extension's PHP symbols (php-fpm defines them, not
+                // a library), after it has listed what it found: its list stands, and a library it
+                // couldn't find is still a refusal below.
+                let out = match run_in_root_out(self.root, &[&interp, "--list", &real], Duration::from_secs(30)) {
+                    Ok((true, out, _)) => out,
+                    Ok((false, out, err)) if !out.is_empty() && err.lines().all(|l| l.contains("symbol not found")) => out,
+                    Ok((false, _, err)) => return Err(refused(&real, format!("listing its libraries: {}", err.lines().next().unwrap_or("failed")))),
+                    Err(e) => return Err(refused(&real, format!("listing its libraries: {e}"))),
+                };
                 let libs = phpconf::parse_ld_list(&out).map_err(|name| refused(&real, format!("needs {name}, which the host's loader can't find")))?;
                 for lib in libs {
                     self.object(&lib, false)?;
@@ -438,7 +475,13 @@ impl Walker<'_> {
             return Err(refused(&real, owner_why(&m, "the file")));
         }
         let bytes = self.read(&real, &m, MAX_FILE)?;
-        let source = self.source(&real, &bytes)?;
+        // A file under /etc is a config (rpm records /etc/passwd's checksum as installed; adding a
+        // user changes it): held to the ownership rules, as configs are, not to a package's
+        // checksum. Binaries and libraries never are.
+        let source = match self.source(&real, &bytes) {
+            Err(e) if real.starts_with("/etc/") && e.why.contains("don't match what") => "config, changed since its package (root-owned)".to_owned(),
+            r => r?,
+        };
         let sha256 = pkgdb::hex(&Sha256::digest(&bytes));
         // The folders on the way exist in the guest as they do here.
         self.dirs_of(path)?;
@@ -569,7 +612,15 @@ fn compiled<'c>(w: &mut Walker<'_>, fpm_bytes: &[u8], candidates: &'c [String]) 
 /// Captures and validates the host's PHP for `req` ([module docs](self)).
 pub fn capture(req: &Request) -> Result<Capture, Refused> {
     let db = PkgDb::open(&req.root).map_err(|e| refused(req.root.join("var/lib").display().to_string(), e))?;
-    let mut w = Walker { root: &req.root, db: &db, items: BTreeMap::new(), watch: BTreeMap::new(), listed: BTreeSet::new() };
+    let mut w = Walker { root: &req.root, db: &db, items: BTreeMap::new(), watch: BTreeMap::new(), listed: BTreeSet::new(), loader: None, unpackaged_link: None };
+    // The top-level links of a merged /usr (/bin → usr/bin, /lib64 → usr/lib64…): the guest has
+    // them as the host does, so a program named by either path is there (PHP runs /bin/sh).
+    for top in TOPS {
+        let p = format!("/{top}");
+        if w.lstat(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+            w.resolve(&p, Links::Strict)?;
+        }
+    }
     let fpm = w.which(&req.php_fpm).ok_or_else(|| refused(&req.php_fpm, format!("no such program on {PHP_PATH}")))?;
     let fpm = w.object(&fpm, true)?;
     let fpm_bytes = {
@@ -708,6 +759,8 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
     let (mut helpers, mut missing) = (Vec::new(), Vec::new());
     let mut names: Vec<String> = HELPERS.iter().map(|h| (*h).to_owned()).collect();
     names[1] = sendmail;
+    // PHP's CLI beside php-fpm: layer 3's helper is `<PHP_BINDIR>/php`.
+    names.push(join(&prefix, "bin/php"));
     for h in names {
         match w.which(&h) {
             Some(p) => {
@@ -747,6 +800,15 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
             w.watch.insert(f.to_owned(), "-".to_owned());
         }
     }
+    // OpenSSL's own folder, whose links lead to the certificates captured above (PHP's https
+    // streams use its default paths); only the links a package installed.
+    for l in ["/usr/lib/ssl/certs", "/usr/lib/ssl/openssl.cnf", "/usr/lib/ssl/cert.pem"] {
+        if w.lstat(l).is_ok_and(|m| m.file_type().is_symlink()) && w.db.owns(l).is_some() {
+            w.dirs_of(l)?;
+            let target = fs::read_link(w.host(l)).map_err(|e| refused(l, e.to_string()))?.to_string_lossy().into_owned();
+            w.items.insert(l.to_owned(), Item::Link { path: l.to_owned(), target, source: format!("{}:{}", w.db.kind.map_or("pkg", |k| k.as_str()), w.db.owns(l).unwrap_or("")) });
+        }
+    }
     // Every captured entry must have a base folder to be mounted on.
     for p in w.items.keys() {
         let top = p.trim_start_matches('/').split('/').next().unwrap_or("");
@@ -763,6 +825,7 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
         ext_dir,
         ini,
         conf_d,
+        scan_dirs: scan,
         fpm_files,
         pools: fc.pools,
         items,
@@ -887,6 +950,17 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// environment but [`PHP_PATH`], stdin closed, for at most `timeout`. Its stdout (at most
 /// 16 MiB); an exit that isn't 0 is an error with its stderr's first line.
 pub fn run_in_root(root: &Path, argv: &[&str], timeout: Duration) -> Result<String, String> {
+    match run_in_root_out(root, argv, timeout)? {
+        (true, out, _) => Ok(out),
+        (false, _, err) => {
+            let first = err.lines().next().unwrap_or("").to_owned();
+            Err(format!("{} failed{}", argv[0], if first.is_empty() { String::new() } else { format!(": {first}") }))
+        }
+    }
+}
+
+/// [`run_in_root`]'s run: whether it exited 0, its stdout and its stderr.
+pub fn run_in_root_out(root: &Path, argv: &[&str], timeout: Duration) -> Result<(bool, String, String), String> {
     let root_c = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).map_err(|_| "a NUL in the root".to_owned())?;
     let mut cmd = Command::new(argv[0]);
     cmd.args(&argv[1..]).env_clear().env("PATH", PHP_PATH).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -933,17 +1007,13 @@ pub fn run_in_root(root: &Path, argv: &[&str], timeout: Duration) -> Result<Stri
     };
     let out = reader.join().unwrap_or_default();
     let err = ereader.join().unwrap_or_default();
-    if !status.success() {
-        let first = String::from_utf8_lossy(&err).lines().next().unwrap_or("").to_owned();
-        return Err(format!("{} {status}{}", argv[0], if first.is_empty() { String::new() } else { format!(": {first}") }));
-    }
-    Ok(String::from_utf8_lossy(&out).into_owned())
+    Ok((status.success(), String::from_utf8_lossy(&out).into_owned(), String::from_utf8_lossy(&err).into_owned()))
 }
 
 /// Lays `items` out under `stage` (root's, empty): folders, links, and each file copied from
 /// the host and hashed again, so the disk holds the bytes that were checked. Also the extra
 /// folders the guest mounts on (`mounts`, guest paths) and `/var/run` → `/run`.
-pub fn stage_php(root: &Path, items: &[Item], mounts: &[String], stage: &Path) -> Result<(), Refused> {
+pub fn stage_php(root: &Path, items: &[Item], mounts: &[String], files: &[String], stage: &Path) -> Result<(), Refused> {
     let at = |p: &str| stage.join(p.trim_start_matches('/'));
     for i in items {
         match i {
@@ -978,6 +1048,15 @@ pub fn stage_php(root: &Path, items: &[Item], mounts: &[String], stage: &Path) -
     }
     for m in mounts {
         fs::create_dir_all(at(m)).map_err(|e| refused(m, e.to_string()))?;
+    }
+    // Empty files a file of the config layer is bound onto (php.ini at its host path).
+    for f in files {
+        if let Some(d) = at(f).parent() {
+            fs::create_dir_all(d).map_err(|e| refused(f, e.to_string()))?;
+        }
+        if fs::symlink_metadata(at(f)).is_err() {
+            fs::write(at(f), b"").map_err(|e| refused(f, e.to_string()))?;
+        }
     }
     if stage.join("var").is_dir() && fs::symlink_metadata(stage.join("var/run")).is_err() {
         std::os::unix::fs::symlink("/run", stage.join("var/run")).map_err(|e| refused("/var/run", e.to_string()))?;

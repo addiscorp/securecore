@@ -44,6 +44,7 @@ echo 'guest_init=', strpos($cmdline, 'init=/sc/securecore-init') !== false ? 1 :
 // The guest's PHP is the host's (#101): php-fpm from sc.fpm, the config layer's php-fpm.conf.
 echo 'guest_fpm=', preg_match('/ sc\.fpm=(\S+)/', $cmdline, $f) ? $f[1] : '', "\n";
 echo 'php_ini_scan=', (string) getenv('PHP_INI_SCAN_DIR'), "\n";
+echo 'memory_limit=', (string) ini_get('memory_limit'), "\n";
 echo 'ini_files=', (string) php_ini_scanned_files() === '' ? '' : str_replace(["\n", ' '], '', (string) php_ini_scanned_files()), "\n";
 // A program the guest lacks (the preload says so on stderr, into the launcher's log).
 if (isset($_GET['missing'])) {

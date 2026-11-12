@@ -166,6 +166,8 @@ phplog() {
   esac
 }
 launcher_pid() { cat "$tdir/launcher.pid" 2>/dev/null; }
+# The host's PHP the guest is built from (#101): the stack's php container's, through its root.
+mvm_php_root() { echo "/proc/$(docker inspect -f '{{.State.Pid}}' "$(compose ps -q php)")/root"; }
 # (This file's own variables start with _, so a suite's never change under it.)
 launcher_alive() { _p=$(launcher_pid); [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null; }
 php_state() {
@@ -195,7 +197,7 @@ launcher_start() {
     "$mvm_fpm" $(sed 's/=.*//; s/^/--guest-env /' "$tdir/guest.env") \
     --config "$_site/securecore.json" --vm-dir "$mvm_vm" --state-dir "$mvm_state" --listen "unix:$mvm_run/fpm.sock" \
     --listen-owner 0 --listen-group 101 --listen-mode 0660 --vm-user "$mvm_vmuser" --pool-user "$mvm_pool" \
-    --guest-root "$html" --guest-ini "$tdir/guest.ini" "$@" >> "$mvm_log" 2>&1 < /dev/null &
+    --guest-root "$html" --guest-ini "$tdir/guest.ini" --php-root "$(mvm_php_root)" "$@" >> "$mvm_log" 2>&1 < /dev/null &
   _i=0
   until phplog "$_mark" | grep -q 'securecore-fpm: serving FastCGI'; do
     [ -s "$tdir/launcher.exit" ] && return 1

@@ -127,7 +127,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && export CARGO_TARGET_DIR="/build/target/init-static" \
  && RUSTFLAGS="-C target-feature=+crt-static" cargo build --locked --release -p securecore-fpm --target x86_64-unknown-linux-gnu \
  && mkdir -p /out && cp "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/securecore-fpm" /out/securecore-init \
- && ! ldd /out/securecore-init > /dev/null 2>&1
+ && { ldd /out/securecore-init 2>&1 || true; } | grep -qE 'statically linked|not a dynamic executable'
 
 # Layer 1 as a microVM: the SecureCore base (#101). The guest is the host's own PHP: the launcher
 # captures the host's php-fpm, its extensions and their libraries into a disk of their own, its

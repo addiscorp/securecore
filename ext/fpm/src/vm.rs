@@ -1001,7 +1001,13 @@ fn prepare(loaded: &Loaded, opts: &Options, capture: capture::Capture) -> Result
     // The PHP layer also holds the folders the guest mounts on: the site root and any tmpfs.
     let mut mounts = vec![plan.guest_root.clone()];
     mounts.extend(plan.tmpfs.iter().cloned());
-    let php_key = sha_of(&format!("{}\nmounts {mounts:?}\n", capture.php_key));
+    // The host's own config paths, where the config layer is bound too (a PHP that reads its
+    // compiled-in ones: the CLI layer 3's helper runs).
+    let scan_dir = capture.scan_dirs.first().filter(|d| no_space("a scan folder", d).is_ok()).cloned();
+    let ini_file = capture.ini.as_ref().map(|i| i.path.clone()).filter(|p| no_space("php.ini", p).is_ok());
+    mounts.extend(scan_dir.iter().cloned());
+    let mount_files: Vec<String> = ini_file.iter().cloned().collect();
+    let php_key = sha_of(&format!("{}\nmounts {mounts:?}\nfiles {mount_files:?}\n", capture.php_key));
     let php_path = plan.cache.join(format!("php-{}.ext4", &php_key[..16]));
     let conf_path = plan.state.join(format!("conf-{}.ext4", &conf_key[..16]));
     // The site's key: the tree without the writable folders, the state folder and the config
@@ -1046,7 +1052,7 @@ fn prepare(loaded: &Loaded, opts: &Options, capture: capture::Capture) -> Result
         let stage = plan.cache.join("php-stage");
         capture::remove_stage(&stage);
         fs::create_dir_all(&stage).map_err(|e| format!("{}: {e}", stage.display()))?;
-        let made = capture::stage_php(&opts.php_root, &capture.items, &mounts, &stage).map_err(|e| e.to_string()).and_then(|()| capture::image(&stage, &php_path));
+        let made = capture::stage_php(&opts.php_root, &capture.items, &mounts, &mount_files, &stage).map_err(|e| e.to_string()).and_then(|()| capture::image(&stage, &php_path));
         capture::remove_stage(&stage);
         let mb = made?;
         log(&format!("built the PHP layer {} ({mb} MiB, {} entries) in {:.0} ms", php_path.display(), capture.items.len(), ms(t)));
@@ -1078,7 +1084,13 @@ fn prepare(loaded: &Loaded, opts: &Options, capture: capture::Capture) -> Result
         sync.push(SyncFolder { rel: d.rel(&plan.root)?, id: d.id.clone(), cap: bytes });
         sizes.push((bytes >> 20).to_string());
     }
-    let args = boot_args(&plan, opts, &env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), &capture.fpm);
+    let mut args = boot_args(&plan, opts, &env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), &capture.fpm);
+    if let Some(d) = &scan_dir {
+        let _ = write!(args, " sc.inidir={d}");
+    }
+    if let Some(f) = &ini_file {
+        let _ = write!(args, " sc.inifile={f}");
+    }
     let key = Key {
         files,
         php: php_key,
