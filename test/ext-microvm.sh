@@ -5,11 +5,12 @@
 # (default sc-mvm, port 8095); docker/compose.ext-microvm.yml puts MariaDB's socket folder on the
 # host and adds an nginx (port 8096) whose PHP goes to the host-side securecore-fpm, which runs
 # php-fpm in a jailed Firecracker guest. Checks:
-#   1. the values: off runs php-fpm as it is; gelada sandboxes it in place; auto is gelada even
-#      on this KVM host (until #72) and says why; auto with a config the VM can't express falls
-#      back with that reason and microvm refuses it; microvm refuses a root image nothing
-#      verified, and a kernel without Landlock when layer 3 is on; in the php container (no
-#      /dev/kvm) auto falls back and microvm exits 125 without php-fpm ever running;
+#   1. the values: off runs php-fpm as it is; gelada sandboxes it in place, even with KVM here;
+#      auto is the microVM on this KVM host and serves WordPress from it; auto falls back to
+#      gelada in exactly one line saying why for each reason the microVM can't run (no KVM, no
+#      verified root image, a kernel without Landlock when layer 3 is on, a config the VM can't
+#      express, uploads that don't fit), and microvm refuses those with exit 125; in the php
+#      container (no /dev/kvm) auto falls back and microvm exits 125 without php-fpm ever running;
 #   2. a real WordPress front page from the guest (its kernel, loopback only, securecore-init as
 #      PID 1), with layer 2 enforcing and layer 3's child running there, the database through
 #      MariaDB's socket; Firecracker jailed as an unprivileged uid, so MariaDB's root (unix_socket
@@ -408,7 +409,21 @@ sed "s|{ \"port\": 4444|{ \"port\": 5555, \"socket\": \"$sockdir/locked/inner/db
 grep -q '"port": 5555' "$dir/microvm-locked.json" || die "the locked-socket fixture"
 once off "$dir/off.json" --vm-dir "$vm"
 once gelada "$dir/gelada.json" --vm-dir "$vm"
-once auto "$dir/auto.json" --vm-dir "$vm" --state-dir "$dir/gated-state"
+# auto falls back to gelada for each reason the microVM can't run, saying which in one line: no
+# KVM (a --kvm device that isn't there), no verified root image, a kernel without Landlock and
+# seccomp with layer 3 on, a config the VM can't express, and uploads that don't fit (a 32 MiB
+# state folder has no room for the uploads disk's copy).
+for d in nokvm-state small-state; do
+  if [ -e "$dir/$d" ]; then umount "$dir/$d" 2>/dev/null; find "$dir/$d" -mindepth 1 -xdev -delete; rmdir "$dir/$d"; fi
+done
+once auto-nokvm "$dir/auto.json" --vm-dir "$vm" --kvm "$dir/no-kvm" --state-dir "$dir/nokvm-state"
+once auto-norootfs "$dir/auto.json" --vm-dir "$dir/vm-norootfs"
+once auto-mirabkernel "$dir/auto.json" --vm-dir "$dir/vm-mirabkernel"
+once auto-deny "$dir/auto-deny.json" --vm-dir "$vm"
+mkdir -p "$dir/small-state"
+mount -t tmpfs -o size=32m,mode=0700 tmpfs "$dir/small-state" || die "a 32 MiB tmpfs for the state folder"
+once auto-nofit "$dir/auto.json" --vm-dir "$vm" --state-dir "$dir/small-state"
+umount "$dir/small-state" && rmdir "$dir/small-state"
 once microvm-deny "$dir/microvm-deny.json" --vm-dir "$vm"
 once microvm-norootfs "$dir/microvm.json" --vm-dir "$dir/vm-norootfs"
 once microvm-mirabkernel "$dir/microvm.json" --vm-dir "$dir/vm-mirabkernel"
@@ -418,7 +433,7 @@ once microvm-locked "$dir/microvm-locked.json" --vm-dir "$vm"
 once retired "$dir/retired.json" --vm-dir "$vm"
 kill "$locked_pid" 2>/dev/null
 rm -f "$site/wp-content/sc-evil"
-for v in off gelada auto; do
+for v in off gelada auto-nokvm auto-norootfs auto-mirabkernel auto-deny auto-nofit; do
   has "$dir/value-$v.log" "exit=0" "$v (KVM host): the launcher execs php-fpm"
   has "$dir/value-$v.log" standin-ran "$v: php-fpm ran"
 done
@@ -426,10 +441,35 @@ has "$dir/value-off.log" "layer 1 is off in $site/securecore.json" "off: the lau
 has "$dir/value-off.log" "Seccomp_filters: 0" "off: php-fpm has no seccomp filter"
 has "$dir/value-gelada.log" "layer 1 isolation gelada: gelada" "gelada: chosen as asked, even with KVM here"
 has "$dir/value-gelada.log" "NoNewPrivs: 1 Seccomp_filters: 2" "gelada: php-fpm runs under gelada's two seccomp filters"
-has "$dir/value-auto.log" "layer 1 isolation auto: gelada, because auto doesn't pick the microVM until its writable folders sync back to the host (addiscorp/securecore#72)" \
-  "auto on a KVM host that could run the microVM: gelada, with the #72 gate as the reason"
-has "$dir/value-auto.log" "NoNewPrivs: 1 Seccomp_filters: 2" "auto: php-fpm runs under gelada"
-is "$( [ -e "$dir/gated-state" ] && echo made || echo none)" none "gated auto probes nothing: no state folder, no hashing, no cgroup write"
+fell="layer 1 isolation auto: gelada, because the microVM can't run here"
+for v in nokvm norootfs mirabkernel deny nofit; do
+  has "$dir/value-auto-$v.log" "NoNewPrivs: 1 Seccomp_filters: 2" "auto, $v: php-fpm runs under gelada"
+  is "$(grep -c "^securecore-fpm: $fell (" "$dir/value-auto-$v.log")" 1 "auto, $v: exactly one line says it fell back, and why"
+  # That line and gelada's own "layer 1 on from …": nothing else from the launcher.
+  is "$(grep -c '^securecore-fpm: ' "$dir/value-auto-$v.log")" 2 "auto, $v: and the launcher says nothing else before php-fpm"
+done
+has "$dir/value-auto-nokvm.log" "$fell (no KVM: $dir/no-kvm: No such file or directory (os error 2))" "auto without KVM: gelada, because there is no KVM"
+is "$( [ -e "$dir/nokvm-state" ] && echo made || echo none)" none "auto without KVM probes nothing further: no state folder, no hashing, no cgroup write"
+has "$dir/value-auto-norootfs.log" "$fell (the guest root image isn't verified: $dir/vm-norootfs/installed.json records no rootfs_sha256)" \
+  "auto without a verified root image: gelada, saying so"
+has "$dir/value-auto-mirabkernel.log" "$fell (layer 3 is on, but the guest kernel $dir/vm-mirabkernel/vmlinux has no Landlock and seccomp filters" \
+  "auto with layer 3 on a kernel without Landlock and seccomp: gelada, saying so"
+has "$dir/value-auto-deny.log" "$fell (layer1.deny $site/wp-content/private is inside the app root" "auto with a config the VM can't express: gelada, saying so"
+has "$dir/value-auto-nofit.log" "$fell ($site/wp-content/uploads takes " "auto with uploads that don't fit: gelada, naming the folder"
+has "$dir/value-auto-nofit.log" "MiB free for its writable disk)" "and the room there is"
+# auto on this host, which can run the microVM: the microVM, serving WordPress.
+clean_state
+if start auto "$dir/auto.json"; then
+  has "$dir/auto.log" "securecore-fpm: layer 1 isolation auto: microvm" "auto on a KVM host that can run the microVM: the microVM"
+  lacks "$dir/auto.log" "because" "with no fallback reason"
+  is "$(vcode /)" 200 "auto: the front page through the microVM is 200"
+  probe "" auto
+  is "$(val auto guest_init)/$(val auto netdev)" 1/lo "auto: PHP runs in the guest (securecore-init, loopback only)"
+  stop
+  is "$STOPPED" 0 "auto: SIGTERM stops the VM and the launcher exits 0"
+else
+  fail "auto on a KVM host: the microVM serves" "$(tail -3 "$dir/auto.log" | tr '\n' ' ')"
+fi
 for v in deny norootfs mirabkernel link dotdot locked; do
   has "$dir/value-microvm-$v.log" "exit=125" "microvm, $v: exit 125"
   lacks "$dir/value-microvm-$v.log" standin-ran "microvm, $v: php-fpm never ran"
@@ -457,7 +497,9 @@ for v in auto microvm; do
   compose cp "$dir/$v.json" "php:/tmp/sc-$v.json" >/dev/null 2>&1
   in_php "rm -f /tmp/sc-ran; securecore-fpm --config /tmp/sc-$v.json --php-fpm /bin/sh -- -c \"$standin; touch /tmp/sc-ran\"; echo exit=\$?; ls /tmp/sc-ran 2>/dev/null" > "$dir/container-$v.log" 2>&1
 done
-has "$dir/container-auto.log" "layer 1 isolation auto: gelada, because auto doesn't pick the microVM" "auto without KVM: gelada (the gate answers before any probe)"
+has "$dir/container-auto.log" "layer 1 isolation auto: gelada, because the microVM can't run here (no KVM: /dev/kvm: No such file or directory (os error 2))" \
+  "auto in a container without /dev/kvm: gelada, because there is no KVM"
+is "$(grep -c 'because' "$dir/container-auto.log")" 1 "in one line"
 has "$dir/container-auto.log" "exit=0" "auto without KVM: php-fpm starts"
 has "$dir/container-auto.log" "Seccomp_filters: 3" "auto without KVM: php-fpm runs under gelada (Docker's filter + gelada's 2)"
 has "$dir/container-microvm.log" "exit=125" "microvm without KVM: the launcher exits 125"
@@ -599,7 +641,10 @@ if [ "$started" = 1 ]; then
   is "$STOPPED" 0 "SIGTERM during a slow reload: the launcher exits 0"
   lacks "$dir/first.log" "did not sync" "and the guest synced its disks first"
   has "$dir/first.log" "stopped by signal 15" "and says so"
-  is "$(pgrep -fc "api-sock /fc.sock")" 0 "no Firecracker left running"
+  # This site's VM only (its jail id is sc- and the app root's sha256): another site's on a shared
+  # host isn't this launcher's.
+  fcid=sc-$(printf %s "$site" | sha256sum | cut -c1-16)
+  is "$(pgrep -fc -- "--id $fcid .*api-sock /fc.sock")" 0 "no Firecracker of this site's ($fcid) left running"
   is "$(grep -c " $state/jail" /proc/self/mountinfo)" 0 "and nothing mounted in its jail"
 else
   fail "microvm: the first start serves"

@@ -93,24 +93,52 @@ fn each_isolation_value_behaves_as_decided() {
     // microvm on a config the VM can't express (the probe's reason): refused, never gelada.
     let inexpressible = || Err("layer1.deny /srv/site/private is inside the app root".to_owned());
     assert!(matches!(choose(&isolation("microvm"), inexpressible), Err(Refusal::NoMicrovm { .. })));
-    // auto, once the gate opens: the microVM, or gelada with the reason. The only value that
-    // falls back, whether the host or the config is why.
+    // auto: the microVM where it can run, or gelada with the reason. The only value that falls
+    // back, whether the host or the config is why. (`choose`, the launcher's own: the default.)
+    const { assert!(AUTO_SELECTS_MICROVM, "auto is the microVM where KVM exists (Sami, 10 Nov)") };
     let auto = isolation("auto");
-    assert_eq!(choose_with(&auto, true, yes), Ok(Choice::Microvm));
-    let fell = choose_with(&auto, true, no).expect("falls back");
+    assert_eq!(choose(&auto, yes), Ok(Choice::Microvm), "auto on a host that can run the microVM: the microVM");
+    let fell = choose(&auto, no).expect("falls back");
     assert_eq!(fell, Choice::Gelada { fallback: Some("/dev/kvm: No such file or directory (os error 2)".into()) });
     assert_eq!(fell.to_string(), "gelada, because the microVM can't run here (/dev/kvm: No such file or directory (os error 2))");
     assert_eq!(
-        choose_with(&auto, true, inexpressible),
+        choose(&auto, inexpressible),
         Ok(Choice::Gelada { fallback: Some("layer1.deny /srv/site/private is inside the app root".into()) })
     );
-    // auto today (#72 not landed): gelada even where the microVM could run, and it says why.
-    const { assert!(!AUTO_SELECTS_MICROVM, "auto must not pick the microVM before uploads sync back (#72)") };
-    // Gated auto asks the host nothing at all: a gelada start pays for no probe.
-    assert_eq!(choose(&auto, || panic!("gated auto must not probe")), Ok(Choice::Gelada { fallback: Some(AUTO_GATE.into()) }));
-    // No isolation key is auto.
+    // No isolation key is auto, so the default is the microVM too.
     let default = securecore_config::Config::from_slice(layer1(r#"{}"#).as_bytes()).expect("valid").layer1;
-    assert_eq!(choose_with(&default, true, yes), Ok(Choice::Microvm));
+    assert_eq!(default.isolation(), securecore_config::Isolation::Auto);
+    assert_eq!(choose(&default, yes), Ok(Choice::Microvm), "no isolation key: the microVM where it can run");
+    assert!(matches!(choose(&default, no), Ok(Choice::Gelada { fallback: Some(_) })), "and gelada where it can't");
+    // With the gate off (a build that turns AUTO_SELECTS_MICROVM off again), auto asks the host
+    // nothing at all and is gelada, saying so.
+    assert_eq!(
+        choose_with(&auto, false, || panic!("gated auto must not probe")),
+        Ok(Choice::Gelada { fallback: Some(AUTO_GATE.into()) })
+    );
+    assert_eq!(
+        choose_with(&auto, false, || panic!("gated auto must not probe")).expect("gelada").to_string(),
+        format!("gelada, because {AUTO_GATE}")
+    );
+}
+
+/// Each reason `auto` falls back for is one line: what the launcher logs after
+/// `layer 1 isolation auto: ` never spans lines, whatever the reason says.
+#[test]
+fn a_fallback_is_one_line() {
+    let auto = isolation("auto");
+    for why in [
+        "no KVM: /dev/kvm: No such file or directory (os error 2)",
+        "the guest root image isn't verified: /usr/local/share/securecore/vm/installed.json records no rootfs_sha256",
+        "layer 3 is on, but the guest kernel /v/vmlinux has no Landlock and seccomp filters (…)",
+        "layer1.deny /srv/site/private is inside the app root",
+        "/srv/site/wp-content/uploads takes 900 MiB, and the state folder's filesystem has 20 MiB free for its writable disk",
+        "a reason a program printed\nwith a second line\r\n",
+    ] {
+        let line = choose(&auto, || Err(why.to_owned())).expect("falls back").to_string();
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        assert!(line.starts_with("gelada, because the microVM can't run here ("), "{line}");
+    }
 }
 
 #[test]

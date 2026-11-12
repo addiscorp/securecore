@@ -7,8 +7,8 @@
 //!   php-fpm, master and workers, runs inside it.
 //! - **microvm**: boots the guest's php-fpm in a jailed Firecracker microVM and stays in the
 //!   foreground as its only way in and out, until SIGTERM/SIGINT/SIGQUIT (see `vm.rs`).
-//! - **auto** (the default): gelada, and the reason; the microVM once `auto` may pick it
-//!   ([`securecore_fpm::AUTO_SELECTS_MICROVM`]).
+//! - **auto** (the default): the microVM where this host can run it for this config, and gelada
+//!   otherwise, with one log line saying why ([`securecore_fpm::AUTO_SELECTS_MICROVM`]).
 //! - layer 1 off: execs php-fpm as it is and says so.
 //!
 //! Fails closed: an invalid file, a layer 1 it can't enforce, `microvm` where the microVM

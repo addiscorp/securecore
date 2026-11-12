@@ -29,7 +29,10 @@
 #      securecore-vault.php  the mu-plugin, into <wordpress>/wp-content/mu-plugins
 #      securecore.json       only if there is none: every layer off (an existing one is kept)
 #      securecore.ini        last: `extension=securecore.so` and `securecore.config=<file>`
-# 4. Says what it did, one line per step, and what to run next (restart php-fpm).
+# 4. Says what it did, one line per step, and what to run next (restart php-fpm). With the guest
+#    image installed and layer1.isolation auto (the default), it says whether this host's next
+#    php-fpm start through securecore-fpm runs in the microVM (it has /dev/kvm) or stays gelada,
+#    what that first start does with the uploads, and how to opt out (isolation "gelada").
 #
 # Idempotent: a file already installed with the same bytes is left alone ("unchanged"), so
 # running it again changes nothing. It never restarts a service, never runs sudo itself, and
@@ -434,6 +437,34 @@ else
   step "$NOTE" "Loaded" "this PHP refuses $CONFIG here: $out $(cat "$WORK/loaded.err")"
   say "  php-fpm refuses it the same way unless its environment differs (vault env variables). Fix the file before restarting php-fpm."
 fi
+
+# Layer 1 on this host from now on: `auto` (the default) is the microVM wherever it can run, so an
+# existing site whose php-fpm starts through securecore-fpm moves into it at its next start.
+# Said here, before anyone restarts php-fpm. The value is read with this PHP (-n: without
+# SecureCore loaded), never edited.
+# shellcheck disable=SC2016 # the $c is PHP's, expanded by neither shell
+ISOLATION=$(SC_CONF="$CONFIG" "$PHP" -n -r '$c = json_decode((string) @file_get_contents(getenv("SC_CONF")), true);
+  echo is_array($c["layer1"] ?? null) ? ($c["layer1"]["isolation"] ?? "auto") : "";' 2>/dev/null) || ISOLATION=
+# The connect ports with neither "socket" nor "address": in the microVM those reach only public
+# hosts by name, through the host (layer 2 decides which).
+# shellcheck disable=SC2016 # the $c and $p are PHP's
+BARE=$(SC_CONF="$CONFIG" "$PHP" -n -r '$c = json_decode((string) @file_get_contents(getenv("SC_CONF")), true);
+  foreach ((array) ($c["layer1"]["network"]["connect"] ?? []) as $p) { if (is_array($p) && !isset($p["socket"]) && !isset($p["address"])) echo $p["port"] ?? "", " "; }' 2>/dev/null | sed 's/ $//') || BARE=
+case $ISOLATION in
+  auto)
+    if [ -n "$GUEST" ] && [ -c /dev/kvm ]; then
+      step "$NOTE" "Layer 1" "layer1.isolation is auto (the default), which is now the microVM where it can run, and this host has KVM and the verified guest: php-fpm started through securecore-fpm moves into the microVM at its next start (the launcher logs \"layer 1 isolation auto: microvm\", or gelada and why)"
+      say "  At that first start each writable folder inside the site (uploads) is copied into the VM's disk and kept in step with the host's folder: the host's files stay where they are, a file you change on the host wins, nothing is removed."
+      say "  The host needs no swap or encrypted swap, and about 300 MiB of memory per busy site. To stay on gelada, set \"isolation\": \"gelada\" in layer1 of $CONFIG."
+      if [ -n "$BARE" ]; then
+        say "  layer1.network.connect port(s) $BARE have no \"socket\" or \"address\": in the microVM they reach only public hosts by name. A database or service on this host or its network needs one, e.g. { \"port\": 3306, \"socket\": \"/run/mysqld/mysqld.sock\" } or { \"port\": 3306, \"address\": \"127.0.0.1:3306\" }."
+      fi
+    elif [ -n "$GUEST" ]; then
+      step "$SKIP" "Layer 1" "layer1.isolation is auto, the microVM where it can run; this host has no /dev/kvm, so it stays gelada"
+    fi
+    ;;
+  gelada | microvm) step "$SAME" "Layer 1" "layer1.isolation is $ISOLATION in $CONFIG, kept as it is (auto, the default, is the microVM where it can run)" ;;
+esac
 
 say ""
 say "SecureCore $REL is installed for $PHP_LABEL. Next:"

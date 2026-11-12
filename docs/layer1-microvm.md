@@ -6,7 +6,8 @@ the host kernel). This spike runs php-fpm inside a Firecracker microVM instead. 
 
 - securecore drives Firecracker over its API socket itself, with no mirab CLI in between.
 - It reuses mirab's pinned Firecracker and mirab's guest kernel.
-- Hosts without `/dev/kvm` fall back to today's gelada layer 1.
+- Hosts without `/dev/kvm` fall back to today's gelada layer 1. (Since 10 Nov the microVM is
+  layer 1's default where KVM exists: "`auto` is the microVM where KVM exists", below.)
 
 All numbers were measured on **[xps]**: Linux 6.18.57 (NixOS), 4 cores, 7.5 GiB, `/dev/kvm`
 present. The setup:
@@ -604,9 +605,57 @@ The product version of items 1, 2 and 4 is in `ext/fpm` (`securecore-fpm`; `ext/
   clock is set; a stop syncs them first.
 - After the security review (PR #75): Firecracker runs under its jailer as an unprivileged
   user, chrooted, in its own namespaces and cgroup, so the guest's socket connections carry that
-  user's credentials, not root's; only files the installer recorded by sha256 boot; `auto` is
-  gated off until #72 syncs uploads back; the snapshot is warmed without the database; every
-  start message brings fresh entropy and replaces php-fpm's workers.
+  user's credentials, not root's; only files the installer recorded by sha256 boot; `auto` was
+  gated off until #72 synced uploads back (it no longer is: next section); the snapshot is warmed
+  without the database; every start message brings fresh entropy and replaces php-fpm's workers.
+
+## `auto` is the microVM where KVM exists
+
+Sami made the microVM layer 1's default on 10 Nov, and with uploads syncing back (#72, #81), the
+guest image in every release (#80, #82–#84) and the suites passing on a microVM target (#88),
+`auto` (the default, also when `isolation` is absent) now picks it: `AUTO_SELECTS_MICROVM` in
+`ext/fpm/src/lib.rs` is on, and a test pins it there. The launcher logs
+`layer 1 isolation auto: microvm`.
+
+**Where the microVM can't run, `auto` is gelada**, as layer 1 was before, and logs exactly one
+line saying why: `layer 1 isolation auto: gelada, because the microVM can't run here (<reason>)`.
+The reasons, most basic first (the launcher checks them in this order, and `test/ext-microvm.sh`
+checks each line on [xps]):
+
+- no KVM (`no KVM: /dev/kvm: No such file or directory (os error 2)`, or an API version other
+  than 12);
+- the launcher isn't root (the jailer needs it);
+- nothing verified installed (no `installed.json`: arm64, or a release without the guest), or no
+  jailed user, or no e2fsprogs;
+- a config the microVM can't express (a denied path inside the app root, `unixSockets`, a
+  writable folder that is a link or holds `..`, no port to take FastCGI on, a root-owned app
+  root without `--pool-user`);
+- a root image, kernel, Firecracker or jailer that doesn't match `installed.json` (or that it
+  doesn't name: `the guest root image isn't verified: …`);
+- uploads that don't fit: a writable folder of more than 1 Mi entries, or one whose new disk's
+  copy doesn't fit the state folder's filesystem;
+- a guest kernel without Landlock and seccomp while layer 3 is on;
+- a `connect[].socket` the jailed user can't open;
+- no cgroup v2.
+
+`microvm` refuses for the same reasons (exit 125); `gelada` and `off` are unchanged. A microVM
+that `auto` picked and that then fails to boot is a failed start (exit 125), not a silent gelada.
+
+**Opting out:** `"layer1": { "isolation": "gelada", … }` keeps gelada on a KVM host.
+
+**Host requirements:** x86_64 Linux with KVM, cgroup v2, the launcher as root, the installer's
+files; **no swap, or encrypted swap** (the guest's memory holds the vault's secrets, below); and
+**about 300 MiB of memory per busy site** (section 2: about 270 MB cold-booted under load, 96 MB
+restored and idle; each VM's cgroup allows the guest's 512 MiB plus 256 MiB).
+
+**Upgrades.** `ext/install.sh` on a KVM host over a site whose `isolation` is `auto` says that
+the next php-fpm start through `securecore-fpm` moves into the microVM, what happens to the
+uploads and how to opt out, and lists the `connect` ports with neither `socket` nor `address`
+(in the microVM those reach only public hosts by name, so a database on the host needs one). It
+starts nothing. That next start makes each writable disk from the host's folder (`mke2fs -d`,
+so the first listing finds both sides in step and sends nothing); the host's files stay, a file
+the owner changes on the host wins, and nothing is removed. `test/release-check.sh` (7b) checks
+exactly this on a site with 203 uploads.
 - Nothing is pinned: `scripts/mirab-vm.sh` resolves mirab's newest stable release, its
   `vm/manifest.json` and the Firecracker mirab pins at that commit, and `install-ext.sh` checks
   each file against those sha256s. `bench/microvm/firecracker.json` and `mirab-kernel.json`

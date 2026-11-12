@@ -56,9 +56,10 @@ pub struct Layer1 {
     #[schemars(skip)]
     pub retired_enabled: Option<serde_json::Value>,
     /// Layer 1's switch, and what php-fpm runs inside (addiscorp/securecore#71). `off` turns
-    /// layer 1 off. `auto`, the default, is gelada while the microVM is gated (until #72), then
-    /// a microVM where one can run and gelada otherwise; it is the only value that falls back.
-    /// `gelada` is gelada. `microvm` refuses to start without one.
+    /// layer 1 off. `auto`, the default, is a Firecracker microVM where one can run (KVM, the
+    /// verified guest files, a config the microVM can enforce) and gelada otherwise, logging why;
+    /// it is the only value that falls back. `gelada` is gelada, even where KVM exists (the way
+    /// to opt out of the microVM). `microvm` refuses to start without one.
     #[serde(default)]
     pub isolation: Isolation,
     /// Folders php-fpm may write (relative to the folder containing securecore.json, or

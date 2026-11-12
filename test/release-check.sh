@@ -32,7 +32,12 @@
 #      changed gzip, or a release.json naming another image, is refused with nothing placed); then
 #      the php container, privileged with this host's /dev/kvm, runs the installed securecore-fpm
 #      with isolation microvm, and WordPress is served from a Firecracker guest booted from the
-#      installed files only. Needs /dev/kvm then: none is a failure, never a skip.
+#      installed files only; then an upgrade over an existing site with uploads (7b): a site
+#      under gelada with 203 uploads, install-ext.sh again on this KVM host with isolation auto
+#      (it says the next start is the microVM, what happens to uploads, how to opt out), and the
+#      next start is the microVM with every upload on the host unchanged, seen by the guest, a
+#      guest upload reaching the host and the owner's host edit winning over the guest's write.
+#      Needs /dev/kvm then: none is a failure, never a skip.
 # Exits non-zero on any failure. Writes .tmp/release-check/<cell>/. Takes the stack down (with
 # its volumes) at the end unless SECURECORE_RELEASE_KEEP=1.
 #   SECURECORE_RELEASE_PROJECT / SECURECORE_RELEASE_PORT: another compose project / port
@@ -364,6 +369,11 @@ compose restart web > /dev/null 2>&1
 if wait_200; then pass "layer 1: started by securecore-fpm, front page 200"; else fail "layer 1: started by securecore-fpm, front page 200" "$(compose logs php 2>&1 | tail -5 | tr '\n' '|')"; fi
 phplog "$t" > "$dir/layer1.log"
 has "$dir/layer1.log" "securecore-fpm: layer 1 on from $conf" "layer 1: the launcher says layer 1 is on"
+# The example's isolation is auto, the microVM where it can run: this container has no /dev/kvm,
+# so gelada, in one line that says so.
+has "$dir/layer1.log" "securecore-fpm: layer 1 isolation auto: gelada, because the microVM can't run here (no KVM: /dev/kvm: No such file or directory (os error 2))" \
+  "layer 1: auto without /dev/kvm is gelada, and the launcher says why"
+is "$(grep -c "layer 1 isolation auto: " "$dir/layer1.log")" 1 "in exactly one line"
 core layer1
 is "$(field layer1 nonewprivs)/$(field layer1 seccomp)" 1/2 "layer 1: the SAPI runs with no_new_privs and seccomp filters"
 is "$(field layer1 write-wp-includes)" BLOCKED "layer 1: core can't write wp-includes (outside layer1.write)"
@@ -445,6 +455,104 @@ if [ -n "$guest" ]; then
     fi
     is "$(in_root 'ls -A /tmp/small | wc -l' | tr -d ' ')" 0 "and nothing is left in it"
     in_root 'umount /tmp/small && rmdir /tmp/small'
+
+    # --- 7b. an upgrade over an existing site with uploads: auto moves into the microVM ----------
+    # The site before the upgrade: its config at auto (which was gelada before the microVM became
+    # its default), real uploads its user owns, and no microVM state (a new php container, so
+    # nothing of the boot above is kept). install-ext.sh runs again on this KVM host (the same
+    # image and devices, the same site volume) and says what the next start does; that start is
+    # the microVM: every upload is still on the host with the same bytes, the guest sees them, the
+    # guest's new upload reaches the host, and a file the owner changed on the host wins over the
+    # guest's write (#81's rule). The php service is stopped meanwhile: ZTS cells have no php-fpm
+    # to serve under gelada, and the guest must not start before the installer has run.
+    echo "# an upgrade over an existing site with uploads"
+    eventually() { n=0; until eval "$2"; do n=$((n + 1)); [ "$n" -lt "$1" ] || return 1; sleep 0.5; done; }
+    oneoff() { kcompose run --rm --no-deps -T php sh -c "$1"; }
+    upl=/var/www/html/wp-content/uploads
+    sed -e 's|{ "port": 3306 }|{ "port": 3306, "address": "db:3306" }|' ext/examples/wordpress.json > "$dir/auto.json"
+    if grep -q '"isolation": "auto"' "$dir/auto.json" && grep -q '"address": "db:3306"' "$dir/auto.json"; then
+      pass "the upgrade's config (the example: isolation auto; 3306 to db:3306)"
+    else
+      fail "the upgrade's config (the example: isolation auto; 3306 to db:3306)"
+    fi
+    put_conf "$dir/auto.json"
+    in_root "chmod 644 $conf"
+    kcompose rm -fs php > "$dir/rm-php.log" 2>&1 || fail "upgrade: remove the php container (see $dir/rm-php.log)"
+    # Uploads as a site has them: year/month folders, a 5 MiB image, 200 small files, a name with
+    # a space, an empty folder; the site's user owns them, as WordPress writes them.
+    oneoff "set -e; find $upl -mindepth 1 -delete; mkdir -p $upl/2026/10 $upl/2026/11 $upl/empty-folder
+      head -c 5242880 /dev/urandom > $upl/2026/10/photo-1.jpg
+      head -c 1048577 /dev/urandom > '$upl/2026/11/a photo.png'
+      printf 'the site owner wrote this\n' > $upl/2026/11/notes.txt
+      i=0; while [ \$i -lt 200 ]; do head -c \$((i * 37 + 1)) /dev/urandom > $upl/2026/11/thumb-\$i.webp; i=\$((i + 1)); done
+      chown -R www-data:www-data $upl" > "$dir/uploads-make.log" 2>&1 || fail "upgrade: the uploads (see $dir/uploads-make.log)"
+    # Every file's sha256 and every folder, but the probe's own exec check (it writes
+    # sc-mvm-exec.sh into uploads on every request).
+    list_cmd="cd $upl && find . -type f -print0 | sort -z | xargs -0 sha256sum; find . -type d | sort"
+    listing() { in_root "$list_cmd" | grep -v ' \./sc-mvm-exec\.sh$'; }
+    oneoff "$list_cmd" | grep -v ' \./sc-mvm-exec\.sh$' > "$dir/uploads-before"
+    is "$(grep -c ' \./' "$dir/uploads-before")" 203 "upgrade: the site has 203 uploads before it"
+    # The upgrade itself, on this KVM host, with the config at the default.
+    oneoff 'cd / && sh /release/install-ext.sh --from file:///release' > "$dir/install-upgrade.log" 2>&1; rc=$?
+    is "$rc" 0 "upgrade: install-ext.sh on a KVM host over the existing site: exit 0"
+    has "$dir/install-upgrade.log" "layer1.isolation is auto (the default), which is now the microVM where it can run, and this host has KVM and the verified guest" \
+      "upgrade: install-ext.sh says auto is now the microVM on this host"
+    has "$dir/install-upgrade.log" "moves into the microVM at its next start" "and that the next php-fpm start moves into it"
+    has "$dir/install-upgrade.log" "the host's files stay where they are, a file you change on the host wins, nothing is removed" "and what happens to the uploads"
+    has "$dir/install-upgrade.log" "To stay on gelada, set \"isolation\": \"gelada\"" "and how to opt out"
+    has "$dir/install-upgrade.log" "port(s) 53 443 have no \"socket\" or \"address\"" "and which connect ports reach only public hosts in the microVM"
+    # The next start: the microVM, its uploads disk made from the host's folder.
+    t=$(now)
+    kcompose up -d php > "$dir/up-upgrade.log" 2>&1 || fail "upgrade: compose up (see $dir/up-upgrade.log)"
+    compose restart web > /dev/null 2>&1
+    i=0; until [ "$(code /sc-mvm-probe.php)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 240 ] || break; sleep 1; done
+    phplog "$t" > "$dir/upgrade.log"
+    if [ "$i" -lt 240 ]; then pass "upgrade: the next start serves ($i s)"; else fail "upgrade: the next start serves" "$(tail -8 "$dir/upgrade.log" | tr '\n' '|')"; fi
+    has "$dir/upgrade.log" "securecore-fpm: layer 1 isolation auto: microvm" "upgrade: the next start is the microVM (auto, no fallback)"
+    has "$dir/upgrade.log" "made the writable disk" "upgrade: the uploads disk is made from the host's folder"
+    curl -s "$base/sc-mvm-probe.php?sha=2026/10/photo-1.jpg" > "$dir/probe-up1"
+    is "$(field probe-up1 guest_init)" 1 "upgrade: PHP runs in the guest"
+    is "$(field probe-up1 sha)" "$(grep ' \./2026/10/photo-1.jpg$' "$dir/uploads-before" | cut -d' ' -f1)" "upgrade: the guest sees the existing 5 MiB upload, byte for byte"
+    curl -s "$base/sc-mvm-probe.php?sha=2026/11/thumb-199.webp" > "$dir/probe-up2"
+    is "$(field probe-up2 sha)" "$(grep ' \./2026/11/thumb-199.webp$' "$dir/uploads-before" | cut -d' ' -f1)" "upgrade: and the last small one"
+    is "$(code /wp-content/uploads/2026/10/photo-1.jpg)" 200 "upgrade: nginx still serves the existing uploads from the host"
+    listing > "$dir/uploads-first"
+    if diff "$dir/uploads-before" "$dir/uploads-first" > "$dir/uploads-first.diff"; then
+      pass "upgrade: after the first start every upload is on the host with the same bytes, nothing lost or added"
+    else
+      fail "upgrade: after the first start every upload is on the host with the same bytes" "$(head -5 "$dir/uploads-first.diff" | tr '\n' '|')"
+    fi
+    # The owner changes a file on the host; the guest then writes the same file and a new one.
+    in_root "printf 'the owner changed this on the host\n' > $upl/2026/11/notes.txt && chown www-data:www-data $upl/2026/11/notes.txt"
+    owner_sha=$(in_root "sha256sum $upl/2026/11/notes.txt" | cut -d' ' -f1)
+    curl -s "$base/sc-mvm-probe.php?put=2026/11/new-in-guest.bin&size=1048576&seed=up" > "$dir/probe-put"
+    put_sha=$(field probe-put put_sha)
+    curl -s "$base/sc-mvm-probe.php?put=2026/11/notes.txt&size=64&seed=guest" > "$dir/probe-over"
+    if eventually 40 "[ \"\$(in_root 'sha256sum $upl/2026/11/new-in-guest.bin 2>/dev/null' | cut -d' ' -f1)\" = \"$put_sha\" ]"; then
+      pass "upgrade: the guest's new upload reaches the host's folder"
+    else
+      fail "upgrade: the guest's new upload reaches the host's folder"
+    fi
+    if eventually 20 "phplog '$t' | grep -q 'the host refused \"2026/11/notes.txt\"'"; then
+      pass "upgrade: the host refuses the guest's write over the owner's change, and logs it"
+    else
+      fail "upgrade: the host refuses the guest's write over the owner's change, and logs it"
+    fi
+    is "$(in_root "sha256sum $upl/2026/11/notes.txt" | cut -d' ' -f1)" "$owner_sha" "upgrade: the owner's change on the host wins over the guest's write"
+    # The next start pushes the host's version into the guest; still nothing removed.
+    kcompose restart php > /dev/null 2>&1
+    i=0; until [ "$(code /sc-mvm-probe.php)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 240 ] || break; sleep 1; done
+    curl -s "$base/sc-mvm-probe.php?sha=2026/11/notes.txt" > "$dir/probe-pushed"
+    is "$(field probe-pushed sha)" "$owner_sha" "upgrade: at the next start the guest has the owner's version"
+    listing > "$dir/uploads-after"
+    grep -v -e ' \./2026/11/notes.txt$' -e ' \./2026/11/new-in-guest.bin$' "$dir/uploads-after" > "$dir/uploads-after.rest"
+    grep -v -e ' \./2026/11/notes.txt$' "$dir/uploads-before" > "$dir/uploads-before.rest"
+    if diff "$dir/uploads-before.rest" "$dir/uploads-after.rest" > "$dir/uploads-after.diff"; then
+      pass "upgrade: after two starts every other upload is on the host unchanged"
+    else
+      fail "upgrade: after two starts every other upload is on the host unchanged" "$(head -5 "$dir/uploads-after.diff" | tr '\n' '|')"
+    fi
+    is "$(in_root 'find /var/lib/securecore/vm -path "*/trash/*" -type f | wc -l' | tr -d ' ')" 0 "upgrade: nothing went to the sync's trash"
   fi
 fi
 

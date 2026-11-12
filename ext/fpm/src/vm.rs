@@ -565,26 +565,37 @@ pub fn kernel_supports_layer3(kernel: &Path) -> Result<(), String> {
 }
 
 /// Whether this host can run `loaded`'s layer 1 as a microVM. `Err` says why not, for `auto`'s
-/// log line and `microvm`'s refusal:
-/// - the launcher is root (the jailer needs it), and the jailed user exists and isn't root;
+/// log line and `microvm`'s refusal. In this order, host first, so the reason is the most basic
+/// one (a host without KVM says so, not that some file is missing), and nothing is written
+/// until the host and the installed files pass:
 /// - `kvm` opens read-write and answers KVM_GET_API_VERSION with 12;
+/// - the launcher is root (the jailer needs it);
+/// - the installer's record (`installed.json`) exists, and the jailed user exists and isn't root;
+/// - `mke2fs`, `e2fsck` and `resize2fs` on PATH;
+/// - the config is one a microVM can enforce ([`plan`]);
 /// - Firecracker, the jailer, the kernel and the root image match the installer's record;
-/// - the config is one a microVM can enforce ([`plan`]), and each `connect[].socket` is a
-///   socket the jailed user may open itself;
+/// - every writable folder fits its disk and the sync ([`fits`]);
 /// - with layer 3 on, the kernel has Landlock and seccomp;
-/// - cgroup v2, and `mke2fs`, `e2fsck` and `resize2fs` on PATH.
+/// - each `connect[].socket` is a socket the jailed user may open itself;
+/// - cgroup v2.
 pub fn available(loaded: &Loaded, opts: &Options) -> Result<(), String> {
+    let dev = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&opts.kvm)
+        .map_err(|e| format!("no KVM: {}: {e}", opts.kvm.display()))?;
+    // SAFETY: KVM_GET_API_VERSION takes no argument and returns an int; the fd is open.
+    let v = unsafe { libc::ioctl(dev.as_raw_fd(), KVM_GET_API_VERSION, 0) };
+    if v != KVM_API_VERSION {
+        return Err(format!("no KVM: {}: KVM_GET_API_VERSION returned {v}, not {KVM_API_VERSION}", opts.kvm.display()));
+    }
+    drop(dev);
     // SAFETY: geteuid(2) takes nothing and can't fail.
     if unsafe { libc::geteuid() } != 0 {
         return Err("the microVM's jailer needs the launcher to run as root".into());
     }
+    recorded(&opts.assets.record)?;
     let user = jail::user(&opts.vm_user)?;
-    let dev = OpenOptions::new().read(true).write(true).open(&opts.kvm).map_err(|e| format!("{}: {e}", opts.kvm.display()))?;
-    // SAFETY: KVM_GET_API_VERSION takes no argument and returns an int; the fd is open.
-    let v = unsafe { libc::ioctl(dev.as_raw_fd(), KVM_GET_API_VERSION, 0) };
-    if v != KVM_API_VERSION {
-        return Err(format!("{}: KVM_GET_API_VERSION returned {v}, not {KVM_API_VERSION}", opts.kvm.display()));
-    }
     for tool in ["mke2fs", "e2fsck", "resize2fs"] {
         if !on_path(tool) {
             return Err(format!("{tool} (e2fsprogs) isn't on PATH; it builds and grows the site's disks"));
@@ -2672,6 +2683,23 @@ mod tests {
             guest_env: vec![],
             guest_ini: None,
         }
+    }
+
+    /// The host comes first: without KVM that is the reason, whoever runs the launcher and
+    /// whatever is installed, and nothing is written (no state folder).
+    #[test]
+    fn no_kvm_is_the_first_reason_and_writes_nothing() {
+        let dir = scratch("nokvm");
+        let l = loaded(&dir, r#"{"isolation":"auto","write":["wp-content/uploads"],"network":{"bind":[{"port":9000}]}}"#);
+        let state = dir.join("state");
+        let o = Options { kvm: dir.join("no-kvm"), state: Some(state.clone()), vm_user: "no-such-user-sc".into(), ..opts() };
+        let e = available(&l, &o).expect_err("no KVM");
+        assert_eq!(e, format!("no KVM: {}: No such file or directory (os error 2)", dir.join("no-kvm").display()));
+        assert!(!state.exists(), "nothing probed past KVM");
+        // A device that isn't KVM: says so too.
+        let o = Options { kvm: PathBuf::from("/dev/null"), ..o };
+        assert!(available(&l, &o).expect_err("not KVM").starts_with("no KVM: /dev/null: KVM_GET_API_VERSION returned"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
