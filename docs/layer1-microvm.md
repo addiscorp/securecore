@@ -1075,7 +1075,10 @@ sha256 of every captured file no package's checksum covers (a compiled php-fpm, 
 `securecore-fpm --check-capture --write-record`), and every capture checks them against it: one
 that differs or isn't recorded is refused, naming it (`run the installer again` after an
 upgrade). What lives in `/etc` (`hostname`, `hosts`, generated certificate bundles) differs from
-host to host and changes in normal use, so it is held to the ownership rules only, as configs are. Without a record, the first capture writes it. `--unpackaged-record` names another.
+host to host and changes in normal use, so it is held to the ownership rules only, as configs are.
+The installer is the only writer: a start without a record refuses (`run the installer to record
+unpackaged files`), so `auto` runs gelada and `microvm` exits 125. `--unpackaged-record` names
+another file.
 
 **Parsing as PHP does** (#102 review). A value with two quoted strings (PHP joins them), or text
 after a quoted string other than a comment, is refused with its file and line rather than
