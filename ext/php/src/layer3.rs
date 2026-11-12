@@ -212,6 +212,9 @@ struct Channel {
     cap_logged: bool,
     /// The worker connection's charset (the only one `SET NAMES` may name, [`gateway::admit`]).
     charset: String,
+    /// The worker's server is MariaDB, read once per request from the hello's facts
+    /// ([`gateway::is_mariadb`]); otherwise the gateway refuses every query.
+    mariadb: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -387,6 +390,7 @@ pub fn securecore_layer3_open(slug: String, file: String, abspath: String, prefi
                 queries: 0,
                 cap_logged: false,
                 charset: hello.db.charset.clone(),
+                mariadb: gateway::is_mariadb(&hello.db.server_info),
             };
             let slot = channels.entry(slug.clone()).or_insert(Some(channel));
             pump(&slug, slot, Some(first))
@@ -511,7 +515,7 @@ fn pump(slug: &str, slot: &mut Option<Channel>, mut first: Option<Vec<u8>>) -> Z
             }
         };
         if let Some(sql) = gateway::decode_query(&frame) {
-            match gateway::admit(sql, ch.queries, cap, &ch.charset) {
+            match gateway::admit(sql, ch.queries, cap, &ch.charset, ch.mariadb) {
                 Ok(text) => {
                     ch.queries += 1;
                     ch.pending = Some(text.to_owned());

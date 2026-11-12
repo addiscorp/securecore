@@ -1127,11 +1127,14 @@ crash, an exception in the worker, in a `finally`), the stand-in puts the connec
   it runs `ROLLBACK AND NO CHAIN`, turns autocommit on, reads the state again, and replaces the
   connection if it still isn't clean; with the line `layer3 plugin:<slug> left a transaction open
   on the worker's connection: rolled back`.
-- **MySQL:** an open transaction can't be seen without the PROCESS privilege (and InnoDB starts
-  one lazily), so whenever autocommit was on before the plugin's first query, the same
-  `ROLLBACK AND NO CHAIN` and `SET autocommit = 1` run unconditionally (a no-op when nothing is
-  open). A transaction core itself held open around a call into an isolated plugin would be
-  rolled back too; WordPress core holds none while rendering.
+- **MySQL (and anything else that isn't MariaDB): the gateway refuses.** An open transaction
+  can't be seen there without the PROCESS privilege (InnoDB starts one lazily, and `START
+  TRANSACTION` leaves `@@autocommit` as it was), so the worker couldn't put the connection back
+  without risking a transaction core itself opened around the call (WooCommerce does). Until
+  there's a MySQL test leg, every isolated plugin's query fails closed when the worker's
+  `db_server_info()` isn't MariaDB (read once per request, with the hello), with one line per
+  request: `layer3 plugin:<slug> database refused: the database gateway supports MariaDB only for
+  now (#99)`. The stand-in's MySQL rollback path stays, unreached, for that leg.
 
 So core's later writes in the request never join what the plugin left, and no row lock outlives
 the call. A transaction the plugin opens and ends within one call is its own, as unisolated. XA

@@ -49,6 +49,18 @@ pub enum Refusal {
     /// releases the connection: session state persists into core's later queries on the worker's
     /// connection.
     SessionState,
+    /// The worker's server isn't MariaDB ([`is_mariadb`]). On MySQL the worker can't see whether
+    /// a transaction is open (no `@@in_transaction`), so it couldn't put the connection back
+    /// without risking core's own transaction: the gateway fails closed until a MySQL test leg
+    /// exists (addiscorp/securecore#99).
+    NotMariaDb,
+}
+
+/// Whether the worker's server is MariaDB, from `mysqli_get_server_info()` (`11.4.4-MariaDB-…`,
+/// or `5.5.5-10.11.6-MariaDB-…` through the old replication prefix). Anything else (MySQL,
+/// Percona, Aurora MySQL, TiDB, an empty string) is not.
+pub fn is_mariadb(server_info: &str) -> bool {
+    server_info.to_ascii_lowercase().contains("mariadb")
 }
 
 impl Refusal {
@@ -60,19 +72,23 @@ impl Refusal {
             Refusal::NotUtf8 => "the query is not UTF-8".to_owned(),
             Refusal::TimeCap => "it changes the statement time cap".to_owned(),
             Refusal::SessionState => "it changes the worker connection's session state".to_owned(),
+            Refusal::NotMariaDb => "the database gateway supports MariaDB only for now (#99)".to_owned(),
         }
     }
 
     /// Logged once per request and plugin, not per query: a loop past the cap would flood the log.
     pub fn once_per_request(&self) -> bool {
-        matches!(self, Refusal::Queries(_))
+        matches!(self, Refusal::Queries(_) | Refusal::NotMariaDb)
     }
 }
 
 /// Whether the worker runs `sql`, the plugin's `sent`-th query of the request (counting from 0),
-/// under a cap of `cap` queries, on a connection whose charset is `charset`. `Ok` is the text,
-/// for PHP.
-pub fn admit<'a>(sql: &'a [u8], sent: u32, cap: u32, charset: &str) -> Result<&'a str, Refusal> {
+/// under a cap of `cap` queries, on a connection whose charset is `charset` and whose server is
+/// MariaDB (`mariadb`, [`is_mariadb`]). `Ok` is the text, for PHP.
+pub fn admit<'a>(sql: &'a [u8], sent: u32, cap: u32, charset: &str, mariadb: bool) -> Result<&'a str, Refusal> {
+    if !mariadb {
+        return Err(Refusal::NotMariaDb);
+    }
     if sent >= cap {
         return Err(Refusal::Queries(cap));
     }
@@ -206,15 +222,15 @@ mod tests {
 
     #[test]
     fn admit_counts_sizes_and_reads_utf8() {
-        assert_eq!(admit(b"SELECT 1", 0, 1, U), Ok("SELECT 1"));
-        assert_eq!(admit(b"SELECT 1", 1, 1, U), Err(Refusal::Queries(1)));
-        assert_eq!(admit(b"SELECT 1", 7, 3, U), Err(Refusal::Queries(3)));
+        assert_eq!(admit(b"SELECT 1", 0, 1, U, true), Ok("SELECT 1"));
+        assert_eq!(admit(b"SELECT 1", 1, 1, U, true), Err(Refusal::Queries(1)));
+        assert_eq!(admit(b"SELECT 1", 7, 3, U, true), Err(Refusal::Queries(3)));
         let long = vec![b'x'; MAX_SQL + 1];
-        assert_eq!(admit(&long, 0, 10, U), Err(Refusal::TooLong(MAX_SQL + 1)));
-        assert_eq!(admit(&long[..MAX_SQL], 0, 10, U).map(str::len), Ok(MAX_SQL));
+        assert_eq!(admit(&long, 0, 10, U, true), Err(Refusal::TooLong(MAX_SQL + 1)));
+        assert_eq!(admit(&long[..MAX_SQL], 0, 10, U, true).map(str::len), Ok(MAX_SQL));
         // Layer 2 reads text: a byte that is not UTF-8 (hidden in a comment) is refused here.
-        assert_eq!(admit(b"SELECT LOAD_FILE('/etc/passwd') /* \xff */", 0, 10, U), Err(Refusal::NotUtf8));
-        assert_eq!(admit("SELECT 'é'".as_bytes(), 0, 10, U), Ok("SELECT 'é'"));
+        assert_eq!(admit(b"SELECT LOAD_FILE('/etc/passwd') /* \xff */", 0, 10, U, true), Err(Refusal::NotUtf8));
+        assert_eq!(admit("SELECT 'é'".as_bytes(), 0, 10, U, true), Ok("SELECT 'é'"));
     }
 
     const U: &str = "utf8mb4";
@@ -227,7 +243,7 @@ mod tests {
             "SET STATEMENT MAX_STATEMENT_TIME=100 FOR SELECT SLEEP(100)",
             "SELECT @@max_statement_time",
         ] {
-            assert_eq!(admit(sql.as_bytes(), 0, 10, U), Err(Refusal::TimeCap), "{sql}");
+            assert_eq!(admit(sql.as_bytes(), 0, 10, U, true), Err(Refusal::TimeCap), "{sql}");
         }
     }
 
@@ -242,7 +258,7 @@ mod tests {
             "SET SQL_BIG_SELECTS=1",
             "set session sql_big_selects = ON",
         ] {
-            assert!(admit(sql.as_bytes(), 0, 10, U).is_ok(), "{sql}");
+            assert!(admit(sql.as_bytes(), 0, 10, U, true).is_ok(), "{sql}");
         }
         for sql in [
             "SET SESSION completion_type = 'CHAIN'",
@@ -269,13 +285,29 @@ mod tests {
             "commit work release",
             "ROLLBACK /* x */ RELEASE",
         ] {
-            assert_eq!(admit(sql.as_bytes(), 0, 10, U), Err(Refusal::SessionState), "{sql}");
+            assert_eq!(admit(sql.as_bytes(), 0, 10, U, true), Err(Refusal::SessionState), "{sql}");
         }
         for sql in ["COMMIT", "ROLLBACK AND NO CHAIN NO RELEASE", "ROLLBACK TO SAVEPOINT a", "RELEASE SAVEPOINT a", "SELECT 'SET x = 1'"] {
-            assert!(admit(sql.as_bytes(), 0, 10, U).is_ok(), "{sql}");
+            assert!(admit(sql.as_bytes(), 0, 10, U, true).is_ok(), "{sql}");
         }
         // No charset known: no SET NAMES either.
-        assert_eq!(admit(b"SET NAMES utf8mb4", 0, 10, ""), Err(Refusal::SessionState));
+        assert_eq!(admit(b"SET NAMES utf8mb4", 0, 10, "", true), Err(Refusal::SessionState));
+    }
+
+    #[test]
+    fn the_gateway_is_mariadb_only_for_now() {
+        for s in ["11.4.4-MariaDB-ubu2404", "5.5.5-10.11.6-MariaDB-0+deb12u1", "10.6.18-mariadb-log"] {
+            assert!(is_mariadb(s), "{s}");
+        }
+        for s in ["8.0.36", "8.4.0-0ubuntu0.24.04.1", "5.7.44-log", "8.0.32-24 Percona Server", "5.7.12-TiDB-v7.5.0", ""] {
+            assert!(!is_mariadb(s), "{s}");
+        }
+        // On anything else every query is refused, with the one reason (logged once a request).
+        for sql in ["SELECT 1", "START TRANSACTION", "UPDATE wp_x SET a = 1"] {
+            assert_eq!(admit(sql.as_bytes(), 0, 10, U, false), Err(Refusal::NotMariaDb), "{sql}");
+        }
+        assert_eq!(Refusal::NotMariaDb.reason(), "the database gateway supports MariaDB only for now (#99)");
+        assert!(Refusal::NotMariaDb.once_per_request());
     }
 
     #[test]
