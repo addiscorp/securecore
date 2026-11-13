@@ -2776,7 +2776,7 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, keys: 
                             Ok(a) => a.collect(),
                             Err(e) => return log(&format!("guest port {port} → {address}: {e}")),
                         };
-                        if let Err(e) = egress_as_pool(c, &addrs, pool) {
+                        if let Err(e) = connect_as_pool(c, &addrs, pool, false) {
                             log(&format!("guest port {port} → {address}: {e}"));
                         }
                     });
@@ -2898,8 +2898,18 @@ const FORWARD_SLOTS: usize = 64;
 /// uid-based firewall rules on the host apply) with no supplementary groups, an empty
 /// environment and no new privileges, killed if the launcher dies.
 pub fn spawn_egress_helper(exe: &Path, conn: UnixStream, addrs: &[std::net::SocketAddr], user: User) -> Result<Child, String> {
+    spawn_connect_helper(exe, conn, addrs, user, true)
+}
+
+/// [`spawn_egress_helper`], with egress's OK/ERR answer to the guest or (`handshake` false, a
+/// forwarded `connect[].address` port) without it.
+pub fn spawn_connect_helper(exe: &Path, conn: UnixStream, addrs: &[std::net::SocketAddr], user: User, handshake: bool) -> Result<Child, String> {
     let mut cmd = Command::new(exe);
-    cmd.env_clear().arg0("securecore-fpm").arg("--egress-connect").args(addrs.iter().map(|a| a.to_string()));
+    cmd.env_clear().arg0("securecore-fpm").arg("--egress-connect");
+    if !handshake {
+        cmd.arg("--raw");
+    }
+    cmd.args(addrs.iter().map(|a| a.to_string()));
     cmd.stdin(Stdio::from(std::os::fd::OwnedFd::from(conn))).stdout(Stdio::piped());
     // SAFETY: only syscalls between fork and exec, on values made before the fork.
     unsafe {
@@ -2920,7 +2930,11 @@ pub fn spawn_egress_helper(exe: &Path, conn: UnixStream, addrs: &[std::net::Sock
 /// The egress connector in production: the helper as the pool user, waited on; the address it
 /// used, or why none.
 fn egress_as_pool(conn: UnixStream, addrs: &[std::net::SocketAddr], pool: User) -> Result<String, String> {
-    let child = spawn_egress_helper(Path::new("/proc/self/exe"), conn, addrs, pool)?;
+    connect_as_pool(conn, addrs, pool, true)
+}
+
+fn connect_as_pool(conn: UnixStream, addrs: &[std::net::SocketAddr], pool: User, handshake: bool) -> Result<String, String> {
+    let child = spawn_connect_helper(Path::new("/proc/self/exe"), conn, addrs, pool, handshake)?;
     let out = child.wait_with_output().map_err(|e| format!("the egress helper: {e}"))?;
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().next().unwrap_or("").to_owned();

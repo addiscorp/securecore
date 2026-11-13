@@ -246,19 +246,31 @@ pub fn serve(conn: UnixStream, egress: &Egress, own: &[IpAddr], connect: &Connec
 /// ways until both sides close; or tells it `ERR`. The address used, or why none. What the
 /// pool user's helper runs ([`helper_main`]).
 pub fn connect_and_pipe(conn: UnixStream, addrs: &[SocketAddr]) -> Result<String, String> {
+    connect_and_pipe_as(conn, addrs, true)
+}
+
+/// [`connect_and_pipe`], with egress's `OK`/`ERR` answer to the guest (`handshake`), or without
+/// it: a `connect[].address` port (the database's) carries the bytes from the first one, as the
+/// guest's preload expects for a forwarded port (#102 verification: an `OK` line there broke
+/// MySQL's protocol).
+pub fn connect_and_pipe_as(conn: UnixStream, addrs: &[SocketAddr], handshake: bool) -> Result<String, String> {
     let mut last = String::from("no address");
     for a in addrs {
         match TcpStream::connect_timeout(a, CONNECT_TIMEOUT) {
             Ok(tcp) => {
                 let _ = tcp.set_nodelay(true);
-                (&conn).write_all(b"OK\n").map_err(|e| e.to_string())?;
+                if handshake {
+                    (&conn).write_all(b"OK\n").map_err(|e| e.to_string())?;
+                }
                 crate::vm::pipe_both(conn, tcp);
                 return Ok(a.to_string());
             }
             Err(e) => last = format!("{a}: {e}"),
         }
     }
-    let _ = (&conn).write_all(format!("ERR {last}\n").as_bytes());
+    if handshake {
+        let _ = (&conn).write_all(format!("ERR {last}\n").as_bytes());
+    }
     Err(last)
 }
 
@@ -272,13 +284,18 @@ pub fn helper_main(addrs: &[String]) -> u8 {
         eprintln!("securecore-fpm: egress: the connect helper never runs as root; refusing");
         return 125;
     }
+    // `--raw` first: a forwarded `connect[].address` port, with no OK/ERR answer to the guest.
+    let (handshake, addrs) = match addrs.split_first() {
+        Some((f, rest)) if f == "--raw" => (false, rest),
+        _ => (true, addrs),
+    };
     let Ok(addrs) = addrs.iter().map(|a| a.parse::<SocketAddr>()).collect::<Result<Vec<_>, _>>() else {
         println!("error the launcher passed an address that isn't one");
         return 2;
     };
     // SAFETY: fd 0 is the guest's connection the launcher handed over.
     let conn = unsafe { UnixStream::from_raw_fd(0) };
-    match connect_and_pipe(conn, &addrs) {
+    match connect_and_pipe_as(conn, &addrs, handshake) {
         Ok(via) => {
             println!("via {via}");
             0
@@ -303,6 +320,26 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    /// A forwarded address port carries the bytes from the first one; egress answers OK first.
+    #[test]
+    fn a_forwarded_port_has_no_handshake_and_egress_does() {
+        for handshake in [false, true] {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let local = l.local_addr().expect("addr");
+            let (mut guest, host) = UnixStream::pair().expect("pair");
+            let t = thread::spawn(move || connect_and_pipe_as(host, &[local], handshake));
+            let (mut srv, _) = l.accept().expect("accept");
+            srv.write_all(b"\x4a\x00\x00\x00 mysql greeting").expect("write");
+            drop(srv);
+            let mut got = Vec::new();
+            guest.read_to_end(&mut got).expect("read");
+            let want: &[u8] = if handshake { b"OK\n\x4a\x00\x00\x00 mysql greeting" } else { b"\x4a\x00\x00\x00 mysql greeting" };
+            assert_eq!(got, want, "handshake {handshake}");
+            drop(guest);
+            assert!(t.join().expect("join").is_ok());
+        }
+    }
 
     fn egress(mode: Mode, hosts: Option<&[&str]>) -> Egress {
         Egress { ports: vec![443, 8443], layer2: hosts.map(|h| (mode, h.iter().map(|s| (*s).to_owned()).collect())) }
