@@ -114,10 +114,13 @@ compose up -d db php web mvmweb > "$dir/up.log" 2>&1 || die "compose up (see $di
 # A site volume from an earlier run may hold an older securecore.json (one with the retired
 # layer1.enabled is refused, so php-fpm wouldn't start): the current example, then php again.
 site=$(docker volume inspect -f '{{.Mountpoint}}' "${project}_wp")
+# What an earlier run that was stopped midway left in the php container's own config (#101's
+# pools, ini files and the extension copies): php-fpm there must start as the image has it.
+compose exec -T php sh -c 'rm -f /usr/local/etc/php-fpm.d/zz-sc101-*.conf /usr/local/etc/php/conf.d/zz-sc101*.ini; find /opt/sc101 -delete 2>/dev/null; :' > /dev/null 2>&1
 if [ -f "$site/securecore.json" ]; then
   cp ext/examples/wordpress.json "$site/securecore.json"
-  compose restart php > /dev/null 2>&1
 fi
+compose restart php > /dev/null 2>&1
 i=0
 until compose exec -T db mariadb -uwordpress -pwordpress-db-password -e 'select 1' wordpress >/dev/null 2>&1; do
   i=$((i + 1)); [ "$i" -lt 90 ] || die "the database did not start"; sleep 1
