@@ -250,9 +250,19 @@ start() {
     sleep 0.1
   done
 }
+# bounded_wait <pid> <seconds>: wait for it, killing it (SIGKILL) past the bound, so no wait in
+# this test is ever without end; its exit status.
+# (Running: there, and not a zombie waiting to be reaped, which `kill -0` also finds.)
+running() { [ -r "/proc/$1/stat" ] && ! awk '{ sub(/^[^)]*\) /, ""); exit ($1 == "Z") ? 0 : 1 }' "/proc/$1/stat"; }
+bounded_wait() {
+  _n=0
+  while running "$1" && [ "$_n" -lt $(($2 * 10)) ]; do _n=$((_n + 1)); sleep 0.1; done
+  running "$1" && { echo "FAIL pid $1 still ran after $2 s: killed"; fails=$((fails + 1)); kill -KILL "$1"; }
+  wait "$1"
+}
 stop() {
   [ -n "$PID" ] || return 0
-  kill -TERM "$PID"; wait "$PID"; STOPPED=$?; PID=""
+  kill -TERM "$PID"; bounded_wait "$PID" 120; STOPPED=$?; PID=""
 }
 PID=""
 trap '[ -z "$PID" ] || kill -TERM "$PID" 2>/dev/null; kill "$peer_pid" 2>/dev/null' EXIT
@@ -282,7 +292,7 @@ once() {
     microvm*) fpm_env --config "$site/securecore.json" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" --php-root "$(php_root)" "$@" > "$dir/value-$name.log" 2>&1 & ;;
     *) fpm_env --config "$site/securecore.json" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" --php-root "$(php_root)" "$@" --php-fpm /bin/sh -- -c "$standin" > "$dir/value-$name.log" 2>&1 & ;;
   esac
-  wait $!
+  bounded_wait $! 600
   echo "exit=$?" >> "$dir/value-$name.log"
 }
 # eventually <tenths> <shell test>: until the test holds, or the time is up.
@@ -690,10 +700,6 @@ if [ "$started" = 1 ]; then
   is "$(val first guest_fpm)" /usr/local/sbin/php-fpm "the guest runs the host's own php-fpm, at its own path"
   is "$(val first php_ini_scan)" /sc/conf/conf.d "with the host's scan folder, from the config layer"
   is "$(val first ini_files | grep -c 'securecore.ini')" 1 "whose files are the host's (securecore.ini among them)"
-  probe "?missing=1" missing
-  is "$(val missing missing_rc)" 127 "a program the guest lacks isn't there (exit 127)"
-  eventually 50 "grep -q 'guest-init: \"sc-no-such-program-101\" isn.t in the guest' \"$dir/first.log\"" || true
-  has "$dir/first.log" "guest-init: \"sc-no-such-program-101\" isn't in the guest: the host had no such program to capture" "and the guest's init says which program PHP tried to run"
   is "$(val first euid)" 1234 "the guest's php-fpm workers run as the host's pool user (1234), not the image's www-data"
   is "$(val first netdev)" lo "the guest has loopback only, no network device"
   # #86 review: a program PHP starts gets neither the vsock preload nor its ports, and /tmp runs
@@ -712,6 +718,11 @@ if [ "$started" = 1 ]; then
     "control: uid 0 on MariaDB's socket is the database's root (unix_socket), which the guest never gets"
   skew=$(( $(date +%s) - $(val first time) ))
   is "$( [ "${skew#-}" -le 2 ] && echo ok )" ok "the guest's clock matches the host's (skew ${skew} s)"
+  # (After the clock check: this one waits for a log line, which the skew would count.)
+  probe "?missing=1" missing
+  is "$(val missing missing_rc)" 127 "a program the guest lacks isn't there (exit 127)"
+  eventually 50 "grep -q 'guest-init: \"sc-no-such-program-101\" isn.t in the guest' \"$dir/first.log\"" || true
+  has "$dir/first.log" "guest-init: \"sc-no-such-program-101\" isn't in the guest: the host had no such program to capture" "and the guest's init says which program PHP tried to run"
   vget /sc-status.php > "$dir/status.first"
   is "$(sed -n 's/^loaded=//p;s/^layer2_mode=//p' "$dir/status.first" | tr '\n' /)" "1/enforce/" "the extension is loaded in the guest, layer 2 enforcing"
   is "$(sed -n 's/^layer1=//p;s/^layer2=//p;s/^layer3=//p' "$dir/status.first" | tr '\n' /)" "1/1/1/" "all three layers on in the guest's config"
@@ -762,7 +773,7 @@ if [ "$started" = 1 ]; then
   kill -USR2 "$PID"
   i=0
   while [ "$(reloads)" -lt $((before + 2)) ] && [ "$i" -lt 120 ]; do i=$((i + 1)); sleep 0.5; done
-  wait "$slow"
+  bounded_wait "$slow" 120
   is "$(reloads)" $((before + 2)) "two USR2s close together: two reloads, one after the other"
   lacks "$dir/first.log" "reload failed" "neither reload failed"
   is "$(kill -0 "$PID" 2>/dev/null && echo running)" running "the launcher (and its VM) still runs after both"
@@ -983,7 +994,7 @@ if start egress "$dir/microvm.json"; then
   hold_pid=$!
   eventually 40 "ss -Htne state established '( dport = :443 )' | grep -q 'uid:1234 '" || true
   owners=$(ss -Htne state established '( dport = :443 )' | grep -o 'uid:[0-9]*' | sort -u | tr '\n' ' ')
-  wait "$hold_pid"
+  bounded_wait "$hold_pid" 60
   is "$(val hold tcp)" CONNECTED "a plain socket in the guest reaches api.wordpress.org:443 by name"
   is "$(echo "$owners" | grep -c 'uid:1234 ')" 1 "the host connects it as the pool user (1234; owners of :443 connections: ${owners:-none})"
   has "$dir/egress.log" "egress connects only to public addresses that aren't this host's, as the pool user" "the launcher says so"
@@ -1056,7 +1067,7 @@ echo "# Firecracker exits on its own: the launcher stops and clears the jail"
 if start fcdied "$dir/microvm.json"; then
   dpid=$(sed -n 's/.*Firecracker runs jailed as uid [0-9]* gid [0-9]* (pid \([0-9]*\)).*/\1/p' "$dir/fcdied.log")
   kill -KILL "$dpid"
-  wait "$PID"; rc=$?; PID=""
+  bounded_wait "$PID" 60; rc=$?; PID=""
   is "$( [ "$rc" != 0 ] && echo failed)" failed "the launcher exits non-zero (exit $rc)"
   has "$dir/fcdied.log" "Firecracker exited on its own; the jail is cleared" "and says the jail is cleared"
   is "$(grep -c " $state/jail" /proc/self/mountinfo)" 0 "nothing stays mounted in the jail"
@@ -1130,7 +1141,7 @@ refuses() {
   # Never a hang: a launcher that starts serving instead is stopped.
   eventually 900 "! kill -0 $rp 2>/dev/null || grep -q 'serving FastCGI' \"$dir/$1.log\"" || true
   kill -0 "$rp" 2>/dev/null && kill -TERM "$rp"
-  wait "$rp"
+  bounded_wait "$rp" 120
   is "$?" 125 "$1: microvm refuses to start (exit 125)"
   [ -z "$2" ] || has "$dir/$1.log" "the host's PHP can't be captured: $2" "$1: naming $2"
   has "$dir/$1.log" "$3" "$1: $3"
@@ -1261,32 +1272,37 @@ kill "$npid" 2>/dev/null
 # serves (stopped with SIGSTOP the moment it starts): the first launcher gives up at the deadline
 # (--pools-ready-within 20), stops every pool's (SIGTERM, then SIGKILL after 10 s) and exits
 # (microvm: 125) within the deadline plus the grace.
+# (The PHP root is resolved before the launcher goes into the background: a `$(…)` inside the
+# background job is a child of it too, and stopping that one hung this test once.)
 pools_run() {
+  pr=$(php_root)
   fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" \
-    --guest-root "$html" --php-root "$(php_root)" "$@" > "$dir/$pname.log" 2>&1 &
+    --guest-root "$html" --php-root "$pr" "$@" > "$dir/$pname.log" 2>&1 &
   PID=$!
 }
 cp "$dir/microvm.json" "$site/securecore.json"
 pname=pools-hang
 pools_run --pools-ready-within 20
-eventually 600 "[ -n \"\$(pgrep -P $PID | head -1)\" ]" || true
-hung=$(pgrep -P "$PID" | head -1)
-kill -STOP "$hung" 2>/dev/null
+# A pool's own launcher: a child of the first, and one that runs with --pool.
+eventually 600 "[ -n \"\$(pgrep -P $PID -f -- '--pool ' | head -1)\" ]" || true
+hung=$(pgrep -P "$PID" -f -- '--pool ' | head -1)
+[ -n "$hung" ] && kill -STOP "$hung"
 # From the moment the pools' launchers start, the deadline runs.
 t0=$(date +%s)
-wait "$PID"; rc=$?; PID=""
+bounded_wait "$PID" 90; rc=$?; PID=""
 took=$(( $(date +%s) - t0 ))
 is "$rc" 125 "a pool's launcher that never serves: the first launcher gives up (microvm: exit 125)"
 is "$( [ "$took" -le 45 ] && echo within)" within "within the deadline (20 s) and the grace (10 s) (took ${took} s)"
 has "$dir/pools-hang.log" "didn't serve within 20 s" "and says which pool and why"
-is "$(kill -0 "$hung" 2>/dev/null && echo alive || echo gone)" gone "the hung launcher is killed and reaped (pid $hung)"
+is "$( [ -n "$hung" ] && ! kill -0 "$hung" 2>/dev/null && echo gone || echo "alive or never found")" gone "the hung launcher is killed and reaped (pid ${hung:-none})"
+[ -z "$hung" ] || { kill -CONT "$hung" 2>/dev/null; kill -KILL "$hung" 2>/dev/null; }
 # SIGTERM while the pools start: taken at once, every pool's launcher stopped, exit 0.
 pname=pools-term
 pools_run
 sleep 2
 t0=$(date +%s)
 kill -TERM "$PID"
-wait "$PID"; rc=$?; PID=""
+bounded_wait "$PID" 60; rc=$?; PID=""
 took=$(( $(date +%s) - t0 ))
 is "$rc" 0 "SIGTERM during the pools' start: exit 0"
 is "$( [ "$took" -le 15 ] && echo within)" within "within the grace (took ${took} s)"
