@@ -1299,16 +1299,21 @@ is "$( [ "$took" -le 45 ] && echo within)" within "within the deadline (20 s) an
 has "$dir/pools-hang.log" "didn't serve within 20 s" "and says which pool and why"
 is "$( [ -n "$hung" ] && ! kill -0 "$hung" 2>/dev/null && echo gone || echo "alive or never found")" gone "the hung launcher is killed and reaped (pid ${hung:-none})"
 [ -z "$hung" ] || { kill -CONT "$hung" 2>/dev/null; kill -KILL "$hung" 2>/dev/null; }
-# SIGTERM while the pools start: taken at once, every pool's launcher stopped, exit 0.
+# SIGTERM while the pools start (one held back with SIGSTOP, so the first launcher is still waiting
+# for it): taken at once, every pool's launcher stopped (the held one killed after the grace), exit 0.
 pname=pools-term
 pools_run
-sleep 2
+eventually 600 "[ -n \"\$(pgrep -P $PID -f -- '--pool ' | head -1)\" ]" || true
+held=$(pgrep -P "$PID" -f -- '--pool ' | head -1)
+[ -n "$held" ] && kill -STOP "$held"
+sleep 1
 t0=$(date +%s)
 kill -TERM "$PID"
 bounded_wait "$PID" 60; rc=$?; PID=""
 took=$(( $(date +%s) - t0 ))
+[ -z "$held" ] || { kill -CONT "$held" 2>/dev/null; kill -KILL "$held" 2>/dev/null; }
 is "$rc" 0 "SIGTERM during the pools' start: exit 0"
-is "$( [ "$took" -le 15 ] && echo within)" within "within the grace (took ${took} s)"
+is "$( [ "$took" -le 20 ] && echo within)" within "within the grace (10 s) (took ${took} s)"
 has "$dir/pools-term.log" "before every pool served" "and says it stopped before they served"
 is "$(pgrep -fc -- "--id sc-$(printf %s "$site" | sha256sum | cut -c1-12)-")" 0 "no pool's Firecracker is left running"
 # A pool of another site (#102 review, Sami's decision): microvm refuses the whole config, naming
