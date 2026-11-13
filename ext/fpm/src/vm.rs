@@ -53,6 +53,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use securecore_config::Loaded;
 use sha2::{Digest as _, Sha256};
 
+use crate::capture;
 use crate::fcgi;
 use crate::guestlog;
 use crate::guest::{CTL_PORT, Ctl, FPM_PORT, LOG_PORT};
@@ -70,12 +71,13 @@ pub const DEFAULT_VM_USER: &str = "securecore-vm";
 /// is the same binary: it boots with `sc.proto=<this>`, answers the handshake only when it is
 /// its own, and takes no start message otherwise ([`handshake`]).
 /// 5: the log port's numbered, acknowledged frames ([`guestlog`], #86).
-pub const PROTOCOL: u32 = 5;
+/// 6: the guest is the host's own PHP (#101): the base, then the PHP and config layers.
+pub const PROTOCOL: u32 = 6;
 /// KVM_GET_API_VERSION, and the only value every KVM since Linux 2.6.22 returns.
 const KVM_GET_API_VERSION: libc::c_ulong = 0xAE00;
 const KVM_API_VERSION: i32 = 12;
-/// The guest root image's warm-up script: reads the site's PHP files into the page cache.
-pub const WARM_SCRIPT: &str = "/usr/local/lib/securecore/warm.php";
+/// The base's warm-up script: reads the site's PHP files into the page cache.
+pub const WARM_SCRIPT: &str = "/sc/warm.php";
 /// Symbols only a kernel with Landlock and with seccomp filters has (searched in `vmlinux`).
 const LANDLOCK_SYMBOL: &[u8] = b"landlock_merge_ruleset\0";
 const SECCOMP_SYMBOL: &[u8] = b"__seccomp_filter\0";
@@ -176,6 +178,25 @@ pub struct Options {
     /// lines ([`crate::guest::site_ini`]), delivered at each start and again whenever it changes.
     /// A missing file is no settings.
     pub guest_ini: Option<PathBuf>,
+    /// Where the host's PHP is (#101): `/` on a host (`--php-root`).
+    pub php_root: PathBuf,
+    /// The host's php-fpm (`--php-fpm`: a path, or a name on [`capture::PHP_PATH`]).
+    pub php_fpm: String,
+    /// php-fpm's own arguments (after the launcher's), for its `-y`, `-c` and `-p`.
+    pub fpm_args: Vec<String>,
+    /// The one pool this launcher runs (`--pool`, set by the launcher itself for a php-fpm with
+    /// several: one VM per pool, each a launcher of its own).
+    pub pool: Option<String>,
+    /// The install's record of the unpackaged files' sha256s (`--unpackaged-record`,
+    /// [`capture::DEFAULT_RECORD`]).
+    pub record: PathBuf,
+    /// The database server's user (`--db-user`, `mysql`): a MySQL socket the guest reaches is
+    /// this user's or root's, in folders only they may write.
+    pub db_user: String,
+    /// The database targets the operator approves for a bare 3306 (`--db-address`,
+    /// `--db-socket`), beside MySQL's own loopback ports and the database user's sockets.
+    pub db_address: Option<String>,
+    pub db_socket: Option<PathBuf>,
 }
 
 /// The site's php.ini settings as the guest gets them: `None` without `--guest-ini` or while the
@@ -266,10 +287,102 @@ pub struct Plan {
     pub egress: Vec<u16>,
     pub listen: Listen,
     pub state: PathBuf,
-    /// The jail's id: `sc-` and 16 hex digits of the app root's sha256.
+    /// Where the host's PHP capture and its layer disks are kept: the site's state folder (with
+    /// several pools, the one above each pool's).
+    pub cache: PathBuf,
+    /// The jail's id: `sc-` and 16 hex digits of the app root's sha256 (and the pool's).
     pub id: String,
     /// The site's pool user: disks are copied as it, and the guest's pool runs as its uid/gid.
     pub pool: User,
+    /// Unix sockets in the guest that reach a forwarded port (`localhost` for MySQL: PHP's
+    /// default sockets), as guest paths under `/run` or `/tmp`.
+    pub guest_socks: Vec<(u16, String)>,
+}
+
+/// What the host's pool says, for [`plan_with`]: who it runs as and where it listens.
+#[derive(Debug, Clone, Default)]
+pub struct PoolHints {
+    pub user: Option<User>,
+    pub listen: Option<Listen>,
+    pub listen_mode: Option<SocketMode>,
+    pub admit: Admit,
+}
+
+/// Who may connect to the launcher's listening socket, as the pool says (#102 review): php-fpm's
+/// `listen.allowed_clients` for TCP, its `listen.acl_users`/`listen.acl_groups` for a unix socket.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Admit {
+    #[default]
+    Any,
+    /// TCP: only these peer addresses.
+    Addresses(Vec<std::net::IpAddr>),
+    /// A unix socket: only peers (SO_PEERCRED) with one of these uids, or whose gid, or a group
+    /// they belong to, is one of these gids; root always.
+    Users { uids: Vec<u32>, gids: Vec<u32>, members: Vec<u32> },
+}
+
+impl Admit {
+    /// Whether a TCP peer may connect.
+    pub fn tcp(&self, peer: std::net::IpAddr) -> bool {
+        match self {
+            Admit::Addresses(a) => a.iter().any(|x| *x == peer || x.to_canonical() == peer.to_canonical()),
+            _ => true,
+        }
+    }
+
+    /// Whether a unix-socket peer (uid, gid) may connect.
+    pub fn unix(&self, uid: u32, gid: u32) -> bool {
+        match self {
+            Admit::Users { uids, gids, members } => uid == 0 || uids.contains(&uid) || gids.contains(&gid) || members.contains(&uid),
+            _ => true,
+        }
+    }
+}
+
+/// The pool's rule of who may connect (`admit`), for where the launcher listens: kept as it is
+/// when it fits that socket, refused when it can't (a pool's `allowed_clients` with a unix
+/// `--listen`, its ACLs with a TCP one), never dropped.
+pub fn listen_admit(listen: &Listen, admit: &Admit) -> Result<Admit, String> {
+    match (listen, admit) {
+        (_, Admit::Any) | (Listen::Tcp(_), Admit::Addresses(_)) | (Listen::Unix(_), Admit::Users { .. }) => Ok(admit.clone()),
+        (Listen::Unix(p), Admit::Addresses(_)) => Err(format!(
+            "its listen.allowed_clients can't apply to the unix socket --listen unix:{} names: listen on TCP, or remove allowed_clients",
+            p.display()
+        )),
+        (Listen::Tcp(a), Admit::Users { .. }) => {
+            Err(format!("its listen.acl_users/acl_groups can't apply to the TCP address --listen {a} names: listen on a unix socket, or remove the ACLs"))
+        }
+    }
+}
+
+/// The site a pool serves, by its own settings: `chdir`, `php_admin_value[doc_root]` /
+/// `php_value[doc_root]`, then `prefix` (`$pool` replaced). `None`: the pool names none.
+pub fn pool_site(pool: &crate::phpconf::Pool) -> Option<String> {
+    ["chdir", "php_admin_value[doc_root]", "php_value[doc_root]", "prefix"]
+        .iter()
+        .find_map(|k| pool.get(k).filter(|v| !v.is_empty()))
+        .map(|v| v.replace("$pool", &pool.name).trim_end_matches('/').to_owned())
+}
+
+/// Whether a pool is this site's (#102 review, Sami's decision): its site (above) is the app root
+/// or inside it, on the host or as the guest sees it. A pool that names no site is this site's
+/// only when it is php-fpm's only pool.
+pub fn pool_is_this_site(pool: &crate::phpconf::Pool, root: &Path, guest_root: &str, only: bool) -> Result<(), String> {
+    match pool_site(pool) {
+        None if only => Ok(()),
+        None => Err(format!(
+            "pool [{}] names no site (chdir, doc_root or prefix), and php-fpm has several pools: each pool a microVM runs must name its site, so one site's VM never serves another's",
+            pool.name
+        )),
+        Some(s) => {
+            let inside = |r: &str| s == r || s.starts_with(&format!("{r}/"));
+            if inside(root.to_string_lossy().trim_end_matches('/')) || inside(guest_root.trim_end_matches('/')) {
+                Ok(())
+            } else {
+                Err(format!("pool [{}] serves another site ({s}), not this one ({}): a microVM here holds only this site's files", pool.name, root.display()))
+            }
+        }
+    }
 }
 
 fn no_space(what: &str, s: &str) -> Result<(), String> {
@@ -313,8 +426,32 @@ fn no_link_beneath(root: &Path, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The microVM plan for `loaded`'s layer 1, or why it can't be one.
+/// The microVM plan for `loaded`'s layer 1, or why it can't be one. The pool user and the
+/// listening address are the flags' or, without them, the app root's owner and the first
+/// `layer1.network.bind` port; [`prepare`] plans again with the host pool's ([`plan_with`]).
 pub fn plan(loaded: &Loaded, opts: &Options) -> Result<Plan, String> {
+    plan_with(loaded, opts, &PoolHints::default(), false)
+}
+
+/// The site's state folder: `--state-dir`, or one under [`DEFAULT_STATE_DIR`] by the app root.
+pub fn state_base(loaded: &Loaded, opts: &Options) -> PathBuf {
+    let key = sha_of(&loaded.root.display().to_string());
+    opts.state.clone().unwrap_or_else(|| Path::new(DEFAULT_STATE_DIR).join(&key[..16]))
+}
+
+/// A pool's name as a folder name and a jail id: php-fpm's names are section names, so anything
+/// else is refused.
+pub fn pool_dir_name(name: &str) -> Result<String, String> {
+    if name.is_empty() || name.len() > 32 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.') || name.starts_with('.') {
+        return Err(format!("php-fpm pool [{name}]: a microVM pool's name is 1 to 32 of A-Z a-z 0-9 _ - . (it names its state folder)"));
+    }
+    Ok(format!("pool-{name}"))
+}
+
+/// [`plan`] with the host pool's user and listening address as the defaults the flags override.
+/// `defer`: plan without them yet (the cheap checks run before the capture): a missing pool user
+/// or listening address isn't an error then.
+pub fn plan_with(loaded: &Loaded, opts: &Options, hints: &PoolHints, defer: bool) -> Result<Plan, String> {
     let layer1 = &loaded.config.layer1;
     let root = loaded.root.clone();
     let root_str = root.to_str().ok_or("the app root's path isn't UTF-8")?.to_owned();
@@ -390,31 +527,44 @@ pub fn plan(loaded: &Loaded, opts: &Options) -> Result<Plan, String> {
             (None, None) => egress.push(port),
         }
     }
-    let listen = match &opts.listen {
-        Some(l) => l.clone(),
-        None => {
-            let port = layer1.network.bind.first().ok_or(
-                "layer1.network.bind is empty, so there is no port to take FastCGI on: list one, or pass --listen",
-            )?;
-            Listen::Tcp(format!("127.0.0.1:{}", port.port))
-        }
+    let listen = match (&opts.listen, &hints.listen) {
+        (Some(l), _) | (None, Some(l)) => l.clone(),
+        (None, None) => match layer1.network.bind.first() {
+            Some(port) => Listen::Tcp(format!("127.0.0.1:{}", port.port)),
+            None if defer => Listen::Tcp(String::new()),
+            None => {
+                return Err("layer1.network.bind is empty and the pool has no listen, so there is no port to take FastCGI on: list one, or pass --listen".into());
+            }
+        },
     };
     let key = sha_of(&root_str);
-    let state = opts.state.clone().unwrap_or_else(|| Path::new(DEFAULT_STATE_DIR).join(&key[..16]));
-    let id = format!("sc-{}", &key[..16]);
-    let pool = pool_user(opts, &root)?;
-    Ok(Plan { root, guest_root, disks, tmpfs, sockets, addresses, egress, listen, state, id, pool })
+    let cache = state_base(loaded, opts);
+    let (state, id) = match &opts.pool {
+        Some(name) => {
+            let dir = pool_dir_name(name)?;
+            (cache.join(&dir), format!("sc-{}-{}", &key[..12], &sha_of(name)[..6]))
+        }
+        None => (cache.clone(), format!("sc-{}", &key[..16])),
+    };
+    let pool = match pool_user(opts, &root, hints.user) {
+        Ok(u) => u,
+        Err(_) if defer => User { uid: u32::MAX, gid: u32::MAX },
+        Err(e) => return Err(e),
+    };
+    Ok(Plan { root, guest_root, disks, tmpfs, sockets, addresses, egress, listen, state, cache, id, pool, guest_socks: Vec::new() })
 }
 
-/// The site's pool user: `--pool-user` (a name or `<uid>:<gid>`), or the app root's owner. Never
-/// root: the disks are copied as this user, and the guest's php-fpm pool runs as it.
-fn pool_user(opts: &Options, root: &Path) -> Result<User, String> {
-    match &opts.pool_user {
-        Some(spec) => jail::user(spec).map_err(|e| {
+/// The site's pool user: `--pool-user` (a name or `<uid>:<gid>`), else the host pool's `user`
+/// (`hint`), else the app root's owner. Never root: the disks are copied as this user, and the
+/// guest's php-fpm pool runs as it.
+fn pool_user(opts: &Options, root: &Path, hint: Option<User>) -> Result<User, String> {
+    match (&opts.pool_user, hint) {
+        (Some(spec), _) => jail::user(spec).map_err(|e| {
             e.replace("--vm-user", "--pool-user")
                 .replace("Firecracker must not run as root", "the site's files are copied and served as this user, never root")
         }),
-        None => {
+        (None, Some(u)) => Ok(u),
+        (None, None) => {
             let m = fs::metadata(root).map_err(|e| format!("{}: {e}", root.display()))?;
             if m.uid() == 0 || m.gid() == 0 {
                 return Err(format!(
@@ -579,6 +729,17 @@ pub fn kernel_supports_layer3(kernel: &Path) -> Result<(), String> {
 /// - each `connect[].socket` is a socket the jailed user may open itself;
 /// - cgroup v2.
 pub fn available(loaded: &Loaded, opts: &Options) -> Result<(), String> {
+    match prepare_all(loaded, opts)? {
+        Ready::One(_) | Ready::Pools(_) => Ok(()),
+    }
+}
+
+/// The host checks every start makes first, before anything is captured or built, host first so
+/// the reason is the most basic one (a host without KVM says so and writes nothing): KVM, root,
+/// the installer's record, the jailed user, e2fsprogs, the plan (without the host pool's user and
+/// listen yet), the verified files, the writable folders' fit, layer 3's kernel, the sockets, the
+/// cgroup.
+fn host_checks(loaded: &Loaded, opts: &Options) -> Result<(Plan, User), String> {
     let dev = OpenOptions::new()
         .read(true)
         .write(true)
@@ -601,9 +762,11 @@ pub fn available(loaded: &Loaded, opts: &Options) -> Result<(), String> {
             return Err(format!("{tool} (e2fsprogs) isn't on PATH; it builds and grows the site's disks"));
         }
     }
-    let plan = plan(loaded, opts)?;
-    fs::create_dir_all(&plan.state).map_err(|e| format!("{}: {e}", plan.state.display()))?;
-    fs::set_permissions(&plan.state, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    let plan = plan_with(loaded, opts, &PoolHints::default(), true)?;
+    for dir in [&plan.cache, &plan.state] {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    }
     verify(&opts.assets, &plan.state)?;
     // Every writable folder must fit its disk (sized from it, [`disk_mib`]) and the sync.
     for d in &plan.disks {
@@ -615,7 +778,651 @@ pub fn available(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         kernel_supports_layer3(&opts.assets.kernel)?;
     }
     open_sockets(&plan, user)?;
-    Jail::cgroup_parent()
+    Jail::cgroup_parent()?;
+    Ok((plan, user))
+}
+
+/// What [`prepare_all`] found: one VM to run here, or a php-fpm with several pools, one VM (and
+/// one launcher) each, all prepared once already.
+pub enum Ready {
+    One(Box<Prepared>),
+    Pools(Vec<String>),
+}
+
+/// Everything a start does before anything boots (#100 review: `auto` commits only after all of
+/// it): the host checks, the capture of the host's PHP and its validation, the pool's user,
+/// listen and sockets, the vault's env sources, the state folder's claim, the space every new
+/// disk and the snapshot need (with a margin), the PHP and config layers, the site disk (copied
+/// as the pool user) and the writable disks. A php-fpm with several pools prepares each (in its
+/// own state folder below the site's): [`Ready::Pools`].
+pub fn prepare_all(loaded: &Loaded, opts: &Options) -> Result<Ready, String> {
+    let (plan0, _) = host_checks(loaded, opts)?;
+    let capture = host_capture(&plan0, opts)?;
+    // Every pool php-fpm runs is this site's, or the microVM isn't for this config (#102 review:
+    // a VM holds one site's files; under `auto` the whole config falls back once, with this).
+    let only = capture.pools.len() == 1;
+    for p in capture.pools.iter().filter(|p| opts.pool.as_ref().is_none_or(|n| *n == p.name)) {
+        pool_is_this_site(p, &loaded.root, &plan0.guest_root, only)?;
+    }
+    if opts.pool.is_some() || capture.pools.len() == 1 {
+        return prepare(loaded, opts, capture).map(|p| Ready::One(Box::new(p)));
+    }
+    if opts.listen.is_some() {
+        return Err(format!(
+            "php-fpm's config has {} pools ({}): each gets a microVM of its own listening where its pool says, so --listen can't be given",
+            capture.pools.len(),
+            capture.pools.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let mut names = Vec::new();
+    for p in &capture.pools {
+        let mut o = opts.clone();
+        o.pool = Some(p.name.clone());
+        host_checks(loaded, &o)?;
+        // Each pool's checks and disks now, so a child launcher fails on nothing it can find
+        // here; its state lock is let go for it.
+        drop(prepare(loaded, &o, capture.clone()).map_err(|e| format!("pool [{}]: {e}", p.name))?);
+        names.push(p.name.clone());
+    }
+    Ok(Ready::Pools(names))
+}
+
+/// The host's PHP, captured and validated ([`capture::capture_cached`]), the app root as the
+/// guest mounts it.
+fn host_capture(plan: &Plan, opts: &Options) -> Result<capture::Capture, String> {
+    status("capturing the host's PHP");
+    let req = capture::Request {
+        root: opts.php_root.clone(),
+        php_fpm: opts.php_fpm.clone(),
+        fpm_args: opts.fpm_args.clone(),
+        scan_dir_env: std::env::var("PHP_INI_SCAN_DIR").ok(),
+        app_root: plan.guest_root.clone(),
+        record: Some(opts.record.clone()),
+    };
+    let (c, reused) = capture::capture_cached(&req, &plan.cache, &log).map_err(|e| e.to_string())?;
+    if reused {
+        log(&format!("the host's PHP {} is as captured before ({} entries, checked against {})", c.php_version, c.items.len(), c.pkg));
+    }
+    if !c.missing_helpers.is_empty() {
+        log(&format!("the host has no {}: PHP in the guest can't run them either (each attempt is logged)", c.missing_helpers.join(", ")));
+    }
+    Ok(c)
+}
+
+/// A user or group of the PHP root: a number, or a name in its `/etc/passwd` / `/etc/group`.
+fn root_id(root: &Path, spec: &str, group: bool) -> Result<u32, String> {
+    if let Ok(n) = spec.parse::<u32>() {
+        return Ok(n);
+    }
+    let file = root.join(if group { "etc/group" } else { "etc/passwd" });
+    let text = fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    text.lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() > 3 && f[0] == spec).then(|| f[2].parse::<u32>().ok()).flatten()
+        })
+        .ok_or_else(|| format!("{}: no {} {spec}", file.display(), if group { "group" } else { "user" }))
+}
+
+/// The host pool's user, listen and its socket's owner, group and mode.
+fn pool_hints(root: &Path, pool: &crate::phpconf::Pool) -> Result<PoolHints, String> {
+    let at = |e: String| format!("{} pool [{}]: {e}", pool.file, pool.name);
+    let user = match pool.get("user") {
+        Some(u) => {
+            let uid = root_id(root, u, false).map_err(at)?;
+            let gid = match pool.get("group") {
+                Some(g) => root_id(root, g, true).map_err(at)?,
+                None => {
+                    // php-fpm: the user's own group.
+                    let file = root.join("etc/passwd");
+                    let text = fs::read_to_string(&file).unwrap_or_default();
+                    text.lines()
+                        .find_map(|l| {
+                            let f: Vec<&str> = l.split(':').collect();
+                            (f.len() > 3 && f[2] == uid.to_string()).then(|| f[3].parse::<u32>().ok()).flatten()
+                        })
+                        .unwrap_or(uid)
+                }
+            };
+            if uid == 0 || gid == 0 {
+                return Err(at("the pool runs as root, which a microVM's pool never does: give it a user of its own".into()));
+            }
+            Some(User { uid, gid })
+        }
+        None => None,
+    };
+    let listen = match pool.listen() {
+        Some(l) => Some(match crate::phpconf::pool_listen(&l).map_err(at)? {
+            crate::phpconf::PoolListen::Unix(p) => Listen::Unix(PathBuf::from(p)),
+            crate::phpconf::PoolListen::Tcp(a) => Listen::Tcp(a),
+        }),
+        None => None,
+    };
+    let mut listen_mode = SocketMode {
+        owner: pool.get("listen.owner").map(|o| root_id(root, o, false)).transpose().map_err(at)?,
+        group: pool.get("listen.group").map(|g| root_id(root, g, true)).transpose().map_err(at)?,
+        mode: crate::phpconf::listen_mode(pool.get("listen.mode")).map_err(at)?,
+    };
+    let admit = match &listen {
+        Some(Listen::Tcp(_)) => match crate::phpconf::allowed_clients(pool.get("listen.allowed_clients")).map_err(at)? {
+            Some(a) => Admit::Addresses(a),
+            None => Admit::Any,
+        },
+        Some(Listen::Unix(_)) => {
+            let users = crate::phpconf::acl_list(pool.get("listen.acl_users"));
+            let groups = crate::phpconf::acl_list(pool.get("listen.acl_groups"));
+            if users.is_empty() && groups.is_empty() {
+                Admit::Any
+            } else {
+                // php-fpm: with ACLs, listen.owner and listen.group are ignored and the socket is
+                // for the listed users and groups. Here the socket is open to all (0666) and every
+                // connection's peer is checked against the lists instead.
+                listen_mode = SocketMode { owner: None, group: None, mode: 0o666 };
+                let uids = users.iter().map(|u| root_id(root, u, false)).collect::<Result<Vec<_>, _>>().map_err(at)?;
+                let gids = groups.iter().map(|g| root_id(root, g, true)).collect::<Result<Vec<_>, _>>().map_err(at)?;
+                let members = group_members(root, &gids);
+                Admit::Users { uids, gids, members }
+            }
+        }
+        None => Admit::Any,
+    };
+    Ok(PoolHints { user, listen, listen_mode: Some(listen_mode), admit })
+}
+
+/// The uids of the users `/etc/group` (under `root`) lists in the groups `gids`, as named in
+/// `/etc/passwd`.
+fn group_members(root: &Path, gids: &[u32]) -> Vec<u32> {
+    let group = fs::read_to_string(root.join("etc/group")).unwrap_or_default();
+    let mut out = Vec::new();
+    for l in group.lines() {
+        let f: Vec<&str> = l.split(':').collect();
+        if f.len() > 3 && f[2].parse::<u32>().is_ok_and(|g| gids.contains(&g)) {
+            for name in f[3].split(',').filter(|n| !n.is_empty()) {
+                if let Ok(uid) = root_id(root, name, false) {
+                    out.push(uid);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The standard places MySQL and MariaDB put their socket (never `/tmp`, which anyone may take).
+pub const MYSQL_SOCKETS: [&str; 3] = ["/run/mysqld/mysqld.sock", "/var/run/mysqld/mysqld.sock", "/var/lib/mysql/mysql.sock"];
+
+/// Whether `path` is a socket the database server put there: a socket owned by root or the
+/// database's user (`db`: uid and gid), every folder above it owned by one of them and writable
+/// by no one else (its group only when that is root's or the database's). Any local user could
+/// otherwise put a socket where the guest's database connections (and their passwords) go.
+/// `approved`: the operator named this very socket (`--db-socket`), so root's is accepted too;
+/// otherwise only the database user's (#102 verification: a root-owned socket such as D-Bus's is
+/// never a database because a site's `DB_HOST` names it).
+pub fn trusted_db_socket(path: &Path, db: Option<(u32, u32)>, approved: bool) -> Result<(), String> {
+    let ok_uid = |u: u32| u == 0 || db.is_some_and(|(d, _)| d == u);
+    let ok_gid = |g: u32| g == 0 || db.is_some_and(|(_, d)| d == g);
+    let m = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()) {
+        return Err(format!("{} is not a socket", path.display()));
+    }
+    let owner_ok = if approved { ok_uid(m.uid()) } else { db.is_some_and(|(d, _)| d == m.uid()) };
+    if !owner_ok {
+        return Err(format!(
+            "the socket {} is owned by uid {}, not the database's user (--db-user{}){}",
+            path.display(),
+            m.uid(),
+            db.map_or_else(|| ", which this host doesn't have".to_owned(), |(d, _)| format!(", uid {d}")),
+            if approved { "" } else { "; name it with --db-socket if it really is the database's" }
+        ));
+    }
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        let dm = fs::symlink_metadata(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        if dm.file_type().is_symlink() {
+            return Err(format!("{} is a link on the way to the MySQL socket {}", d.display(), path.display()));
+        }
+        let mode = dm.mode();
+        if !ok_uid(dm.uid()) || mode & 0o002 != 0 || (mode & 0o020 != 0 && !ok_gid(dm.gid())) {
+            return Err(format!(
+                "{} (owner {}:{}, mode {:o}) on the way to the MySQL socket {} may be written by someone other than root and the database's user",
+                d.display(),
+                dm.uid(),
+                dm.gid(),
+                mode & 0o7777,
+                path.display()
+            ));
+        }
+        dir = d.parent();
+    }
+    Ok(())
+}
+
+/// The database's user and group (`--db-user`: a name in the host's `/etc/passwd`, or a uid);
+/// `None` when the host has no such user (then only root's sockets are trusted).
+pub fn db_ids(spec: &str) -> Option<(u32, u32)> {
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let by = |f: &dyn Fn(&[&str]) -> bool| {
+        passwd.lines().map(|l| l.split(':').collect::<Vec<_>>()).find(|f2| f2.len() > 3 && f(f2)).and_then(|f| Some((f[2].parse().ok()?, f[3].parse().ok()?)))
+    };
+    match spec.parse::<u32>() {
+        Ok(uid) => by(&|f| f[2] == spec).or(Some((uid, uid))),
+        // The default names MySQL's user; MariaDB's packages may name theirs mariadb.
+        Err(_) if spec == "mysql" => by(&|f| f[0] == "mysql").or_else(|| by(&|f| f[0] == "mariadb")),
+        Err(_) => by(&|f| f[0] == spec),
+    }
+}
+
+/// WordPress's `DB_HOST` for this site, as the launcher can read it: `wp-config.php` in the app
+/// root (or the folder above, where WordPress also looks), read as the site's files are (no
+/// link, capped), its `define` read by [`crate::phpconf::wp_db_host`] with the launcher's
+/// environment.
+pub fn site_db_host(root: &Path) -> Option<String> {
+    for rel in ["wp-config.php", "../wp-config.php"] {
+        let (base, file) = match rel.strip_prefix("../") {
+            Some(f) => (root.parent()?, f),
+            None => (root, rel),
+        };
+        if let Ok(Some(b)) = crate::sitefile::read_beneath(base, Path::new(file), 1 << 20) {
+            return crate::phpconf::wp_db_host(&String::from_utf8_lossy(&b), &|n| std::env::var(n).ok());
+        }
+    }
+    None
+}
+
+/// Where a guest unix socket can be: on the guest's tmpfs folders.
+fn guest_sock_ok(p: &str) -> bool {
+    (p.starts_with("/run/") || p.starts_with("/var/run/") || p.starts_with("/tmp/")) && !p.contains("/../") && !p.chars().any(char::is_whitespace)
+}
+
+/// The database targets the operator approved, in root's own configuration (the launcher's
+/// flags), never the site's: `--db-address <host:port>` and `--db-socket <path>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DbApproved {
+    pub address: Option<String>,
+    pub socket: Option<PathBuf>,
+}
+
+/// MySQL's own TCP ports: the classic protocol and the X protocol.
+pub const MYSQL_PORTS: [u16; 2] = [3306, 33060];
+
+/// The database port (#100 review, #102 review and its verification): a bare
+/// `{ "port": 3306 }`. The site's `DB_HOST` (`db_host`, from `wp-config.php`) is only a hint for
+/// which of the targets the operator approved to use, never a target of its own (Sami's
+/// decision): a site must not point the launcher, which is root, at Redis, D-Bus or another
+/// pool's php-fpm.
+/// - **TCP** (`127.0.0.1`/`::1`, or any host): only MySQL's ports on the loopback
+///   ([`MYSQL_PORTS`]), or exactly the host:port `approved.address` names. The connection is made
+///   as the pool user, so the host's uid-based firewall rules apply.
+/// - **A unix socket** (`localhost`, with a socket or PHP's default, `hint_sockets`, or MySQL's
+///   standard places): only one the database user owns, in folders only root or that user may
+///   write (`trusted(path, approved)`, [`trusted_db_socket`]), or exactly `approved.socket`.
+/// - Anything else, or no `DB_HOST` the launcher can read: no database for the guest on 3306
+///   (it stays an egress port: public names only), and the launcher says why.
+///
+/// An explicit `connect` entry (`socket` or `address`) wins over all of this. Whatever 3306
+/// reaches, PHP's `localhost` reaches too: a socket in the guest at each of PHP's default
+/// sockets, the host socket's own path and `/run/mysqld/mysqld.sock`. Returns what was decided,
+/// for the log.
+pub fn resolve_db(
+    plan: &mut Plan,
+    db_host: Option<&str>,
+    hint_sockets: &[String],
+    approved: &DbApproved,
+    trusted: &dyn Fn(&Path, bool) -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    const DB: u16 = 3306;
+    let mut said = None;
+    let no_db = |why: String| Some(format!("port {DB} has no socket or address, and {why}: the guest gets no database on it (only public names)"));
+    if plan.egress.contains(&DB) {
+        let target = db_host.and_then(securecore_config::dbhost::parse_db_host);
+        let defaults = securecore_config::dbhost::Defaults { host: "localhost", port: DB, socket: hint_sockets.first().map(String::as_str) };
+        match (db_host, target.map(|t| t.resolve(&defaults))) {
+            (None, _) | (_, None) => {
+                said = no_db(
+                    "the site's DB_HOST isn't one the launcher can read (wp-config.php's define, a literal or the environment); \
+                     give the connect entry a socket or address, or approve one with --db-socket / --db-address"
+                        .into(),
+                );
+            }
+            (Some(h), Some(ep)) if ep.host == "localhost" => {
+                let sock = match &ep.socket {
+                    Some(s) => Some(PathBuf::from(s)),
+                    None => approved.socket.clone().or_else(|| MYSQL_SOCKETS.iter().map(PathBuf::from).find(|p| p.exists())),
+                };
+                match sock {
+                    None => said = no_db(format!("DB_HOST is {h}, but this host has no MySQL socket at {} (and PHP names none)", MYSQL_SOCKETS.join(", "))),
+                    Some(sock) => {
+                        let real = fs::canonicalize(&sock).unwrap_or_else(|_| sock.clone());
+                        let is_approved = approved.socket.as_ref().is_some_and(|a| fs::canonicalize(a).unwrap_or_else(|_| a.clone()) == real);
+                        match trusted(&real, is_approved) {
+                            Err(e) => said = no_db(format!("DB_HOST is {h}, but {e}")),
+                            Ok(()) => {
+                                plan.egress.retain(|p| *p != DB);
+                                said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, so it goes to the database's socket {}", real.display()));
+                                plan.sockets.push((DB, real));
+                            }
+                        }
+                    }
+                }
+            }
+            (Some(h), Some(ep)) => {
+                let addr = if ep.host.contains(':') { format!("[{}]:{}", ep.host, ep.port) } else { format!("{}:{}", ep.host, ep.port) };
+                let loopback = ep.host == "127.0.0.1" || ep.host == "::1";
+                let named = approved.address.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&addr));
+                if named || (loopback && MYSQL_PORTS.contains(&ep.port)) {
+                    plan.egress.retain(|p| *p != DB);
+                    said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, so it goes to {addr}, connected as the pool user"));
+                    plan.addresses.push((DB, addr));
+                } else if loopback {
+                    said = no_db(format!(
+                        "DB_HOST is {h}: port {} on this host isn't MySQL's ({}) nor the one --db-address approves",
+                        ep.port,
+                        MYSQL_PORTS.map(|p| p.to_string()).join(", ")
+                    ));
+                } else {
+                    said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, a database the guest reaches by name (public addresses only)"));
+                }
+            }
+        }
+    }
+    let forwarded = plan.sockets.iter().any(|(p, _)| *p == DB) || plan.addresses.iter().any(|(p, _)| *p == DB);
+    if forwarded {
+        let host_sock: Vec<String> = plan.sockets.iter().filter(|(p, _)| *p == DB).map(|(_, s)| s.display().to_string()).collect();
+        let mut paths: Vec<String> = Vec::new();
+        for p in hint_sockets.iter().map(String::as_str).chain(host_sock.iter().map(String::as_str)).chain(["/run/mysqld/mysqld.sock"]) {
+            // /var/run is /run in the guest.
+            let p = p.strip_prefix("/var").filter(|r| r.starts_with("/run/")).unwrap_or(p);
+            if guest_sock_ok(p) && !paths.iter().any(|x| x == p) {
+                paths.push(p.to_owned());
+            }
+        }
+        plan.guest_socks.extend(paths.into_iter().map(|p| (DB, p)));
+    }
+    Ok(said)
+}
+
+/// One message to systemd's notify socket, when the launcher runs under it.
+pub fn notify(msg: &str) {
+    if let Ok(s) = std::env::var("NOTIFY_SOCKET") {
+        let _ = notify_to(&s, msg);
+    }
+}
+
+fn notify_to(socket: &str, msg: &str) -> io::Result<()> {
+    let d = UnixDatagram::unbound()?;
+    if let Some(name) = socket.strip_prefix('@') {
+        use std::os::linux::net::SocketAddrExt as _;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+        d.send_to_addr(msg.as_bytes(), &addr)?;
+    } else {
+        d.send_to(msg.as_bytes(), socket)?;
+    }
+    Ok(())
+}
+
+fn status(what: &str) {
+    notify(&format!("STATUS={what}\n"));
+}
+
+/// Set once the VM serves, or the start has failed or fallen back, or a stop began: the start's
+/// timeout extensions stop (they must never stretch systemd's stop timeout either).
+static SERVING: AtomicBool = AtomicBool::new(false);
+
+/// No more `EXTEND_TIMEOUT_USEC` ([`extend_start_timeout`]).
+pub fn stop_extending() {
+    SERVING.store(true, Ordering::SeqCst);
+}
+/// How much longer each extension asks systemd for, and how often one is sent.
+pub const EXTEND_BY: Duration = Duration::from_secs(30);
+const EXTEND_EVERY: Duration = Duration::from_secs(10);
+
+/// A first start captures the host's PHP, builds its disks and makes a snapshot, which may take
+/// longer than systemd's `TimeoutStartSec` (#100 review): while it does, systemd is told every
+/// 10 s that it needs 30 s more (`EXTEND_TIMEOUT_USEC`), until the VM serves. Nothing without
+/// `NOTIFY_SOCKET`.
+pub fn extend_start_timeout() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    if std::env::var_os("NOTIFY_SOCKET").is_none() {
+        return;
+    }
+    STARTED.call_once(|| {
+        thread::spawn(|| {
+            while !SERVING.load(Ordering::SeqCst) {
+                notify(&format!("EXTEND_TIMEOUT_USEC={}\n", EXTEND_BY.as_micros()));
+                // In small steps, so a stop that begins meanwhile sends no further extension.
+                let t = Instant::now();
+                while t.elapsed() < EXTEND_EVERY && !SERVING.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+    });
+}
+
+/// Bytes the filesystem holding `path` has in all.
+fn fs_size(path: &Path) -> Result<u64, String> {
+    let c = cpath(path)?;
+    // SAFETY: statvfs(2) fills the zeroed struct passed.
+    unsafe {
+        let mut s: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut s) < 0 {
+            return Err(format!("{}: {}", path.display(), io::Error::last_os_error()));
+        }
+        Ok(s.f_blocks as u64 * s.f_frsize as u64)
+    }
+}
+
+/// What a start may leave free at the least on the state folder's filesystem, which is often the
+/// database's too (#100 review): a twentieth of it, and at least 1 GiB.
+pub fn space_margin(fs_bytes: u64) -> u64 {
+    (fs_bytes / 20).max(1 << 30)
+}
+
+/// Whether the new files a start makes (`needs`: what, bytes) fit the state folder's filesystem
+/// (`free` of `fs_bytes`) with [`space_margin`] left.
+pub fn space_ok(needs: &[(String, u64)], free: u64, fs_bytes: u64) -> Result<(), String> {
+    let total: u64 = needs.iter().map(|(_, b)| b).sum();
+    let margin = space_margin(fs_bytes);
+    if total + margin <= free {
+        return Ok(());
+    }
+    Err(format!(
+        "this start needs {} MiB on the state folder's filesystem ({}) and keeps {} MiB free beside it (for the database and the host), but it has {} MiB free",
+        total >> 20,
+        needs.iter().map(|(w, b)| format!("{w} {} MiB", b >> 20)).collect::<Vec<_>>().join(", "),
+        margin >> 20,
+        free >> 20
+    ))
+}
+
+/// One VM, prepared ([`prepare_all`]): nothing is left that can fail but the boot.
+pub struct Prepared {
+    plan: Plan,
+    user: User,
+    sockets: Vec<(u16, jail::SocketDir)>,
+    env: Vec<(String, String)>,
+    ini: Option<String>,
+    machine_parts: (PathBuf, PathBuf, PathBuf, Vec<(String, PathBuf)>, String, String),
+    sync: Vec<SyncFolder>,
+    /// The listening socket's owner, group and mode: the pool's, or the flags'.
+    listen_mode: SocketMode,
+    /// Who may connect: the pool's `listen.allowed_clients`, or its ACLs.
+    admit: Admit,
+    _lock: fs::File,
+    pub pool_name: String,
+}
+
+/// [`prepare_all`] for one pool (`opts.pool`, or the only one).
+fn prepare(loaded: &Loaded, opts: &Options, capture: capture::Capture) -> Result<Prepared, String> {
+    let pool = match &opts.pool {
+        Some(n) => capture.pools.iter().find(|p| p.name == *n).ok_or_else(|| format!("php-fpm's config has no pool [{n}]"))?,
+        None => &capture.pools[0],
+    };
+    let hints = pool_hints(&opts.php_root, pool)?;
+    let mut plan = plan_with(loaded, opts, &hints, false)?;
+    // Where the pool listens, with its listen.owner/group/mode; --listen and its flags win.
+    let listen_mode = match (&opts.listen, &hints.listen, hints.listen_mode) {
+        (None, Some(_), Some(m)) => m,
+        _ => opts.listen_mode,
+    };
+    // The pool's own rule of who may connect stands whatever --listen says (#102 verification);
+    // one that can't apply to --listen's kind of socket is refused, never dropped.
+    let admit = listen_admit(&plan.listen, &hints.admit).map_err(|e| format!("pool [{}]: {e}", pool.name))?;
+    let user = jail::user(&opts.vm_user)?;
+    let lock = lock_state(&plan.state)?;
+    let db = db_ids(&opts.db_user);
+    let db_host = site_db_host(&plan.root);
+    let approved = DbApproved { address: opts.db_address.clone(), socket: opts.db_socket.clone() };
+    if let Some(said) = resolve_db(&mut plan, db_host.as_deref(), &capture.mysql_sockets, &approved, &|p, a| trusted_db_socket(p, db, a))? {
+        log(&said);
+    }
+    // Checked again here, not only in host_checks: what is checked is what is bind-mounted.
+    let sockets = open_sockets(&plan, user)?;
+    claim_state(&plan)?;
+    // The vault's env sources and the pool's env[] (#100 review): a name the launcher lacks
+    // refuses now, not after the choice.
+    let mut names = opts.guest_env.clone();
+    let mut env = guest_env(loaded, &names, |n| std::env::var(n).ok())?;
+    for r in pool.env_refs() {
+        if !env.iter().any(|(n, _)| *n == r)
+            && let Ok(v) = std::env::var(&r)
+            && crate::guest::env_name_ok(&r)
+            && v.len() <= crate::guest::MAX_ENV_VALUE
+        {
+            names.push(r.clone());
+            env.push((r, v));
+        }
+    }
+    if !env.is_empty() {
+        // The names only, never a value.
+        log(&format!("the guest's php-fpm gets {} from the launcher's environment, in each start message", env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(" ")));
+    }
+    let ini = read_site_ini(opts.guest_ini.as_deref())?;
+    let files = verify(&opts.assets, &plan.state)?;
+    // The guest's php-fpm config for this pool, and the layers' keys.
+    let (fpm_conf, dropped) = crate::phpconf::guest_fpm_conf(pool, plan.pool.uid, plan.pool.gid, FPM_PORT);
+    if !dropped.is_empty() {
+        log(&format!("pool [{}]: the guest's pool leaves out the host's {} (host paths and sockets)", pool.name, dropped.join(" ")));
+    }
+    let conf_files = capture::conf_files(&capture, &fpm_conf);
+    let conf_key = capture::conf_key(&conf_files);
+    // The PHP layer also holds the folders the guest mounts on: the site root and any tmpfs.
+    let mut mounts = vec![plan.guest_root.clone()];
+    mounts.extend(plan.tmpfs.iter().cloned());
+    // The host's own config paths, where the config layer is bound too (a PHP that reads its
+    // compiled-in ones: the CLI layer 3's helper runs).
+    let scan_dir = capture.scan_dirs.first().filter(|d| no_space("a scan folder", d).is_ok()).cloned();
+    let ini_file = capture.ini.as_ref().map(|i| i.path.clone()).filter(|p| no_space("php.ini", p).is_ok());
+    mounts.extend(scan_dir.iter().cloned());
+    let mount_files: Vec<String> = ini_file.iter().cloned().collect();
+    let php_key = sha_of(&format!("{}\nmounts {mounts:?}\nfiles {mount_files:?}\n", capture.php_key));
+    let php_path = plan.cache.join(format!("php-{}.ext4", &php_key[..16]));
+    let conf_path = plan.state.join(format!("conf-{}.ext4", &conf_key[..16]));
+    // The site's key: the tree without the writable folders, the state folder and the config
+    // file, whose bytes are keyed by their own sha256 instead (copying the same file in again
+    // changes its mtime, not the site).
+    let mut skip: BTreeSet<PathBuf> = plan.disks.iter().map(|d| d.host.clone()).collect();
+    skip.insert(plan.cache.clone());
+    skip.insert(plan.state.clone());
+    skip.extend(loaded.path.file_name().map(|name| plan.root.join(name)));
+    let (tree, bytes, entries) = site_sha256(&plan.root, &skip).map_err(|e| format!("{}: {e}", plan.root.display()))?;
+    let site = sha_of(&format!("tree {tree}\nconfig {}\n", loaded.sha256));
+    // Space for what this start makes new, with a margin, before any of it is made.
+    let mut needs: Vec<(String, u64)> = Vec::new();
+    let site_path = plan.state.join(format!("site-{}.ext4", &site[..16]));
+    if !site_path.is_file() {
+        needs.push(("site disk".into(), bytes * 4 / 3 + (64 << 20)));
+    }
+    if !php_path.is_file() {
+        let b: u64 = capture.items.iter().map(|i| if let capture::Item::File { size, .. } = i { size.div_ceil(4096) * 4096 } else { 4096 }).sum();
+        needs.push(("PHP layer".into(), b + b / 5 + (32 << 20)));
+    }
+    if !conf_path.is_file() {
+        needs.push(("config layer".into(), 33 << 20));
+    }
+    let mut writable_new = 0u64;
+    for d in &plan.disks {
+        if !plan.state.join(format!("{}.ext4", d.id)).is_file() {
+            writable_new += folder_usage(&plan, d)?.0 + (64 << 20);
+        }
+    }
+    if writable_new > 0 {
+        needs.push(("writable disks".into(), writable_new));
+    }
+    if opts.snapshot {
+        needs.push(("snapshot".into(), u64::from(opts.mem_mib) << 20));
+    }
+    space_ok(&needs, free_bytes(&plan.state)?, fs_size(&plan.state)?)?;
+    // The layers, cached by what they hold.
+    status("building the guest's disks");
+    if !php_path.is_file() {
+        let t = Instant::now();
+        let stage = plan.cache.join("php-stage");
+        capture::remove_stage(&stage);
+        fs::create_dir_all(&stage).map_err(|e| format!("{}: {e}", stage.display()))?;
+        let made = capture::stage_php(&opts.php_root, &capture.items, &mounts, &mount_files, &stage).map_err(|e| e.to_string()).and_then(|()| capture::image(&stage, &php_path));
+        capture::remove_stage(&stage);
+        let mb = made?;
+        log(&format!("built the PHP layer {} ({mb} MiB, {} entries) in {:.0} ms", php_path.display(), capture.items.len(), ms(t)));
+        remove_others(&plan.cache, "php-", &php_path);
+    }
+    if !conf_path.is_file() {
+        let t = Instant::now();
+        let stage = plan.state.join("conf-stage");
+        capture::remove_stage(&stage);
+        let made = capture::stage_conf(&conf_files, &stage).map_err(|e| format!("{}: {e}", stage.display())).and_then(|()| capture::image(&stage, &conf_path));
+        capture::remove_stage(&stage);
+        made?;
+        log(&format!("built the config layer {} ({} files) in {:.0} ms", conf_path.display(), conf_files.len(), ms(t)));
+        remove_others(&plan.state, "conf-", &conf_path);
+    }
+    for p in [&php_path, &conf_path] {
+        std::os::unix::fs::chown(p, Some(0), Some(user.gid)).map_err(|e| e.to_string())?;
+        fs::set_permissions(p, fs::Permissions::from_mode(0o640)).map_err(|e| e.to_string())?;
+    }
+    // The site disk is copied as the pool user (#100 review: a file it can't read refuses now).
+    let site_path = site_disk(&plan, &site, bytes, entries, user)?;
+    let mut disks = Vec::new();
+    let mut sync = Vec::new();
+    let mut sizes = Vec::new();
+    for d in &plan.disks {
+        let (used, _) = folder_usage(&plan, d)?;
+        let (path, bytes) = write_disk(&plan, d, disk_mib(opts.write_disk_mib, used), user)?;
+        disks.push((d.id.clone(), path));
+        sync.push(SyncFolder { rel: d.rel(&plan.root)?, id: d.id.clone(), cap: bytes });
+        sizes.push((bytes >> 20).to_string());
+    }
+    let mut args = boot_args(&plan, opts, &env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), &capture.fpm);
+    if let Some(d) = &scan_dir {
+        let _ = write!(args, " sc.inidir={d}");
+    }
+    if let Some(f) = &ini_file {
+        let _ = write!(args, " sc.inifile={f}");
+    }
+    let key = Key {
+        files,
+        php: php_key,
+        conf: conf_key,
+        site,
+        config: loaded.sha256.clone(),
+        machine: format!(
+            "mem {} vcpus {} args {args} drives {} size {}",
+            opts.mem_mib,
+            opts.vcpus,
+            disks.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(","),
+            sizes.join(",")
+        ),
+    };
+    let pool_name = pool.name.clone();
+    Ok(Prepared { plan, user, sockets, env, ini, machine_parts: (php_path, conf_path, site_path, disks, args, key.sha256()), sync, listen_mode, admit, _lock: lock, pool_name })
+}
+
+/// Removes `<dir>/<prefix>*` but `keep` (older layer disks).
+fn remove_others(dir: &Path, prefix: &str, keep: &Path) {
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with(prefix) && e.path() != keep && e.path().extension().is_some_and(|x| x == "ext4") {
+            let _ = fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Each `connect[].socket`'s folder, opened with no symlink on its (resolved) path and held:
@@ -636,6 +1443,9 @@ fn open_sockets(plan: &Plan, user: User) -> Result<Vec<(u16, jail::SocketDir)>, 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
     pub files: Key0,
+    /// The host's PHP layer and config layer (#101): their contents' sha256s.
+    pub php: String,
+    pub conf: String,
     pub site: String,
     pub config: String,
     /// Everything else that shapes the guest: memory, vCPUs, boot arguments (without the
@@ -646,8 +1456,8 @@ pub struct Key {
 impl Key {
     pub fn sha256(&self) -> String {
         sha_of(&format!(
-            "securecore-fpm microvm {PROTOCOL}\nfirecracker {}\njailer {}\nkernel {}\nrootfs {}\nsite {}\nconfig {}\nmachine {}\n",
-            self.files.firecracker, self.files.jailer, self.files.kernel, self.files.rootfs, self.site, self.config, self.machine
+            "securecore-fpm microvm {PROTOCOL}\nfirecracker {}\njailer {}\nkernel {}\nrootfs {}\nphp {}\nconf {}\nsite {}\nconfig {}\nmachine {}\n",
+            self.files.firecracker, self.files.jailer, self.files.kernel, self.files.rootfs, self.php, self.conf, self.site, self.config, self.machine
         ))
     }
 }
@@ -1030,9 +1840,16 @@ fn claim_state(plan: &Plan) -> Result<(), String> {
     fs::write(&mine, serde_json::json!({ "root": root }).to_string()).map_err(|e| format!("{}: {e}", mine.display()))
 }
 
+/// How long one Firecracker API call may take.
+pub const API_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One request on Firecracker's API socket. Errors carry Firecracker's own fault message.
 fn api(sock: &Path, method: &str, path: &str, body: &str) -> Result<(), String> {
     let mut s = UnixStream::connect(sock).map_err(|e| format!("{}: {e}", sock.display()))?;
+    // A Firecracker that stops answering never holds a start forever (#102 verification): the
+    // slowest call, a snapshot of the whole guest memory, takes about a second.
+    s.set_read_timeout(Some(API_TIMEOUT)).map_err(|e| e.to_string())?;
+    s.set_write_timeout(Some(API_TIMEOUT)).map_err(|e| e.to_string())?;
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
@@ -1067,13 +1884,16 @@ fn api(sock: &Path, method: &str, path: &str, body: &str) -> Result<(), String> 
 /// The guest's boot arguments, without the clock (that part goes into no key). `env_names`: the
 /// names (never the values) of php-fpm's delivered environment, so php-fpm can start at boot
 /// with a placeholder for each ([`crate::guest::NOT_DELIVERED`]).
-fn boot_args(plan: &Plan, opts: &Options, env_names: &[&str]) -> String {
+fn boot_args(plan: &Plan, opts: &Options, env_names: &[&str], fpm: &str) -> String {
     // mirab's (src/isolation/firecracker.ts): the i8042 flags skip a 500 ms keyboard probe.
     // Firecracker adds root=/dev/vda ro for a read-only root drive.
     let mut a = format!(
-        "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/securecore-init i8042.noaux i8042.nokbd i8042.nopnp \
-         i8042.dumbkbd quiet loglevel=1 sc.proto={PROTOCOL} sc.root={} sc.user={}:{}",
-        plan.guest_root, plan.pool.uid, plan.pool.gid
+        "console=ttyS0 reboot=k panic=1 pci=off init={} i8042.noaux i8042.nokbd i8042.nopnp \
+         i8042.dumbkbd quiet loglevel=1 sc.proto={PROTOCOL} sc.root={} sc.user={}:{} sc.fpm={fpm}",
+        crate::guest::INIT,
+        plan.guest_root,
+        plan.pool.uid,
+        plan.pool.gid
     );
     let ports: Vec<String> = plan.sockets.iter().map(|(p, _)| p).chain(plan.addresses.iter().map(|(p, _)| p)).map(u16::to_string).collect();
     if !ports.is_empty() {
@@ -1085,11 +1905,8 @@ fn boot_args(plan: &Plan, opts: &Options, env_names: &[&str]) -> String {
     if !plan.egress.is_empty() {
         let _ = write!(a, " sc.egress={}", plan.egress.iter().map(u16::to_string).collect::<Vec<_>>().join(","));
     }
-    for (port, socket) in &plan.sockets {
-        let s = socket.display().to_string();
-        if s.starts_with("/run/") && !s.chars().any(char::is_whitespace) {
-            let _ = write!(a, " sc.sock={port}:{s}");
-        }
+    for (port, path) in &plan.guest_socks {
+        let _ = write!(a, " sc.sock={port}:{path}");
     }
     for x in &opts.guest_args {
         a.push(' ');
@@ -1103,6 +1920,8 @@ const IN_API: &str = "/fc.sock";
 const IN_VSOCK: &str = "/v.sock";
 const IN_KERNEL: &str = "/vmlinux";
 const IN_ROOTFS: &str = "/rootfs.ext4";
+const IN_PHP: &str = "/php.ext4";
+const IN_CONF: &str = "/conf.ext4";
 const IN_SITE: &str = "/site.ext4";
 const IN_SNAP: &str = "/snap";
 const IN_SNAP_NEW: &str = "/snap-new";
@@ -1167,6 +1986,9 @@ impl Drop for Vm {
 
 /// Everything the driver has decided before booting: the files, the drives and the key.
 struct Machine {
+    /// The host's PHP and its settings (#101).
+    php: PathBuf,
+    conf: PathBuf,
     site: PathBuf,
     disks: Vec<(String, PathBuf)>,
     args: String,
@@ -1203,6 +2025,8 @@ impl Vm {
         j.prepare()?;
         j.place(&opts.assets.kernel, IN_KERNEL)?;
         j.place(&opts.assets.rootfs, IN_ROOTFS)?;
+        j.place(&m.php, IN_PHP)?;
+        j.place(&m.conf, IN_CONF)?;
         j.place(&m.site, IN_SITE)?;
         for (id, path) in &m.disks {
             j.place(path, &format!("/{id}.ext4"))?;
@@ -1330,7 +2154,13 @@ fn cold_boot(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring) -> Result
     vm.api("PUT", "/machine-config", &format!(r#"{{"vcpu_count":{},"mem_size_mib":{},"smt":false}}"#, opts.vcpus, opts.mem_mib))?;
     let args = format!("{} sc.time={}", m.args, now().0);
     vm.api("PUT", "/boot-source", &format!(r#"{{"kernel_image_path":{},"boot_args":{}}}"#, json_str(IN_KERNEL), json_str(&args)))?;
-    let mut drives = vec![("rootfs".to_owned(), IN_ROOTFS.to_owned(), true, true), ("site".to_owned(), IN_SITE.to_owned(), false, true)];
+    // In the order the guest names them (crate::guest: vda base, vdb PHP, vdc config, vdd site).
+    let mut drives = vec![
+        ("rootfs".to_owned(), IN_ROOTFS.to_owned(), true, true),
+        ("php".to_owned(), IN_PHP.to_owned(), false, true),
+        ("conf".to_owned(), IN_CONF.to_owned(), false, true),
+        ("site".to_owned(), IN_SITE.to_owned(), false, true),
+    ];
     drives.extend(m.disks.iter().map(|(id, _)| (id.clone(), format!("/{id}.ext4"), false, false)));
     for (id, path, root, ro) in drives {
         // A writable disk passes the guest's flushes on to the host's disk (fsync); Firecracker's
@@ -1454,9 +2284,9 @@ fn start_message(plan: &Plan, restored: bool, entropy: [u8; 64], env: &[(String,
     if restored {
         lines.push(Ctl::Refresh);
     }
-    // vda root, vdb site, then the writable disks in drive order.
+    // vda base, vdb PHP, vdc config, vdd site, then the writable disks in drive order.
     for (n, disk) in plan.disks.iter().enumerate() {
-        let device = format!("/dev/vd{}", char::from(b'c' + n as u8));
+        let device = format!("/dev/vd{}", char::from(crate::guest::FIRST_WRITABLE + n as u8));
         lines.push(Ctl::Mount { device, path: disk.guest.clone() });
     }
     lines.extend(plan.tmpfs.iter().map(|p| Ctl::Tmpfs { path: p.clone() }));
@@ -1942,6 +2772,7 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, keys: 
             let l = bind_unix(&short.join(format!("v.sock_{port}")), owned)?;
             let address = address.clone();
             let port = *port;
+            let pool = plan.pool;
             let slots: &'static Slots = Box::leak(Box::new(Slots::new(FORWARD_SLOTS)));
             thread::spawn(move || {
                 for c in l.incoming().flatten() {
@@ -1952,12 +2783,14 @@ fn wire(plan: &Plan, m: &Machine, j: &Jail, short: &Path, wiring: Wiring, keys: 
                     let address = address.clone();
                     thread::spawn(move || {
                         let _slot = slot;
-                        match TcpStream::connect(&address) {
-                            Ok(t) => {
-                                let _ = t.set_nodelay(true);
-                                pipe_both(c, t);
-                            }
-                            Err(e) => log(&format!("guest port {port} → {address}: {e}")),
+                        // Never as root (#102 verification): the pool user connects, as the host's
+                        // own php-fpm would, so uid-based firewall rules apply to the guest's.
+                        let addrs: Vec<std::net::SocketAddr> = match std::net::ToSocketAddrs::to_socket_addrs(address.as_str()) {
+                            Ok(a) => a.collect(),
+                            Err(e) => return log(&format!("guest port {port} → {address}: {e}")),
+                        };
+                        if let Err(e) = connect_as_pool(c, &addrs, pool, false) {
+                            log(&format!("guest port {port} → {address}: {e}"));
                         }
                     });
                 }
@@ -2078,8 +2911,18 @@ const FORWARD_SLOTS: usize = 64;
 /// uid-based firewall rules on the host apply) with no supplementary groups, an empty
 /// environment and no new privileges, killed if the launcher dies.
 pub fn spawn_egress_helper(exe: &Path, conn: UnixStream, addrs: &[std::net::SocketAddr], user: User) -> Result<Child, String> {
+    spawn_connect_helper(exe, conn, addrs, user, true)
+}
+
+/// [`spawn_egress_helper`], with egress's OK/ERR answer to the guest or (`handshake` false, a
+/// forwarded `connect[].address` port) without it.
+pub fn spawn_connect_helper(exe: &Path, conn: UnixStream, addrs: &[std::net::SocketAddr], user: User, handshake: bool) -> Result<Child, String> {
     let mut cmd = Command::new(exe);
-    cmd.env_clear().arg0("securecore-fpm").arg("--egress-connect").args(addrs.iter().map(|a| a.to_string()));
+    cmd.env_clear().arg0("securecore-fpm").arg("--egress-connect");
+    if !handshake {
+        cmd.arg("--raw");
+    }
+    cmd.args(addrs.iter().map(|a| a.to_string()));
     cmd.stdin(Stdio::from(std::os::fd::OwnedFd::from(conn))).stdout(Stdio::piped());
     // SAFETY: only syscalls between fork and exec, on values made before the fork.
     unsafe {
@@ -2100,7 +2943,11 @@ pub fn spawn_egress_helper(exe: &Path, conn: UnixStream, addrs: &[std::net::Sock
 /// The egress connector in production: the helper as the pool user, waited on; the address it
 /// used, or why none.
 fn egress_as_pool(conn: UnixStream, addrs: &[std::net::SocketAddr], pool: User) -> Result<String, String> {
-    let child = spawn_egress_helper(Path::new("/proc/self/exe"), conn, addrs, pool)?;
+    connect_as_pool(conn, addrs, pool, true)
+}
+
+fn connect_as_pool(conn: UnixStream, addrs: &[std::net::SocketAddr], pool: User, handshake: bool) -> Result<String, String> {
+    let child = spawn_connect_helper(Path::new("/proc/self/exe"), conn, addrs, pool, handshake)?;
     let out = child.wait_with_output().map_err(|e| format!("the egress helper: {e}"))?;
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().next().unwrap_or("").to_owned();
@@ -2395,8 +3242,47 @@ fn spawn_writer(uds: &Path, root: &Path, state: &Path, folders: &[SyncFolder], p
     Ok(child)
 }
 
-fn serve<S: vsock::Half>(incoming: impl Iterator<Item = io::Result<S>>, uds: PathBuf) {
+/// The peer of an accepted connection, judged by the pool's rule (#102 review): the address of a
+/// TCP peer, the credentials of a unix-socket one.
+pub trait Peer {
+    fn admitted(&self, admit: &Admit) -> Result<(), String>;
+}
+
+impl Peer for TcpStream {
+    fn admitted(&self, admit: &Admit) -> Result<(), String> {
+        let ip = self.peer_addr().map_err(|e| e.to_string())?.ip();
+        if admit.tcp(ip) { Ok(()) } else { Err(format!("{ip} isn't in the pool's listen.allowed_clients")) }
+    }
+}
+
+impl Peer for UnixStream {
+    fn admitted(&self, admit: &Admit) -> Result<(), String> {
+        if *admit == Admit::Any {
+            return Ok(());
+        }
+        let mut cred = libc::ucred { pid: 0, uid: u32::MAX, gid: u32::MAX };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: getsockopt(2) SO_PEERCRED fills the ucred passed, of the length given.
+        let r = unsafe { libc::getsockopt(self.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &mut len) };
+        if r < 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        if admit.unix(cred.uid, cred.gid) { Ok(()) } else { Err(format!("uid {} gid {} isn't in the pool's listen.acl_users or listen.acl_groups", cred.uid, cred.gid)) }
+    }
+}
+
+fn serve<S: vsock::Half + Peer>(incoming: impl Iterator<Item = io::Result<S>>, uds: PathBuf, admit: Admit) {
+    let refusals = std::sync::atomic::AtomicU64::new(0);
     for c in incoming.flatten() {
+        if let Err(why) = c.admitted(&admit) {
+            // Said for the first few, then every thousandth: a flood can't fill the log.
+            let n = refusals.fetch_add(1, Ordering::Relaxed);
+            if n < 5 || n.is_multiple_of(1000) {
+                log(&format!("refused a FastCGI connection: {why} ({} refused so far)", n + 1));
+            }
+            drop(c);
+            continue;
+        }
         match vsock::connect_through(&uds, FPM_PORT, Duration::from_secs(2)) {
             Ok(v) => {
                 let _ = vsock::join(c, v);
@@ -2431,9 +3317,12 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// and HUP reload the guest's php-fpm gracefully; USR1 (php-fpm's log reopen) is acknowledged:
 /// the launcher writes only to stderr, so there is no file to reopen. Blocked before any
 /// thread starts, so every thread inherits the mask and only `sigwait` sees them.
-const SIGNALS: [libc::c_int; 6] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGUSR1, libc::SIGUSR2];
+pub const SIGNALS: [libc::c_int; 6] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGUSR1, libc::SIGUSR2];
 
-fn block_signals() -> libc::sigset_t {
+/// Blocks [`SIGNALS`] in this thread (and every thread started after). The launcher does it
+/// before a microVM start prepares anything, so no helper thread can take a stop signal's
+/// default action; [`unblock_signals`] puts them back before gelada's exec.
+pub fn block_signals() -> libc::sigset_t {
     // SAFETY: sigemptyset/sigaddset/pthread_sigmask on a sigset_t we own.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
@@ -2466,28 +3355,56 @@ fn lock_state(state: &Path) -> Result<fs::File, String> {
     Ok(f)
 }
 
-/// Runs php-fpm in the microVM until a stop signal. Returns only on failure (the launcher
-/// exits 125) or after a clean stop (`Ok`).
-pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
+/// How a microVM start ended: before it served (so `auto` may still run gelada, nothing having
+/// been served), or after.
+#[derive(Debug)]
+pub enum RunError {
+    BeforeServing(String),
+    AfterServing(String),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::BeforeServing(e) | RunError::AfterServing(e) => f.write_str(e),
+        }
+    }
+}
+
+/// The signal mask [`block_signals`] set, put back (before gelada's exec).
+pub fn unblock_signals() {
+    // SAFETY: as block_signals, unblocking the same set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for s in SIGNALS {
+            libc::sigaddset(&mut set, s);
+        }
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Runs php-fpm in the microVM `p` ([`prepare_all`]) until a stop signal. Returns only on failure
+/// (before or after it served) or after a clean stop (`Ok`).
+pub fn run(loaded: &Loaded, opts: &Options, p: Prepared, t0: Instant) -> Result<(), RunError> {
     let set = block_signals();
-    let t0 = Instant::now();
-    let plan = plan(loaded, opts)?;
-    let user = jail::user(&opts.vm_user)?;
-    fs::create_dir_all(&plan.state).map_err(|e| format!("{}: {e}", plan.state.display()))?;
-    fs::set_permissions(&plan.state, fs::Permissions::from_mode(0o700)).map_err(|e| format!("{}: {e}", plan.state.display()))?;
-    let _lock = lock_state(&plan.state)?;
-    // Checked again here, not only in `available`: what is checked is what is bind-mounted.
-    let sockets = open_sockets(&plan, user)?;
+    let before = RunError::BeforeServing;
+    let Prepared { plan, user, sockets, env, ini, machine_parts: (php, conf, site_path, disks, args, key), sync, listen_mode, admit, _lock, pool_name: _ } = p;
     // Before any thread: whatever ends this process, the VM ends with it.
     let jail = Jail::new(&plan.state, &plan.id, user);
-    let mounts: Vec<PathBuf> = plan.sockets.iter().map(|(p, _)| jail.root.join(format!("sock-{p}"))).collect();
-    let _watchdog = jail.watchdog(&mounts)?;
-    claim_state(&plan)?;
-    let env = guest_env(loaded, &opts.guest_env, |n| std::env::var(n).ok())?;
-    if !env.is_empty() {
-        // The names only, never a value.
-        log(&format!("the guest's php-fpm gets {} from the launcher's environment, in each start message", env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(" ")));
-    }
+    // What [`Jail::bind_dir`] mounts: the socket's folder, or the socket alone in a shared folder.
+    let mounts: Vec<PathBuf> = plan
+        .sockets
+        .iter()
+        .map(|(p, s)| {
+            let at = jail.root.join(format!("sock-{p}"));
+            match (s.parent(), s.file_name()) {
+                (Some(d), Some(n)) if jail::bind_socket_only(d) => at.join(n),
+                _ => at,
+            }
+        })
+        .collect();
+    let _watchdog = jail.watchdog(&mounts).map_err(before)?;
     let egress = crate::egress::Egress::new(loaded, plan.egress.clone());
     if !plan.egress.is_empty() {
         log(&format!(
@@ -2502,46 +3419,13 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         ));
         log("egress connects only to public addresses that aren't this host's, as the pool user");
     }
-    let files = verify(&opts.assets, &plan.state)?;
-    // The site's key: the tree without the writable folders, the state folder and the config
-    // file, whose bytes are keyed by their own sha256 instead (copying the same file in again
-    // changes its mtime, not the site).
-    let mut skip: BTreeSet<PathBuf> = plan.disks.iter().map(|d| d.host.clone()).collect();
-    skip.insert(plan.state.clone());
-    skip.extend(loaded.path.file_name().map(|name| plan.root.join(name)));
-    let (tree, bytes, entries) = site_sha256(&plan.root, &skip).map_err(|e| format!("{}: {e}", plan.root.display()))?;
-    let site = sha_of(&format!("tree {tree}\nconfig {}\n", loaded.sha256));
-    let site_path = site_disk(&plan, &site, bytes, entries, user)?;
-    let mut disks = Vec::new();
-    let mut sync = Vec::new();
-    let mut sizes = Vec::new();
-    for d in &plan.disks {
-        let (used, _) = folder_usage(&plan, d)?;
-        let (path, bytes) = write_disk(&plan, d, disk_mib(opts.write_disk_mib, used), user)?;
-        disks.push((d.id.clone(), path));
-        sync.push(SyncFolder { rel: d.rel(&plan.root)?, id: d.id.clone(), cap: bytes });
-        sizes.push((bytes >> 20).to_string());
-    }
-    let args = boot_args(&plan, opts, &env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>());
-    let key = Key {
-        files,
-        site,
-        config: loaded.sha256.clone(),
-        machine: format!(
-            "mem {} vcpus {} args {args} drives {} size {}",
-            opts.mem_mib,
-            opts.vcpus,
-            disks.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(","),
-            sizes.join(",")
-        ),
-    };
     let egress: &'static std::sync::RwLock<crate::egress::Egress> = Box::leak(Box::new(std::sync::RwLock::new(egress)));
-    let ini = read_site_ini(opts.guest_ini.as_deref())?;
     if let (Some(path), Some(text)) = (&opts.guest_ini, &ini) {
         log(&format!("the guest's php-fpm gets the site's php.ini settings from {} ({} lines), in each start message", path.display(), text.lines().count()));
     }
-    let m = Machine { site: site_path, disks, args, key: key.sha256(), user, sockets, egress };
-    let (mut vm, how, ready) = bring_up(&mut Real { plan: &plan, opts, m: &m, env: &env, ini: ini.as_deref() }, opts.snapshot)?;
+    let m = Machine { php, conf, site: site_path, disks, args, key, user, sockets, egress };
+    status("starting the microVM");
+    let (mut vm, how, ready) = bring_up(&mut Real { plan: &plan, opts, m: &m, env: &env, ini: ini.as_deref() }, opts.snapshot).map_err(before)?;
     let t_ready = ready.duration_since(t0).as_secs_f64() * 1000.0;
     let t_started = ms(t0);
     match how {
@@ -2565,22 +3449,33 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     match &plan.listen {
         Listen::Unix(path) => {
             // nginx must reach it: by default the pool user's group, as php-fpm's listen.group.
-            let mode = SocketMode { group: opts.listen_mode.group.or(Some(plan.pool.gid)), ..opts.listen_mode };
-            let l = bind_unix(path, mode)?;
-            thread::spawn(move || serve(l.incoming(), uds.clone()));
+            let mode = SocketMode { group: listen_mode.group.or(Some(plan.pool.gid)), ..listen_mode };
+            if let Some(dir) = path.parent() {
+                // As php-fpm does for its own socket's folder (/run/php on Debian).
+                let _ = fs::create_dir_all(dir);
+            }
+            let l = bind_unix(path, mode).map_err(before)?;
+            let admit = admit.clone();
+            thread::spawn(move || serve(l.incoming(), uds.clone(), admit));
         }
         Listen::Tcp(addr) => {
-            let l = TcpListener::bind(addr).map_err(|e| format!("--listen {addr}: {e}"))?;
-            thread::spawn(move || serve(l.incoming(), uds.clone()));
+            let l = TcpListener::bind(addr).map_err(|e| before(format!("listen {addr}: {e}")))?;
+            let admit = admit.clone();
+            thread::spawn(move || serve(l.incoming(), uds.clone(), admit));
         }
     }
+    if admit != Admit::Any {
+        log(&format!("FastCGI connections are taken only from {admit:?} (the pool's allowed_clients / ACLs)"));
+    }
     log(&format!("serving FastCGI on {} (state {})", plan.listen, plan.state.display()));
+    SERVING.store(true, Ordering::SeqCst);
     match notify_ready(std::env::var("NOTIFY_SOCKET").ok().as_deref(), std::process::id()) {
         Ok(true) => log("told systemd we are ready (NOTIFY_SOCKET)"),
         Ok(false) => {}
         Err(e) => log(&format!("could not notify systemd (NOTIFY_SOCKET): {e}")),
     }
-    let mut child = vm.child.take().ok_or("no Firecracker")?;
+    let after = RunError::AfterServing;
+    let mut child = vm.child.take().ok_or_else(|| after("no Firecracker".into()))?;
     let state = plan.state.clone();
     let guest_log = vm.log;
     thread::spawn(move || {
@@ -2627,9 +3522,10 @@ pub fn run(loaded: &Loaded, opts: &Options) -> Result<(), String> {
         }
     };
     QUITTING.store(true, Ordering::SeqCst);
+    stop_extending();
     if FIRECRACKER_EXITED.load(Ordering::SeqCst) {
         drop(vm);
-        return Err("Firecracker exited on its own; the jail is cleared".into());
+        return Err(after("Firecracker exited on its own; the jail is cleared".into()));
     }
     // The guest's writes to the writable disks reach the host's images before the VM stops.
     if let Err(e) = tell_guest(&vm.vsock, &[Ctl::Sync, Ctl::Done], crate::guest::SYNC_TIMEOUT) {
@@ -2682,6 +3578,14 @@ mod tests {
             guest_args: vec![],
             guest_env: vec![],
             guest_ini: None,
+            php_root: PathBuf::from("/"),
+            php_fpm: "php-fpm".into(),
+            fpm_args: vec![],
+            pool: None,
+            record: PathBuf::from("/nonexistent/record.json"),
+            db_user: "mysql".into(),
+            db_address: None,
+            db_socket: None,
         }
     }
 
@@ -2729,6 +3633,193 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_3306_reaches_the_hosts_database() {
+        let dir = scratch("bare3306");
+        let l = loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"connect":[{"port":3306},{"port":443}]}}"#);
+        let p0 = plan(&l, &opts()).expect("plan");
+        assert_eq!(p0.egress, [3306, 443], "planned as egress until the host is asked");
+        let none = DbApproved::default();
+        let ok: &dyn Fn(&Path, bool) -> Result<(), String> = &|_, _| Ok(());
+        let no_db = |p: &Plan| p.sockets.is_empty() && p.addresses.is_empty() && p.guest_socks.is_empty() && p.egress.contains(&3306);
+        // DB_HOST localhost:<socket>: that socket, when the database's user owns it.
+        let mut p = p0.clone();
+        let said = resolve_db(&mut p, Some("localhost:/run/sc-test/mysqld.sock"), &[], &none, ok).expect("ok").expect("said");
+        assert!(said.contains("database's socket /run/sc-test/mysqld.sock"), "{said}");
+        assert_eq!(p.egress, [443]);
+        assert_eq!(p.sockets, [(3306, PathBuf::from("/run/sc-test/mysqld.sock"))]);
+        assert!(p.guest_socks.contains(&(3306, "/run/sc-test/mysqld.sock".to_owned())), "localhost in the guest: {:?}", p.guest_socks);
+        assert!(!p.guest_socks.iter().any(|(_, s)| s.starts_with("/tmp")), "never /tmp: {:?}", p.guest_socks);
+        // DB_HOST localhost: PHP's own default socket.
+        let mut p = p0.clone();
+        resolve_db(&mut p, Some("localhost"), &["/run/php-says/mysqld.sock".to_owned()], &none, ok).expect("ok");
+        assert_eq!(p.sockets, [(3306, PathBuf::from("/run/php-says/mysqld.sock"))]);
+        // A hostile DB_HOST (#102 verification): D-Bus's socket (root's, not the database user's)
+        // gives the guest no database, and says why; it is never an error that hides the site.
+        let mut p = p0.clone();
+        let said = resolve_db(&mut p, Some("localhost:/run/dbus/system_bus_socket"), &[], &none, &|_, approved| {
+            if approved { Ok(()) } else { Err("the socket /run/dbus/system_bus_socket is owned by uid 0, not the database's user".into()) }
+        })
+        .expect("not an error")
+        .expect("said");
+        assert!(said.contains("not the database's user") && said.contains("the guest gets no database"), "{said}");
+        assert!(no_db(&p), "{p:?}");
+        // The operator may approve a root-owned socket by naming it (--db-socket).
+        let mut p = p0.clone();
+        let named = DbApproved { socket: Some("/run/dbus/system_bus_socket".into()), ..DbApproved::default() };
+        resolve_db(&mut p, Some("localhost:/run/dbus/system_bus_socket"), &[], &named, &|_, approved| if approved { Ok(()) } else { Err("x".into()) }).expect("ok");
+        assert_eq!(p.sockets.len(), 1, "approved by root's configuration");
+        // A hostile DB_HOST at Redis (127.0.0.1:6379), or any other loopback port: no database.
+        for h in ["127.0.0.1:6379", "127.0.0.1:2375", "[::1]:9000", "127.0.0.1:3307"] {
+            let mut p = p0.clone();
+            let said = resolve_db(&mut p, Some(h), &[], &none, ok).expect("ok").expect("said");
+            assert!(said.contains("isn't MySQL's") && said.contains("the guest gets no database"), "{h}: {said}");
+            assert!(no_db(&p), "{h}: {p:?}");
+        }
+        // MySQL's own ports on the loopback, and exactly what --db-address names.
+        for (h, want) in [("127.0.0.1", "127.0.0.1:3306"), ("127.0.0.1:33060", "127.0.0.1:33060"), ("[::1]:3306", "[::1]:3306")] {
+            let mut p = p0.clone();
+            let said = resolve_db(&mut p, Some(h), &[], &none, ok).expect("ok").expect("said");
+            assert!(said.contains("as the pool user"), "{said}");
+            assert_eq!(p.addresses, [(3306, want.to_owned())], "{h}");
+        }
+        let mut p = p0.clone();
+        let addr = DbApproved { address: Some("10.0.0.5:3307".into()), ..DbApproved::default() };
+        resolve_db(&mut p, Some("10.0.0.5:3307"), &[], &addr, ok).expect("ok");
+        assert_eq!(p.addresses, [(3306, "10.0.0.5:3307".to_owned())], "the address root's configuration names");
+        // Another host, or no DB_HOST: an egress port still, never a guess at the loopback.
+        for h in [Some("db.example.com"), None] {
+            let mut p = p0.clone();
+            let said = resolve_db(&mut p, h, &[], &none, ok).expect("ok").expect("said");
+            assert!(said.contains("by name") || said.contains("only public names"), "{said}");
+            assert!(no_db(&p));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mysql_socket_is_trusted_only_from_root_or_the_database() {
+        // Run as root (the check target is): owners are set here.
+        // SAFETY: geteuid(2) takes nothing.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        // Below / itself: the system temp folder is 1777, and the rule refuses anything under it.
+        let dir = Path::new("/").join(format!("sc-dbsock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let d = dir.join("mysqld");
+        fs::create_dir_all(&d).expect("dir");
+        let chown = |p: &Path, u: u32, g: u32| std::os::unix::fs::chown(p, Some(u), Some(g)).expect("chown");
+        let chmod = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).expect("chmod");
+        chown(&dir, 0, 0);
+        chmod(&dir, 0o755);
+        let sock = d.join("mysqld.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        // Control: the same socket under the system temp folder (1777 above it) is refused.
+        let tmp = std::env::temp_dir();
+        if fs::metadata(&tmp).is_ok_and(|m| m.mode() & 0o002 != 0) {
+            let t = tmp.join(format!("sc-dbsock-{}.sock", std::process::id()));
+            let _ = fs::remove_file(&t);
+            let _lt = std::os::unix::net::UnixListener::bind(&t).expect("bind");
+            assert!(trusted_db_socket(&t, None, true).is_err(), "a socket in a folder anyone may write, even approved");
+            let _ = fs::remove_file(&t);
+        }
+        chown(&d, 999, 999);
+        chmod(&d, 0o755);
+        chown(&sock, 999, 999);
+        assert_eq!(trusted_db_socket(&sock, Some((999, 999)), false), Ok(()), "the database's socket in its own folder");
+        assert!(trusted_db_socket(&sock, None, false).is_err(), "no database user known");
+        chown(&sock, 1234, 1234);
+        assert!(trusted_db_socket(&sock, Some((999, 999)), false).expect_err("another user's").contains("owned by uid 1234"));
+        // Root's socket (D-Bus's, say): never because a site names it; only when the operator does.
+        chown(&sock, 0, 0);
+        assert!(trusted_db_socket(&sock, Some((999, 999)), false).expect_err("root's, not approved").contains("--db-socket"));
+        assert_eq!(trusted_db_socket(&sock, Some((999, 999)), true), Ok(()), "root's, approved by --db-socket");
+        chown(&sock, 999, 999);
+        chmod(&d, 0o777);
+        assert!(trusted_db_socket(&sock, Some((999, 999)), false).expect_err("a folder anyone may write").contains("may be written"));
+        chmod(&d, 0o775);
+        chown(&d, 999, 1234);
+        assert!(trusted_db_socket(&sock, Some((999, 999)), false).is_err(), "group-writable by another group");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pool_takes_connections_only_from_whom_it_lists() {
+        let a = Admit::Addresses(vec!["127.0.0.1".parse().unwrap(), "10.0.0.5".parse().unwrap()]);
+        assert!(a.tcp("127.0.0.1".parse().unwrap()) && a.tcp("10.0.0.5".parse().unwrap()));
+        assert!(!a.tcp("10.0.0.6".parse().unwrap()), "an address the pool doesn't list");
+        assert!(a.tcp("::ffff:127.0.0.1".parse().unwrap()), "a v4-mapped peer is its v4 address");
+        let u = Admit::Users { uids: vec![33], gids: vec![101], members: vec![1500] };
+        assert!(u.unix(33, 5) && u.unix(7, 101) && u.unix(1500, 7) && u.unix(0, 0));
+        assert!(!u.unix(1234, 1234), "a user the ACLs don't list");
+        assert!(Admit::Any.tcp("192.0.2.1".parse().unwrap()) && Admit::Any.unix(1, 1));
+        // --listen keeps the pool's rule, or refuses: never drops it.
+        let (tcp, unix) = (Listen::Tcp("127.0.0.1:9000".into()), Listen::Unix("/run/x.sock".into()));
+        assert_eq!(listen_admit(&tcp, &a), Ok(a.clone()));
+        assert_eq!(listen_admit(&unix, &u), Ok(u.clone()));
+        assert!(listen_admit(&unix, &a).expect_err("allowed_clients on a unix socket").contains("allowed_clients"));
+        assert!(listen_admit(&tcp, &u).expect_err("ACLs on TCP").contains("acl_users"));
+        assert_eq!(listen_admit(&tcp, &Admit::Any), Ok(Admit::Any));
+        assert!(jail::bind_socket_only(Path::new("/run")) && jail::bind_socket_only(Path::new("/tmp/")) && jail::bind_socket_only(Path::new("/")));
+        assert!(!jail::bind_socket_only(Path::new("/run/mysqld")), "a socket's own folder is bound as a folder");
+    }
+
+    #[test]
+    fn only_this_sites_pools_run_here() {
+        let pool = |name: &str, k: &str, v: &str| {
+            let mut c = crate::phpconf::FpmConfig::default();
+            c.add("/p.conf", &format!("[{name}]\n{k} = {v}\n"));
+            c.pools.remove(0)
+        };
+        let root = Path::new("/var/lib/docker/volumes/site/_data");
+        assert!(pool_is_this_site(&pool("a", "chdir", "/var/www/html"), root, "/var/www/html", false).is_ok(), "the guest's root");
+        assert!(pool_is_this_site(&pool("a", "php_admin_value[doc_root]", "/var/lib/docker/volumes/site/_data/public"), root, "/var/www/html", false).is_ok());
+        assert!(pool_is_this_site(&pool("a", "prefix", "/var/www/$pool"), root, "/var/www/a", false).is_ok(), "$pool replaced");
+        let e = pool_is_this_site(&pool("b", "chdir", "/srv/other-site"), root, "/var/www/html", false).expect_err("another site");
+        assert!(e.contains("pool [b] serves another site (/srv/other-site)"), "{e}");
+        assert!(pool_is_this_site(&pool("c", "pm", "static"), root, "/var/www/html", true).is_ok(), "php-fpm's only pool, naming no site");
+        assert!(pool_is_this_site(&pool("c", "pm", "static"), root, "/var/www/html", false).is_err(), "one of several naming no site");
+        assert!(pool_is_this_site(&pool("d", "chdir", "/var/www/html2"), root, "/var/www/html", false).is_err(), "a sibling with a common prefix");
+    }
+
+    #[test]
+    fn a_start_keeps_a_margin_free() {
+        let gib = 1u64 << 30;
+        assert_eq!(space_margin(10 * gib), gib, "at least 1 GiB");
+        assert_eq!(space_margin(100 * gib), 5 * gib, "a twentieth");
+        let needs = vec![("site disk".to_owned(), gib / 4), ("PHP layer".to_owned(), gib / 4), ("snapshot".to_owned(), gib / 2)];
+        assert!(space_ok(&needs, 3 * gib, 10 * gib).is_ok());
+        let e = space_ok(&needs, gib + gib / 2, 10 * gib).expect_err("1 GiB of disks and 1 GiB of margin in 1.5 GiB");
+        assert!(e.contains("needs 1024 MiB") && e.contains("site disk 256 MiB, PHP layer 256 MiB, snapshot 512 MiB") && e.contains("keeps 1024 MiB free"), "{e}");
+    }
+
+    #[test]
+    fn a_pool_has_a_state_folder_and_jail_of_its_own() {
+        let dir = scratch("pools");
+        let l = loaded(&dir, r#"{"isolation":"microvm","network":{"connect":[]}}"#);
+        let e = plan(&l, &opts()).expect_err("no bind port and no pool listen");
+        assert!(e.contains("the pool has no listen"), "{e}");
+        let hints = PoolHints { user: Some(User { uid: 1234, gid: 1235 }), listen: Some(Listen::Unix("/run/php/www.sock".into())), listen_mode: None, admit: Admit::Any };
+        let mut o = opts();
+        o.pool_user = None;
+        let p = plan_with(&l, &o, &hints, false).expect("plan");
+        assert_eq!(p.pool, User { uid: 1234, gid: 1235 }, "the pool's user");
+        assert_eq!(p.listen, Listen::Unix("/run/php/www.sock".into()), "where the pool listens");
+        assert_eq!(p.state, p.cache);
+        o.pool = Some("admin".into());
+        o.listen = Some(Listen::Tcp("127.0.0.1:9100".into()));
+        let q = plan_with(&l, &o, &hints, false).expect("plan");
+        assert_eq!(q.state, p.cache.join("pool-admin"), "below the site's");
+        assert_ne!(q.id, p.id);
+        assert_eq!(q.listen, Listen::Tcp("127.0.0.1:9100".into()), "--listen wins");
+        assert_eq!(plan_with(&l, &opts(), &hints, false).expect("plan").pool, User { uid: 33, gid: 33 }, "--pool-user wins");
+        for bad in ["", "../x", ".hidden", "a b", &"x".repeat(33)] {
+            assert!(pool_dir_name(bad).is_err(), "{bad:?}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_plan_maps_layer1_onto_disks_tmpfs_and_forwards() {
         let dir = scratch("plan");
         let l = loaded(
@@ -2736,7 +3827,10 @@ mod tests {
             r#"{"isolation":"microvm","write":["wp-content/uploads","/tmp","/var/cache/sc"],"deny":["/srv/backups"],
                 "network":{"bind":[{"port":9000}],"connect":[{"port":3306,"socket":"/run/mysqld/mysqld.sock"},{"port":6379,"address":"10.0.0.5:6379"},{"port":443}]}}"#,
         );
-        let p = plan(&l, &opts()).expect("plan");
+        let mut p = plan(&l, &opts()).expect("plan");
+        // A forwarded 3306 is PHP's `localhost` too: sockets in the guest.
+        assert_eq!(resolve_db(&mut p, None, &[], &DbApproved::default(), &|_, _| Err("never asked".into())), Ok(None), "3306 has its socket: nothing to decide");
+        assert_eq!(p.guest_socks, [(3306, "/run/mysqld/mysqld.sock".to_owned())]);
         assert_eq!(p.disks.len(), 1);
         assert_eq!(p.disks[0].guest, "/var/www/html/wp-content/uploads", "a folder in the root, at the guest root");
         assert_eq!(p.disks[0].host, dir.join("wp-content/uploads"));
@@ -2744,7 +3838,7 @@ mod tests {
         assert_eq!(p.sockets, [(3306, PathBuf::from("/run/mysqld/mysqld.sock"))]);
         assert_eq!(p.addresses, [(6379, "10.0.0.5:6379".to_owned())]);
         assert_eq!(p.egress, [443], "no socket or address: named hosts through the host");
-        assert!(boot_args(&p, &opts(), &[]).contains(" sc.egress=443"), "the guest learns its egress ports");
+        assert!(boot_args(&p, &opts(), &[], "/usr/local/sbin/php-fpm").contains(" sc.egress=443"), "the guest learns its egress ports");
         let e = plan(
             &loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"connect":[{"port":1517,"address":"10.0.0.1:1"}]}}"#),
             &opts(),
@@ -2754,7 +3848,8 @@ mod tests {
         assert_eq!(p.listen, Listen::Tcp("127.0.0.1:9000".into()), "the first bind port, on loopback");
         assert!(p.state.starts_with(DEFAULT_STATE_DIR));
         assert!(p.id.starts_with("sc-") && p.id.len() == 19, "{}", p.id);
-        let args = boot_args(&p, &opts(), &["WORDPRESS_DB_PASSWORD"]);
+        let args = boot_args(&p, &opts(), &["WORDPRESS_DB_PASSWORD"], "/usr/sbin/php-fpm8.3");
+        assert!(args.contains(" sc.fpm=/usr/sbin/php-fpm8.3") && args.contains(" init=/sc/securecore-init "), "the host's php-fpm, under the base's init: {args}");
         assert!(args.contains(" sc.env=WORDPRESS_DB_PASSWORD"), "the names, for php-fpm's placeholders at boot: {args}");
         assert!(args.contains(" sc.root=/var/www/html") && args.contains(" sc.ports=3306,6379"), "{args}");
         assert!(args.contains(&format!(" sc.proto={PROTOCOL} ")), "the guest learns the protocol it was booted for: {args}");
@@ -2767,7 +3862,7 @@ mod tests {
         assert_eq!(msg[1], Ctl::Entropy { hex: "07".repeat(64) }, "then fresh randomness");
         assert_eq!(msg[2], Ctl::Env { name: "WORDPRESS_DB_PASSWORD".into(), hex: hex(b"s3cret") }, "then php-fpm's environment");
         assert_eq!(msg[3], Ctl::Refresh, "a restore replaces the workers forked before the snapshot");
-        assert_eq!(msg[4], Ctl::Mount { device: "/dev/vdc".into(), path: "/var/www/html/wp-content/uploads".into() });
+        assert_eq!(msg[4], Ctl::Mount { device: "/dev/vde".into(), path: "/var/www/html/wp-content/uploads".into() }, "after the base, PHP, config and site");
         assert_eq!(msg[5], Ctl::Tmpfs { path: "/var/cache/sc".into() });
         assert_eq!(msg.last(), Some(&Ctl::Done));
         assert!(!start_message(&p, false, [7; 64], &env, None).contains(&Ctl::Refresh), "a cold boot's workers are fresh");
@@ -2831,8 +3926,10 @@ mod tests {
         fs::write(dir.join("index.php"), "<?php echo 2;").expect("write");
         assert_ne!(site_sha256(&dir, &skip).expect("sha").0, a, "an edit is");
         let files = Key0 { firecracker: "f".into(), jailer: "j".into(), kernel: "k".into(), rootfs: "r".into() };
-        let k = Key { files: files.clone(), site: "s".into(), config: "c".into(), machine: "m".into() };
+        let k = Key { files: files.clone(), php: "p".into(), conf: "i".into(), site: "s".into(), config: "c".into(), machine: "m".into() };
         for changed in [
+            Key { php: "p2".into(), ..k.clone() },
+            Key { conf: "i2".into(), ..k.clone() },
             Key { files: Key0 { kernel: "k2".into(), ..files.clone() }, ..k.clone() },
             Key { files: Key0 { rootfs: "r2".into(), ..files.clone() }, ..k.clone() },
             Key { files: Key0 { jailer: "j2".into(), ..files.clone() }, ..k.clone() },

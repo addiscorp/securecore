@@ -980,6 +980,201 @@ that a key learned in one restored guest is worthless in the next. An audit trai
 survive a compromised guest has to be kept outside it: the host's egress, sync and database
 logs are the launcher's own.
 
+## The guest is the host's own PHP (#101)
+
+Sami decided on 12 Nov that the microVM adapts to the host: the guest runs the host's own
+php-fpm, extensions and settings, not a fixed PHP image. `ext/fpm/src/capture.rs` captures them
+at every start (and reuses the last capture when nothing it read changed), `pkgdb.rs` reads the
+host's package database, and `phpconf.rs` parses php.ini and php-fpm's config.
+
+```
+vda  rootfs.ext4  the SecureCore base (the release's, sha256 in installed.json): /sc/securecore-init
+                  (static), /sc/libsc-vsock-connect.so, /sc/warm.php, empty mount points; nothing else
+vdb  php-<key>.ext4   the host's php-fpm, every extension in its extension folder, the libraries
+                  they load, /bin/sh, sendmail, ImageMagick and ghostscript when present, their data
+                  (CA certificates, ImageMagick's modules…); mounted at /sc/php, and each top-level
+                  folder bound onto the base's (/sc/php/usr → /usr; /lib64 → usr/lib64 follows the
+                  host's own link)
+vdc  conf-<key>.ext4  php.ini, the scan folder's files, and php-fpm.conf for this pool; at /sc/conf
+vdd  site, vde… the writable folders (as before)
+```
+
+**What is captured.** php-fpm (`--php-fpm`, a path or a name on the usual PATH), every `.so` in its
+extension folder (`php-fpm -n -i`, run as nobody once php-fpm and its libraries are checked; a
+config's `extension_dir` wins), every `.so` a config names by path inside PHP's own folders, and
+for each of these the libraries the host's own loader lists (`ld.so --list`, glibc or musl). The
+helpers PHP runs, when the host has them: `/bin/sh` (exec, popen, proc_open), sendmail
+(`sendmail_path`), `convert`/`magick` and `gs`; with ImageMagick, its module and config folders
+(its coders are loaded by name, not by the linker); with ghostscript, its resources. Data:
+`ld.so.cache`, `passwd`/`group` (never `shadow`), the CA certificates, `openssl.cnf`,
+`localtime`. Never anything under `/etc/ssl/private`.
+
+**What is checked** (Sami: in case the host is compromised):
+- **Package checksums.** A file a package installed must match its package manager's record:
+  dpkg's md5sums, apk's SHA-1 (`Z:Q1…`), rpm's file digests (SHA-256 on current distributions; the
+  host's `rpm -qa` reads the database, chrooted, as nobody). A merged `/usr` is looked up both ways.
+- **Ownership.** Every file root's and writable by no one else (its group only when that is
+  root's), in folders that are the same all the way from `/`.
+- **Links.** On the way to a binary or library: a top-level link (`/lib64` → `usr/lib64`) or a
+  merged `/usr`'s own (`/usr/sbin` → `bin`), a link a package installed, or the package manager's
+  alternatives. A link no package installed (ldconfig's soname links, busybox's applets) is
+  allowed only when it leads to a file a package installed whose checksum matches: an unpackaged
+  file is never reached through one.
+- **Configs under `/etc`** that the data includes (`passwd`, `group`) are held to the ownership
+  rules only, as configs are: rpm records `/etc/passwd`'s checksum as installed. In data folders and configs a link is followed and what it
+  points at is checked as a file of its own (and copied, so the guest has no link there).
+- **Configs.** php.ini, the scan folder (`PHP_INI_SCAN_DIR` as php-fpm reads it), php-fpm's
+  config and its includes: the same ownership rules, parsed, and refused when `extension` or
+  `zend_extension` names native code outside the captured set, or `auto_prepend_file`,
+  `auto_append_file` or `opcache.preload` (in php.ini or a pool's `php_*_value`) runs a PHP file
+  outside the app root.
+- **The bytes that boot.** Each file is hashed as it is read, and the copy that goes into the
+  disk is hashed again (a file changed in between is refused).
+
+Any failure is one line naming the file, and the launcher refuses (`microvm`, exit 125) or falls
+back (`auto`):
+
+```
+securecore-fpm: /var/www/html/securecore.json: layer1.isolation is "microvm" but the microVM can't run here (the host's PHP can't be captured: /usr/lib/x86_64-linux-gnu/libxml2.so.2.9.14: its bytes don't match what dpkg recorded for libxml2 (Md5 …, the file's is …): it changed after its package installed it). …
+… (the host's PHP can't be captured: /usr/local/lib/php/extensions/no-debug-non-zts-20230831/sockets.so: the file is owned by 1234:0 with mode 644; everything captured must be root's and writable by no one else)
+… (the host's PHP can't be captured: /usr/local/etc/php/conf.d/zz-sc101-evil.ini:1: extension = /opt/sc101/evil.so loads native code from outside the captured set (…))
+```
+
+**The manifest.** `<state>/capture-manifest.json`, root's, 0600: every entry's path, where its
+bytes came from, owner, mode, sha256 and source (`dpkg:libxml2`, `unpackaged (root-owned)`,
+`config`…). A capture that differs from the last logs what changed
+(`capture: 1 entries changed since the last capture: /usr/local/etc/php/conf.d/zz-sc101.ini`).
+
+**Caching.** The PHP layer is keyed by the sha256 of every captured entry (path, mode, owner,
+sha256, link target) and the guest's mount points; the config layer by its files' sha256s; the
+snapshot's key holds both. A start where nothing the last capture read has changed (each path
+stat'ed: device, inode, size, mtime, ctime, mode, owner) reuses it without hashing anything. A
+php.ini edit rebuilds only the config layer (a few KiB) and the snapshot.
+
+**One VM per pool** (#100 review). Each pool in php-fpm's config gets a microVM, each a launcher
+of its own (`--pool <name>`, state in `<state>/pool-<name>/`, the PHP layer shared):
+- it listens where the pool says (`listen`, with `listen.owner`, `listen.group` and `listen.mode`;
+  `$pool` replaced), so nginx needs no change; `--listen` still wins for a single pool;
+- its php-fpm runs as the pool's `user`/`group` (`--pool-user` wins);
+- the guest's pool carries `pm`, `pm.*`, `env[]`, `php_value`/`php_flag`/`php_admin_value`/
+  `php_admin_flag`, `clear_env`, `request_terminate_timeout`, `rlimit_*`,
+  `security.limit_extensions` and `catch_workers_output` over, and leaves out what names the host's
+  paths (logs, slowlog, chroot, chdir; the launcher logs which). `env[X] = $NAME` delivers `NAME`
+  from the launcher's environment, as php-fpm's master on the host would read it;
+- the first launcher tells systemd it is ready once every pool's VM serves, passes stop and reload
+  signals on, and stops them all when one stops. Its wait has a deadline (`--pools-ready-within`,
+  300 s); a stop signal during it is taken at once. Stopping the pools' launchers is SIGTERM, up
+  to 10 s, then SIGKILL, and each is reaped. A pool's own launcher never falls back by itself: the
+  first one decides for the whole config. Every Firecracker API call has a 60 s timeout.
+- `--listen` keeps the pool's `allowed_clients` or ACLs, and refuses when they can't apply to its
+  kind of socket.
+
+Several pools of one site share its writable folders; each VM syncs its own disk with them.
+
+**Every check before `auto` commits** (#100 review). Everything a start does before the boot now
+happens before the choice: the host checks, the capture and its validation, the pool's user and
+sockets, the vault's env sources and the pool's `env[]`, `claim_state`, the space every new disk
+and the snapshot need (with a margin: a twentieth of the filesystem and at least 1 GiB stays
+free, for the database), the PHP and config layers, the site disk (copied as the pool user) and
+the writable disks. So `auto` falls back on any of them with the reason. And a VM `auto` chose
+that then fails before it serves anything (its boot, its listening socket) falls back to gelada
+too (`layer 1 isolation auto: gelada, because the microVM failed before it served (…)`);
+`microvm` still exits 125.
+
+**A bare 3306 and `localhost`** (#100 and #102 reviews, and Sami's decision on the second's
+verification). A `{ "port": 3306 }` with no socket or address: the site's own `DB_HOST` is only a
+hint for which target the operator approved to use, never a target of its own, because the
+launcher is root and a site must not point it at Redis, D-Bus or another pool's php-fpm. The
+launcher reads `DB_HOST` from `wp-config.php` (a literal, or the official image's
+`getenv_docker('WORDPRESS_DB_HOST', …)` from its own environment; comments are skipped, and two
+defines that disagree are no answer):
+- `localhost` (or `localhost:/path`): that socket, PHP's default socket
+  (`mysqli.default_socket`, `pdo_mysql.default_socket`), or MySQL's standard places, never `/tmp`.
+  The socket must be the database user's (`--db-user`, `mysql`, else `mariadb`), in folders only
+  root or that user may write, or exactly the one `--db-socket` names (then root's is accepted);
+- TCP: MySQL's own ports on the loopback (3306, 33060 for the X protocol), or exactly the
+  host:port `--db-address` names. The connection is made as the pool user (`--egress-connect`), so
+  the host's uid-based firewall rules apply, never as root;
+- anything else, or a `DB_HOST` the launcher can't read: the guest gets no database on 3306 (it
+  stays an egress port, public names only), and the launcher says why. The start still serves.
+
+A socket in its own folder is bind-mounted into the jail with that folder; a socket directly in a
+folder services share (`/`, `/run`, `/var/run`, `/tmp`, `/var/tmp`, `/dev`, `/dev/shm`) is
+bind-mounted alone, never the folder. This holds for `connect[].socket` entries too.
+
+Whatever 3306 reaches, the guest has a unix socket at each of PHP's default sockets, the host
+socket's own path and `/run/mysqld/mysqld.sock`, so `DB_HOST=localhost` works as on the host.
+
+**Who may connect** (#102 review). A pool's `listen = 9000` binds `127.0.0.1:9000`, never every
+address (only a pool that names one, `0.0.0.0:9000`, gets that). `listen.allowed_clients` is
+enforced on every TCP connection; `listen.acl_users` and `listen.acl_groups` on a unix socket
+(the socket is then 0666 and each connection's peer credentials are checked, root always
+admitted). Refusals are logged (the first five, then every thousandth).
+
+**Only this site's pools** (#102 review, Sami's decision). A microVM holds one site's files, so
+only pools whose `chdir`, `doc_root` or `prefix` is this app root (or inside it, on the host or as
+the guest sees it) run here; php-fpm's only pool may name none. Any other pool refuses the whole
+config (`pool [X] serves another site (…)`), and `auto` falls back to gelada once. All pools of
+one site share its writable folders (each VM syncs its own disk with them), so they must be of one
+trust level.
+
+**Unpackaged files** (#102 review, Sami's decision: trust on first use). The installer records the
+sha256 of every captured file no package's checksum covers (a compiled php-fpm, PECL extensions,
+`securecore.so`) in `/var/lib/securecore/unpackaged.json` (root's, 0600;
+`securecore-fpm --check-capture --write-record`), and every capture checks them against it: one
+that differs or isn't recorded is refused, naming it (`run the installer again` after an
+upgrade). What lives in `/etc` (`hostname`, `hosts`, generated certificate bundles) differs from
+host to host and changes in normal use, so it is held to the ownership rules only, as configs are.
+The installer is the only writer: a start without a record refuses (`run the installer to record
+unpackaged files`), so `auto` runs gelada and `microvm` exits 125. `--unpackaged-record` names
+another file.
+
+**Parsing as PHP does** (#102 review). A value with two quoted strings (PHP joins them), or text
+after a quoted string other than a comment, is refused with its file and line rather than
+guessed; `\"` and `\\` in double quotes are read as PHP reads them. Pool settings go into the
+guest's config byte for byte as the host's file has them. `ffi.preload` is refused unless every
+file it names is captured. Data files are captured only when everyone may read them (a 0600 key
+beside the certificates stays out). dpkg's diversions are followed; rpm's SHA-224 and SHA-384
+digests are checked, and an algorithm the capture can't compute refuses the file. rpm itself must
+pass the ownership rules before it runs, and its package's checksum after.
+
+**A long first start** (#100 review). Under systemd (`NOTIFY_SOCKET`), the launcher sends
+`EXTEND_TIMEOUT_USEC=30000000` every 10 s from the moment it starts preparing until the VM serves,
+and `STATUS=` lines for each step, so a first capture, disk build and snapshot never run into
+`TimeoutStartSec`.
+
+**A program PHP runs that the guest lacks** is logged: the preload hooks `execve`, `execv` and
+`execvp`, and one that fails with ENOENT for a name on no PATH folder writes
+`securecore-guest: <name> isn't in the guest: the host had no such program to capture (PHP tried
+to run <path>)` to the worker's stderr, which reaches the launcher's log.
+
+**Proved on other package managers** (`test/ext-capture.sh`): Debian trixie (php8.4-fpm, dpkg),
+Alpine 3.22 (php84-fpm, apk, musl's loader) and Fedora 42 (php-fpm, rpm) capture their own
+distribution's PHP, and refuse it, naming the file, once a packaged `opcache.so` has a byte
+appended, once it isn't root's, and once a config loads a `.so` from `/opt`.
+
+**Measured on [xps]** (the `test/ext-microvm.sh` stack: WordPress's php8.3-fpm image, PHP 8.3.36,
+its libraries dpkg's; launcher log figures, "started … after launch"):
+
+| start | what it did | to ready |
+|---|---|---|
+| first build (empty state) | capture 2.7 s, PHP layer 2.0 s, config layer 23 ms, site disk 0.6 s, two writable disks, cold boot + warm-up + snapshot 1.1 s, restore | 8.3 s |
+| after a PHP package upgrade (`zlib1g` 1.3.1-1+b1 → +deb13u1 from trixie-security) | capture 2.7 s, PHP layer 1.8 s, a new site disk 0.6 s (the config differed too), snapshot 1.4 s | 7.3 s |
+| a php.ini-only change | capture 2.7 s, config layer 23 ms, snapshot 1.2 s, restore | 4.6 s |
+| a normal restore | the capture reused (every path stat'ed), restore 25 ms | 0.26–0.28 s |
+
+What is captured there: 1135 files (201 MiB) and 119 links, 1116 of the files checked against
+dpkg's records and 19 unpackaged and root-owned (php-fpm, `php`, the extensions,
+`securecore.so`), 19 configs, one pool. The PHP layer is a 283 MiB image (188 MiB on disk), the
+config layer a few KiB, and the base `rootfs.ext4` 37 MiB (8 MiB used) instead of 1110 MiB.
+Most of the PHP layer is ghostscript's resources and ImageMagick's libraries; gd, imagick and
+intl bring their own (libavif, libgomp, ICU).
+
+**Limits.** glibc's gconv modules aren't captured (PHP's iconv then has glibc's built-in
+charsets). Fonts ghostscript finds through fontconfig aren't either. A dpkg diversion isn't
+followed. The preload is built against glibc 2.36, so a musl host (Alpine) captures and validates
+but doesn't boot until a musl preload ships.
+
 ## Follow-up issues (not filed)
 
 1. **mirab: Landlock and seccomp in the x86_64 guest kernel.** Add `SECURITY`,

@@ -19,22 +19,28 @@ namespace SecureCore\Layer3;
 
 final class State
 {
-    /** True once forked into a child: the database is closed to it. */
+    /** True once forked into a child: $wpdb is the database gateway from then on. */
     public static bool $child = false;
     public static string $slug = '';
     /** @var array<int, callable> id => the plugin's callback */
     public static array $callbacks = [];
     public static int $next = 1;
-    /** @var array<string, true> queries already logged as refused in this child */
-    public static array $refused = [];
 }
 
-/** A $wpdb with no connection: during the zygote's boot it serves wp_load_alloptions() from the
- *  snapshot and answers everything else empty; in a child it refuses every query. */
+/** A $wpdb with no connection (and no credential). During the zygote's boot it serves
+ *  wp_load_alloptions() from the snapshot and answers everything else empty. In a child it is
+ *  the database gateway (#94): each query goes to the php-fpm worker, which runs it on its own
+ *  connection under layer 2's policy, charged to this plugin, and answers with what its $wpdb
+ *  saw. Everything else (get_results, get_row, get_var, get_col, prepare, insert, update,
+ *  delete, replace, dbDelta) is wpdb's own code, on top of query(). */
 function make_wpdb(string $prefix, array $options): \wpdb
 {
     return new class($prefix, $options) extends \wpdb {
         private array $snapshot;
+        private string $server_info = '8.0.0';
+        private string $version = '8.0.0';
+        /** @var list<string> the last result's column names (get_col_info('name')) */
+        private array $col_names = [];
 
         public function __construct(string $prefix, array $options)
         {
@@ -46,15 +52,74 @@ function make_wpdb(string $prefix, array $options): \wpdb
             $this->snapshot = $options;
         }
 
+        /** In the child: the worker's connection facts (never a credential). */
+        public function become_gateway(array $facts): void
+        {
+            $this->charset = (string) ($facts['charset'] ?? '');
+            $this->collate = (string) ($facts['collate'] ?? '');
+            $this->version = (string) ($facts['db_version'] ?? '') ?: '8.0.0';
+            $this->server_info = (string) ($facts['db_server_info'] ?? '') ?: $this->version;
+            $this->snapshot = [];
+        }
+
         public function query($query)
         {
-            $this->flush();
-            $this->last_query = (string) $query;
-            if (State::$child) {
-                refused_query((string) $query);
+            if (!State::$child) {
+                $this->flush();
+                $this->last_query = (string) $query;
+                return false;
             }
-            return false;
+            // As wpdb::query(): the plugin's own `query` filters run here, the worker's there.
+            $query = apply_filters('query', $query);
+            if (!$query) {
+                $this->insert_id = 0;
+                return false;
+            }
+            $this->flush();
+            $this->func_call = "\$db->query(\"$query\")";
+            $this->last_query = (string) $query;
+            ++$this->num_queries;
+            $answer = \securecore_layer3_db((string) $query);
+            $a = is_string($answer) ? unserialize($answer, ['allowed_classes' => false]) : null;
+            if (!is_array($a)) {
+                $this->insert_id = 0;
+                $this->last_error = 'securecore: the database gateway did not answer';
+                return false;
+            }
+            $this->last_error = (string) ($a['error'] ?? '');
+            $this->rows_affected = (int) ($a['affected'] ?? 0);
+            // Only an INSERT/REPLACE sets it, as in wpdb::query().
+            if (array_key_exists('insert_id', $a)) $this->insert_id = (int) $a['insert_id'];
+            $this->col_names = is_array($a['cols'] ?? null) ? array_values($a['cols']) : [];
+            $keys = is_array($a['keys'] ?? null) ? array_values($a['keys']) : [];
+            $this->last_result = [];
+            foreach (is_array($a['rows'] ?? null) ? $a['rows'] : [] as $row) {
+                if (!is_array($row) || count($row) !== count($keys)) continue;
+                $this->last_result[] = (object) array_combine($keys, array_values($row));
+            }
+            $this->num_rows = (int) ($a['num_rows'] ?? count($this->last_result));
+            $ret = $a['ret'] ?? false;
+            return is_int($ret) || is_bool($ret) ? $ret : false;
         }
+
+        /** Escapes as mysqli_real_escape_string() does on a utf8mb4 (any ASCII-compatible)
+         *  connection, so the worker receives the same text the plugin would send unisolated.
+         *  Layer 2 refuses the charsets where this would differ. */
+        public function _real_escape($data)
+        {
+            if (!is_scalar($data)) return '';
+            $escaped = strtr((string) $data, ["\\" => "\\\\", "\0" => "\\0", "\n" => "\\n", "\r" => "\\r", "'" => "\\'", '"' => '\\"', "\x1a" => "\\Z"]);
+            return $this->add_placeholder_escape($escaped);
+        }
+
+        public function get_col_info($info_type = 'name', $col_offset = -1)
+        {
+            // Names only: the rest of mysqli's field metadata does not cross (see ext/README.md).
+            if ($info_type !== 'name' || $this->col_names === []) return null;
+            return $col_offset === -1 ? $this->col_names : ($this->col_names[$col_offset] ?? null);
+        }
+
+        protected function load_col_info() {}
 
         public function get_results($query = null, $output = OBJECT)
         {
@@ -68,30 +133,11 @@ function make_wpdb(string $prefix, array $options): \wpdb
             return parent::get_results($query, $output);
         }
 
-        public function _real_escape($data)
-        {
-            if (!is_scalar($data)) return '';
-            return $this->add_placeholder_escape(addslashes((string) $data));
-        }
-
-        public function db_version() { return '8.0.0'; }
-        public function db_server_info() { return '8.0.0'; }
-        public function get_col_info($info_type = 'name', $col_offset = -1) { return []; }
+        public function db_version() { return $this->version; }
+        public function db_server_info() { return $this->server_info; }
         public function check_connection($allow_bail = true) { return true; }
         public function close() { return true; }
-
-        /** The child keeps none of the snapshot (#47): it only carried the boot. */
-        public function drop_snapshot(): void { $this->snapshot = []; }
     };
-}
-
-function refused_query(string $sql): void
-{
-    $sql = preg_replace('/\s+/', ' ', trim($sql));
-    if (strlen($sql) > 160) $sql = substr($sql, 0, 160) . '...';
-    if (isset(State::$refused[$sql])) return;
-    State::$refused[$sql] = true;
-    error_log('securecore: layer3 plugin:' . State::$slug . ' database refused (not yet available to an isolated plugin): ' . $sql);
 }
 
 /** Objects and resources don't cross to the worker yet: they become null. */
@@ -207,7 +253,8 @@ remove_all_filters('stylesheet_directory');
 $request = \securecore_layer3_zygote();
 State::$child = true;
 State::$slug = $request['slug'];
-$GLOBALS['wpdb']->drop_snapshot();
+// The child keeps none of the snapshot (#47): it only carried the boot.
+$GLOBALS['wpdb']->become_gateway($request);
 @ini_set('memory_limit', $request['memory_mb'] . 'M');
 // The plugin loads at global scope, as wp-settings.php loads it (its top-level variables are
 // globals), with its output captured.

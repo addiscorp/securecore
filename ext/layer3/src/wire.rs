@@ -248,13 +248,39 @@ pub struct Hello {
     pub snapshot_sha: String,
     /// sha256 of the worker's live securecore.json: the child reloads when it differs.
     pub config_sha: String,
+    /// The worker's connection facts the child's `$wpdb` reports without a connection (no
+    /// credential: no host, user, password or database name).
+    pub db: DbFacts,
 }
 
-const HELLO_MAGIC: &str = "securecore-layer3/1";
+/// What `$wpdb` knows about its connection that WordPress and plugins read without querying:
+/// `$wpdb->charset` / `collate` (`get_charset_collate()`, dbDelta), `db_version()` (`has_cap()`)
+/// and `db_server_info()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DbFacts {
+    pub charset: String,
+    pub collate: String,
+    pub version: String,
+    pub server_info: String,
+}
+
+const HELLO_MAGIC: &str = "securecore-layer3/2";
 
 impl Hello {
     pub fn encode(&self) -> Result<Vec<u8>, String> {
-        let fields = [&self.slug, &self.file, &self.abspath, &self.prefix, &self.snapshot_sha, &self.config_sha];
+        let d = &self.db;
+        let fields = [
+            &self.slug,
+            &self.file,
+            &self.abspath,
+            &self.prefix,
+            &self.snapshot_sha,
+            &self.config_sha,
+            &d.charset,
+            &d.collate,
+            &d.version,
+            &d.server_info,
+        ];
         if let Some(bad) = fields.iter().find(|f| f.contains('\n') || f.contains('\0')) {
             return Err(format!("layer3: a hello field contains a newline or NUL: {bad:?}"));
         }
@@ -273,7 +299,15 @@ impl Hello {
             return Err("layer3: not a hello".into());
         }
         let mut next = || lines.next().map(str::to_owned).ok_or_else(|| "layer3: hello is short".to_owned());
-        let hello = Hello { slug: next()?, file: next()?, abspath: next()?, prefix: next()?, snapshot_sha: next()?, config_sha: next()? };
+        let hello = Hello {
+            slug: next()?,
+            file: next()?,
+            abspath: next()?,
+            prefix: next()?,
+            snapshot_sha: next()?,
+            config_sha: next()?,
+            db: DbFacts { charset: next()?, collate: next()?, version: next()?, server_info: next()? },
+        };
         if lines.next().is_some() {
             return Err("layer3: hello has extra lines".into());
         }
@@ -323,8 +357,16 @@ mod tests {
             prefix: "wp_".into(),
             snapshot_sha: "ab".repeat(32),
             config_sha: "cd".repeat(32),
+            db: DbFacts {
+                charset: "utf8mb4".into(),
+                collate: "utf8mb4_unicode_520_ci".into(),
+                version: "11.4.4".into(),
+                server_info: "11.4.4-MariaDB-ubu2404".into(),
+            },
         };
         assert_eq!(Hello::decode(&h.encode().unwrap()).unwrap(), h);
+        let bad = Hello { db: DbFacts { server_info: "x\ny".into(), ..h.db.clone() }, ..h.clone() };
+        assert!(bad.encode().is_err(), "a newline in the db facts is refused too");
         let bad = Hello { slug: "a\nb".into(), ..h.clone() };
         assert!(bad.encode().is_err());
         assert!(Hello::decode(b"other\n").is_err());
@@ -340,6 +382,21 @@ mod tests {
         assert_eq!(decode_ready(b"error nope"), None);
         assert_eq!(decode_kill(&encode_kill(77)), Some(77));
         assert_eq!(decode_kill(b"R"), None);
+    }
+
+    /// A hostile peer's length prefix is checked before anything is allocated or read: a header
+    /// claiming more than MAX_FRAME is refused at once, with its body never sent.
+    #[test]
+    fn an_oversized_frame_is_refused_from_its_header() {
+        let (a, b) = socketpair(libc::SOCK_STREAM).unwrap();
+        let len = u32::try_from(MAX_FRAME + 1).unwrap();
+        send_all(a.as_fd(), &len.to_be_bytes(), None).unwrap();
+        let e = read_frame(b.as_fd(), Some(Instant::now() + Duration::from_secs(5))).unwrap_err();
+        assert!(e.to_string().contains("over the"), "{e}");
+        send_all(a.as_fd(), &u32::MAX.to_be_bytes(), None).unwrap();
+        assert!(read_frame(b.as_fd(), Some(Instant::now() + Duration::from_secs(5))).is_err());
+        // And a writer can't send one.
+        assert!(write_frame(a.as_fd(), &vec![0; MAX_FRAME + 1], None).is_err());
     }
 
     #[test]

@@ -292,3 +292,64 @@ int setsockopt(int fd, int level, int name, const void *val, socklen_t len) {
     }
     return real(fd, level, name, val, len);
 }
+
+/* A program PHP runs that the guest doesn't have (addiscorp/securecore#101): the guest is the
+ * host's own PHP, and the programs PHP runs (the shell, sendmail, ImageMagick, ghostscript) are
+ * captured only when the host has them. An exec that fails with ENOENT for a name found in no
+ * PATH folder says so on stderr, once per name in a process: php-fpm's workers' stderr goes to
+ * the launcher's log (catch_workers_output), and a shell PHP started inherits it. An exec of a
+ * name some later PATH folder has (a shell trying each folder) says nothing. */
+static void say_missing(const char *path) {
+    static char last[256];
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    if (!*name || strcmp(last, name) == 0) return;
+    const char *p = getenv("PATH");
+    if (!p) p = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    char buf[512];
+    while (*p) {
+        const char *end = strchr(p, ':');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (n && n + strlen(name) + 2 < sizeof buf) {
+            memcpy(buf, p, n);
+            buf[n] = '/';
+            strcpy(buf + n + 1, name);
+            if (access(buf, X_OK) == 0) return;
+        }
+        p += n + (end ? 1 : 0);
+        if (!end) break;
+    }
+    if (path[0] == '/' && access(path, F_OK) == 0) return;
+    snprintf(last, sizeof last, "%s", name);
+    dprintf(2, "securecore-guest: %s isn't in the guest: the host had no such program to capture (PHP tried to run %s)\n", name, path);
+}
+
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    static int (*real)(const char *, char *const[], char *const[]);
+    if (!real) real = (int (*)(const char *, char *const[], char *const[]))dlsym(RTLD_NEXT, "execve");
+    int r = real(path, argv, envp);
+    int e = errno;
+    if (e == ENOENT) say_missing(path);
+    errno = e;
+    return r;
+}
+
+int execv(const char *path, char *const argv[]) {
+    static int (*real)(const char *, char *const[]);
+    if (!real) real = (int (*)(const char *, char *const[]))dlsym(RTLD_NEXT, "execv");
+    int r = real(path, argv);
+    int e = errno;
+    if (e == ENOENT) say_missing(path);
+    errno = e;
+    return r;
+}
+
+int execvp(const char *file, char *const argv[]) {
+    static int (*real)(const char *, char *const[]);
+    if (!real) real = (int (*)(const char *, char *const[]))dlsym(RTLD_NEXT, "execvp");
+    int r = real(file, argv);
+    int e = errno;
+    if (e == ENOENT) say_missing(file);
+    errno = e;
+    return r;
+}

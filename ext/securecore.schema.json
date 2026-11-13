@@ -277,6 +277,8 @@
         "limits": {
           "$ref": "#/$defs/Limits",
           "default": {
+            "dbQueries": 1000,
+            "dbResultBytes": 4194304,
             "memoryMb": 256,
             "timeoutMs": 5000
           }
@@ -301,6 +303,21 @@
     "Limits": {
       "type": "object",
       "properties": {
+        "dbQueries": {
+          "description": "Database queries one isolated component may send through the gateway in one request\n(its load and every call together). Past it each query fails, with a line.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 1000,
+          "minimum": 1
+        },
+        "dbResultBytes": {
+          "description": "The largest answer to one gateway query that crosses back to the child (its rows,\nserialized), in bytes; at most 16777216 (16 MiB). A larger one fails, with a line.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 4194304,
+          "maximum": 16777216,
+          "minimum": 1
+        },
         "memoryMb": {
           "description": "Memory limit for one isolated child.",
           "type": "integer",

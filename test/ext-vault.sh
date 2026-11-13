@@ -130,7 +130,7 @@ cleanup() {
   in_php "rm -rf $plugin $connect_plugin $muplugin $earlymu $html/sc-vault-routine.php $html/sc-vault-core.php $html/sc-vault-connect-core.php $html/sc-lit-config.php $fakescript $fakecap $fakepid"
   put ext/examples/wordpress.json
   # Restore the extension ini in case a revert step changed it, then restart.
-  compose cp docker/securecore.ini "php:$ini" >/dev/null 2>&1
+  php_put docker/securecore.ini "$ini" >/dev/null 2>&1
   php_restart >/dev/null 2>&1
   wait_200 || echo "FAIL php-fpm did not come back after cleanup"
 }
@@ -360,7 +360,7 @@ if on_microvm; then
 else
   compose cp "php:$ini" "$dir/securecore.ini" >>"$dir/cp.log" 2>&1
   grep -v '^extension=' "$dir/securecore.ini" > "$dir/no-ext.ini"
-  compose cp "$dir/no-ext.ini" "php:$ini" >/dev/null 2>&1
+  php_put "$dir/no-ext.ini" "$ini" >/dev/null 2>&1
   compose restart php >/dev/null 2>&1
   wait_200 || fail "no-ext: php-fpm serves the front page"
   if [ "$(compose exec -T php php -m | grep -cx securecore)" = 0 ]; then pass "revert (no extension): securecore is not loaded"; else fail "revert (no extension): securecore is not loaded"; fi
@@ -372,7 +372,7 @@ else
   fail "revert (no extension): the probe sees the secrets" "getenv_db=$(field "$dir/core.no-ext" getenv_db)"
 fi
 # Restore the extension and the vault config.
-on_microvm || compose cp "$dir/securecore.ini" "php:$ini" >/dev/null 2>&1
+on_microvm || php_put "$dir/securecore.ini" "$ini" >/dev/null 2>&1
 apply enforce
 
 # --- 5b. opcache: a wpConfig literal secret is refused at startup (fail closed) ---------------

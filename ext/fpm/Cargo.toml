@@ -16,6 +16,11 @@ securecore-attribution = { path = "../attribution" }
 libc.workspace = true
 # Snapshot keys: the sha256 of the VM's files and of the site tree.
 sha2.workspace = true
+# The host's package databases' checksums (#101): dpkg's MD5, apk's SHA-1.
+md-5.workspace = true
+sha1.workspace = true
+# The capture's record (#101).
+serde.workspace = true
 # The installer's record of the VM's files (installed.json), and Firecracker's API bodies.
 serde_json.workspace = true
 

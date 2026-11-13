@@ -6,7 +6,9 @@
 //!   never a secret; #47).
 //! - [`wire`] (Linux): the control socket, the per-request socket and their messages.
 //! - [`child`] (Linux): the child's sandbox (gelada) and rlimits.
+//! - [`gateway`]: the database gateway's frames and the worker's admission rules (#94).
 
+pub mod gateway;
 pub mod options;
 
 #[cfg(target_os = "linux")]

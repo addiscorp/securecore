@@ -174,7 +174,9 @@ pub fn db_caller(root: &Path, from: *const zend_execute_data) -> Component {
     let frames: Vec<securecore_db::caller::Frame<'_>> = named
         .iter()
         .map(|f| securecore_db::caller::Frame {
-            component: map.frame(&layout, now, f.file),
+            // Layer 3's database gateway (#94): the stand-in running an isolated plugin's query
+            // is that plugin, so its query is charged as the plugin's own `$wpdb` call would be.
+            component: crate::layer3::gateway_component(f.file).unwrap_or_else(|| map.frame(&layout, now, f.file)),
             file: f.file,
             function: f.function.as_deref(),
             db_layer: f.db_layer,
