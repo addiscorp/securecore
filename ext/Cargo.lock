@@ -1198,10 +1198,13 @@ dependencies = [
  "gelada",
  "landlock",
  "libc",
+ "md-5",
  "seccompiler",
  "securecore-attribution",
  "securecore-config",
+ "serde",
  "serde_json",
+ "sha1",
  "sha2",
 ]
 

@@ -132,6 +132,17 @@ pub fn open_dir_beneath(root: &Path, rel: &Path) -> Result<std::os::fd::OwnedFd,
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
+/// Folders many services share their sockets in: a socket directly in one is bind-mounted into
+/// the jail alone, never with its folder.
+pub const SHARED_SOCKET_DIRS: [&str; 7] = ["/", "/run", "/var/run", "/tmp", "/var/tmp", "/dev", "/dev/shm"];
+
+/// Whether a socket in `dir` is bind-mounted alone (see [`SHARED_SOCKET_DIRS`]).
+pub fn bind_socket_only(dir: &Path) -> bool {
+    let d = dir.to_string_lossy();
+    let d = d.trim_end_matches('/');
+    SHARED_SOCKET_DIRS.iter().any(|s| s.trim_end_matches('/') == d)
+}
+
 /// A `connect[].socket`'s folder, held open from the moment it is checked: the check
 /// ([`can_connect_as`]) and the bind mount ([`Jail::bind_dir`]) both go through this handle, so
 /// they see the same folder whatever happens to the path in between.
@@ -457,7 +468,16 @@ impl Jail {
     pub fn bind_dir(&self, src: &SocketDir, name: &str) -> Result<(), String> {
         let dst = self.host(name);
         fs::create_dir_all(&dst).map_err(|e| format!("{}: {e}", dst.display()))?;
-        let (s, d) = (cstr(&src.proc_path()).map_err(|e| e.to_string())?, cstr(&dst).map_err(|e| e.to_string())?);
+        // A socket directly in a folder every service shares (/run, /tmp…): only the socket goes
+        // into the jail, never the whole folder (#102 verification: all of /run, D-Bus included).
+        let (from, dst) = if bind_socket_only(src.path.parent().unwrap_or(Path::new("/"))) {
+            let at = dst.join(&src.name);
+            fs::write(&at, b"").map_err(|e| format!("{}: {e}", at.display()))?;
+            (src.proc_path().join(&src.name), at)
+        } else {
+            (src.proc_path(), dst)
+        };
+        let (s, d) = (cstr(&from).map_err(|e| e.to_string())?, cstr(&dst).map_err(|e| e.to_string())?);
         let none = std::ptr::null();
         let shown = src.path.parent().unwrap_or(Path::new("/")).display();
         // SAFETY: mount(2) with NUL-terminated paths; a bind, then its read-only remount.

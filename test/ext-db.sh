@@ -61,7 +61,7 @@ cleanup() {
   wp plugin deactivate securecore-db-probe >/dev/null 2>&1
   in_php "rm -rf $plugin $html/sc-db-core.php $html/wp-content/db.php"
   dbq "DROP TABLE IF EXISTS wp_securecore_db_probe, wp_otherplugin_data" >/dev/null 2>&1
-  [ -f "$dir/securecore.ini" ] && compose cp "$dir/securecore.ini" "php:$ini" >/dev/null 2>&1
+  [ -f "$dir/securecore.ini" ] && php_put "$dir/securecore.ini" "$ini" >/dev/null 2>&1
   put ext/examples/wordpress.json
   php_restart >/dev/null 2>&1
   wait_200 || echo "FAIL php-fpm did not come back after cleanup"
@@ -252,7 +252,7 @@ if on_microvm; then
 else
   compose cp "php:$ini" "$dir/securecore.ini" >>"$dir/cp.log" 2>&1
   grep -v '^extension=' "$dir/securecore.ini" > "$dir/no-ext.ini"
-  compose cp "$dir/no-ext.ini" "php:$ini" >>"$dir/cp.log" 2>&1
+  php_put "$dir/no-ext.ini" "$ini" >>"$dir/cp.log" 2>&1
   compose restart php >/dev/null 2>&1
 fi
 wait_200 || fail "unloaded: front page 200"
@@ -260,7 +260,7 @@ curl -s "$base/?sc_db=run" > "$dir/out.unloaded"
 completed unloaded
 for c in $own_cases $refused_cases; do expect unloaded "$c" RAN; done
 passthrough unloaded RAN
-on_microvm || compose cp "$dir/securecore.ini" "php:$ini" >>"$dir/cp.log" 2>&1
+on_microvm || php_put "$dir/securecore.ini" "$ini" >>"$dir/cp.log" 2>&1
 
 echo
 na_summary
