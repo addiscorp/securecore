@@ -1073,13 +1073,18 @@ Several pools of one site share its writable folders; each VM syncs its own disk
 
 **Every check before `auto` commits** (#100 review). Everything a start does before the boot now
 happens before the choice: the host checks, the capture and its validation, the pool's user and
-sockets, the vault's env sources and the pool's `env[]`, `claim_state`, the space every new disk
-and the snapshot need (with a margin: a twentieth of the filesystem and at least 1 GiB stays
-free, for the database), the PHP and config layers, the site disk (copied as the pool user) and
+sockets, the vault's env sources and the pool's `env[]`, `claim_state`, the space the start
+needs (below, with a margin: a twentieth of the filesystem and at least 1 GiB stays free, for
+the database), a bare 3306 the guest wouldn't reach and a pool on a bare port (both below), the
+PHP and config layers, the site disk (copied as the pool user) and
 the writable disks. So `auto` falls back on any of them with the reason. And a VM `auto` chose
 that then fails before it serves anything (its boot, its listening socket) falls back to gelada
 too (`layer 1 isolation auto: gelada, because the microVM failed before it served (…)`);
-`microvm` still exits 125.
+`microvm` still exits 125. gelada applies only to a process with one thread, and a microVM start
+that was prepared or begun has started some (systemd's timeout extensions, the VM's sync and
+log), so after such a fallback the launcher execs itself again, same pid, with the decision
+(`--gelada-fallback <line>`, the launcher's own) and applies gelada there (#100 review: without
+it every `auto` fallback under systemd, no KVM included, exited 125).
 
 **A bare 3306 and `localhost`** (#100 and #102 reviews, and Sami's decision on the second's
 verification). A `{ "port": 3306 }` with no socket or address: the site's own `DB_HOST` is only a
@@ -1096,7 +1101,31 @@ defines that disagree are no answer):
   host:port `--db-address` names. The connection is made as the pool user (`--egress-connect`), so
   the host's uid-based firewall rules apply, never as root;
 - anything else, or a `DB_HOST` the launcher can't read: the guest gets no database on 3306 (it
-  stays an egress port, public names only), and the launcher says why. The start still serves.
+  stays an egress port, public names only), and the launcher says why. Under `microvm` the start
+  still serves. Under `auto` it stays on gelada, which reaches that database on 3306 as before,
+  unless `DB_HOST` is a name the guest reaches through egress (layer 2's hosts, a public address):
+  an upgrade never costs a site its database (#100 review: `auto_db_gap`).
+
+When 3306 goes to an address, the guest's PHP still connects where the site's `DB_HOST` says (a
+name, another port, `10.0.0.5:3307`, `127.0.0.1:33060`): the launcher passes that endpoint
+(`sc.dbalias=<host>:<port>`), and the guest's connect hook answers the name with `127.0.0.1` and
+sends a connection to it, or to that IPv4 address, on that port, to 3306's forward. So
+`--db-address db:3306` with the site's own `DB_HOST=db` works unchanged (`test/release-check.sh`
+7b). An IPv6 `DB_HOST` gets no alias: give it as `127.0.0.1` or a name.
+
+**A pool on a bare port** (#100 review). php-fpm binds `listen = 9000` on every address; the
+microVM on `127.0.0.1:9000` only (#102 review). Under `auto`, with no `--listen` and a
+`listen.allowed_clients` that admits more than the loopback (or none), the start stays on gelada
+(`pool [www] has listen = 9000, which php-fpm binds on every address, …`), so a web server on
+another host or container never gets 502s after an upgrade. A pool on a unix socket (Debian's
+`/run/php/php8.3-fpm.sock`, which nginx's `fastcgi_pass unix:…` names) or on an address is served
+exactly there, under `auto` too.
+
+**The space a start takes** (#100 review). The check counts the site disk, the PHP and config
+layers, the snapshot and each writable disk **as it may fill** (they are sparse: a new one up to
+its whole size, an existing one up to its size less what it holds), and keeps a twentieth of the
+filesystem, at least 1 GiB, free beside them for the database. `auto` falls back when that
+doesn't fit (`this start needs …`), before anything is built.
 
 A socket in its own folder is bind-mounted into the jail with that folder; a socket directly in a
 folder services share (`/`, `/run`, `/var/run`, `/tmp`, `/var/tmp`, `/dev`, `/dev/shm`) is

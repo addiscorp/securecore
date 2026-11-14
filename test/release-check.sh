@@ -33,10 +33,14 @@
 #      the php container, privileged with this host's /dev/kvm, runs the installed securecore-fpm
 #      with isolation microvm, and WordPress is served from a Firecracker guest booted from the
 #      installed files only; then an upgrade over an existing site with uploads (7b): a site
-#      under gelada with 203 uploads, install-ext.sh again on this KVM host with isolation auto
-#      (it says the next start is the microVM, what happens to uploads, how to opt out), and the
-#      next start is the microVM with every upload on the host unchanged, seen by the guest, a
-#      guest upload reaching the host and the owner's host edit winning over the guest's write.
+#      under gelada with 203 uploads, the example config as it ships (isolation auto, a bare
+#      3306) and its own WORDPRESS_DB_HOST (db: another container), install-ext.sh again on this
+#      KVM host (it says the next start is the microVM, what happens to uploads, where the bare
+#      3306 goes, how to opt out); the next start stays on gelada, saying the guest wouldn't reach
+#      the database, and WordPress keeps it; with the operator's --db-address db:3306 the next
+#      start is the microVM, WordPress in the guest reaching its database at DB_HOST=db, every
+#      upload on the host unchanged, seen by the guest, a guest upload reaching the host and the
+#      owner's host edit winning over the guest's write.
 #      Needs /dev/kvm then: none is a failure, never a skip.
 # Exits non-zero on any failure. Writes .tmp/release-check/<cell>/. Takes the stack down (with
 # its volumes) at the end unless SECURECORE_RELEASE_KEEP=1.
@@ -469,17 +473,20 @@ if [ -n "$guest" ]; then
     # to serve under gelada, and the guest must not start before the installer has run.
     echo "# an upgrade over an existing site with uploads"
     eventually() { n=0; until eval "$2"; do n=$((n + 1)); [ "$n" -lt "$1" ] || return 1; sleep 0.5; done; }
-    oneoff() { kcompose run --rm --no-deps -T php sh -c "$1"; }
+    # The site as it is (#100 review): the example config untouched (a bare 3306), and the site's
+    # own WORDPRESS_DB_HOST (db, another container: a private address) never rewritten.
+    ucompose() { kcompose -f docker/compose.release-check-upgrade.yml "$@"; }
+    oneoff() { ucompose run --rm --no-deps -T php sh -c "$1"; }
     upl=/var/www/html/wp-content/uploads
-    sed -e 's|{ "port": 3306 }|{ "port": 3306, "address": "db:3306" }|' ext/examples/wordpress.json > "$dir/auto.json"
-    if grep -q '"isolation": "auto"' "$dir/auto.json" && grep -q '"address": "db:3306"' "$dir/auto.json"; then
-      pass "the upgrade's config (the example: isolation auto; 3306 to db:3306)"
+    cp ext/examples/wordpress.json "$dir/auto.json"
+    if grep -q '"isolation": "auto"' "$dir/auto.json" && grep -q '{ "port": 3306 }' "$dir/auto.json" && ! grep -q '"address"' "$dir/auto.json"; then
+      pass "the upgrade's config is the example as it ships (isolation auto; a bare 3306)"
     else
-      fail "the upgrade's config (the example: isolation auto; 3306 to db:3306)"
+      fail "the upgrade's config is the example as it ships (isolation auto; a bare 3306)"
     fi
     put_conf "$dir/auto.json"
     in_root "chmod 644 $conf"
-    kcompose rm -fs php > "$dir/rm-php.log" 2>&1 || fail "upgrade: remove the php container (see $dir/rm-php.log)"
+    ucompose rm -fs php > "$dir/rm-php.log" 2>&1 || fail "upgrade: remove the php container (see $dir/rm-php.log)"
     # Uploads as a site has them: year/month folders, a 5 MiB image, 200 small files, a name with
     # a space, an empty folder; the site's user owns them, as WordPress writes them.
     oneoff "set -e; find $upl -mindepth 1 -delete; mkdir -p $upl/2026/10 $upl/2026/11 $upl/empty-folder
@@ -503,14 +510,43 @@ if [ -n "$guest" ]; then
     has "$dir/install-upgrade.log" "the host's files stay where they are, a file you change on the host wins, nothing is removed" "and what happens to the uploads"
     has "$dir/install-upgrade.log" "To stay on gelada, set \"isolation\": \"gelada\"" "and how to opt out"
     has "$dir/install-upgrade.log" "port(s) 53 443 have no \"socket\" or \"address\"" "and which connect ports reach only public hosts in the microVM"
-    # The next start: the microVM, its uploads disk made from the host's folder.
+    has "$dir/install-upgrade.log" "port 3306 has no \"socket\" or \"address\": in the microVM it goes to the database the site's DB_HOST names" \
+      "and where the bare 3306 goes, and that any other database keeps the site on gelada"
+    # The next start, the site as it is: its database is the db container (a private address the
+    # guest can't reach by name, and no one approved it). auto stays on gelada, saying why, and the
+    # site keeps its database: the front page (which needs it) is 200, and the uploads are as they were.
     t=$(now)
-    kcompose up -d php > "$dir/up-upgrade.log" 2>&1 || fail "upgrade: compose up (see $dir/up-upgrade.log)"
+    SC_APPROVE_DB='' ucompose up -d php > "$dir/up-kept.log" 2>&1 || fail "upgrade: compose up (see $dir/up-kept.log)"
     compose restart web > /dev/null 2>&1
-    i=0; until [ "$(code /sc-mvm-probe.php)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 240 ] || break; sleep 1; done
+    i=0; until [ "$(code /)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 240 ] || break; sleep 1; done
+    phplog "$t" > "$dir/upgrade-kept.log"
+    if [ "$i" -lt 240 ]; then pass "upgrade, the site as it is: WordPress keeps its database (the front page: 200, $i s)"; else fail "upgrade, the site as it is: WordPress keeps its database" "$(tail -8 "$dir/upgrade-kept.log" | tr '\n' '|')"; fi
+    has "$dir/upgrade-kept.log" "layer 1 isolation auto: gelada, because the microVM can't run here (DB_HOST is db, which the guest can't reach by name" \
+      "upgrade, the site as it is: auto stays on gelada, because the guest wouldn't reach the database"
+    has "$dir/upgrade-kept.log" "approve it with --db-socket or --db-address" "and says how to approve it"
+    lacks_line "$dir/upgrade-kept.log" "made the writable disk" "upgrade, the site as it is: nothing of the microVM was built"
+    is "$(curl -s "$base/sc-mvm-probe.php" | sed -n 's/^guest_init=//p')" 0 "upgrade, the site as it is: PHP runs on the host (gelada), not in a guest"
+    listing > "$dir/uploads-kept"
+    if diff "$dir/uploads-before" "$dir/uploads-kept" > "$dir/uploads-kept.diff"; then
+      pass "upgrade, the site as it is: every upload unchanged"
+    else
+      fail "upgrade, the site as it is: every upload unchanged" "$(head -5 "$dir/uploads-kept.diff" | tr '\n' '|')"
+    fi
+    # The operator approves that database in the server's unit (--db-address db:3306): the next
+    # start is the microVM, its uploads disk made from the host's folder, and WordPress in the
+    # guest reaches its database at its own DB_HOST (db), through the bare 3306.
+    t=$(now)
+    SC_APPROVE_DB=db:3306 ucompose up -d php > "$dir/up-upgrade.log" 2>&1 || fail "upgrade: compose up (see $dir/up-upgrade.log)"
+    compose restart web > /dev/null 2>&1
+    i=0; until [ "$(code /sc-mvm-probe.php)" = 200 ] && grep -q 'serving FastCGI' "$dir/upgrade.log" 2>/dev/null; do
+      i=$((i + 1)); [ "$i" -lt 240 ] || break; sleep 1; phplog "$t" > "$dir/upgrade.log"
+    done
     phplog "$t" > "$dir/upgrade.log"
     if [ "$i" -lt 240 ]; then pass "upgrade: the next start serves ($i s)"; else fail "upgrade: the next start serves" "$(tail -8 "$dir/upgrade.log" | tr '\n' '|')"; fi
-    has "$dir/upgrade.log" "securecore-fpm: layer 1 isolation auto: microvm" "upgrade: the next start is the microVM (auto, no fallback)"
+    has "$dir/upgrade.log" "securecore-fpm: layer 1 isolation auto: microvm" "upgrade, approved: the next start is the microVM (auto, no fallback)"
+    has "$dir/upgrade.log" "port 3306 has no socket or address: DB_HOST is db, so it goes to db:3306, connected as the pool user" \
+      "upgrade, approved: the bare 3306 goes to the approved database the site's DB_HOST names"
+    is "$(code /)" 200 "upgrade, approved: WordPress in the guest reaches its database at its own DB_HOST, db (the front page: 200)"
     has "$dir/upgrade.log" "made the writable disk" "upgrade: the uploads disk is made from the host's folder"
     curl -s "$base/sc-mvm-probe.php?sha=2026/10/photo-1.jpg" > "$dir/probe-up1"
     is "$(field probe-up1 guest_init)" 1 "upgrade: PHP runs in the guest"
@@ -542,7 +578,7 @@ if [ -n "$guest" ]; then
     fi
     is "$(in_root "sha256sum $upl/2026/11/notes.txt" | cut -d' ' -f1)" "$owner_sha" "upgrade: the owner's change on the host wins over the guest's write"
     # The next start pushes the host's version into the guest; still nothing removed.
-    kcompose restart php > /dev/null 2>&1
+    ucompose restart php > /dev/null 2>&1
     i=0; until [ "$(code /sc-mvm-probe.php)" = 200 ]; do i=$((i + 1)); [ "$i" -lt 240 ] || break; sleep 1; done
     curl -s "$base/sc-mvm-probe.php?sha=2026/11/notes.txt" > "$dir/probe-pushed"
     is "$(field probe-pushed sha)" "$owner_sha" "upgrade: at the next start the guest has the owner's version"

@@ -297,6 +297,10 @@ pub struct Plan {
     /// Unix sockets in the guest that reach a forwarded port (`localhost` for MySQL: PHP's
     /// default sockets), as guest paths under `/run` or `/tmp`.
     pub guest_socks: Vec<(u16, String)>,
+    /// The site's own `DB_HOST` endpoint (`host:port`, a name or an IPv4 address) when a bare 3306
+    /// goes to an address ([`resolve_db`]): in the guest, a connection to it reaches 3306's
+    /// forward, so the site's unchanged `DB_HOST` works there (`sc.dbalias`).
+    pub db_alias: Option<String>,
 }
 
 /// What the host's pool says, for [`plan_with`]: who it runs as and where it listens.
@@ -551,7 +555,7 @@ pub fn plan_with(loaded: &Loaded, opts: &Options, hints: &PoolHints, defer: bool
         Err(_) if defer => User { uid: u32::MAX, gid: u32::MAX },
         Err(e) => return Err(e),
     };
-    Ok(Plan { root, guest_root, disks, tmpfs, sockets, addresses, egress, listen, state, cache, id, pool, guest_socks: Vec::new() })
+    Ok(Plan { root, guest_root, disks, tmpfs, sockets, addresses, egress, listen, state, cache, id, pool, guest_socks: Vec::new(), db_alias: None })
 }
 
 /// The site's pool user: `--pool-user` (a name or `<uid>:<gid>`), else the host pool's `user`
@@ -1069,7 +1073,7 @@ pub fn resolve_db(
     approved: &DbApproved,
     trusted: &dyn Fn(&Path, bool) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
-    const DB: u16 = 3306;
+    const DB: u16 = crate::guest::DB_FORWARD;
     let mut said = None;
     let no_db = |why: String| Some(format!("port {DB} has no socket or address, and {why}: the guest gets no database on it (only public names)"));
     if plan.egress.contains(&DB) {
@@ -1112,6 +1116,9 @@ pub fn resolve_db(
                     plan.egress.retain(|p| *p != DB);
                     said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, so it goes to {addr}, connected as the pool user"));
                     plan.addresses.push((DB, addr));
+                    // The guest's PHP connects where the site's DB_HOST says (a name, another
+                    // port): that endpoint reaches the forward too (#100 review).
+                    plan.db_alias = db_alias(&ep.host, ep.port, DB);
                 } else if loopback {
                     said = no_db(format!(
                         "DB_HOST is {h}: port {} on this host isn't MySQL's ({}) nor the one --db-address approves",
@@ -1138,6 +1145,74 @@ pub fn resolve_db(
         plan.guest_socks.extend(paths.into_iter().map(|p| (DB, p)));
     }
     Ok(said)
+}
+
+/// The guest's alias for a forwarded database (`sc.dbalias=<host>:<port>`, [`Plan::db_alias`]):
+/// `host:port` when the site's `DB_HOST` names anything but the guest's own `127.0.0.1:<fwd>`.
+/// `None` for an IPv6 address (the guest's connect hook knows IPv4 and names) or a name the
+/// command line can't carry.
+pub fn db_alias(host: &str, port: u16, fwd: u16) -> Option<String> {
+    if host == "127.0.0.1" && port == fwd {
+        return None;
+    }
+    crate::guest::db_alias_host_ok(host).then(|| format!("{host}:{port}"))
+}
+
+/// What `auto` doesn't move into the microVM although it could run there (#100 review): a bare
+/// `{ "port": 3306 }` that leaves the guest without the database the site's `DB_HOST` names.
+/// gelada reaches it on 3306 as before, so `auto` stays there, saying how to approve it.
+/// `no_db`: [`resolve_db`] kept 3306 an egress port (no socket, no address); `said`: what it
+/// logged; `reachable(host, port)`: whether the guest reaches that name through egress (layer 2's
+/// hosts, a public address).
+pub fn auto_db_gap(no_db: bool, said: Option<&str>, db_host: Option<&str>, reachable: &dyn Fn(&str, u16) -> Result<(), String>) -> Option<String> {
+    if !no_db {
+        return None;
+    }
+    let ep = db_host.and_then(securecore_config::dbhost::parse_db_host).map(|t| {
+        t.resolve(&securecore_config::dbhost::Defaults { host: "localhost", port: 3306, socket: None })
+    });
+    let why = match &ep {
+        // Named, not an IP the guest would pick, and reachable: the guest has it through egress.
+        Some(ep) if ep.host != "localhost" && ep.host.parse::<std::net::IpAddr>().is_err() => match reachable(&ep.host, ep.port) {
+            Ok(()) => return None,
+            Err(e) => format!("DB_HOST is {}, which the guest can't reach by name ({e})", db_host.unwrap_or_default()),
+        },
+        Some(ep) if ep.host != "localhost" && !ep.host.starts_with("127.") && ep.host != "::1" => format!(
+            "DB_HOST is {}, an IP address, and the guest reaches other hosts only by name (port 3306 has no socket or address)",
+            db_host.unwrap_or_default()
+        ),
+        _ => said.unwrap_or("port 3306 gives the guest no database").to_owned(),
+    };
+    Some(format!(
+        "{why}; the site would lose its database, which gelada reaches on port 3306: approve it with --db-socket or --db-address, \
+         or give the connect entry a socket or address"
+    ))
+}
+
+/// The other thing `auto` doesn't move (#100 review): a pool whose `listen` is a bare port, which
+/// php-fpm binds on every address, with no `--listen`: the microVM listens on `127.0.0.1` only
+/// ([`crate::phpconf::pool_listen`]), so a web server elsewhere would get 502s. Unless its
+/// `listen.allowed_clients` admits only the loopback anyway.
+pub fn auto_listen_gap(pool: &str, listen: Option<&str>, listen_flag: bool, admit: &Admit) -> Option<String> {
+    let l = listen.filter(|l| crate::phpconf::listens_everywhere(l))?;
+    if listen_flag || matches!(admit, Admit::Addresses(a) if a.iter().all(|ip| ip.to_canonical().is_loopback())) {
+        return None;
+    }
+    Some(format!(
+        "pool [{pool}] has listen = {l}, which php-fpm binds on every address, and the microVM listens on 127.0.0.1:{l} only: \
+         a web server on another host or container would get 502s. Set listen = 127.0.0.1:{l} or 0.0.0.0:{l} (or --listen) to say which"
+    ))
+}
+
+/// What a writable disk may still take on the state folder's filesystem: a new one grows to its
+/// whole size (`want`), an existing one (`Some((size, allocated))`) to the larger of its size and
+/// `want`, less what it holds already (#100 review: the disks are sparse; they fill as the guest
+/// writes, next to the database).
+pub fn disk_room(want: u64, existing: Option<(u64, u64)>) -> u64 {
+    match existing {
+        None => want,
+        Some((size, allocated)) => want.max(size).saturating_sub(allocated),
+    }
 }
 
 /// One message to systemd's notify socket, when the launcher runs under it.
@@ -1272,7 +1347,25 @@ fn prepare(loaded: &Loaded, opts: &Options, capture: capture::Capture) -> Result
     let db = db_ids(&opts.db_user);
     let db_host = site_db_host(&plan.root);
     let approved = DbApproved { address: opts.db_address.clone(), socket: opts.db_socket.clone() };
-    if let Some(said) = resolve_db(&mut plan, db_host.as_deref(), &capture.mysql_sockets, &approved, &|p, a| trusted_db_socket(p, db, a))? {
+    let said = resolve_db(&mut plan, db_host.as_deref(), &capture.mysql_sockets, &approved, &|p, a| trusted_db_socket(p, db, a))?;
+    // Under `auto`, a start that would cost the site its database or its web server's FastCGI
+    // stays on gelada (#100 review): before anything is built.
+    if loaded.config.layer1.isolation() == securecore_config::Isolation::Auto {
+        let egress = crate::egress::Egress::new(loaded, plan.egress.clone());
+        let own = crate::egress::host_addresses();
+        let reachable = |h: &str, p: u16| -> Result<(), String> {
+            egress.allows(h, p)?;
+            crate::egress::addresses(h, p, &own).map(|_| ())
+        };
+        let no_db = plan.egress.contains(&crate::guest::DB_FORWARD);
+        if let Some(why) = auto_db_gap(no_db, said.as_deref(), db_host.as_deref(), &reachable) {
+            return Err(why);
+        }
+        if let Some(why) = auto_listen_gap(&pool.name, pool.listen().as_deref(), opts.listen.is_some(), &hints.admit) {
+            return Err(why);
+        }
+    }
+    if let Some(said) = said {
         log(&said);
     }
     // Checked again here, not only in host_checks: what is checked is what is bind-mounted.
@@ -1339,14 +1432,15 @@ fn prepare(loaded: &Loaded, opts: &Options, capture: capture::Capture) -> Result
     if !conf_path.is_file() {
         needs.push(("config layer".into(), 33 << 20));
     }
-    let mut writable_new = 0u64;
+    // Each writable disk is sparse: what it may still take as the guest fills it (#100 review).
+    let mut writable = 0u64;
     for d in &plan.disks {
-        if !plan.state.join(format!("{}.ext4", d.id)).is_file() {
-            writable_new += folder_usage(&plan, d)?.0 + (64 << 20);
-        }
+        let want = disk_mib(opts.write_disk_mib, folder_usage(&plan, d)?.0) << 20;
+        let existing = fs::metadata(plan.state.join(format!("{}.ext4", d.id))).ok().filter(|m| m.is_file()).map(|m| (m.len(), m.blocks() * 512));
+        writable += disk_room(want, existing);
     }
-    if writable_new > 0 {
-        needs.push(("writable disks".into(), writable_new));
+    if writable > 0 {
+        needs.push(("writable disks, as they fill".into(), writable));
     }
     if opts.snapshot {
         needs.push(("snapshot".into(), u64::from(opts.mem_mib) << 20));
@@ -1907,6 +2001,9 @@ fn boot_args(plan: &Plan, opts: &Options, env_names: &[&str], fpm: &str) -> Stri
     }
     for (port, path) in &plan.guest_socks {
         let _ = write!(a, " sc.sock={port}:{path}");
+    }
+    if let Some(alias) = &plan.db_alias {
+        let _ = write!(a, " sc.dbalias={alias}");
     }
     for x in &opts.guest_args {
         a.push(' ');
@@ -3693,6 +3790,76 @@ mod tests {
             assert!(said.contains("by name") || said.contains("only public names"), "{said}");
             assert!(no_db(&p));
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_stays_on_gelada_rather_than_lose_the_database() {
+        let public = |_: &str, _: u16| -> Result<(), String> { Ok(()) };
+        let private = |h: &str, _: u16| -> Result<(), String> { Err(format!("{h} resolves to no public address")) };
+        let said = Some("port 3306 has no socket or address, and …: the guest gets no database on it (only public names)");
+        // A forward was found (a socket, an approved address): nothing to keep.
+        assert_eq!(auto_db_gap(false, said, Some("db"), &private), None);
+        // The site's database on this host, another container, a private address, or unknown.
+        for h in [Some("localhost"), Some("127.0.0.1:6379"), Some("db"), Some("10.0.0.5"), Some("192.168.1.9:3307"), None] {
+            let why = auto_db_gap(true, said, h, &private).unwrap_or_else(|| panic!("{h:?}: auto must keep gelada"));
+            assert!(why.contains("the site would lose its database") && why.contains("--db-address"), "{h:?}: {why}");
+        }
+        assert!(auto_db_gap(true, said, Some("db:3306"), &private).expect("db").contains("DB_HOST is db:3306, which the guest can't reach by name"));
+        assert!(auto_db_gap(true, said, Some("10.0.0.5"), &public).expect("an IP").contains("an IP address"), "an IP is never egress, public or not");
+        // A public database by name: the guest reaches it through egress.
+        assert_eq!(auto_db_gap(true, said, Some("db.example.com:3306"), &public), None);
+    }
+
+    #[test]
+    fn auto_stays_on_gelada_for_a_pool_listening_everywhere() {
+        let any = Admit::Any;
+        let why = auto_listen_gap("www", Some("9000"), false, &any).expect("a bare port");
+        assert!(why.contains("pool [www] has listen = 9000") && why.contains("502"), "{why}");
+        assert_eq!(auto_listen_gap("www", Some("9000"), true, &any), None, "--listen says where");
+        let lo = Admit::Addresses(vec!["127.0.0.1".parse().expect("ip")]);
+        assert_eq!(auto_listen_gap("www", Some("9000"), false, &lo), None, "only the loopback is admitted anyway");
+        let lan = Admit::Addresses(vec!["127.0.0.1".parse().expect("ip"), "10.0.0.2".parse().expect("ip")]);
+        assert!(auto_listen_gap("www", Some("9000"), false, &lan).is_some(), "a client elsewhere");
+        for l in ["127.0.0.1:9000", "0.0.0.0:9000", "/run/php/php8.3-fpm.sock"] {
+            assert_eq!(auto_listen_gap("www", Some(l), false, &any), None, "{l}: binds where it says");
+        }
+        assert_eq!(auto_listen_gap("www", None, false, &any), None);
+    }
+
+    #[test]
+    fn a_writable_disk_counts_what_it_may_still_take() {
+        let (mib, gib) = (1u64 << 20, 1u64 << 30);
+        assert_eq!(disk_room(gib, None), gib, "a new disk may fill to its size, not only its first copy");
+        assert_eq!(disk_room(gib, Some((gib, 300 * mib))), gib - 300 * mib, "an existing one, less what it holds");
+        assert_eq!(disk_room(2 * gib, Some((gib, 300 * mib))), 2 * gib - 300 * mib, "grown at this start");
+        assert_eq!(disk_room(gib, Some((2 * gib, 2 * gib))), 0, "full");
+    }
+
+    #[test]
+    fn the_sites_db_host_reaches_the_forward_in_the_guest() {
+        let dir = scratch("dbalias");
+        let l = loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"connect":[{"port":3306},{"port":443}]}}"#);
+        let p0 = plan(&l, &opts()).expect("plan");
+        let ok: &dyn Fn(&Path, bool) -> Result<(), String> = &|_, _| Ok(());
+        for (h, approved, want) in [
+            ("db", Some("db:3306"), Some("db:3306")),
+            ("10.0.0.5:3307", Some("10.0.0.5:3307"), Some("10.0.0.5:3307")),
+            ("127.0.0.1:33060", None, Some("127.0.0.1:33060")),
+            ("127.0.0.1", None, None),
+        ] {
+            let mut p = p0.clone();
+            let a = DbApproved { address: approved.map(str::to_owned), ..DbApproved::default() };
+            resolve_db(&mut p, Some(h), &[], &a, ok).expect("ok");
+            assert_eq!(p.db_alias.as_deref(), want, "{h}");
+            let args = boot_args(&p, &opts(), &[], "/usr/sbin/php-fpm");
+            assert_eq!(args.contains(" sc.dbalias="), want.is_some(), "{h}: {args}");
+            let boot = crate::guest::parse_cmdline(&args).expect("the guest parses it");
+            assert_eq!(boot.db_alias.as_deref(), want, "{h}: the guest takes it");
+        }
+        assert_eq!(db_alias("::1", 3306, 3306), None, "IPv6: not for the connect hook");
+        assert!(crate::guest::parse_cmdline("sc.root=/srv sc.dbalias=db").is_err(), "no port");
+        assert!(crate::guest::parse_cmdline("sc.root=/srv sc.dbalias=a/b:3306").is_err(), "not a name");
         let _ = fs::remove_dir_all(&dir);
     }
 

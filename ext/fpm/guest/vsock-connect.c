@@ -17,6 +17,12 @@
  * the one the program asked for), or "ERR <why>\n", which is ECONNREFUSED here. That handshake
  * is blocking, inside connect(), and the socket's O_NONBLOCK is put back after: a non-blocking
  * connect() then simply returns 0. getpeername() on it answers the 127.77.x.y address.
+ *
+ * The site's own DB_HOST (addiscorp/securecore#100 review), with SC_DB_ALIAS="<host>:<port>:<fwd>":
+ * when a bare 3306 goes to an address the operator approved, the site's DB_HOST still names
+ * that address (a name, an IPv4 address, another port). getaddrinfo() of that name answers
+ * 127.0.0.1, and a connect() to 127.0.0.1 (for a name) or to that IPv4 address, on that port,
+ * becomes the vsock connect to <fwd>, the database's forward. Nothing else changes.
  *   cc -O2 -shared -fPIC -o libsc-vsock-connect.so vsock-connect.c -ldl -lpthread
  */
 #define _GNU_SOURCE
@@ -53,12 +59,68 @@ static int parse_ports(const char *s, unsigned short *out) {
     return n;
 }
 
+static int listed(unsigned short p);
+
+/* SC_DB_ALIAS: the site's DB_HOST endpoint and the forward it reaches (0: none). */
+static char alias_host[254];
+static unsigned short alias_port = 0, alias_fwd = 0;
+static int alias_is_ip = 0;
+static struct in_addr alias_ip;
+
+static unsigned short parse_port(const char *s) {
+    char *end;
+    long p = strtol(s, &end, 10);
+    return (end != s && !*end && p > 0 && p < 65536) ? (unsigned short)p : 0;
+}
+
+static void load_alias(const char *a) {
+    alias_port = alias_fwd = 0;
+    if (!a) return;
+    char buf[300];
+    if (strlen(a) >= sizeof buf) return;
+    strcpy(buf, a);
+    char *fwd = strrchr(buf, ':');
+    if (!fwd) return;
+    *fwd++ = 0;
+    char *port = strrchr(buf, ':');
+    if (!port) return;
+    *port++ = 0;
+    unsigned short p = parse_port(port), f = parse_port(fwd);
+    size_t n = strlen(buf);
+    if (!p || !f || !n || n >= sizeof alias_host) return;
+    memcpy(alias_host, buf, n + 1);
+    alias_is_ip = inet_pton(AF_INET, alias_host, &alias_ip) == 1;
+    alias_port = p;
+    alias_fwd = f;
+}
+
 static void load_ports(void) {
     nports = parse_ports(getenv("SC_VSOCK_PORTS"), ports);
     negress = parse_ports(getenv("SC_EGRESS_PORTS"), egress);
     const char *h = getenv("SC_EGRESS_HOST_PORT");
     egress_host_port = h ? (unsigned int)strtoul(h, NULL, 10) : 0;
     if (!egress_host_port) negress = 0;
+    load_alias(getenv("SC_DB_ALIAS"));
+}
+
+/* Whether `node` is SC_DB_ALIAS's name (a trailing dot allowed). */
+static int alias_name(const char *node) {
+    if (nports < 0) load_ports();
+    if (!alias_port || alias_is_ip || !node) return 0;
+    size_t n = strlen(alias_host);
+    return strncasecmp(node, alias_host, n) == 0 && (node[n] == 0 || (node[n] == '.' && node[n + 1] == 0));
+}
+
+/* The vsock port a connect() to `in` goes to: SC_DB_ALIAS's forward for its endpoint, the same
+ * port for a forwarded one on 127.0.0.1, or 0 (untouched). */
+static unsigned int vsock_port_for(const struct sockaddr_in *in) {
+    unsigned short port = ntohs(in->sin_port);
+    if (nports < 0) load_ports();
+    if (alias_port && port == alias_port
+        && (alias_is_ip ? in->sin_addr.s_addr == alias_ip.s_addr : in->sin_addr.s_addr == htonl(INADDR_LOOPBACK)))
+        return alias_fwd;
+    if (in->sin_addr.s_addr == htonl(INADDR_LOOPBACK) && listed(port)) return port;
+    return 0;
 }
 
 /* Read once, in php-fpm's master at load time, then taken out of the environment: the workers are
@@ -71,6 +133,7 @@ __attribute__((constructor)) static void init(void) {
     unsetenv("SC_VSOCK_PORTS");
     unsetenv("SC_EGRESS_PORTS");
     unsetenv("SC_EGRESS_HOST_PORT");
+    unsetenv("SC_DB_ALIAS");
 }
 
 static int listed(unsigned short p) {
@@ -139,6 +202,8 @@ static int ours(const char *node) {
 int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
     static int (*real)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
     if (!real) real = (int (*)(const char *, const char *, const struct addrinfo *, struct addrinfo **))dlsym(RTLD_NEXT, "getaddrinfo");
+    /* The site's DB_HOST name: the loopback, where connect() takes it to the forward. */
+    if (alias_name(node)) return real("127.0.0.1", service, hints, res);
     if (!ours(node) || (hints && hints->ai_family != AF_UNSPEC && hints->ai_family != AF_INET) || (hints && (hints->ai_flags & AI_NUMERICHOST)))
         return real(node, service, hints, res);
     long port = 0;
@@ -259,7 +324,8 @@ int connect(int fd, const struct sockaddr *sa, socklen_t len) {
             errno = e;
             return r;
         }
-        if (in->sin_addr.s_addr == htonl(INADDR_LOOPBACK) && listed(port)) {
+        unsigned int vport = vsock_port_for(in);
+        if (vport) {
             int fl = fcntl(fd, F_GETFL), fdfl = fcntl(fd, F_GETFD);
             if (fl < 0 || fdfl < 0) return -1;
             int v = socket(AF_VSOCK, SOCK_STREAM | ((fl & O_NONBLOCK) ? SOCK_NONBLOCK : 0), 0);
@@ -275,7 +341,7 @@ int connect(int fd, const struct sockaddr *sa, socklen_t len) {
             memset(&vm, 0, sizeof vm);
             vm.svm_family = AF_VSOCK;
             vm.svm_cid = VMADDR_CID_HOST;
-            vm.svm_port = port;
+            vm.svm_port = vport;
             return real(fd, (const struct sockaddr *)&vm, sizeof vm);
         }
     }

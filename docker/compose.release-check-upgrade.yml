@@ -1,0 +1,10 @@
+# The release check's upgrade (test/release-check.sh 7b, #100 review), on top of
+# compose.release-check.yml and compose.release-check-kvm.yml: the site exactly as it was before
+# the upgrade (its WORDPRESS_DB_HOST, db, unchanged; the example config, a bare 3306), started
+# through securecore-fpm as a server's unit would. SC_APPROVE_DB is the operator's approval of the
+# database in that unit (--db-address), empty for none.
+services:
+  php:
+    command: ["sapi-microvm", "--as-site"]
+    environment:
+      SC_APPROVE_DB: ${SC_APPROVE_DB:-}

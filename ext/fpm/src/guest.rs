@@ -43,6 +43,9 @@ pub const FPM_PORT: u32 = 9000;
 pub const LOG_PORT: u32 = 1514;
 /// The guest port the host's start message arrives on.
 pub const CTL_PORT: u32 = 1515;
+/// The port a bare `{ "port": 3306 }` forwards the database on ([`crate::vm::resolve_db`]), and
+/// where [`Boot::db_alias`]'s endpoint goes.
+pub const DB_FORWARD: u16 = 3306;
 /// mysqlnd's connect onto vsock, preloaded into php-fpm (#70): in the SecureCore base, beside
 /// the init.
 pub const PRELOAD: &str = "/sc/libsc-vsock-connect.so";
@@ -112,6 +115,19 @@ pub struct Boot {
     /// layer's are bound too (the CLI layer 3's helper runs reads its compiled-in ones).
     pub ini_dir: Option<String>,
     pub ini_file: Option<String>,
+    /// `sc.dbalias=<host>:<port>`: the site's own `DB_HOST` endpoint, when a bare 3306 goes to an
+    /// address (#100 review). php-fpm's connections to it (the name, or the IPv4 address, on that
+    /// port) reach 3306's forward, so the site's `DB_HOST` works unchanged (`SC_DB_ALIAS`).
+    pub db_alias: Option<String>,
+}
+
+/// The host part of `sc.dbalias`: an IPv4 address or a host name (letters, digits, `.`, `-`,
+/// `_`; at most 253 bytes), so the command line and the connect hook can carry it.
+pub fn db_alias_host_ok(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host != "localhost"
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
 }
 
 /// Parses the guest's kernel command line. Paths may not hold spaces (the command line is
@@ -145,6 +161,15 @@ pub fn parse_cmdline(line: &str) -> Result<Boot, String> {
                 let (port, path) = value.split_once(':').ok_or_else(|| format!("sc.sock={value}: want PORT:PATH"))?;
                 let port = port.parse().map_err(|_| format!("sc.sock: {port} is not a port"))?;
                 boot.socks.push((port, path.to_owned()));
+            }
+            "sc.dbalias" => {
+                let bad = || format!("sc.dbalias={value}: want <host>:<port>");
+                let (h, p) = value.rsplit_once(':').ok_or_else(bad)?;
+                p.parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(bad)?;
+                if !db_alias_host_ok(h) {
+                    return Err(bad());
+                }
+                boot.db_alias = Some(value.to_owned());
             }
             "sc.ext" => boot.ext = value != "0",
             "sc.inidir" if value.starts_with('/') => boot.ini_dir = Some(value.to_owned()),
@@ -1075,6 +1100,10 @@ fn start_php_fpm(boot: &Boot) -> io::Result<u32> {
         cmd.env("LD_PRELOAD", PRELOAD).env("SC_VSOCK_PORTS", list(&boot.ports));
         if !boot.egress.is_empty() {
             cmd.env("SC_EGRESS_PORTS", list(&boot.egress)).env("SC_EGRESS_HOST_PORT", crate::egress::EGRESS_PORT.to_string());
+        }
+        // The site's DB_HOST endpoint reaches the database's forward (always 3306's).
+        if let Some(a) = &boot.db_alias {
+            cmd.env("SC_DB_ALIAS", format!("{a}:{DB_FORWARD}"));
         }
     }
     // The host's scan folder (as captured), then the site's settings when it has any (#90).

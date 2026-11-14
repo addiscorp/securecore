@@ -11,6 +11,11 @@
 #      verified root image, a kernel without Landlock when layer 3 is on, a config the VM can't
 #      express, uploads that don't fit), and microvm refuses those with exit 125; in the php
 #      container (no /dev/kvm) auto falls back and microvm exits 125 without php-fpm ever running;
+#      auto also falls back (#100 review) for what a start finds past the host checks: a file the
+#      pool user can't read, an env variable the launcher lacks, an orphaned uploads disk, no room
+#      for the whole start with its margin, a bare 3306 whose DB_HOST the guest can't reach, a pool
+#      on a bare port with no --listen; and after the choice, a VM that fails before it serves (a
+#      busy --listen port), where microvm exits 125; a pool on a unix socket is served there;
 #   2. a real WordPress front page from the guest (its kernel, loopback only, securecore-init as
 #      PID 1), with layer 2 enforcing and layer 3's child running there, the database through
 #      MariaDB's socket; Firecracker jailed as an unprivileged uid, so MariaDB's root (unix_socket
@@ -47,6 +52,7 @@
 #   test/ext-microvm.sh density    N sites' VMs at once: PSS, KSM, restores under load, p50
 #                                  (DENSITY_NS, DENSITY_MEM; docs/layer1-microvm.md "Density")
 #   test/ext-microvm.sh log        only the guest's log under load (3d, #86)
+#   test/ext-microvm.sh fallback   only auto's fallbacks past the host checks and after the choice
 # Needs: the guest kernel (KERNEL=, default .tmp/mvm/vmlinux-sc from bench/microvm/kernel.sh:
 # mirab's kernel plus Landlock and seccomp, until mirab#89 ships them); a host securecore-fpm
 # (SECURECORE_FPM=, default .target/release/securecore-fpm); docker, mke2fs, e2fsck, resize2fs,
@@ -349,6 +355,141 @@ log_stress() {
   find "$lg" -mindepth 1 -delete
   rmdir "$lg"
 }
+# auto, past the host checks (#100 review): every reason found later in a start (the capture, the
+# pool, the database, the site disk, the env, the state, the space) and the boot itself falls back
+# to gelada with the reason; only "microvm" exits 125. These starts capture the php container's
+# real php-fpm (the capture searches its own PATH under --php-root), and gelada, after a fallback,
+# runs php-fpm from the launcher's PATH: a stand-in there says it ran, and under what.
+# (`test/ext-microvm.sh fallback` runs only this.)
+auto_fallbacks() {
+  echo "# auto falls back past the host checks, and after the choice (#100 review)"
+  mkdir -p "$dir/standin-bin"
+  printf '#!/bin/sh\n%s\n' "$standin" > "$dir/standin-bin/php-fpm"
+  chmod 755 "$dir/standin-bin/php-fpm"
+  conf auto > "$dir/auto.json"
+  fell="layer 1 isolation auto: gelada, because the microVM can't run here"
+  # fellback <name> <config> [flags]: an auto (or microvm) start in the foreground, bounded.
+  fellback() {
+    name=$1 config=$2; shift 2
+    cp "$config" "$site/securecore.json"
+    (
+      PATH="$dir/standin-bin:$PATH"
+      export PATH
+      fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" \
+        --guest-root "$html" --php-root "$(php_root)" "$@"
+    ) > "$dir/value-$name.log" 2>&1 &
+    bounded_wait $! 900
+    echo "exit=$?" >> "$dir/value-$name.log"
+  }
+  # gelada_ran <name> <what>: the launcher fell back and execed php-fpm under gelada.
+  gelada_ran() {
+    has "$dir/value-$1.log" "exit=0" "$2: the launcher execs php-fpm (no exit 125)"
+    has "$dir/value-$1.log" "NoNewPrivs: 1 Seccomp_filters: 2" "$2: php-fpm runs under gelada"
+  }
+  clean_state
+  listen="unix:$run/fb.sock"
+  # Under systemd (NOTIFY_SOCKET), a start asks for more time from a thread of its own while it
+  # prepares, and gelada applies only to a process with one thread: a fallback, here the commonest
+  # one (no KVM), must still run php-fpm under gelada (the launcher runs itself again for it).
+  (
+    NOTIFY_SOCKET=$dir/fb-notify.sock
+    export NOTIFY_SOCKET
+    fellback auto-notify "$dir/auto.json" --listen "$listen" --kvm "$dir/no-kvm"
+  )
+  has "$dir/value-auto-notify.log" "$fell (no KVM: $dir/no-kvm" "auto under systemd (NOTIFY_SOCKET) without KVM: gelada"
+  is "$(grep -c 'layer 1 isolation auto: ' "$dir/value-auto-notify.log")" 1 "in exactly one line"
+  gelada_ran auto-notify "auto under systemd, no KVM"
+  # A file only root may read in the site: the site disk is copied as the pool user.
+  echo secret > "$site/sc-root-only.txt"
+  chmod 600 "$site/sc-root-only.txt"
+  fellback auto-rootonly "$dir/auto.json" --listen "$listen"
+  rm -f "$site/sc-root-only.txt"
+  has "$dir/value-auto-rootonly.log" "$fell (" "auto, a root-only file in the site: gelada"
+  has "$dir/value-auto-rootonly.log" "as uid 1234" "because the site disk is copied as the pool user"
+  gelada_ran auto-rootonly "auto, a root-only file"
+  # A variable the guest needs that the launcher's environment lacks (the vault's env, a pool's env[]).
+  fellback auto-noenv "$dir/auto.json" --listen "$listen" --guest-env SC_NOT_IN_THE_ENVIRONMENT
+  has "$dir/value-auto-noenv.log" "$fell (the launcher's environment has no SC_NOT_IN_THE_ENVIRONMENT" "auto, an env variable the launcher lacks: gelada, naming it"
+  gelada_ran auto-noenv "auto, a missing env variable"
+  # Leftover state: the uploads disk of a site that moved, beside this one's new state folder.
+  st=$dir/fb-states
+  mkdir -p "$st/old" "$st/new"
+  find "$st" -mindepth 2 -delete
+  printf '{"root":"/srv/a-site-that-moved"}\n' > "$st/old/site.json"
+  : > "$st/old/w-uploads.ext4"
+  fellback auto-orphan "$dir/auto.json" --listen "$listen" --state-dir "$st/new"
+  has "$dir/value-auto-orphan.log" "$fell ($st/old holds the writable disks (uploads) of the site that was at /srv/a-site-that-moved" "auto, an orphaned uploads disk beside it: gelada, naming it"
+  gelada_ran auto-orphan "auto, leftover state"
+  find "$st" -mindepth 1 -delete
+  # The space a start takes, all of it (the site disk, the layers, the writable disks as they may
+  # fill, the snapshot) with a margin left for the database: a 1200 MiB state folder fits the
+  # uploads' copy (the host check) but not that.
+  mkdir -p "$dir/mid-state"
+  umount "$dir/mid-state" 2>/dev/null
+  mount -t tmpfs -o size=1200m,mode=0700 tmpfs "$dir/mid-state" || die "a 1200 MiB tmpfs for the state folder"
+  fellback auto-space "$dir/auto.json" --listen "$listen" --state-dir "$dir/mid-state"
+  umount "$dir/mid-state" && rmdir "$dir/mid-state"
+  has "$dir/value-auto-space.log" "$fell (this start needs " "auto without room for the whole start: gelada"
+  has "$dir/value-auto-space.log" "writable disks, as they fill" "counting the writable disks as they may fill"
+  has "$dir/value-auto-space.log" "keeps 1024 MiB free beside it (for the database and the host)" "and the margin it keeps"
+  gelada_ran auto-space "auto, no room"
+  # A bare 3306 whose DB_HOST the guest can't reach (a name with no public address, a private
+  # IP): gelada, which reaches it on 3306 as before; never a microVM without its database.
+  sed "s|{ \"port\": 3306, \"socket\": \"$mysqld/mysqld.sock\" }|{ \"port\": 3306 }|" "$dir/auto.json" > "$dir/auto-bare.json"
+  grep -q '{ "port": 3306 }' "$dir/auto-bare.json" || die "the auto bare-3306 fixture"
+  cp "$dir/guest.env" "$dir/guest.env.fb"
+  for c in "name sc-no-such-db.invalid" "ip 10.255.255.1:3306"; do
+    n=${c%% *} h=${c#* }
+    sed "s|^WORDPRESS_DB_HOST=.*|WORDPRESS_DB_HOST=$h|" "$dir/guest.env.fb" > "$dir/guest.env"
+    fellback "auto-db-$n" "$dir/auto-bare.json" --listen "$listen"
+    has "$dir/value-auto-db-$n.log" "$fell (DB_HOST is $h" "auto, a bare 3306 and DB_HOST $h: gelada"
+    has "$dir/value-auto-db-$n.log" "the site would lose its database, which gelada reaches on port 3306: approve it with --db-socket or --db-address" "and how to approve it"
+    gelada_ran "auto-db-$n" "auto, DB_HOST $h"
+  done
+  cp "$dir/guest.env.fb" "$dir/guest.env"
+  # A pool listening on a bare port (the image's listen = 9000: every address) with no --listen:
+  # in the microVM a web server elsewhere would get 502s.
+  fellback auto-listen "$dir/auto.json"
+  has "$dir/value-auto-listen.log" "$fell (pool [www] has listen = 9000, which php-fpm binds on every address" "auto, a pool on a bare port and no --listen: gelada"
+  gelada_ran auto-listen "auto, listen = 9000"
+  # A pool on a unix socket, as Debian's (nginx: fastcgi_pass unix:/run/php/…sock), and no
+  # --listen: auto is the microVM, answering at the pool's own socket.
+  in_php "printf '[www]\nlisten = $sockdir/auto-www.sock\n' > /usr/local/etc/php-fpm.d/zz-sc100-listen.conf"
+  cp "$dir/auto.json" "$site/securecore.json"
+  fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" \
+    --guest-root "$html" --php-root "$(php_root)" > "$dir/auto-sock.log" 2>&1 &
+  PID=$!
+  eventually 3000 "grep -q 'serving FastCGI' \"$dir/auto-sock.log\" || ! kill -0 $PID 2>/dev/null" || true
+  has "$dir/auto-sock.log" "layer 1 isolation auto: microvm" "auto, a pool on a unix socket: the microVM"
+  has "$dir/auto-sock.log" "serving FastCGI on unix:$sockdir/auto-www.sock" "listening at the pool's own socket"
+  is "$(python3 test/ext/microvm/fcgi-ping.py "unix:$sockdir/auto-www.sock")" pong "php-fpm in the guest answers there"
+  stop
+  in_php "rm -f /usr/local/etc/php-fpm.d/zz-sc100-listen.conf"
+  # After the choice: a VM auto chose that fails before it serves (its --listen port is taken)
+  # falls back to gelada; "microvm" exits 125. No VM of this site's is left either way.
+  python3 -I -c 'import socket, time; s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 9341)); s.listen(1); time.sleep(900)' &
+  busy=$!
+  sleep 0.5
+  fellback auto-busy "$dir/auto.json" --listen 127.0.0.1:9341
+  sed 's|"isolation": "auto"|"isolation": "microvm"|' "$dir/auto.json" > "$dir/microvm-busy.json"
+  fellback microvm-busy "$dir/microvm-busy.json" --listen 127.0.0.1:9341
+  kill "$busy" 2>/dev/null
+  has "$dir/value-auto-busy.log" "layer 1 isolation auto: microvm" "auto, a busy --listen port: the microVM was chosen"
+  has "$dir/value-auto-busy.log" "layer 1 isolation auto: gelada, because the microVM failed before it served (listen 127.0.0.1:9341" \
+    "and when it failed before serving, gelada, saying why"
+  gelada_ran auto-busy "auto, after the choice"
+  is "$(grep -c 'layer 1 isolation auto: gelada' "$dir/value-auto-busy.log")" 1 "the fallback is said once"
+  has "$dir/value-microvm-busy.log" "exit=125" "microvm, a busy --listen port: exit 125"
+  lacks "$dir/value-microvm-busy.log" standin-ran "and php-fpm never ran"
+  is "$(pgrep -fc -- "--id sc-$(printf %s "$site" | sha256sum | cut -c1-16) ")" 0 "no Firecracker of this site's left running after either"
+  clean_state
+}
+if [ "$what" = fallback ]; then
+  auto_fallbacks
+  if [ "$fails" -eq 0 ]; then echo "all fallback checks passed"; else echo "$fails check(s) failed"; fi
+  [ "$fails" -eq 0 ]
+  exit
+fi
 if [ "$what" = log ]; then
   log_stress
   if [ "$fails" -eq 0 ]; then echo "all log checks passed"; else echo "$fails check(s) failed"; fi
@@ -669,6 +810,7 @@ has "$dir/container-auto.log" "Seccomp_filters: 3" "auto without KVM: php-fpm ru
 has "$dir/container-microvm.log" "exit=125" "microvm without KVM: the launcher exits 125"
 has "$dir/container-microvm.log" "layer1.isolation is \"microvm\" but the microVM can't run here" "microvm without KVM: refused, with the reason"
 lacks "$dir/container-microvm.log" "standin-ran" "microvm without KVM: php-fpm never ran"
+auto_fallbacks
 
 # --- 2. WordPress from the jailed guest, and 3. the snapshot -----------------------------------
 echo "# microvm: the first start makes the snapshot"

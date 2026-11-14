@@ -473,9 +473,18 @@ case $ISOLATION in
       step "$NOTE" "Layer 1" "layer1.isolation is auto (the default), which is now the microVM where it can run, and this host has KVM and the verified guest: php-fpm started through securecore-fpm moves into the microVM at its next start (the launcher logs \"layer 1 isolation auto: microvm\", or gelada and why)"
       say "  At that first start each writable folder inside the site (uploads) is copied into the VM's disk and kept in step with the host's folder: the host's files stay where they are, a file you change on the host wins, nothing is removed."
       say "  The host needs no swap or encrypted swap, and about 300 MiB of memory per busy site. To stay on gelada, set \"isolation\": \"gelada\" in layer1 of $CONFIG."
-      if [ -n "$BARE" ]; then
-        say "  layer1.network.connect port(s) $BARE have no \"socket\" or \"address\": in the microVM they reach only public hosts by name. A database or service on this host or its network needs one, e.g. { \"port\": 3306, \"socket\": \"/run/mysqld/mysqld.sock\" } or { \"port\": 3306, \"address\": \"127.0.0.1:3306\" }."
+      # A bare 3306 is the site's database, found from its DB_HOST (#102); anything else bare is
+      # egress. auto never moves a site whose database the guest wouldn't reach (#100 review).
+      # shellcheck disable=SC2086 # the ports are words
+      OTHER=$(printf '%s\n' $BARE | grep -vx 3306 | tr '\n' ' ' | sed 's/ $//')
+      # shellcheck disable=SC2086 # the ports are words
+      if printf '%s\n' $BARE | grep -qx 3306; then
+        say "  layer1.network.connect port 3306 has no \"socket\" or \"address\": in the microVM it goes to the database the site's DB_HOST names when that is this host's MySQL socket, MySQL on 127.0.0.1, or one you approve in the launcher's flags (--db-socket <path>, --db-address <host:port>). Any other database (another host or container, a private address) keeps the site on gelada, and the launcher says why."
       fi
+      if [ -n "$OTHER" ]; then
+        say "  layer1.network.connect port(s) $OTHER have no \"socket\" or \"address\": in the microVM they reach only public hosts by name. A service on this host or its network needs one, e.g. { \"port\": 6379, \"socket\": \"/run/redis/redis.sock\" } or { \"port\": 6379, \"address\": \"127.0.0.1:6379\" }."
+      fi
+      say "  A pool whose listen is a bare port (listen = 9000) also stays on gelada unless --listen or a listen with an address says where FastCGI goes: php-fpm takes that port on every address, the microVM on 127.0.0.1 only."
     elif [ -n "$GUEST" ]; then
       step "$SKIP" "Layer 1" "layer1.isolation is auto, the microVM where it can run; this host has no /dev/kvm, so it stays gelada"
     fi

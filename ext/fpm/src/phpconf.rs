@@ -322,13 +322,19 @@ pub fn pool_listen(v: &str) -> Result<PoolListen, String> {
     if v.starts_with('/') {
         return Ok(PoolListen::Unix(v.to_owned()));
     }
-    if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+    if listens_everywhere(v) {
         v.parse::<u16>().map_err(|_| format!("listen = {v}: not a port"))?;
         return Ok(PoolListen::Tcp(format!("127.0.0.1:{v}")));
     }
     let (_, port) = v.rsplit_once(':').ok_or_else(|| format!("listen = {v}: want a path, a port or address:port"))?;
     port.parse::<u16>().map_err(|_| format!("listen = {v}: {port} is not a port"))?;
     Ok(PoolListen::Tcp(v.to_owned()))
+}
+
+/// Whether a pool's `listen` is a bare port (`listen = 9000`), which php-fpm binds on every
+/// address; [`pool_listen`] takes it as `127.0.0.1:<port>` (#102 review).
+pub fn listens_everywhere(v: &str) -> bool {
+    !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `listen.allowed_clients`: the addresses a TCP pool takes connections from (php-fpm's own

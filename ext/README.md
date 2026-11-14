@@ -846,9 +846,22 @@ before. The checks run in this order, so the line names the most basic reason:
 | a kernel without Landlock and seccomp, with layer 3 on | `layer 3 is on, but the guest kernel …/vmlinux has no Landlock and seccomp filters (…)` |
 | a `connect[].socket` the jailed user can't open | `… may not connect to /run/…/db.sock (Permission denied …)` |
 | no cgroup v2 | `/sys/fs/cgroup is not cgroup v2`, or why the jailer's parent cgroup can't be made |
+| the host's PHP can't be captured or validated, or a pool serves another site | `… differs from its package's checksum …`, `run the installer to record unpackaged files`, `pool [X] serves another site (…)` |
+| a file in the site the pool user can't read (the site disk is copied as it) | `mke2fs …/site-….ext4 (copying /srv/site as uid 33) …` and the file it couldn't read |
+| an env variable the guest needs that the launcher lacks | `the launcher's environment has no WORDPRESS_DB_PASSWORD, which the guest's php-fpm needs (…)` |
+| a state folder another site's, or an orphaned uploads disk beside it | `/var/lib/securecore/vm/x holds the writable disks (uploads) of the site that was at /srv/old, which no longer exists. …` |
+| no room for the whole start, with a twentieth of the filesystem (at least 1 GiB) left for the database | `this start needs 2400 MiB on the state folder's filesystem (site disk 140 MiB, PHP layer 90 MiB, config layer 33 MiB, writable disks, as they fill 1024 MiB, snapshot 512 MiB) and keeps 1024 MiB free beside it (…), but it has 2000 MiB free` |
+| a bare `{ "port": 3306 }` whose `DB_HOST` the guest wouldn't reach (another host or container, a private address, an unreadable `DB_HOST`), and no `--db-address`/`--db-socket` approving it | `DB_HOST is db, which the guest can't reach by name (…); the site would lose its database, which gelada reaches on port 3306: approve it with --db-socket or --db-address, or give the connect entry a socket or address` |
+| a pool listening on a bare port (`listen = 9000`, every address to php-fpm) with no `--listen` | `pool [www] has listen = 9000, which php-fpm binds on every address, and the microVM listens on 127.0.0.1:9000 only: …` |
 
-`microvm` refuses to start for the same reasons (exit 125, the same text). A microVM that
-`auto` picked and that then fails to boot is a failed start (exit 125), never a silent gelada.
+`microvm` refuses to start for the same reasons (exit 125, the same text), except the last two:
+there a bare 3306 the guest can't reach stays an egress port (public names only, logged) and a
+bare-port pool listens on `127.0.0.1`. A microVM that `auto` picked and that then fails before
+it serves anything (its boot, its listening socket) falls back to gelada too, in one line
+(`layer 1 isolation auto: gelada, because the microVM failed before it served (…)`); `microvm`
+exits 125. Under systemd (`Type=notify`) a long first start (the capture, the disks, the
+snapshot) asks for more time every 10 s (`EXTEND_TIMEOUT_USEC`) until it serves, so it never
+runs into `TimeoutStartSec`.
 
 **Upgrading an existing site.** On a host with KVM where `ext/install.sh` installs the guest, a
 site whose php-fpm starts through `securecore-fpm` with `isolation` `auto` (or no `isolation`)
@@ -857,12 +870,20 @@ nothing. That first start copies each writable folder inside the app root (uploa
 VM's disk, from the host's folder, and from then on the two are kept in step (the table below):
 the host's files stay where they are, nginx and backups keep reading them, a file changed on the
 host wins, and nothing is removed but what the guest deletes (into the trash). Before
-restarting, check two things the microVM does differently from gelada: a `connect` port with
-neither `socket` nor `address` reaches only public hosts by name, so a database on the host or
-its network needs one (`{ "port": 3306, "socket": "/run/mysqld/mysqld.sock" }` or
-`{ "port": 3306, "address": "127.0.0.1:3306" }`; the installer lists those ports); and the guest's
-php-fpm gets only the vault's env sources and `--guest-env` names from the launcher's
-environment. To stay on gelada, set `isolation` to `gelada` before the restart.
+restarting, check what the microVM does differently from gelada:
+- a bare `{ "port": 3306 }` goes to the database the site's `DB_HOST` names when that is this
+  host's MySQL socket, MySQL on `127.0.0.1`, or one approved in the launcher's flags
+  (`--db-socket <path>`, `--db-address <host:port>`); the site's `DB_HOST` then works in the guest
+  unchanged (a name or address it names reaches the forward). Any other database keeps `auto` on
+  gelada, saying why, so an upgrade never costs a site its database;
+- any other `connect` port with neither `socket` nor `address` reaches only public hosts by name
+  (the installer lists those ports);
+- a pool on a bare port (`listen = 9000`) keeps `auto` on gelada unless `--listen` or an address
+  in `listen` says where FastCGI goes (php-fpm takes every address, the microVM `127.0.0.1`);
+- the guest's php-fpm gets only the vault's env sources, the pool's `env[]` and `--guest-env`
+  names from the launcher's environment.
+
+To stay on gelada, set `isolation` to `gelada` before the restart.
 
 **The microVM can run** when all of these hold (otherwise `auto` logs why and `microvm` exits
 125 with it):
