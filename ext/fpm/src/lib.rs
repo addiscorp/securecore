@@ -32,6 +32,8 @@ pub mod sitefile;
 #[cfg(target_os = "linux")]
 pub mod jail;
 #[cfg(target_os = "linux")]
+pub mod space;
+#[cfg(target_os = "linux")]
 pub mod sync;
 #[cfg(target_os = "linux")]
 pub mod vm;

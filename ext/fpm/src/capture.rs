@@ -162,6 +162,9 @@ pub struct Capture {
     pub missing_helpers: Vec<String>,
     /// Where PHP's settings say `localhost` reaches MySQL.
     pub mysql_sockets: Vec<String>,
+    /// PHP's `memory_limit` as its ini files set it (the last one), for the guest's size.
+    #[serde(default)]
+    pub memory_limit: Option<String>,
     /// The package manager whose records the binaries were checked against.
     pub pkg: String,
     /// The PHP layer's key: the sha256 of every item.
@@ -909,7 +912,9 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
             return Err(refused(p, format!("is under /{top}, which the guest's base has no folder for (it has {})", TOPS.join(" "))));
         }
     }
-    let mysql_sockets = phpconf::mysql_default_sockets(&settings.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>());
+    let all: Vec<phpconf::Setting> = settings.iter().map(|(_, s)| s.clone()).collect();
+    let mysql_sockets = phpconf::mysql_default_sockets(&all);
+    let memory_limit = phpconf::last_setting(&all, "memory_limit");
     let items: Vec<Item> = w.items.values().cloned().collect();
     // The install's record of what no package's checksum covers (trust on first use, the
     // installer the only writer): a start without one refuses, so `auto` runs gelada.
@@ -930,6 +935,7 @@ pub fn capture(req: &Request) -> Result<Capture, Refused> {
         helpers,
         missing_helpers: missing,
         mysql_sockets,
+        memory_limit,
         pkg: db.kind.map_or_else(|| "none".to_owned(), |k| format!("{} ({} paths)", k.as_str(), db.len())),
         php_key,
         watch: w.watch.into_iter().collect(),
@@ -1262,10 +1268,13 @@ pub fn image(stage: &Path, out: &Path) -> Result<u64, String> {
     cmd.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default()).stdin(Stdio::null());
     cmd.args(["-q", "-F", "-t", "ext4", "-b", "4096", "-m", "0", "-O", "^has_journal"]).arg("-N").arg((entries * 2 + 1024).to_string());
     cmd.args(["-E", "root_owner=0:0", "-d"]).arg(stage).arg(&tmp).arg(format!("{mb}M"));
-    let o = cmd.output().map_err(|e| format!("mke2fs: {e}"))?;
-    if !o.status.success() {
+    // Bounded by the start's deadline, as every disk tool (#100 re-review).
+    let (status, stderr) = crate::vm::tool_status_until(&mut cmd, "mke2fs", crate::vm::tool_deadline()).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("mke2fs {}: {} {}", out.display(), o.status, String::from_utf8_lossy(&o.stderr).trim()));
+    })?;
+    if !status.success() {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("mke2fs {}: {status} {}", out.display(), String::from_utf8_lossy(&stderr).trim()));
     }
     fs::rename(&tmp, out).map_err(|e| format!("{}: {e}", out.display()))?;
     Ok(mb)

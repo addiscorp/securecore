@@ -853,15 +853,31 @@ before. The checks run in this order, so the line names the most basic reason:
 | no room for the whole start, with a twentieth of the filesystem (at least 1 GiB) left for the database | `this start needs 2400 MiB on the state folder's filesystem (site disk 140 MiB, PHP layer 90 MiB, config layer 33 MiB, writable disks, as they fill 1024 MiB, snapshot 512 MiB) and keeps 1024 MiB free beside it (…), but it has 2000 MiB free` |
 | a bare `{ "port": 3306 }` whose `DB_HOST` the guest wouldn't reach (another host or container, a private address, an unreadable `DB_HOST`), and no `--db-address`/`--db-socket` approving it | `DB_HOST is db, which the guest can't reach by name (…); the site would lose its database, which gelada reaches on port 3306: approve it with --db-socket or --db-address, or give the connect entry a socket or address` |
 | a pool listening on a bare port (`listen = 9000`, every address to php-fpm) with no `--listen` | `pool [www] has listen = 9000, which php-fpm binds on every address, and the microVM listens on 127.0.0.1:9000 only: …` |
+| any other bare `connect` port (not 3306, 53, 80 or 443): a Redis, memcached, Postgres or SMTP server nothing says the place of | `layer1.network.connect port(s) 6379 have no "socket" or "address": gelada reaches any host on them, the microVM only public names, …` |
+| a pool larger than a guest this host can give (`pm.max_children × memory_limit` + 256 MiB above three quarters of its memory, or above `--mem`; or `memory_limit = -1`) | `pool [www] has pm.max_children 30 × memory_limit 256 MiB + 256 MiB = 7936 MiB, more than this host gives one microVM (6144 MiB, …)` |
+| a start that runs past `--start-within` (600 s) | `the start took longer than 600 s (--start-within), so the microVM gives up on it`, or `mke2fs: still running at the start's deadline …` |
+| room that other sites' starts already keep (the shared record, `--space-ledger`) | `this start needs … but it has 9000 MiB free, 8000 MiB of which other sites' starts keep for their disks` |
 
-`microvm` refuses to start for the same reasons (exit 125, the same text), except the last two:
-there a bare 3306 the guest can't reach stays an egress port (public names only, logged) and a
-bare-port pool listens on `127.0.0.1`. A microVM that `auto` picked and that then fails before
+`microvm` refuses to start for the same reasons (exit 125, the same text), except the bare
+ports and the pool's size: there a bare 3306 the guest can't reach, or any other bare port,
+stays an egress port (public names only, logged), a bare-port pool listens on `127.0.0.1`, and
+a pool too big gets three quarters of the host's memory with a line saying it is short.
+
+**The guest's size.** Without `--mem`/`--vcpus` the guest is sized from its pool: memory
+`pm.max_children × memory_limit` (the pool's `php_admin_value`/`php_value`, else PHP's ini, else
+128M) plus 256 MiB, at least 512 MiB and at most three quarters of the host's; one vCPU per four
+workers, at least 2, at most the host's. Memory the guest never touches is never the host's, so
+a larger guest costs only what its workers use. The launcher logs it (`the guest gets 896 MiB and
+2 vCPUs: pool [www] has pm.max_children 5 × memory_limit 128 MiB + 256 MiB = 896 MiB`). A microVM that `auto` picked and that then fails before
 it serves anything (its boot, its listening socket) falls back to gelada too, in one line
 (`layer 1 isolation auto: gelada, because the microVM failed before it served (…)`); `microvm`
 exits 125. Under systemd (`Type=notify`) a long first start (the capture, the disks, the
 snapshot) asks for more time every 10 s (`EXTEND_TIMEOUT_USEC`) until it serves, so it never
-runs into `TimeoutStartSec`.
+runs into `TimeoutStartSec`, but never past `--start-within` (600 s): then it stops asking, a
+disk tool still running (mke2fs, e2fsck, resize2fs) is killed, and `auto` runs gelada. The space
+check counts what other sites' starts on the same filesystem keep for their disks (a shared
+record, `--space-ledger`, default `/var/lib/securecore/space.json`, under a lock), so sites
+starting together at boot never all take the same free space.
 
 **Upgrading an existing site.** On a host with KVM where `ext/install.sh` installs the guest, a
 site whose php-fpm starts through `securecore-fpm` with `isolation` `auto` (or no `isolation`)

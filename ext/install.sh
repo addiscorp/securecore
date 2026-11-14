@@ -482,7 +482,7 @@ case $ISOLATION in
         say "  layer1.network.connect port 3306 has no \"socket\" or \"address\": in the microVM it goes to the database the site's DB_HOST names when that is this host's MySQL socket, MySQL on 127.0.0.1, or one you approve in the launcher's flags (--db-socket <path>, --db-address <host:port>). Any other database (another host or container, a private address) keeps the site on gelada, and the launcher says why."
       fi
       if [ -n "$OTHER" ]; then
-        say "  layer1.network.connect port(s) $OTHER have no \"socket\" or \"address\": in the microVM they reach only public hosts by name. A service on this host or its network needs one, e.g. { \"port\": 6379, \"socket\": \"/run/redis/redis.sock\" } or { \"port\": 6379, \"address\": \"127.0.0.1:6379\" }."
+        say "  layer1.network.connect port(s) $OTHER have no \"socket\" or \"address\": in the microVM a bare port reaches only public hosts by name. Ports other than 53, 80 and 443 keep the site on gelada until they say where they go (a Redis, memcached, Postgres or mail server on this host or its network would be lost otherwise), e.g. { \"port\": 6379, \"socket\": \"/run/redis/redis.sock\" } or { \"port\": 6379, \"address\": \"127.0.0.1:6379\" }."
       fi
       say "  A pool whose listen is a bare port (listen = 9000) also stays on gelada unless --listen or a listen with an address says where FastCGI goes: php-fpm takes that port on every address, the microVM on 127.0.0.1 only."
     elif [ -n "$GUEST" ]; then

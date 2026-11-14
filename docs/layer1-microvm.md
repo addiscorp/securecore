@@ -1121,6 +1121,25 @@ another host or container never gets 502s after an upgrade. A pool on a unix soc
 `/run/php/php8.3-fpm.sock`, which nginx's `fastcgi_pass unix:…` names) or on an address is served
 exactly there, under `auto` too.
 
+**The second review of #100.** Five more things an upgrade must not cost a site:
+- *The guest's size*: from the pool (`pm.max_children × memory_limit` + 256 MiB, at least
+  512 MiB, at most three quarters of the host's; a vCPU per four workers, 2 to the host's) unless
+  `--mem`/`--vcpus` say; under `auto` a pool that can't fit (or has `memory_limit = -1`) stays on
+  gelada (`size_guest`).
+- *Every bare port*: one other than 3306, 53, 80 and 443 keeps `auto` on gelada until a `socket`
+  or `address` says where it goes (`auto_port_gap`): a Redis on `127.0.0.1:6379`, memcached,
+  Postgres or a local SMTP relay would otherwise be lost silently.
+- *A deadline*: `--start-within` (600 s) caps systemd's extensions; every disk tool runs against
+  it (`tool_status_until` kills it), each step checks it (`start_deadline`), and `auto` then runs
+  gelada.
+- *Space shared between sites*: a start checks and records what it keeps (all of its new files
+  while it builds them, then its writable disks' growth) in one file under `flock`
+  (`crate::space`, `--space-ledger`), and counts what the other living starts on its filesystem
+  keep as taken. An entry whose process is gone counts for nothing.
+- *The relaunch*: it execs `/proc/self/exe` (an upgrade that removed the binary's path doesn't
+  matter), and a config that changed to `gelada` or `off` in between runs as it says; only
+  `microvm` refuses.
+
 **The space a start takes** (#100 review). The check counts the site disk, the PHP and config
 layers, the snapshot and each writable disk **as it may fill** (they are sparse: a new one up to
 its whole size, an existing one up to its size less what it holds), and keeps a twentieth of the
