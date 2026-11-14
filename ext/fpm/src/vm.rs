@@ -159,8 +159,15 @@ pub struct Options {
     pub listen_mode: SocketMode,
     /// Where the guest mounts the site, i.e. the root nginx sends (default: the app root).
     pub guest_root: Option<String>,
-    pub mem_mib: u32,
-    pub vcpus: u32,
+    /// `--mem` and `--vcpus`; `None`: sized from the pool and the host ([`size_guest`]).
+    pub mem_mib: Option<u32>,
+    pub vcpus: Option<u32>,
+    /// How long a start may take before it gives up (`--start-within`): systemd is asked for
+    /// more time until then, and `auto` then runs gelada ([`start_deadline`]).
+    pub start_within: Duration,
+    /// The shared record of the space each running start keeps for its disks (`--space-ledger`,
+    /// [`crate::space::DEFAULT_SPACE_LEDGER`]).
+    pub space_ledger: PathBuf,
     /// The size of each writable folder's disk; a larger value grows existing disks.
     pub write_disk_mib: u64,
     /// `<uid>:<gid>` or a user name: who Firecracker runs as.
@@ -297,6 +304,10 @@ pub struct Plan {
     /// Unix sockets in the guest that reach a forwarded port (`localhost` for MySQL: PHP's
     /// default sockets), as guest paths under `/run` or `/tmp`.
     pub guest_socks: Vec<(u16, String)>,
+    /// The site's own `DB_HOST` endpoint (`host:port`, a name or an IPv4 address) when a bare 3306
+    /// goes to an address ([`resolve_db`]): in the guest, a connection to it reaches 3306's
+    /// forward, so the site's unchanged `DB_HOST` works there (`sc.dbalias`).
+    pub db_alias: Option<String>,
 }
 
 /// What the host's pool says, for [`plan_with`]: who it runs as and where it listens.
@@ -551,7 +562,7 @@ pub fn plan_with(loaded: &Loaded, opts: &Options, hints: &PoolHints, defer: bool
         Err(_) if defer => User { uid: u32::MAX, gid: u32::MAX },
         Err(e) => return Err(e),
     };
-    Ok(Plan { root, guest_root, disks, tmpfs, sockets, addresses, egress, listen, state, cache, id, pool, guest_socks: Vec::new() })
+    Ok(Plan { root, guest_root, disks, tmpfs, sockets, addresses, egress, listen, state, cache, id, pool, guest_socks: Vec::new(), db_alias: None })
 }
 
 /// The site's pool user: `--pool-user` (a name or `<uid>:<gid>`), else the host pool's `user`
@@ -715,35 +726,48 @@ pub fn kernel_supports_layer3(kernel: &Path) -> Result<(), String> {
 }
 
 /// Whether this host can run `loaded`'s layer 1 as a microVM. `Err` says why not, for `auto`'s
-/// log line and `microvm`'s refusal:
-/// - the launcher is root (the jailer needs it), and the jailed user exists and isn't root;
+/// log line and `microvm`'s refusal. In this order, host first, so the reason is the most basic
+/// one (a host without KVM says so, not that some file is missing), and nothing is written
+/// until the host and the installed files pass:
 /// - `kvm` opens read-write and answers KVM_GET_API_VERSION with 12;
+/// - the launcher is root (the jailer needs it);
+/// - the installer's record (`installed.json`) exists, and the jailed user exists and isn't root;
+/// - `mke2fs`, `e2fsck` and `resize2fs` on PATH;
+/// - the config is one a microVM can enforce ([`plan`]);
 /// - Firecracker, the jailer, the kernel and the root image match the installer's record;
-/// - the config is one a microVM can enforce ([`plan`]), and each `connect[].socket` is a
-///   socket the jailed user may open itself;
+/// - every writable folder fits its disk and the sync ([`fits`]);
 /// - with layer 3 on, the kernel has Landlock and seccomp;
-/// - cgroup v2, and `mke2fs`, `e2fsck` and `resize2fs` on PATH.
+/// - each `connect[].socket` is a socket the jailed user may open itself;
+/// - cgroup v2.
 pub fn available(loaded: &Loaded, opts: &Options) -> Result<(), String> {
     match prepare_all(loaded, opts)? {
         Ready::One(_) | Ready::Pools(_) => Ok(()),
     }
 }
 
-/// The host checks every start makes first, before anything is captured or built: root, the
-/// jailed user, KVM, e2fsprogs, the plan (without the host pool's user and listen yet), the
-/// verified files, the writable folders' fit, layer 3's kernel, the sockets, the cgroup.
+/// The host checks every start makes first, before anything is captured or built, host first so
+/// the reason is the most basic one (a host without KVM says so and writes nothing): KVM, root,
+/// the installer's record, the jailed user, e2fsprogs, the plan (without the host pool's user and
+/// listen yet), the verified files, the writable folders' fit, layer 3's kernel, the sockets, the
+/// cgroup.
 fn host_checks(loaded: &Loaded, opts: &Options) -> Result<(Plan, User), String> {
+    let dev = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&opts.kvm)
+        .map_err(|e| format!("no KVM: {}: {e}", opts.kvm.display()))?;
+    // SAFETY: KVM_GET_API_VERSION takes no argument and returns an int; the fd is open.
+    let v = unsafe { libc::ioctl(dev.as_raw_fd(), KVM_GET_API_VERSION, 0) };
+    if v != KVM_API_VERSION {
+        return Err(format!("no KVM: {}: KVM_GET_API_VERSION returned {v}, not {KVM_API_VERSION}", opts.kvm.display()));
+    }
+    drop(dev);
     // SAFETY: geteuid(2) takes nothing and can't fail.
     if unsafe { libc::geteuid() } != 0 {
         return Err("the microVM's jailer needs the launcher to run as root".into());
     }
+    recorded(&opts.assets.record)?;
     let user = jail::user(&opts.vm_user)?;
-    let dev = OpenOptions::new().read(true).write(true).open(&opts.kvm).map_err(|e| format!("{}: {e}", opts.kvm.display()))?;
-    // SAFETY: KVM_GET_API_VERSION takes no argument and returns an int; the fd is open.
-    let v = unsafe { libc::ioctl(dev.as_raw_fd(), KVM_GET_API_VERSION, 0) };
-    if v != KVM_API_VERSION {
-        return Err(format!("{}: KVM_GET_API_VERSION returned {v}, not {KVM_API_VERSION}", opts.kvm.display()));
-    }
     for tool in ["mke2fs", "e2fsck", "resize2fs"] {
         if !on_path(tool) {
             return Err(format!("{tool} (e2fsprogs) isn't on PATH; it builds and grows the site's disks"));
@@ -1056,7 +1080,7 @@ pub fn resolve_db(
     approved: &DbApproved,
     trusted: &dyn Fn(&Path, bool) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
-    const DB: u16 = 3306;
+    const DB: u16 = crate::guest::DB_FORWARD;
     let mut said = None;
     let no_db = |why: String| Some(format!("port {DB} has no socket or address, and {why}: the guest gets no database on it (only public names)"));
     if plan.egress.contains(&DB) {
@@ -1099,6 +1123,9 @@ pub fn resolve_db(
                     plan.egress.retain(|p| *p != DB);
                     said = Some(format!("port {DB} has no socket or address: DB_HOST is {h}, so it goes to {addr}, connected as the pool user"));
                     plan.addresses.push((DB, addr));
+                    // The guest's PHP connects where the site's DB_HOST says (a name, another
+                    // port): that endpoint reaches the forward too (#100 review).
+                    plan.db_alias = db_alias(&ep.host, ep.port, DB);
                 } else if loopback {
                     said = no_db(format!(
                         "DB_HOST is {h}: port {} on this host isn't MySQL's ({}) nor the one --db-address approves",
@@ -1125,6 +1152,209 @@ pub fn resolve_db(
         plan.guest_socks.extend(paths.into_iter().map(|p| (DB, p)));
     }
     Ok(said)
+}
+
+/// The guest's alias for a forwarded database (`sc.dbalias=<host>:<port>`, [`Plan::db_alias`]):
+/// `host:port` when the site's `DB_HOST` names anything but the guest's own `127.0.0.1:<fwd>`.
+/// `None` for an IPv6 address (the guest's connect hook knows IPv4 and names) or a name the
+/// command line can't carry.
+pub fn db_alias(host: &str, port: u16, fwd: u16) -> Option<String> {
+    if host == "127.0.0.1" && port == fwd {
+        return None;
+    }
+    crate::guest::db_alias_host_ok(host).then(|| format!("{host}:{port}"))
+}
+
+/// What `auto` doesn't move into the microVM although it could run there (#100 review): a bare
+/// `{ "port": 3306 }` that leaves the guest without the database the site's `DB_HOST` names.
+/// gelada reaches it on 3306 as before, so `auto` stays there, saying how to approve it.
+/// `no_db`: [`resolve_db`] kept 3306 an egress port (no socket, no address); `said`: what it
+/// logged; `reachable(host, port)`: whether the guest reaches that name through egress (layer 2's
+/// hosts, a public address).
+pub fn auto_db_gap(no_db: bool, said: Option<&str>, db_host: Option<&str>, reachable: &dyn Fn(&str, u16) -> Result<(), String>) -> Option<String> {
+    if !no_db {
+        return None;
+    }
+    let ep = db_host.and_then(securecore_config::dbhost::parse_db_host).map(|t| {
+        t.resolve(&securecore_config::dbhost::Defaults { host: "localhost", port: 3306, socket: None })
+    });
+    let why = match &ep {
+        // Named, not an IP the guest would pick, and reachable: the guest has it through egress.
+        Some(ep) if ep.host != "localhost" && ep.host.parse::<std::net::IpAddr>().is_err() => match reachable(&ep.host, ep.port) {
+            Ok(()) => return None,
+            Err(e) => format!("DB_HOST is {}, which the guest can't reach by name ({e})", db_host.unwrap_or_default()),
+        },
+        Some(ep) if ep.host != "localhost" && !ep.host.starts_with("127.") && ep.host != "::1" => format!(
+            "DB_HOST is {}, an IP address, and the guest reaches other hosts only by name (port 3306 has no socket or address)",
+            db_host.unwrap_or_default()
+        ),
+        _ => said.unwrap_or("port 3306 gives the guest no database").to_owned(),
+    };
+    Some(format!(
+        "{why}; the site would lose its database, which gelada reaches on port 3306: approve it with --db-socket or --db-address, \
+         or give the connect entry a socket or address"
+    ))
+}
+
+/// The other thing `auto` doesn't move (#100 review): a pool whose `listen` is a bare port, which
+/// php-fpm binds on every address, with no `--listen`: the microVM listens on `127.0.0.1` only
+/// ([`crate::phpconf::pool_listen`]), so a web server elsewhere would get 502s. Unless its
+/// `listen.allowed_clients` admits only the loopback anyway.
+pub fn auto_listen_gap(pool: &str, listen: Option<&str>, listen_flag: bool, admit: &Admit) -> Option<String> {
+    let l = listen.filter(|l| crate::phpconf::listens_everywhere(l))?;
+    if listen_flag || matches!(admit, Admit::Addresses(a) if a.iter().all(|ip| ip.to_canonical().is_loopback())) {
+        return None;
+    }
+    Some(format!(
+        "pool [{pool}] has listen = {l}, which php-fpm binds on every address, and the microVM listens on 127.0.0.1:{l} only: \
+         a web server on another host or container would get 502s. Set listen = 127.0.0.1:{l} or 0.0.0.0:{l} (or --listen) to say which"
+    ))
+}
+
+/// What a writable disk may still take on the state folder's filesystem: a new one grows to its
+/// whole size (`want`), an existing one (`Some((size, allocated))`) to the larger of its size and
+/// `want`, less what it holds already (#100 review: the disks are sparse; they fill as the guest
+/// writes, next to the database).
+pub fn disk_room(want: u64, existing: Option<(u64, u64)>) -> u64 {
+    match existing {
+        None => want,
+        Some((size, allocated)) => want.max(size).saturating_sub(allocated),
+    }
+}
+
+/// The ports a bare `connect` entry may have under `auto`: those that only ever go to public
+/// hosts by name (DNS, HTTP, HTTPS), which is what a bare port reaches in the microVM.
+pub const PUBLIC_EGRESS_PORTS: [u16; 3] = [53, 80, 443];
+
+/// SMTP, submission over TLS and submission: a public relay's, unless one listens on this host.
+pub const MAIL_PORTS: [u16; 3] = [25, 465, 587];
+
+/// Whether something listens on this host's loopback on `port` (a local mail relay).
+pub fn listens_locally(port: u16) -> bool {
+    TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300)).is_ok()
+}
+
+/// The third thing `auto` doesn't move (#100 re-review): a bare `connect` port (no `socket`, no
+/// `address`) other than 3306 ([`auto_db_gap`]) and [`PUBLIC_EGRESS_PORTS`]. gelada lets it
+/// reach any host on it, the guest only public names, and nothing says where it goes: a Redis
+/// or memcached on this host, a Postgres in a container, an SMTP relay on `localhost:25` would
+/// be lost without a word. `egress`: the plan's bare ports after [`resolve_db`].
+///
+/// Mail submission ([`MAIL_PORTS`]) goes to a public relay by name (WP Mail SMTP, layer 2's hosts
+/// police it) unless a relay listens on this host's loopback (`local(port)`): only then does it
+/// keep `auto` on gelada (#100 second re-review).
+pub fn auto_port_gap(egress: &[u16], local: &dyn Fn(u16) -> bool) -> Option<String> {
+    let ports: Vec<u16> = egress
+        .iter()
+        .copied()
+        .filter(|p| *p != crate::guest::DB_FORWARD && !PUBLIC_EGRESS_PORTS.contains(p) && (!MAIL_PORTS.contains(p) || local(*p)))
+        .collect();
+    let first = *ports.first()?;
+    Some(format!(
+        "layer1.network.connect port(s) {} have no \"socket\" or \"address\": gelada reaches any host on them, the microVM only public \
+         names, and nothing says where they go (a Redis, memcached, Postgres or mail server on this host or its network would be lost): \
+         give each its target, e.g. {{ \"port\": {first}, \"address\": \"127.0.0.1:{first}\" }} or a \"socket\", or set \"isolation\": \"microvm\" \
+         if they only go to public names",
+        ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
+    ))
+}
+
+/// What the guest must hold for one pool: `pm.max_children` workers of `memory_limit` each
+/// (`None`: `-1`, no limit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolSize {
+    pub name: String,
+    pub max_children: u32,
+    pub memory_limit: Option<u64>,
+}
+
+/// The host's memory (MiB, `MemTotal`) and the CPUs this process may use.
+pub fn host_resources() -> (u64, u32) {
+    let mem = fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| m.lines().find_map(|l| l.strip_prefix("MemTotal:").and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())))
+        .map_or(0, |kib| kib >> 10);
+    let cpus = thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX));
+    (mem, cpus)
+}
+
+/// A pool's [`PoolSize`]: its `pm.max_children` (php-fpm requires it; 5 when it can't be read),
+/// and `memory_limit` as the pool sets it (`php_admin_value`, then `php_value`), else as PHP's
+/// ini files do, else PHP's default, 128M.
+pub fn pool_size(pool: &crate::phpconf::Pool, capture: &capture::Capture) -> Result<PoolSize, String> {
+    let max_children = pool.get("pm.max_children").and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| *n > 0).unwrap_or(5);
+    let limit = pool
+        .get("php_admin_value[memory_limit]")
+        .or_else(|| pool.get("php_value[memory_limit]"))
+        .map(str::to_owned)
+        .or_else(|| capture.memory_limit.clone())
+        .unwrap_or_else(|| "128M".to_owned());
+    let memory_limit = crate::phpconf::ini_size(&limit).map_err(|e| format!("pool [{}]: {e}", pool.name))?;
+    Ok(PoolSize { name: pool.name.clone(), max_children, memory_limit })
+}
+
+/// What a guest needs besides its workers: its kernel, init, php-fpm's master, opcache's shared
+/// memory and some page cache.
+pub const GUEST_OVERHEAD_MIB: u64 = 256;
+
+/// The guest's size for a pool, and the line that says why ([`size_guest`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sized {
+    pub mem_mib: u32,
+    pub vcpus: u32,
+    pub said: String,
+}
+
+/// The guest's memory and vCPUs for `pool` on a host with `host` (MiB, CPUs) (#100 re-review:
+/// a pool that worked under gelada must not be OOM-killed in a fixed 512 MiB guest). It needs
+/// `pm.max_children × memory_limit` plus [`GUEST_OVERHEAD_MIB`]; a guest gets at least 512 MiB
+/// (memory a guest doesn't touch is never the host's), at most three quarters of the host's.
+/// vCPUs: one per four workers, at least 2, at most the host's. `--mem` / `--vcpus` win.
+/// Under `auto` (`auto`), a pool that can't fit (more than the cap, more than `--mem`, or no
+/// memory limit to size from) is an `Err`: gelada runs it as before. Under `microvm` the guest
+/// gets the cap and the line says it's short.
+pub fn size_guest(pool: &PoolSize, host: (u64, u32), flag_mem: Option<u32>, flag_vcpus: Option<u32>, auto: bool) -> Result<Sized, String> {
+    let (host_mem, host_cpus) = host;
+    let cap = host_mem * 3 / 4;
+    let vcpus = flag_vcpus.unwrap_or_else(|| pool.max_children.div_ceil(4).max(2).min(host_cpus.max(1)));
+    let what = |limit: u64| format!("pool [{}] has pm.max_children {} × memory_limit {} MiB + {GUEST_OVERHEAD_MIB} MiB", pool.name, pool.max_children, limit >> 20);
+    let Some(limit) = pool.memory_limit else {
+        return match flag_mem {
+            Some(m) => Ok(Sized { mem_mib: m, vcpus, said: format!("the guest gets {m} MiB (--mem) and {vcpus} vCPUs: pool [{}] has no memory_limit", pool.name) }),
+            None if auto => Err(format!(
+                "pool [{}] has memory_limit = -1 (no limit), so the microVM can't be sized for its {} workers: set memory_limit or --mem",
+                pool.name, pool.max_children
+            )),
+            None => Ok(Sized { mem_mib: 512, vcpus, said: format!("the guest gets 512 MiB and {vcpus} vCPUs: pool [{}] has no memory_limit to size from", pool.name) }),
+        };
+    };
+    let need = u64::from(pool.max_children) * (limit >> 20) + GUEST_OVERHEAD_MIB;
+    let to_u32 = |m: u64| u32::try_from(m).unwrap_or(u32::MAX);
+    match flag_mem {
+        Some(m) if auto && need > u64::from(m) => {
+            Err(format!("{} = {need} MiB, more than the guest's --mem {m} MiB: under load its workers would be killed", what(limit)))
+        }
+        Some(m) => Ok(Sized { mem_mib: m, vcpus, said: format!("the guest gets {m} MiB (--mem) and {vcpus} vCPUs: {} = {need} MiB", what(limit)) }),
+        None if need > cap && auto => Err(format!(
+            "{} = {need} MiB, more than this host gives one microVM ({cap} MiB, three quarters of its {host_mem} MiB): under load its workers would be killed",
+            what(limit)
+        )),
+        None if need > cap => Ok(Sized {
+            mem_mib: to_u32(cap),
+            vcpus,
+            said: format!("the guest gets {cap} MiB, three quarters of this host's, and {vcpus} vCPUs: {} = {need} MiB, so it is short", what(limit)),
+        }),
+        None => {
+            let mem = need.max(512);
+            Ok(Sized { mem_mib: to_u32(mem), vcpus, said: format!("the guest gets {mem} MiB and {vcpus} vCPUs: {} = {need} MiB", what(limit)) })
+        }
+    }
+}
+
+/// What a start's writable disks may still take, all of them: each [`disk_room`] (`want`, and the
+/// disk's size and allocation when it exists), existing disks included, since they grow too.
+pub fn writable_room(disks: &[(u64, Option<(u64, u64)>)]) -> u64 {
+    disks.iter().map(|(want, existing)| disk_room(*want, *existing)).sum()
 }
 
 /// One message to systemd's notify socket, when the launcher runs under it.
@@ -1162,17 +1392,27 @@ pub fn stop_extending() {
 pub const EXTEND_BY: Duration = Duration::from_secs(30);
 const EXTEND_EVERY: Duration = Duration::from_secs(10);
 
+/// `--start-within`'s default: how long a start may take, in all.
+pub const START_WITHIN: Duration = Duration::from_secs(600);
+
+/// This start's deadline and the time it was given ([`extend_start_timeout`]).
+static START: std::sync::OnceLock<(Instant, Duration)> = std::sync::OnceLock::new();
+
 /// A first start captures the host's PHP, builds its disks and makes a snapshot, which may take
 /// longer than systemd's `TimeoutStartSec` (#100 review): while it does, systemd is told every
-/// 10 s that it needs 30 s more (`EXTEND_TIMEOUT_USEC`), until the VM serves. Nothing without
-/// `NOTIFY_SOCKET`.
-pub fn extend_start_timeout() {
+/// 10 s that it needs 30 s more (`EXTEND_TIMEOUT_USEC`), until the VM serves or the start ends.
+/// The start itself never runs past `within` (#100 re-reviews): the launcher's watchdog runs
+/// gelada at that deadline, whatever step it is in (`main.rs`), every disk tool still running is
+/// stopped shortly after ([`tool_status_until`]), and the boot never begins past it
+/// ([`start_deadline`]). The deadline holds without `NOTIFY_SOCKET` too.
+pub fn extend_start_timeout(within: Duration) {
     static STARTED: std::sync::Once = std::sync::Once::new();
+    let _ = START.set((Instant::now() + within, within));
     if std::env::var_os("NOTIFY_SOCKET").is_none() {
         return;
     }
     STARTED.call_once(|| {
-        thread::spawn(|| {
+        thread::spawn(move || {
             while !SERVING.load(Ordering::SeqCst) {
                 notify(&format!("EXTEND_TIMEOUT_USEC={}\n", EXTEND_BY.as_micros()));
                 // In small steps, so a stop that begins meanwhile sends no further extension.
@@ -1183,6 +1423,66 @@ pub fn extend_start_timeout() {
             }
         });
     });
+}
+
+/// The start's deadline and the time it was given, once [`extend_start_timeout`] set them.
+pub fn deadline() -> Option<(Instant, Duration)> {
+    START.get().copied()
+}
+
+/// The record that a start of this site ran past its deadline (#100 second re-review): until
+/// the config or the app root changes, the next starts go straight to gelada.
+fn deadline_record(state: &Path) -> PathBuf {
+    state.join("deadline-fallback.json")
+}
+
+/// What the record is kept for: the config's sha256 and the app root's mtime and ctime (a plugin
+/// or theme installed, a file added at the top).
+fn site_stamp(loaded: &Loaded) -> String {
+    let m = fs::metadata(&loaded.root).ok();
+    format!(
+        "config {} root {}.{} {}.{}",
+        loaded.sha256,
+        m.as_ref().map_or(0, |m| m.mtime()),
+        m.as_ref().map_or(0, |m| m.mtime_nsec()),
+        m.as_ref().map_or(0, |m| m.ctime()),
+        m.as_ref().map_or(0, |m| m.ctime_nsec())
+    )
+}
+
+/// Records that this start ran past its deadline (`why`), in its state folder.
+pub fn record_deadline_fallback(loaded: &Loaded, opts: &Options, why: &str) {
+    let state = state_base(loaded, opts);
+    let _ = fs::create_dir_all(&state);
+    let v = serde_json::json!({ "stamp": site_stamp(loaded), "why": why, "at": now().0 });
+    let _ = fs::write(deadline_record(&state), v.to_string());
+}
+
+/// Why `auto` goes straight to gelada: an earlier start of this same site and config ran past its
+/// deadline. A record for another stamp is removed (the site or config changed: try again).
+pub fn deadline_fallback(loaded: &Loaded, opts: &Options) -> Option<String> {
+    let file = deadline_record(&state_base(loaded, opts));
+    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&file).ok()?).ok()?;
+    if v["stamp"].as_str() != Some(site_stamp(loaded).as_str()) {
+        let _ = fs::remove_file(&file);
+        return None;
+    }
+    Some(format!(
+        "a start of this site ran past its deadline before ({}), so it stays on gelada until securecore.json or the site changes, or {} is removed",
+        v["why"].as_str().unwrap_or("?"),
+        file.display()
+    ))
+}
+
+/// `Err` once this start has run past its deadline ([`extend_start_timeout`]); checked before
+/// the boot.
+pub fn start_deadline() -> Result<(), String> {
+    match START.get() {
+        Some((d, within)) if Instant::now() >= *d => {
+            Err(format!("the start took longer than {} s (--start-within), so the microVM gives up on it", within.as_secs()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Bytes the filesystem holding `path` has in all.
@@ -1205,19 +1505,43 @@ pub fn space_margin(fs_bytes: u64) -> u64 {
 }
 
 /// Whether the new files a start makes (`needs`: what, bytes) fit the state folder's filesystem
-/// (`free` of `fs_bytes`) with [`space_margin`] left.
-pub fn space_ok(needs: &[(String, u64)], free: u64, fs_bytes: u64) -> Result<(), String> {
+/// (`free` of `fs_bytes`, less `others`: what other starts on it keep for their disks,
+/// [`crate::space`]) with [`space_margin`] left.
+pub fn space_ok(needs: &[(String, u64)], free: u64, others: u64, fs_bytes: u64) -> Result<(), String> {
     let total: u64 = needs.iter().map(|(_, b)| b).sum();
     let margin = space_margin(fs_bytes);
-    if total + margin <= free {
+    if total + margin + others <= free {
         return Ok(());
     }
     Err(format!(
-        "this start needs {} MiB on the state folder's filesystem ({}) and keeps {} MiB free beside it (for the database and the host), but it has {} MiB free",
+        "this start needs {} MiB on the state folder's filesystem ({}) and keeps {} MiB free beside it (for the database and the host), but it has {} MiB free{}",
         total >> 20,
         needs.iter().map(|(w, b)| format!("{w} {} MiB", b >> 20)).collect::<Vec<_>>().join(", "),
         margin >> 20,
-        free >> 20
+        free >> 20,
+        if others > 0 { format!(", {} MiB of which other sites' starts keep for their disks", others >> 20) } else { String::new() }
+    ))
+}
+
+/// What the host keeps for itself and its database, out of every guest's reach: a quarter of its
+/// memory, and at least 2 GiB (MiB).
+pub fn host_memory_reserve(host_mem: u64) -> u64 {
+    (host_mem / 4).max(2048)
+}
+
+/// Whether a guest of `mine` MiB fits beside the `others` MiB the other running guests on this
+/// host hold (#100 second re-review): a guest's memory, once touched, stays the host's until it
+/// stops (no balloon), so together they stay within the host's memory less
+/// [`host_memory_reserve`]. Checked under `auto` only.
+pub fn memory_ok(mine: u64, others: u64, host_mem: u64) -> Result<(), String> {
+    let reserve = host_memory_reserve(host_mem);
+    let budget = host_mem.saturating_sub(reserve);
+    if mine + others <= budget {
+        return Ok(());
+    }
+    Err(format!(
+        "this guest's {mine} MiB and the {others} MiB the other microVMs on this host hold come to more than its guests' budget, \
+         {budget} MiB ({host_mem} MiB less {reserve} MiB kept for the database and the host)"
     ))
 }
 
@@ -1236,6 +1560,13 @@ pub struct Prepared {
     admit: Admit,
     _lock: fs::File,
     pub pool_name: String,
+    /// The guest's size ([`size_guest`]).
+    mem_mib: u32,
+    vcpus: u32,
+    /// The space this start keeps in the shared record while it runs ([`crate::space`]), and
+    /// what its writable disks may still take (all it keeps once the snapshot is written).
+    space: crate::space::Reservation,
+    writable_room: u64,
 }
 
 /// [`prepare_all`] for one pool (`opts.pool`, or the only one).
@@ -1259,9 +1590,34 @@ fn prepare(loaded: &Loaded, opts: &Options, capture: capture::Capture) -> Result
     let db = db_ids(&opts.db_user);
     let db_host = site_db_host(&plan.root);
     let approved = DbApproved { address: opts.db_address.clone(), socket: opts.db_socket.clone() };
-    if let Some(said) = resolve_db(&mut plan, db_host.as_deref(), &capture.mysql_sockets, &approved, &|p, a| trusted_db_socket(p, db, a))? {
+    let said = resolve_db(&mut plan, db_host.as_deref(), &capture.mysql_sockets, &approved, &|p, a| trusted_db_socket(p, db, a))?;
+    // Under `auto`, a start that would cost the site its database or its web server's FastCGI
+    // stays on gelada (#100 review): before anything is built.
+    if loaded.config.layer1.isolation() == securecore_config::Isolation::Auto {
+        let egress = crate::egress::Egress::new(loaded, plan.egress.clone());
+        let own = crate::egress::host_addresses();
+        let reachable = |h: &str, p: u16| -> Result<(), String> {
+            egress.allows(h, p)?;
+            crate::egress::addresses(h, p, &own).map(|_| ())
+        };
+        let no_db = plan.egress.contains(&crate::guest::DB_FORWARD);
+        if let Some(why) = auto_db_gap(no_db, said.as_deref(), db_host.as_deref(), &reachable) {
+            return Err(why);
+        }
+        if let Some(why) = auto_listen_gap(&pool.name, pool.listen().as_deref(), opts.listen.is_some(), &hints.admit) {
+            return Err(why);
+        }
+        if let Some(why) = auto_port_gap(&plan.egress, &listens_locally) {
+            return Err(why);
+        }
+    }
+    let auto = loaded.config.layer1.isolation() == securecore_config::Isolation::Auto;
+    let sized = size_guest(&pool_size(pool, &capture)?, host_resources(), opts.mem_mib, opts.vcpus, auto)?;
+    if let Some(said) = said {
         log(&said);
     }
+    log(&sized.said);
+    let (mem_mib, vcpus) = (sized.mem_mib, sized.vcpus);
     // Checked again here, not only in host_checks: what is checked is what is bind-mounted.
     let sockets = open_sockets(&plan, user)?;
     claim_state(&plan)?;
@@ -1326,19 +1682,34 @@ fn prepare(loaded: &Loaded, opts: &Options, capture: capture::Capture) -> Result
     if !conf_path.is_file() {
         needs.push(("config layer".into(), 33 << 20));
     }
-    let mut writable_new = 0u64;
+    // Each writable disk is sparse: what it may still take as the guest fills it (#100 review).
+    let mut disks_now = Vec::new();
     for d in &plan.disks {
-        if !plan.state.join(format!("{}.ext4", d.id)).is_file() {
-            writable_new += folder_usage(&plan, d)?.0 + (64 << 20);
-        }
+        let want = disk_mib(opts.write_disk_mib, folder_usage(&plan, d)?.0) << 20;
+        let existing = fs::metadata(plan.state.join(format!("{}.ext4", d.id))).ok().filter(|m| m.is_file()).map(|m| (m.len(), m.blocks() * 512));
+        disks_now.push((want, existing));
     }
-    if writable_new > 0 {
-        needs.push(("writable disks".into(), writable_new));
+    let writable = writable_room(&disks_now);
+    if writable > 0 {
+        needs.push(("writable disks, as they fill".into(), writable));
     }
     if opts.snapshot {
-        needs.push(("snapshot".into(), u64::from(opts.mem_mib) << 20));
+        needs.push(("snapshot".into(), u64::from(mem_mib) << 20));
     }
-    space_ok(&needs, free_bytes(&plan.state)?, fs_size(&plan.state)?)?;
+    // Checked and kept in the shared record under its lock (#100 re-review): what other starts
+    // on this filesystem keep for their disks counts as taken.
+    let total: u64 = needs.iter().map(|(_, b)| b).sum();
+    let dev = fs::metadata(&plan.state).map_err(|e| format!("{}: {e}", plan.state.display()))?.dev();
+    let host_mem = host_resources().0;
+    let space = crate::space::reserve(&opts.space_ledger, &plan.state, dev, total, u64::from(mem_mib), |others| {
+        // Free space measured under the lock (#100 second re-review), and under `auto` every
+        // guest on this host within its memory budget.
+        space_ok(&needs, free_bytes(&plan.state)?, others.bytes, fs_size(&plan.state)?)?;
+        if auto {
+            memory_ok(u64::from(mem_mib), others.mem_mib, host_mem)?;
+        }
+        Ok(())
+    })?;
     // The layers, cached by what they hold.
     status("building the guest's disks");
     if !php_path.is_file() {
@@ -1393,14 +1764,34 @@ fn prepare(loaded: &Loaded, opts: &Options, capture: capture::Capture) -> Result
         config: loaded.sha256.clone(),
         machine: format!(
             "mem {} vcpus {} args {args} drives {} size {}",
-            opts.mem_mib,
-            opts.vcpus,
+            mem_mib,
+            vcpus,
             disks.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(","),
             sizes.join(",")
         ),
     };
     let pool_name = pool.name.clone();
-    Ok(Prepared { plan, user, sockets, env, ini, machine_parts: (php_path, conf_path, site_path, disks, args, key.sha256()), sync, listen_mode, admit, _lock: lock, pool_name })
+    // Built: from now on the writable disks' growth is still to come, and the snapshot until it
+    // is written (#100 second re-review: [`run`] lets it go after the boot).
+    let snapshot_bytes = if opts.snapshot { u64::from(mem_mib) << 20 } else { 0 };
+    space.keep(writable + snapshot_bytes)?;
+    Ok(Prepared {
+        plan,
+        user,
+        sockets,
+        env,
+        ini,
+        machine_parts: (php_path, conf_path, site_path, disks, args, key.sha256()),
+        sync,
+        listen_mode,
+        admit,
+        _lock: lock,
+        pool_name,
+        mem_mib,
+        vcpus,
+        space,
+        writable_room: writable,
+    })
 }
 
 /// Removes `<dir>/<prefix>*` but `keep` (older layer disks).
@@ -1463,11 +1854,47 @@ fn json_str(s: &str) -> String {
 }
 
 fn run_tool(cmd: &mut Command, what: &str) -> Result<(), String> {
-    let out = cmd.stdin(Stdio::null()).output().map_err(|e| format!("{what}: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("{what}: {} {}", out.status, String::from_utf8_lossy(&out.stderr).trim()));
+    let (status, stderr) = tool_status_until(cmd, what, tool_deadline())?;
+    if !status.success() {
+        return Err(format!("{what}: {status} {}", String::from_utf8_lossy(&stderr).trim()));
     }
     Ok(())
+}
+
+/// When a tool this start runs must have ended: the start's deadline ([`start_deadline`]), or
+/// [`START_WITHIN`] from now when none was set.
+pub fn tool_deadline() -> Instant {
+    // A little past the start's: the watchdog (`main.rs`) acts at the deadline itself; this is
+    // the stop for a tool that would outlive it.
+    START.get().map_or_else(|| Instant::now() + START_WITHIN, |(d, _)| *d + Duration::from_secs(10))
+}
+
+/// Runs a tool (mke2fs, e2fsck, resize2fs) to its end or until `deadline`, whichever comes
+/// first (#100 re-review: a copy from a stalled mount must never hold the start forever): past
+/// it the tool is killed and reaped, and the start fails with why. Its status and the first
+/// 64 KiB of its stderr.
+pub fn tool_status_until(cmd: &mut Command, what: &str, deadline: Instant) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e| format!("{what}: {e}"))?;
+    let stderr = child.stderr.take();
+    let reader = thread::spawn(move || {
+        let mut out = Vec::new();
+        if let Some(e) = stderr {
+            let _ = e.take(64 << 10).read_to_end(&mut out);
+        }
+        out
+    });
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((status, reader.join().unwrap_or_default())),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{what}: still running at the start's deadline (--start-within), so it was stopped"));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(format!("{what}: {e}")),
+        }
+    }
 }
 
 /// e2fsck's verdict, by its exit code (e2fsck(8)): 0 clean and 1 errors corrected are fine
@@ -1751,8 +2178,8 @@ fn write_disk(plan: &Plan, disk: &WriteDisk, mib: u64, user: User) -> Result<(Pa
             let mut fsck = Command::new("e2fsck");
             fsck.args(["-f", "-y", &via]);
             as_user(&mut fsck, user, None, &[], Some(&img))?;
-            let out = fsck.stdin(Stdio::null()).output().map_err(|e| format!("e2fsck: {e}"))?;
-            fsck_result(out.status, &out.stderr)?;
+            let (status, stderr) = tool_status_until(&mut fsck, "e2fsck", tool_deadline())?;
+            fsck_result(status, &stderr)?;
             img.set_len(want).map_err(|e| e.to_string())?;
             let mut resize = Command::new("resize2fs");
             resize.arg(&via);
@@ -1895,6 +2322,9 @@ fn boot_args(plan: &Plan, opts: &Options, env_names: &[&str], fpm: &str) -> Stri
     for (port, path) in &plan.guest_socks {
         let _ = write!(a, " sc.sock={port}:{path}");
     }
+    if let Some(alias) = &plan.db_alias {
+        let _ = write!(a, " sc.dbalias={alias}");
+    }
     for x in &opts.guest_args {
         a.push(' ');
         a.push_str(x);
@@ -1985,6 +2415,9 @@ struct Machine {
     sockets: Vec<(u16, jail::SocketDir)>,
     /// What the guest may reach by name.
     egress: &'static std::sync::RwLock<crate::egress::Egress>,
+    /// The guest's size ([`size_guest`]).
+    mem_mib: u32,
+    vcpus: u32,
 }
 
 /// What a jail holds for one spawn: the host ends of the guest's ports come with it.
@@ -2031,7 +2464,7 @@ impl Vm {
         let (root, short) = short_dir(&j.root)?;
         let log_server = wire(plan, m, j, &short, wiring, keys)?;
         let log = log_server.inbox();
-        let mut cmd = j.command(&opts.assets.jailer, &opts.assets.firecracker, opts.vcpus, opts.mem_mib, &["--api-sock", IN_API]);
+        let mut cmd = j.command(&opts.assets.jailer, &opts.assets.firecracker, m.vcpus, m.mem_mib, &["--api-sock", IN_API]);
         // stdout and stderr together, through a pipe, into a capped console.log.
         let (rd, wr) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
         let wr2 = wr.try_clone().map_err(|e| e.to_string())?;
@@ -2138,7 +2571,7 @@ fn give_log_key(vm: &Vm) {
 
 fn cold_boot(plan: &Plan, opts: &Options, m: &Machine, wiring: Wiring) -> Result<Vm, String> {
     let vm = Vm::spawn(plan, opts, m, wiring, None, LogKeys { key: random_key()?, stale: None })?;
-    vm.api("PUT", "/machine-config", &format!(r#"{{"vcpu_count":{},"mem_size_mib":{},"smt":false}}"#, opts.vcpus, opts.mem_mib))?;
+    vm.api("PUT", "/machine-config", &format!(r#"{{"vcpu_count":{},"mem_size_mib":{},"smt":false}}"#, m.vcpus, m.mem_mib))?;
     let args = format!("{} sc.time={}", m.args, now().0);
     vm.api("PUT", "/boot-source", &format!(r#"{{"kernel_image_path":{},"boot_args":{}}}"#, json_str(IN_KERNEL), json_str(&args)))?;
     // In the order the guest names them (crate::guest: vda base, vdb PHP, vdc config, vdd site).
@@ -3376,7 +3809,7 @@ pub fn unblock_signals() {
 pub fn run(loaded: &Loaded, opts: &Options, p: Prepared, t0: Instant) -> Result<(), RunError> {
     let set = block_signals();
     let before = RunError::BeforeServing;
-    let Prepared { plan, user, sockets, env, ini, machine_parts: (php, conf, site_path, disks, args, key), sync, listen_mode, admit, _lock, pool_name: _ } = p;
+    let Prepared { plan, user, sockets, env, ini, machine_parts: (php, conf, site_path, disks, args, key), sync, listen_mode, admit, _lock, pool_name: _, mem_mib, vcpus, space, writable_room } = p;
     // Before any thread: whatever ends this process, the VM ends with it.
     let jail = Jail::new(&plan.state, &plan.id, user);
     // What [`Jail::bind_dir`] mounts: the socket's folder, or the socket alone in a shared folder.
@@ -3410,9 +3843,13 @@ pub fn run(loaded: &Loaded, opts: &Options, p: Prepared, t0: Instant) -> Result<
     if let (Some(path), Some(text)) = (&opts.guest_ini, &ini) {
         log(&format!("the guest's php-fpm gets the site's php.ini settings from {} ({} lines), in each start message", path.display(), text.lines().count()));
     }
-    let m = Machine { php, conf, site: site_path, disks, args, key, user, sockets, egress };
+    let m = Machine { php, conf, site: site_path, disks, args, key, user, sockets, egress, mem_mib, vcpus };
+    start_deadline().map_err(before)?;
     status("starting the microVM");
     let (mut vm, how, ready) = bring_up(&mut Real { plan: &plan, opts, m: &m, env: &env, ini: ini.as_deref() }, opts.snapshot).map_err(before)?;
+    // The snapshot is on disk now (or was there, or wasn't made): only the disks' growth is kept.
+    space.keep(writable_room).map_err(before)?;
+    log(&format!("the shared space record keeps {} MiB for this site's disks as they fill", writable_room >> 20));
     let t_ready = ready.duration_since(t0).as_secs_f64() * 1000.0;
     let t_started = ms(t0);
     match how {
@@ -3556,8 +3993,10 @@ mod tests {
             listen: None,
             listen_mode: SocketMode { owner: None, group: None, mode: 0o660 },
             guest_root: Some("/var/www/html".into()),
-            mem_mib: 512,
-            vcpus: 2,
+            mem_mib: None,
+            vcpus: None,
+            start_within: Duration::from_secs(600),
+            space_ledger: PathBuf::from("/nonexistent/space.json"),
             write_disk_mib: 1024,
             vm_user: "64000:64000".into(),
             pool_user: Some("33:33".into()),
@@ -3574,6 +4013,23 @@ mod tests {
             db_address: None,
             db_socket: None,
         }
+    }
+
+    /// The host comes first: without KVM that is the reason, whoever runs the launcher and
+    /// whatever is installed, and nothing is written (no state folder).
+    #[test]
+    fn no_kvm_is_the_first_reason_and_writes_nothing() {
+        let dir = scratch("nokvm");
+        let l = loaded(&dir, r#"{"isolation":"auto","write":["wp-content/uploads"],"network":{"bind":[{"port":9000}]}}"#);
+        let state = dir.join("state");
+        let o = Options { kvm: dir.join("no-kvm"), state: Some(state.clone()), vm_user: "no-such-user-sc".into(), ..opts() };
+        let e = available(&l, &o).expect_err("no KVM");
+        assert_eq!(e, format!("no KVM: {}: No such file or directory (os error 2)", dir.join("no-kvm").display()));
+        assert!(!state.exists(), "nothing probed past KVM");
+        // A device that isn't KVM: says so too.
+        let o = Options { kvm: PathBuf::from("/dev/null"), ..o };
+        assert!(available(&l, &o).expect_err("not KVM").starts_with("no KVM: /dev/null: KVM_GET_API_VERSION returned"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3663,6 +4119,154 @@ mod tests {
             assert!(said.contains("by name") || said.contains("only public names"), "{said}");
             assert!(no_db(&p));
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_stays_on_gelada_rather_than_lose_the_database() {
+        let public = |_: &str, _: u16| -> Result<(), String> { Ok(()) };
+        let private = |h: &str, _: u16| -> Result<(), String> { Err(format!("{h} resolves to no public address")) };
+        let said = Some("port 3306 has no socket or address, and …: the guest gets no database on it (only public names)");
+        // A forward was found (a socket, an approved address): nothing to keep.
+        assert_eq!(auto_db_gap(false, said, Some("db"), &private), None);
+        // The site's database on this host, another container, a private address, or unknown.
+        for h in [Some("localhost"), Some("127.0.0.1:6379"), Some("db"), Some("10.0.0.5"), Some("192.168.1.9:3307"), None] {
+            let why = auto_db_gap(true, said, h, &private).unwrap_or_else(|| panic!("{h:?}: auto must keep gelada"));
+            assert!(why.contains("the site would lose its database") && why.contains("--db-address"), "{h:?}: {why}");
+        }
+        assert!(auto_db_gap(true, said, Some("db:3306"), &private).expect("db").contains("DB_HOST is db:3306, which the guest can't reach by name"));
+        assert!(auto_db_gap(true, said, Some("10.0.0.5"), &public).expect("an IP").contains("an IP address"), "an IP is never egress, public or not");
+        // A public database by name: the guest reaches it through egress.
+        assert_eq!(auto_db_gap(true, said, Some("db.example.com:3306"), &public), None);
+    }
+
+    #[test]
+    fn auto_stays_on_gelada_for_a_pool_listening_everywhere() {
+        let any = Admit::Any;
+        let why = auto_listen_gap("www", Some("9000"), false, &any).expect("a bare port");
+        assert!(why.contains("pool [www] has listen = 9000") && why.contains("502"), "{why}");
+        assert_eq!(auto_listen_gap("www", Some("9000"), true, &any), None, "--listen says where");
+        let lo = Admit::Addresses(vec!["127.0.0.1".parse().expect("ip")]);
+        assert_eq!(auto_listen_gap("www", Some("9000"), false, &lo), None, "only the loopback is admitted anyway");
+        let lan = Admit::Addresses(vec!["127.0.0.1".parse().expect("ip"), "10.0.0.2".parse().expect("ip")]);
+        assert!(auto_listen_gap("www", Some("9000"), false, &lan).is_some(), "a client elsewhere");
+        for l in ["127.0.0.1:9000", "0.0.0.0:9000", "/run/php/php8.3-fpm.sock"] {
+            assert_eq!(auto_listen_gap("www", Some(l), false, &any), None, "{l}: binds where it says");
+        }
+        assert_eq!(auto_listen_gap("www", None, false, &any), None);
+    }
+
+    #[test]
+    fn the_guest_is_sized_from_the_pool_and_the_host() {
+        let mib = 1u64 << 20;
+        let pool = |n: u32, limit: Option<u64>| PoolSize { name: "www".into(), max_children: n, memory_limit: limit };
+        let host = (16 * 1024, 8);
+        // The image's default pool: 5 × 128M + 256 = 896 MiB, 2 vCPUs.
+        let s = size_guest(&pool(5, Some(128 * mib)), host, None, None, true).expect("fits");
+        assert_eq!((s.mem_mib, s.vcpus), (896, 2), "{}", s.said);
+        assert!(s.said.contains("pm.max_children 5 × memory_limit 128 MiB"), "{}", s.said);
+        // A small pool still gets 512.
+        assert_eq!(size_guest(&pool(1, Some(64 * mib)), host, None, None, true).expect("fits").mem_mib, 512);
+        // WooCommerce's (#100 re-review): 30 × 256M = 7936 MiB of a 16 GiB host's 12288: it fits, with 8 vCPUs.
+        let s = size_guest(&pool(30, Some(256 * mib)), host, None, None, true).expect("fits");
+        assert_eq!((s.mem_mib, s.vcpus), (7936, 8));
+        // On an 8 GiB host it doesn't: auto stays on gelada; microvm gets the cap and says so.
+        let small = (8 * 1024, 4);
+        let e = size_guest(&pool(30, Some(256 * mib)), small, None, None, true).expect_err("too big for auto");
+        assert!(e.contains("7936 MiB, more than this host gives one microVM (6144 MiB"), "{e}");
+        let s = size_guest(&pool(30, Some(256 * mib)), small, None, None, false).expect("microvm");
+        assert_eq!(s.mem_mib, 6144);
+        assert!(s.said.contains("so it is short"), "{}", s.said);
+        // --mem: wins, but auto refuses one too small for the pool.
+        assert!(size_guest(&pool(30, Some(256 * mib)), host, Some(1024), None, true).expect_err("--mem too small").contains("more than the guest's --mem 1024 MiB"));
+        assert_eq!(size_guest(&pool(5, Some(128 * mib)), host, Some(2048), Some(3), true).expect("--mem").mem_mib, 2048);
+        assert_eq!(size_guest(&pool(5, Some(128 * mib)), host, None, Some(3), true).expect("--vcpus").vcpus, 3);
+        // No memory limit: nothing to size from.
+        assert!(size_guest(&pool(5, None), host, None, None, true).expect_err("-1").contains("memory_limit = -1"));
+        assert_eq!(size_guest(&pool(5, None), host, Some(1024), None, true).expect("--mem").mem_mib, 1024);
+        // vCPUs never more than the host's.
+        assert_eq!(size_guest(&pool(64, Some(16 * mib)), (16 * 1024, 4), None, None, true).expect("fits").vcpus, 4);
+        assert_eq!(crate::phpconf::ini_size("256M"), Ok(Some(256 * mib)));
+        assert_eq!(crate::phpconf::ini_size("1g"), Ok(Some(1 << 30)));
+        assert_eq!(crate::phpconf::ini_size("-1"), Ok(None));
+        assert!(crate::phpconf::ini_size("lots").is_err());
+    }
+
+    #[test]
+    fn guests_stay_within_the_hosts_memory_budget() {
+        // 16 GiB: 4 GiB kept for the host, 12 GiB for guests.
+        assert_eq!(host_memory_reserve(16 << 10), 4 << 10);
+        assert_eq!(host_memory_reserve(4 << 10), 2048, "at least 2 GiB");
+        // The re-review's three shops at 7936 MiB on a 16 GiB host: one fits, a second doesn't.
+        memory_ok(7936, 0, 16 << 10).expect("one");
+        let e = memory_ok(7936, 7936, 16 << 10).expect_err("two");
+        assert!(e.contains("7936 MiB the other microVMs on this host hold") && e.contains("12288 MiB (16384 MiB less 4096 MiB"), "{e}");
+    }
+
+    #[test]
+    fn auto_stays_on_gelada_for_a_bare_port_with_nowhere_said() {
+        let none = |_: u16| false;
+        let relay = |p: u16| p == 25;
+        assert_eq!(auto_port_gap(&[53, 443], &none), None, "the example's: public names only");
+        assert_eq!(auto_port_gap(&[3306, 80], &none), None, "3306 is the database's rule");
+        let why = auto_port_gap(&[443, 6379, 25], &relay).expect("Redis and a local SMTP relay");
+        assert!(why.contains("port(s) 6379, 25 have no \"socket\" or \"address\"") && why.contains("\"address\": \"127.0.0.1:6379\""), "{why}");
+        for p in [11211, 5432] {
+            assert!(auto_port_gap(&[p], &none).is_some(), "{p}");
+        }
+        // A public relay (#100 second re-review): mail ports with nothing local on them move.
+        assert_eq!(auto_port_gap(&[587, 465, 25], &none), None, "public relays by name");
+        assert!(auto_port_gap(&[587], &|p| p == 587).is_some(), "a relay on this host's loopback");
+    }
+
+    #[test]
+    fn a_disk_tool_never_outlives_the_starts_deadline() {
+        let t = Instant::now();
+        let e = tool_status_until(Command::new("sleep").arg("30"), "sleep", Instant::now() + Duration::from_millis(300)).expect_err("past the deadline");
+        assert!(e.contains("still running at the start's deadline"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(5), "stopped at the deadline, not after 30 s: {:?}", t.elapsed());
+        let (st, err) = tool_status_until(Command::new("sh").args(["-c", "echo oops >&2; exit 3"]), "sh", Instant::now() + Duration::from_secs(10)).expect("ran");
+        assert_eq!((st.code(), String::from_utf8_lossy(&err).trim()), (Some(3), "oops"));
+    }
+
+    #[test]
+    fn a_writable_disk_counts_what_it_may_still_take() {
+        let (mib, gib) = (1u64 << 20, 1u64 << 30);
+        assert_eq!(disk_room(gib, None), gib, "a new disk may fill to its size, not only its first copy");
+        assert_eq!(disk_room(gib, Some((gib, 300 * mib))), gib - 300 * mib, "an existing one, less what it holds");
+        assert_eq!(disk_room(2 * gib, Some((gib, 300 * mib))), 2 * gib - 300 * mib, "grown at this start");
+        assert_eq!(disk_room(gib, Some((2 * gib, 2 * gib))), 0, "full");
+        // A start's disks together: a new uploads disk (1 GiB) and an existing cache disk that
+        // holds 100 MiB of its 1 GiB. #102 counted only the new one's first copy (its folder's
+        // bytes + 64 MiB); the existing one's 924 MiB of growth is counted too.
+        assert_eq!(writable_room(&[(gib, None), (gib, Some((gib, 100 * mib)))]), 2 * gib - 100 * mib);
+        assert_eq!(writable_room(&[]), 0);
+    }
+
+    #[test]
+    fn the_sites_db_host_reaches_the_forward_in_the_guest() {
+        let dir = scratch("dbalias");
+        let l = loaded(&dir, r#"{"isolation":"microvm","network":{"bind":[{"port":9000}],"connect":[{"port":3306},{"port":443}]}}"#);
+        let p0 = plan(&l, &opts()).expect("plan");
+        let ok: &dyn Fn(&Path, bool) -> Result<(), String> = &|_, _| Ok(());
+        for (h, approved, want) in [
+            ("db", Some("db:3306"), Some("db:3306")),
+            ("10.0.0.5:3307", Some("10.0.0.5:3307"), Some("10.0.0.5:3307")),
+            ("127.0.0.1:33060", None, Some("127.0.0.1:33060")),
+            ("127.0.0.1", None, None),
+        ] {
+            let mut p = p0.clone();
+            let a = DbApproved { address: approved.map(str::to_owned), ..DbApproved::default() };
+            resolve_db(&mut p, Some(h), &[], &a, ok).expect("ok");
+            assert_eq!(p.db_alias.as_deref(), want, "{h}");
+            let args = boot_args(&p, &opts(), &[], "/usr/sbin/php-fpm");
+            assert_eq!(args.contains(" sc.dbalias="), want.is_some(), "{h}: {args}");
+            let boot = crate::guest::parse_cmdline(&args).expect("the guest parses it");
+            assert_eq!(boot.db_alias.as_deref(), want, "{h}: the guest takes it");
+        }
+        assert_eq!(db_alias("::1", 3306, 3306), None, "IPv6: not for the connect hook");
+        assert!(crate::guest::parse_cmdline("sc.root=/srv sc.dbalias=db").is_err(), "no port");
+        assert!(crate::guest::parse_cmdline("sc.root=/srv sc.dbalias=a/b:3306").is_err(), "not a name");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3758,9 +4362,12 @@ mod tests {
         assert_eq!(space_margin(10 * gib), gib, "at least 1 GiB");
         assert_eq!(space_margin(100 * gib), 5 * gib, "a twentieth");
         let needs = vec![("site disk".to_owned(), gib / 4), ("PHP layer".to_owned(), gib / 4), ("snapshot".to_owned(), gib / 2)];
-        assert!(space_ok(&needs, 3 * gib, 10 * gib).is_ok());
-        let e = space_ok(&needs, gib + gib / 2, 10 * gib).expect_err("1 GiB of disks and 1 GiB of margin in 1.5 GiB");
+        assert!(space_ok(&needs, 3 * gib, 0, 10 * gib).is_ok());
+        let e = space_ok(&needs, gib + gib / 2, 0, 10 * gib).expect_err("1 GiB of disks and 1 GiB of margin in 1.5 GiB");
         assert!(e.contains("needs 1024 MiB") && e.contains("site disk 256 MiB, PHP layer 256 MiB, snapshot 512 MiB") && e.contains("keeps 1024 MiB free"), "{e}");
+        // What other sites' starts keep counts as taken (#100 re-review).
+        let e = space_ok(&needs, 3 * gib, 2 * gib, 10 * gib).expect_err("3 GiB free, 2 GiB of it kept by others");
+        assert!(e.contains("2048 MiB of which other sites' starts keep"), "{e}");
     }
 
     #[test]

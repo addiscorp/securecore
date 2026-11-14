@@ -69,7 +69,11 @@ enforce, `caller=core`), attribution (a mu-plugin's `securecore_status()` is cha
 `mu-plugin:sc-smoke` and refused), one enforce refusal (and the same write passing in log mode),
 the vault (placeholders only, the real password with the vault removed), and layer 1 (started by
 `securecore-fpm`: sandboxed, serving, a core write outside `layer1.write` refused that worked
-without it). NTS runs WordPress on php-fpm; the ZTS images have no php-fpm, so ZTS runs it on
+without it; `auto` is gelada there, the container having no `/dev/kvm`, in one line that says
+so). On x86_64 with the guest image it also boots the microVM from the installed files, and
+upgrades a site with uploads on a KVM host: the installer says the next start is the microVM,
+that start is, and every upload is still on the host unchanged, with the owner's host edits
+winning. NTS runs WordPress on php-fpm; the ZTS images have no php-fpm, so ZTS runs it on
 `php-cgi -b` (FastCGI, forked children) behind the same nginx. That exercises the ZTS build's ABI
 and every hook, but in processes, not threads: a threaded ZTS server (FrankenPHP, Apache's worker
 MPM with mod_php) is not in the check. Under php-cgi a request's log lines go down FastCGI's
@@ -813,16 +817,96 @@ and the launcher exits 125.
 
 | value | what runs |
 |---|---|
-| `auto` (the default) | gelada, with the reason. **`auto` does not pick the microVM until the guest's writable folders sync back to the host (#72)**: `AUTO_SELECTS_MICROVM` in `fpm/src/lib.rs` is that gate, and a test pins it off. Once it opens, `auto` is the microVM where it can run and gelada otherwise (`layer 1 isolation auto: gelada, because the microVM can't run here (…)`), whether the host or the config is why. The only value that falls back |
+| `auto` (the default) | **the microVM wherever it can run** (a host with KVM, below), and gelada otherwise, with one line saying why (`layer 1 isolation auto: gelada, because the microVM can't run here (…)`), whether the host or the config is why. The only value that falls back. (`AUTO_SELECTS_MICROVM` in `fpm/src/lib.rs`, pinned on by a test: Sami, 10 Nov) |
 | `microvm` | the microVM, or nothing: without one the launcher exits 125 (`layer1.isolation is "microvm" but this host can't run the microVM (…). "microvm" never falls back`) |
-| `gelada` | gelada on the host kernel, as above, even where KVM exists |
+| `gelada` | gelada on the host kernel, as above, even where KVM exists: **the way to opt out of the microVM** (`"layer1": { "isolation": "gelada", … }`) |
 | `off` | layer 1 off: php-fpm runs as it is. The only way to turn layer 1 off (`layer1.enabled` is retired) |
+
+**Host requirements for the microVM:** x86_64 Linux with KVM (`/dev/kvm`), cgroup v2, the
+launcher started as root (it drops to the jailed user for Firecracker and to the pool user for
+the site's files), the files the installer places (`<vm-dir>`), **no swap or encrypted swap**
+(the guest's memory holds the vault's secrets; below), and memory: **about 300 MiB per busy
+site** (a cold-booted guest is about 270 MB on the host under load, a restored idle one about
+96 MB; each VM's cgroup caps it at the guest's memory plus 256 MiB, `--mem` 512 by default).
+
+**When `auto` is gelada.** Each reason is one line, `securecore-fpm: layer 1 isolation auto:
+gelada, because the microVM can't run here (<reason>)`, and php-fpm then starts under gelada as
+before. The checks run in this order, so the line names the most basic reason:
+
+| reason | the line says, for example |
+|---|---|
+| no KVM | `no KVM: /dev/kvm: No such file or directory (os error 2)` |
+| the launcher isn't root | `the microVM's jailer needs the launcher to run as root` |
+| nothing verified is installed (no `installed.json`; arm64; a release without the guest) | `/usr/local/share/securecore/vm/installed.json: No such file or directory (os error 2); nothing verified is installed (…)` |
+| no jailed user | `the microVM's user securecore-vm doesn't exist (the installer creates it; …)` |
+| e2fsprogs missing | `mke2fs (e2fsprogs) isn't on PATH; it builds and grows the site's disks` |
+| a config the microVM can't express | `layer1.deny /srv/site/private is inside the app root, …`; `unixSockets`; a writable folder that is a link or holds `..`; no bind port and no `--listen`; a root-owned app root without `--pool-user` |
+| no verified root image, kernel, Firecracker or jailer | `the guest root image isn't verified: …/installed.json records no rootfs_sha256`, or `… has sha256 …, but … records …: refusing to boot it` |
+| uploads that don't fit | `/srv/site/wp-content/uploads takes 900 MiB, and the state folder's filesystem has 20 MiB free for its writable disk`, or more than 1 Mi files and folders |
+| a kernel without Landlock and seccomp, with layer 3 on | `layer 3 is on, but the guest kernel …/vmlinux has no Landlock and seccomp filters (…)` |
+| a `connect[].socket` the jailed user can't open | `… may not connect to /run/…/db.sock (Permission denied …)` |
+| no cgroup v2 | `/sys/fs/cgroup is not cgroup v2`, or why the jailer's parent cgroup can't be made |
+| the host's PHP can't be captured or validated, or a pool serves another site | `… differs from its package's checksum …`, `run the installer to record unpackaged files`, `pool [X] serves another site (…)` |
+| a file in the site the pool user can't read (the site disk is copied as it) | `mke2fs …/site-….ext4 (copying /srv/site as uid 33) …` and the file it couldn't read |
+| an env variable the guest needs that the launcher lacks | `the launcher's environment has no WORDPRESS_DB_PASSWORD, which the guest's php-fpm needs (…)` |
+| a state folder another site's, or an orphaned uploads disk beside it | `/var/lib/securecore/vm/x holds the writable disks (uploads) of the site that was at /srv/old, which no longer exists. …` |
+| no room for the whole start, with a twentieth of the filesystem (at least 1 GiB) left for the database | `this start needs 2400 MiB on the state folder's filesystem (site disk 140 MiB, PHP layer 90 MiB, config layer 33 MiB, writable disks, as they fill 1024 MiB, snapshot 512 MiB) and keeps 1024 MiB free beside it (…), but it has 2000 MiB free` |
+| a bare `{ "port": 3306 }` whose `DB_HOST` the guest wouldn't reach (another host or container, a private address, an unreadable `DB_HOST`), and no `--db-address`/`--db-socket` approving it | `DB_HOST is db, which the guest can't reach by name (…); the site would lose its database, which gelada reaches on port 3306: approve it with --db-socket or --db-address, or give the connect entry a socket or address` |
+| a pool listening on a bare port (`listen = 9000`, every address to php-fpm) with no `--listen` | `pool [www] has listen = 9000, which php-fpm binds on every address, and the microVM listens on 127.0.0.1:9000 only: …` |
+| any other bare `connect` port (not 3306, 53, 80 or 443; 25, 465 and 587 only while a mail relay listens on this host's loopback): a Redis, memcached, Postgres or local mail server nothing says the place of | `layer1.network.connect port(s) 6379 have no "socket" or "address": gelada reaches any host on them, the microVM only public names, …` |
+| a pool larger than a guest this host can give (`pm.max_children × memory_limit` + 256 MiB above three quarters of its memory, or above `--mem`; or `memory_limit = -1`) | `pool [www] has pm.max_children 30 × memory_limit 256 MiB + 256 MiB = 7936 MiB, more than this host gives one microVM (6144 MiB, …)` |
+| a start that runs past `--start-within` (600 s), whatever it is doing (a watchdog runs gelada at the deadline), and every later start of the same site and config | `the start took longer than 600 s (--start-within), so the microVM gives up on it`; then `a start of this site ran past its deadline before (…), so it stays on gelada until securecore.json or the site changes, or …/deadline-fallback.json is removed` |
+| the guests on this host together past its memory budget (its memory less a quarter, at least 2 GiB, kept for the database and the host) | `this guest's 7936 MiB and the 7936 MiB the other microVMs on this host hold come to more than its guests' budget, 12288 MiB (…)` |
+| room that other sites' starts already keep (the shared record, `--space-ledger`) | `this start needs … but it has 9000 MiB free, 8000 MiB of which other sites' starts keep for their disks` |
+
+`microvm` refuses to start for the same reasons (exit 125, the same text), except the bare
+ports and the pool's size: there a bare 3306 the guest can't reach, or any other bare port,
+stays an egress port (public names only, logged), a bare-port pool listens on `127.0.0.1`, and
+a pool too big gets three quarters of the host's memory with a line saying it is short.
+
+**The guest's size.** Without `--mem`/`--vcpus` the guest is sized from its pool: memory
+`pm.max_children × memory_limit` (the pool's `php_admin_value`/`php_value`, else PHP's ini, else
+128M) plus 256 MiB, at least 512 MiB and at most three quarters of the host's; one vCPU per four
+workers, at least 2, at most the host's. Memory the guest never touches is never the host's, so
+a larger guest costs only what its workers use. The launcher logs it (`the guest gets 896 MiB and
+2 vCPUs: pool [www] has pm.max_children 5 × memory_limit 128 MiB + 256 MiB = 896 MiB`). A microVM that `auto` picked and that then fails before
+it serves anything (its boot, its listening socket) falls back to gelada too, in one line
+(`layer 1 isolation auto: gelada, because the microVM failed before it served (…)`); `microvm`
+exits 125. Under systemd (`Type=notify`) a long first start (the capture, the disks, the
+snapshot) asks for more time every 10 s (`EXTEND_TIMEOUT_USEC`) until it serves, so it never
+runs into `TimeoutStartSec`, but never past `--start-within` (600 s): then it stops asking, a
+disk tool still running (mke2fs, e2fsck, resize2fs) is killed, and `auto` runs gelada. The space
+check counts what other sites' starts on the same filesystem keep for their disks (a shared
+record, `--space-ledger`, default `/var/lib/securecore/space.json`, under a lock), so sites
+starting together at boot never all take the same free space.
+
+**Upgrading an existing site.** On a host with KVM where `ext/install.sh` installs the guest, a
+site whose php-fpm starts through `securecore-fpm` with `isolation` `auto` (or no `isolation`)
+moves into the microVM at its **next** php-fpm start; the installer says so, and starts
+nothing. That first start copies each writable folder inside the app root (uploads) into the
+VM's disk, from the host's folder, and from then on the two are kept in step (the table below):
+the host's files stay where they are, nginx and backups keep reading them, a file changed on the
+host wins, and nothing is removed but what the guest deletes (into the trash). Before
+restarting, check what the microVM does differently from gelada:
+- a bare `{ "port": 3306 }` goes to the database the site's `DB_HOST` names when that is this
+  host's MySQL socket, MySQL on `127.0.0.1`, or one approved in the launcher's flags
+  (`--db-socket <path>`, `--db-address <host:port>`); the site's `DB_HOST` then works in the guest
+  unchanged (a name or address it names reaches the forward). Any other database keeps `auto` on
+  gelada, saying why, so an upgrade never costs a site its database;
+- any other `connect` port with neither `socket` nor `address` reaches only public hosts by name
+  (the installer lists those ports);
+- a pool on a bare port (`listen = 9000`) keeps `auto` on gelada unless `--listen` or an address
+  in `listen` says where FastCGI goes (php-fpm takes every address, the microVM `127.0.0.1`);
+- the guest's php-fpm gets only the vault's env sources, the pool's `env[]` and `--guest-env`
+  names from the launcher's environment.
+
+To stay on gelada, set `isolation` to `gelada` before the restart.
 
 **The microVM can run** when all of these hold (otherwise `auto` logs why and `microvm` exits
 125 with it):
+- `/dev/kvm` opens read-write and answers `KVM_GET_API_VERSION` with 12;
 - the launcher is root (the jailer needs it) and the jailed user (`--vm-user`, a name or
   `<uid>:<gid>`, default `securecore-vm`, which the installer creates) exists and isn't root;
-- `/dev/kvm` opens read-write and answers `KVM_GET_API_VERSION` with 12;
 - `<vm-dir>/firecracker`, `jailer`, `vmlinux` and `rootfs.ext4` (`--vm-dir`, default
   `/usr/local/share/securecore/vm`) each match the sha256 in `<vm-dir>/installed.json`, the
   installer's record. Nothing unrecorded boots. The installer records the kernel, Firecracker,
@@ -1252,11 +1336,12 @@ WordPress boot in a new zygote, on the request that brings it.
   refused (and the listeners outside the sandbox receive nothing), writes outside the folders
   are refused from core and from a child program, the denied path is unreadable; unixSockets +
   ports and an invalid file exit 125 at launch with php-fpm never starting. In the container
-  there is no `/dev/kvm`, so this is also `auto` falling back to gelada.
+  there is no `/dev/kvm`, so this is also `auto` falling back to gelada (`no KVM`).
 - `test/ext-microvm.sh` (a Linux host with KVM, as root; #71; also CI's `microvm` job, which
-  fails without KVM): the `layer1.isolation` values (off and gelada; auto gelada behind the #72
-  gate; auto falling back and microvm refusing on a config the VM can't express, on an
-  unverified root image and on a kernel without Landlock; in the php container without
+  fails without KVM): the `layer1.isolation` values (off and gelada; auto as the microVM on this
+  host, serving WordPress; auto falling back in one line, and microvm refusing, without KVM, on
+  an unverified root image, on a kernel without Landlock, on a config the VM can't express and on
+  uploads that don't fit the state folder; in the php container without
   `/dev/kvm`, auto falls back and microvm exits 125 without php-fpm running), then the same
   WordPress served from a jailed Firecracker guest: Firecracker as 64000:64000 with no
   supplementary groups, chrooted, in its own network namespace and cgroup; a host socket seeing

@@ -10,7 +10,8 @@
 //!
 //! `layer1.isolation` (addiscorp/securecore#71) picks what php-fpm runs inside: [`choose`]
 //! decides between off, gelada and a Firecracker microVM ([`vm`], the host driver; [`guest`],
-//! the guest's PID 1). `auto`, the default, is the only value that falls back.
+//! the guest's PID 1). `auto`, the default, is the microVM where it can run and gelada
+//! otherwise, with one log line saying why: the only value that falls back.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -31,6 +32,8 @@ pub mod sitefile;
 #[cfg(target_os = "linux")]
 pub mod jail;
 #[cfg(target_os = "linux")]
+pub mod space;
+#[cfg(target_os = "linux")]
 pub mod sync;
 #[cfg(target_os = "linux")]
 pub mod vm;
@@ -48,14 +51,16 @@ pub enum Choice {
     Microvm,
 }
 
-/// Whether `auto` may pick the microVM. Not until the guest's writes to its writable folders
-/// (uploads) sync back to the host (addiscorp/securecore#72): until then a microVM keeps them in
-/// its own disk image, which nginx and backups don't see, so only an explicit `microvm` gets one.
-pub const AUTO_SELECTS_MICROVM: bool = false;
+/// Whether `auto` may pick the microVM. It does (Sami, 10 Nov: the microVM is layer 1's
+/// default): the guest's writable folders sync back to the host (addiscorp/securecore#72, #81),
+/// so nginx and backups see every upload. `auto` is the microVM wherever [`vm::available`] says
+/// it can run, and gelada with the reason everywhere else. Turning this off again makes `auto`
+/// gelada without asking the host anything ([`AUTO_GATE`]); a test pins it on.
+pub const AUTO_SELECTS_MICROVM: bool = true;
 
-/// Why `auto` is gelada on a host that could run the microVM.
-pub const AUTO_GATE: &str = "auto doesn't pick the microVM until its writable folders sync back to the host \
-(addiscorp/securecore#72); set \"microvm\" to ask for it";
+/// Why `auto` is gelada on a host that could run the microVM, were [`AUTO_SELECTS_MICROVM`] off.
+pub const AUTO_GATE: &str = "auto doesn't pick the microVM in this build (AUTO_SELECTS_MICROVM is off); \
+set \"microvm\" to ask for it";
 
 /// `layer1.isolation` against this host. `microvm` is `Ok` when this host can run the microVM
 /// for this config and `Err(why)` when it can't ([`vm::available`] on Linux); it is only asked
@@ -89,7 +94,11 @@ impl fmt::Display for Choice {
             Choice::Off => write!(f, "off"),
             Choice::Gelada { fallback: None } => write!(f, "gelada"),
             Choice::Gelada { fallback: Some(why) } if why == AUTO_GATE => write!(f, "gelada, because {why}"),
-            Choice::Gelada { fallback: Some(why) } => write!(f, "gelada, because the microVM can't run here ({why})"),
+            // One line, whatever the reason holds (a tool's output may span lines).
+            Choice::Gelada { fallback: Some(why) } => {
+                let why = why.split(['\n', '\r']).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+                write!(f, "gelada, because the microVM can't run here ({why})")
+            }
             Choice::Microvm => write!(f, "microvm"),
         }
     }

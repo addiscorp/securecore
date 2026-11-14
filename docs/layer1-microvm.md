@@ -6,7 +6,8 @@ the host kernel). This spike runs php-fpm inside a Firecracker microVM instead. 
 
 - securecore drives Firecracker over its API socket itself, with no mirab CLI in between.
 - It reuses mirab's pinned Firecracker and mirab's guest kernel.
-- Hosts without `/dev/kvm` fall back to today's gelada layer 1.
+- Hosts without `/dev/kvm` fall back to today's gelada layer 1. (Since 10 Nov the microVM is
+  layer 1's default where KVM exists: "`auto` is the microVM where KVM exists", below.)
 
 All numbers were measured on **[xps]**: Linux 6.18.57 (NixOS), 4 cores, 7.5 GiB, `/dev/kvm`
 present. The setup:
@@ -604,9 +605,57 @@ The product version of items 1, 2 and 4 is in `ext/fpm` (`securecore-fpm`; `ext/
   clock is set; a stop syncs them first.
 - After the security review (PR #75): Firecracker runs under its jailer as an unprivileged
   user, chrooted, in its own namespaces and cgroup, so the guest's socket connections carry that
-  user's credentials, not root's; only files the installer recorded by sha256 boot; `auto` is
-  gated off until #72 syncs uploads back; the snapshot is warmed without the database; every
-  start message brings fresh entropy and replaces php-fpm's workers.
+  user's credentials, not root's; only files the installer recorded by sha256 boot; `auto` was
+  gated off until #72 synced uploads back (it no longer is: next section); the snapshot is warmed
+  without the database; every start message brings fresh entropy and replaces php-fpm's workers.
+
+## `auto` is the microVM where KVM exists
+
+Sami made the microVM layer 1's default on 10 Nov, and with uploads syncing back (#72, #81), the
+guest image in every release (#80, #82–#84) and the suites passing on a microVM target (#88),
+`auto` (the default, also when `isolation` is absent) now picks it: `AUTO_SELECTS_MICROVM` in
+`ext/fpm/src/lib.rs` is on, and a test pins it there. The launcher logs
+`layer 1 isolation auto: microvm`.
+
+**Where the microVM can't run, `auto` is gelada**, as layer 1 was before, and logs exactly one
+line saying why: `layer 1 isolation auto: gelada, because the microVM can't run here (<reason>)`.
+The reasons, most basic first (the launcher checks them in this order, and `test/ext-microvm.sh`
+checks each line on [xps]):
+
+- no KVM (`no KVM: /dev/kvm: No such file or directory (os error 2)`, or an API version other
+  than 12);
+- the launcher isn't root (the jailer needs it);
+- nothing verified installed (no `installed.json`: arm64, or a release without the guest), or no
+  jailed user, or no e2fsprogs;
+- a config the microVM can't express (a denied path inside the app root, `unixSockets`, a
+  writable folder that is a link or holds `..`, no port to take FastCGI on, a root-owned app
+  root without `--pool-user`);
+- a root image, kernel, Firecracker or jailer that doesn't match `installed.json` (or that it
+  doesn't name: `the guest root image isn't verified: …`);
+- uploads that don't fit: a writable folder of more than 1 Mi entries, or one whose new disk's
+  copy doesn't fit the state folder's filesystem;
+- a guest kernel without Landlock and seccomp while layer 3 is on;
+- a `connect[].socket` the jailed user can't open;
+- no cgroup v2.
+
+`microvm` refuses for the same reasons (exit 125); `gelada` and `off` are unchanged. A microVM
+that `auto` picked and that then fails to boot is a failed start (exit 125), not a silent gelada.
+
+**Opting out:** `"layer1": { "isolation": "gelada", … }` keeps gelada on a KVM host.
+
+**Host requirements:** x86_64 Linux with KVM, cgroup v2, the launcher as root, the installer's
+files; **no swap, or encrypted swap** (the guest's memory holds the vault's secrets, below); and
+**about 300 MiB of memory per busy site** (section 2: about 270 MB cold-booted under load, 96 MB
+restored and idle; each VM's cgroup allows the guest's 512 MiB plus 256 MiB).
+
+**Upgrades.** `ext/install.sh` on a KVM host over a site whose `isolation` is `auto` says that
+the next php-fpm start through `securecore-fpm` moves into the microVM, what happens to the
+uploads and how to opt out, and lists the `connect` ports with neither `socket` nor `address`
+(in the microVM those reach only public hosts by name, so a database on the host needs one). It
+starts nothing. That next start makes each writable disk from the host's folder (`mke2fs -d`,
+so the first listing finds both sides in step and sends nothing); the host's files stay, a file
+the owner changes on the host wins, and nothing is removed. `test/release-check.sh` (7b) checks
+exactly this on a site with 203 uploads.
 - Nothing is pinned: `scripts/mirab-vm.sh` resolves mirab's newest stable release, its
   `vm/manifest.json` and the Firecracker mirab pins at that commit, and `install-ext.sh` checks
   each file against those sha256s. `bench/microvm/firecracker.json` and `mirab-kernel.json`
@@ -1024,13 +1073,18 @@ Several pools of one site share its writable folders; each VM syncs its own disk
 
 **Every check before `auto` commits** (#100 review). Everything a start does before the boot now
 happens before the choice: the host checks, the capture and its validation, the pool's user and
-sockets, the vault's env sources and the pool's `env[]`, `claim_state`, the space every new disk
-and the snapshot need (with a margin: a twentieth of the filesystem and at least 1 GiB stays
-free, for the database), the PHP and config layers, the site disk (copied as the pool user) and
+sockets, the vault's env sources and the pool's `env[]`, `claim_state`, the space the start
+needs (below, with a margin: a twentieth of the filesystem and at least 1 GiB stays free, for
+the database), a bare 3306 the guest wouldn't reach and a pool on a bare port (both below), the
+PHP and config layers, the site disk (copied as the pool user) and
 the writable disks. So `auto` falls back on any of them with the reason. And a VM `auto` chose
 that then fails before it serves anything (its boot, its listening socket) falls back to gelada
 too (`layer 1 isolation auto: gelada, because the microVM failed before it served (…)`);
-`microvm` still exits 125.
+`microvm` still exits 125. gelada applies only to a process with one thread, and a microVM start
+that was prepared or begun has started some (systemd's timeout extensions, the VM's sync and
+log), so after such a fallback the launcher execs itself again, same pid, with the decision
+(`--gelada-fallback <line>`, the launcher's own) and applies gelada there (#100 review: without
+it every `auto` fallback under systemd, no KVM included, exited 125).
 
 **A bare 3306 and `localhost`** (#100 and #102 reviews, and Sami's decision on the second's
 verification). A `{ "port": 3306 }` with no socket or address: the site's own `DB_HOST` is only a
@@ -1047,7 +1101,70 @@ defines that disagree are no answer):
   host:port `--db-address` names. The connection is made as the pool user (`--egress-connect`), so
   the host's uid-based firewall rules apply, never as root;
 - anything else, or a `DB_HOST` the launcher can't read: the guest gets no database on 3306 (it
-  stays an egress port, public names only), and the launcher says why. The start still serves.
+  stays an egress port, public names only), and the launcher says why. Under `microvm` the start
+  still serves. Under `auto` it stays on gelada, which reaches that database on 3306 as before,
+  unless `DB_HOST` is a name the guest reaches through egress (layer 2's hosts, a public address):
+  an upgrade never costs a site its database (#100 review: `auto_db_gap`).
+
+When 3306 goes to an address, the guest's PHP still connects where the site's `DB_HOST` says (a
+name, another port, `10.0.0.5:3307`, `127.0.0.1:33060`): the launcher passes that endpoint
+(`sc.dbalias=<host>:<port>`), and the guest's connect hook answers the name with `127.0.0.1` and
+sends a connection to it, or to that IPv4 address, on that port, to 3306's forward. So
+`--db-address db:3306` with the site's own `DB_HOST=db` works unchanged (`test/release-check.sh`
+7b). An IPv6 `DB_HOST` gets no alias: give it as `127.0.0.1` or a name.
+
+**A pool on a bare port** (#100 review). php-fpm binds `listen = 9000` on every address; the
+microVM on `127.0.0.1:9000` only (#102 review). Under `auto`, with no `--listen` and a
+`listen.allowed_clients` that admits more than the loopback (or none), the start stays on gelada
+(`pool [www] has listen = 9000, which php-fpm binds on every address, …`), so a web server on
+another host or container never gets 502s after an upgrade. A pool on a unix socket (Debian's
+`/run/php/php8.3-fpm.sock`, which nginx's `fastcgi_pass unix:…` names) or on an address is served
+exactly there, under `auto` too.
+
+**The second review of #100.** Five more things an upgrade must not cost a site:
+- *The guest's size*: from the pool (`pm.max_children × memory_limit` + 256 MiB, at least
+  512 MiB, at most three quarters of the host's; a vCPU per four workers, 2 to the host's) unless
+  `--mem`/`--vcpus` say; under `auto` a pool that can't fit (or has `memory_limit = -1`) stays on
+  gelada (`size_guest`).
+- *Every bare port*: one other than 3306, 53, 80 and 443 keeps `auto` on gelada until a `socket`
+  or `address` says where it goes (`auto_port_gap`): a Redis on `127.0.0.1:6379`, memcached,
+  Postgres or a local SMTP relay would otherwise be lost silently.
+- *A deadline*: `--start-within` (600 s) caps systemd's extensions; every disk tool runs against
+  it (`tool_status_until` kills it), each step checks it (`start_deadline`), and `auto` then runs
+  gelada.
+- *Space shared between sites*: a start checks and records what it keeps (all of its new files
+  while it builds them, then its writable disks' growth) in one file under `flock`
+  (`crate::space`, `--space-ledger`), and counts what the other living starts on its filesystem
+  keep as taken. An entry whose process is gone counts for nothing.
+- *The relaunch*: it execs `/proc/self/exe` (an upgrade that removed the binary's path doesn't
+  matter), and a config that changed to `gelada` or `off` in between runs as it says; only
+  `microvm` refuses.
+
+**The third review of #100.**
+- *Guest memory across sites*: the shared record holds each running guest's memory too. Under
+  `auto`, all guests on the host together stay within its memory less a quarter of it (at least
+  2 GiB) kept for the database and the host, else gelada (`memory_ok`). A guest that has touched
+  memory keeps it (no balloon yet).
+- *The snapshot's bytes* stay kept in the record until the boot has written it (or failed); only
+  then does a start keep just its disks' growth.
+- *A watchdog at the deadline*: whatever the start is doing (a tree walk on slow storage, the
+  capture's hashing, a tool), at `--start-within` the launcher runs gelada at once (the relaunch,
+  from the watchdog thread), and records it in the state folder (`deadline-fallback.json`): the
+  next starts go straight to gelada, saying why, until `securecore.json` or the app root changes
+  (or the file is removed). systemd is asked for more time until the start serves or ends.
+  `microvm` exits 125 at the deadline.
+- *The record*: free space is measured under its lock, and each entry carries the boot it was
+  made in (`/proc/sys/kernel/random/boot_id`), so an entry of an earlier boot counts for nothing.
+  A running guest's growth isn't shrunk as its disks fill: counted twice over time, which errs on
+  the side of gelada for the next site's start.
+- *Mail*: a bare 25, 465 or 587 is a public relay's (by name, policed by layer 2's hosts) unless a
+  relay listens on this host's loopback; only then does it keep `auto` on gelada.
+
+**The space a start takes** (#100 review). The check counts the site disk, the PHP and config
+layers, the snapshot and each writable disk **as it may fill** (they are sparse: a new one up to
+its whole size, an existing one up to its size less what it holds), and keeps a twentieth of the
+filesystem, at least 1 GiB, free beside them for the database. `auto` falls back when that
+doesn't fit (`this start needs …`), before anything is built.
 
 A socket in its own folder is bind-mounted into the jail with that folder; a socket directly in a
 folder services share (`/`, `/run`, `/var/run`, `/tmp`, `/var/tmp`, `/dev`, `/dev/shm`) is

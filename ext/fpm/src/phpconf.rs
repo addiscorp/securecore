@@ -322,13 +322,19 @@ pub fn pool_listen(v: &str) -> Result<PoolListen, String> {
     if v.starts_with('/') {
         return Ok(PoolListen::Unix(v.to_owned()));
     }
-    if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+    if listens_everywhere(v) {
         v.parse::<u16>().map_err(|_| format!("listen = {v}: not a port"))?;
         return Ok(PoolListen::Tcp(format!("127.0.0.1:{v}")));
     }
     let (_, port) = v.rsplit_once(':').ok_or_else(|| format!("listen = {v}: want a path, a port or address:port"))?;
     port.parse::<u16>().map_err(|_| format!("listen = {v}: {port} is not a port"))?;
     Ok(PoolListen::Tcp(v.to_owned()))
+}
+
+/// Whether a pool's `listen` is a bare port (`listen = 9000`), which php-fpm binds on every
+/// address; [`pool_listen`] takes it as `127.0.0.1:<port>` (#102 review).
+pub fn listens_everywhere(v: &str) -> bool {
+    !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `listen.allowed_clients`: the addresses a TCP pool takes connections from (php-fpm's own
@@ -561,6 +567,28 @@ pub fn strip_php_comments(s: &str) -> String {
 
 /// The MySQL default sockets PHP's own settings name (where `localhost` goes for mysqli, PDO
 /// and mysqlnd), in order, without duplicates.
+/// The value the last `key` setting gives (php.ini, then each scan file in order: PHP's own
+/// order, the last one wins).
+pub fn last_setting(settings: &[Setting], key: &str) -> Option<String> {
+    settings.iter().rev().find(|s| s.key.eq_ignore_ascii_case(key)).map(|s| s.value.clone())
+}
+
+/// A php.ini size (`memory_limit`): bytes, or PHP's shorthand `K`, `M`, `G` (either case).
+/// `Ok(None)`: `-1`, no limit. `Err`: anything else.
+pub fn ini_size(v: &str) -> Result<Option<u64>, String> {
+    let t = v.trim().trim_matches('"');
+    if t == "-1" {
+        return Ok(None);
+    }
+    let (num, mul) = match t.chars().last().map(|c| c.to_ascii_uppercase()) {
+        Some('K') => (&t[..t.len() - 1], 1u64 << 10),
+        Some('M') => (&t[..t.len() - 1], 1 << 20),
+        Some('G') => (&t[..t.len() - 1], 1 << 30),
+        _ => (t, 1),
+    };
+    num.trim().parse::<u64>().ok().and_then(|n| n.checked_mul(mul)).map(Some).ok_or_else(|| format!("memory_limit = {v}: not a size"))
+}
+
 pub fn mysql_default_sockets(settings: &[Setting]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for s in settings {

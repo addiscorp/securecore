@@ -101,6 +101,23 @@ what a site needs); `scripts/mirror-php.sh` mirrors the static-php-cli builds li
 extension matrix, publishes it, and promotes a canary to stable with the same bytes (APS 9,
 APS 12; ext/README.md, Release).
 
+## The PHP extension's layer 1: a microVM by default
+
+The SecureCore PHP extension (`ext/`, installed by `ext/install.sh`; ext/README.md) has a layer 1
+that confines php-fpm itself, started through `securecore-fpm`. `layer1.isolation: "auto"`, the
+default, runs php-fpm in a **Firecracker microVM wherever the host has KVM** (and the installer's
+verified guest files, and a config the microVM can enforce), and **falls back to gelada**
+(Landlock + seccomp on the host kernel) everywhere else, logging one line that says why: no KVM,
+no verified root image, a guest kernel without Landlock and seccomp while layer 3 is on, a config
+the microVM can't express, uploads that don't fit, no room for the start beside the database, a
+database (`DB_HOST`) the guest wouldn't reach, a pool on a bare port with no `--listen`, a VM that
+fails before it serves, and the rest listed in ext/README.md. An upgrade never costs a site its
+database or its web server's FastCGI: where the microVM would, `auto` stays on gelada and says why. To stay
+on gelada on a KVM host, set `"isolation": "gelada"`. A microVM host needs KVM, no swap or
+encrypted swap, and about 300 MiB of memory per busy site. An existing site moves into the
+microVM at its next php-fpm start after an upgrade on a KVM host, uploads included (the host's
+files stay and win); the installer says so.
+
 ## Run it (dev stack)
 
 Needs Docker.

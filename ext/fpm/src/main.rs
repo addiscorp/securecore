@@ -7,8 +7,8 @@
 //!   php-fpm, master and workers, runs inside it.
 //! - **microvm**: boots the guest's php-fpm in a jailed Firecracker microVM and stays in the
 //!   foreground as its only way in and out, until SIGTERM/SIGINT/SIGQUIT (see `vm.rs`).
-//! - **auto** (the default): gelada, and the reason; the microVM once `auto` may pick it
-//!   ([`securecore_fpm::AUTO_SELECTS_MICROVM`]).
+//! - **auto** (the default): the microVM where this host can run it for this config, and gelada
+//!   otherwise, with one log line saying why ([`securecore_fpm::AUTO_SELECTS_MICROVM`]).
 //! - layer 1 off: execs php-fpm as it is and says so.
 //!
 //! Fails closed: an invalid file, a layer 1 it can't enforce, `microvm` where the microVM
@@ -29,7 +29,7 @@ const USAGE: &str = "usage: securecore-fpm --config <securecore.json> [--php-fpm
 [--listen unix:<path>|<host>:<port>] [--listen-owner <user>] [--listen-group <group>] [--listen-mode <octal>] \
 [--guest-root <path>] [--mem <MiB>] [--vcpus <n>] [--write-disk-mib <MiB>] [--no-snapshot] \
 [--guest-arg <word>]... [--guest-env <NAME>]... [--guest-ini <file>] [--php-root <dir>] [--pool <name>] \
-[--unpackaged-record <file>] [--db-user <name>|<uid>] [--db-address <host:port>] [--db-socket <path>] [--pools-ready-within <s>] [--] [php-fpm args...] \
+[--unpackaged-record <file>] [--db-user <name>|<uid>] [--db-address <host:port>] [--db-socket <path>] [--pools-ready-within <s>] [--start-within <s>] [--space-ledger <file>] [--] [php-fpm args...] \
 | securecore-fpm --migrate-config <securecore.json>";
 
 struct Args {
@@ -45,8 +45,12 @@ struct Args {
     listen_group: Option<String>,
     listen_mode: u32,
     guest_root: Option<String>,
-    mem: u32,
-    vcpus: u32,
+    /// `None`: sized from the pool and the host (#100 re-review).
+    mem: Option<u32>,
+    vcpus: Option<u32>,
+    /// How long a microVM start may take, in seconds.
+    start_within: u32,
+    space_ledger: PathBuf,
     write_disk_mib: u64,
     snapshot: bool,
     guest_args: Vec<String>,
@@ -66,6 +70,10 @@ struct Args {
     db_socket: Option<PathBuf>,
     /// How long several pools' launchers get to all serve, in seconds.
     pools_within: u32,
+    /// The launcher's own (`--gelada-fallback <line>`): `auto` fell back after a microVM start
+    /// began (threads were started), and the launcher ran itself again to apply gelada in a
+    /// process with one thread ([`relaunch`]). `<line>` is what it logs.
+    gelada_fallback: Option<String>,
     rest: Vec<OsString>,
 }
 
@@ -86,8 +94,10 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
         listen_group: None,
         listen_mode: 0o660,
         guest_root: None,
-        mem: 512,
-        vcpus: 2,
+        mem: None,
+        vcpus: None,
+        start_within: 600,
+        space_ledger: PathBuf::from("/var/lib/securecore/space.json"),
         write_disk_mib: 1024,
         snapshot: true,
         guest_args: Vec::new(),
@@ -100,6 +110,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
         db_address: None,
         db_socket: None,
         pools_within: 300,
+        gelada_fallback: None,
         rest: Vec::new(),
     };
     let mut config = None;
@@ -117,7 +128,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
             }
             "--config" | "--php-fpm" | "--vm-dir" | "--vm-user" | "--pool-user" | "--kvm" | "--state-dir" | "--listen" | "--listen-owner"
             | "--listen-group" | "--listen-mode" | "--guest-root" | "--mem" | "--vcpus" | "--write-disk-mib" | "--guest-arg" | "--guest-env" | "--guest-ini"
-            | "--php-root" | "--pool" | "--unpackaged-record" | "--db-user" | "--db-address" | "--db-socket" | "--pools-ready-within" => {
+            | "--php-root" | "--pool" | "--unpackaged-record" | "--db-user" | "--db-address" | "--db-socket" | "--pools-ready-within" | "--gelada-fallback" | "--start-within" | "--space-ledger" => {
                 args.next();
                 let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
                 let text = || value.to_str().map(str::to_owned).ok_or_else(|| format!("{flag}: not UTF-8"));
@@ -140,8 +151,10 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
                             .ok_or_else(|| format!("{flag}: want an octal mode such as 0660"))?;
                     }
                     "--guest-root" => a.guest_root = Some(text()?),
-                    "--mem" => a.mem = number()?,
-                    "--vcpus" => a.vcpus = number()?,
+                    "--mem" => a.mem = Some(number()?),
+                    "--vcpus" => a.vcpus = Some(number()?),
+                    "--start-within" => a.start_within = number()?,
+                    "--space-ledger" => a.space_ledger = PathBuf::from(&value),
                     "--write-disk-mib" => a.write_disk_mib = u64::from(number()?),
                     "--guest-env" => a.guest_env.push(text()?),
                     "--guest-ini" => a.guest_ini = Some(PathBuf::from(&value)),
@@ -152,6 +165,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
                     "--db-address" => a.db_address = Some(text()?),
                     "--db-socket" => a.db_socket = Some(PathBuf::from(&value)),
                     "--pools-ready-within" => a.pools_within = number()?,
+                    "--gelada-fallback" => a.gelada_fallback = Some(text()?),
                     _ => a.guest_args.push(text()?),
                 }
             }
@@ -161,6 +175,30 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, Strin
     a.config = config.ok_or("--config is required")?;
     a.rest = args.collect();
     Ok(Some(a))
+}
+
+/// The threads this process has (`/proc/self/task`; 1 where that can't be read).
+fn threads() -> usize {
+    std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(1).max(1)
+}
+
+/// gelada applies to the calling process only while it has one thread
+/// ([`gelada::Sandbox::restrict_self`] refuses otherwise). A microVM start that was prepared or
+/// begun has started threads (systemd's start-timeout extensions, the VM's sync and log), so when
+/// `auto` then falls back, the launcher execs itself afresh, same pid, signals unblocked, with
+/// the decision (`--gelada-fallback <line>`), and that process applies gelada (#100 review).
+/// Returns only when the exec fails.
+fn relaunch(argv: &[OsString], line: &str) -> ExitCode {
+    #[cfg(target_os = "linux")]
+    securecore_fpm::vm::unblock_signals();
+    // This very binary, even when its path was replaced or removed meanwhile (an upgrade during
+    // the start: current_exe() would name "… (deleted)").
+    let mut cmd = Command::new("/proc/self/exe");
+    if let Some(name) = argv.first() {
+        cmd.arg0(name);
+    }
+    let err = cmd.arg("--gelada-fallback").arg(line).args(argv.iter().skip(1)).exec();
+    failed(&format!("running the launcher again for gelada ({line}): {err}"))
 }
 
 /// A reason folded onto one line, as the choice's own reasons are.
@@ -217,6 +255,8 @@ mod microvm {
             guest_root: a.guest_root.clone(),
             mem_mib: a.mem,
             vcpus: a.vcpus,
+            start_within: std::time::Duration::from_secs(u64::from(a.start_within)),
+            space_ledger: a.space_ledger.clone(),
             write_disk_mib: a.write_disk_mib,
             vm_user: a.vm_user.clone(),
             pool_user: a.pool_user.clone(),
@@ -246,10 +286,49 @@ mod microvm {
 
     /// Everything before the boot (#100 review: before `auto` commits). Signals are blocked
     /// first, so no thread it starts can take a stop signal's default action.
-    pub fn prepare(loaded: &Loaded, a: &Args) -> Result<Ready, String> {
+    pub fn prepare(loaded: &Loaded, a: &Args, argv: &[std::ffi::OsString]) -> Result<Ready, String> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         vm::block_signals();
-        vm::extend_start_timeout();
-        vm::prepare_all(loaded, &options(a)?).map(Ready)
+        let within = std::time::Duration::from_secs(u64::from(a.start_within));
+        vm::extend_start_timeout(within);
+        let opts = options(a)?;
+        let auto = loaded.config.layer1.isolation() == securecore_config::Isolation::Auto;
+        // An earlier start of this site and config ran past its deadline: straight to gelada.
+        if auto && let Some(why) = vm::deadline_fallback(loaded, &opts) {
+            return Err(why);
+        }
+        // The watchdog (#100 second re-review): at the deadline, whatever step the start is in
+        // (a tree walk on slow storage, the capture's hashing, a tool), `auto` runs gelada at once
+        // (the relaunch, from this thread: exec replaces the whole process) and records it, so the
+        // next start goes straight there; `microvm`, and a pool's own launcher, exit 125.
+        let done = Arc::new(AtomicBool::new(false));
+        {
+            let (done, argv, loaded, opts) = (done.clone(), argv.to_vec(), loaded.clone(), opts.clone());
+            let child = a.pool.is_some();
+            std::thread::spawn(move || {
+                let Some((at, _)) = vm::deadline() else { return };
+                while std::time::Instant::now() < at {
+                    if done.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+                let why = format!("the start took longer than {} s (--start-within), so the microVM gives up on it", within.as_secs());
+                if auto && !child {
+                    vm::record_deadline_fallback(&loaded, &opts, &why);
+                    let _ = super::relaunch(&argv, &format!("gelada, because the microVM can't run here ({why})"));
+                }
+                super::log(&format!("{}: {why}", loaded.path.display()));
+                std::process::exit(i32::from(securecore_fpm::FAILED));
+            });
+        }
+        let r = vm::prepare_all(loaded, &opts).map(Ready);
+        done.store(true, Ordering::SeqCst);
+        r
     }
 
     /// How a microVM start ended.
@@ -291,7 +370,8 @@ mod microvm {
             Err(e) => return Outcome::Fallback(format!("{}: {e}", sock.display())),
         };
         let _ = d.set_read_timeout(Some(std::time::Duration::from_millis(200)));
-        let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
+        // This very binary, as [`super::relaunch`] (an upgrade during the start removes its path).
+        let exe = std::path::PathBuf::from("/proc/self/exe");
         let mut kids: Vec<(String, std::process::Child, bool)> = Vec::new();
         // SIGTERM to every pool's launcher, up to STOP_GRACE for them to stop their VMs, then
         // SIGKILL for any still running (its jail's watchdog ends its VM), and every one reaped:
@@ -411,7 +491,7 @@ mod microvm {
 
     pub struct Ready;
 
-    pub fn prepare(_: &Loaded, _: &Args) -> Result<Ready, String> {
+    pub fn prepare(_: &Loaded, _: &Args, _: &[std::ffi::OsString]) -> Result<Ready, String> {
         Err("the microVM needs Linux with KVM".into())
     }
 
@@ -595,12 +675,25 @@ fn main() -> ExitCode {
     // Everything a microVM start checks and builds happens here, before the choice (#100
     // review): `auto` falls back on any of it, with the reason.
     let mut ready = None;
-    let choice = match choose(layer1, || microvm::prepare(&loaded, &args).map(|r| ready = Some(r))) {
-        Ok(choice) => choice,
-        Err(refusal) => {
-            microvm::stop_extending();
-            return failed(&format!("{path}: {refusal}"));
-        }
+    let choice = match &args.gelada_fallback {
+        // This launcher, run again by itself once `auto` fell back ([`relaunch`]): decided already.
+        // The config may have changed in between (#100 re-review): gelada and off are what it
+        // asks for now, and only microvm, which never falls back, refuses.
+        Some(line) => match layer1.isolation() {
+            securecore_config::Isolation::Auto => Choice::Gelada { fallback: Some(line.clone()) },
+            securecore_config::Isolation::Gelada => Choice::Gelada { fallback: None },
+            securecore_config::Isolation::Off => Choice::Off,
+            securecore_config::Isolation::Microvm => {
+                return failed(&format!("{path}: layer1.isolation is now \"microvm\", which never falls back, and the microVM failed ({line})"));
+            }
+        },
+        None => match choose(layer1, || microvm::prepare(&loaded, &args, &argv).map(|r| ready = Some(r))) {
+            Ok(choice) => choice,
+            Err(refusal) => {
+                microvm::stop_extending();
+                return failed(&format!("{path}: {refusal}"));
+            }
+        },
     };
     // A pool's own launcher (`--pool`, started by the one that runs every pool) never falls back
     // by itself: it exits, and the first launcher decides for the whole config (#102 review).
@@ -613,7 +706,13 @@ fn main() -> ExitCode {
         microvm::stop_extending();
     }
     if layer1.enabled() {
-        log(&format!("layer 1 isolation {}: {choice}", layer1.isolation().as_str()));
+        match (&args.gelada_fallback, &choice) {
+            (Some(line), Choice::Gelada { fallback: Some(_) }) => log(&format!("layer 1 isolation auto: {line}")),
+            // The microVM's preparation started threads (systemd's timeout extensions): gelada
+            // needs a process with one.
+            (None, Choice::Gelada { fallback: Some(_) }) if threads() > 1 => return relaunch(&argv, &choice.to_string()),
+            _ => log(&format!("layer 1 isolation {}: {choice}", layer1.isolation().as_str())),
+        }
     }
     if choice == Choice::Microvm
         && let Some(ready) = ready.take()
@@ -626,7 +725,8 @@ fn main() -> ExitCode {
             // so does a pool's own launcher (its parent decides).
             microvm::Outcome::Fallback(err) if layer1.isolation() == securecore_config::Isolation::Auto && !child => {
                 microvm::stop_extending();
-                log(&format!("layer 1 isolation auto: gelada, because the microVM failed before it served ({})", one_line(&err)));
+                // The VM's threads are still here: gelada in a fresh process.
+                return relaunch(&argv, &format!("gelada, because the microVM failed before it served ({})", one_line(&err)));
             }
             microvm::Outcome::Fallback(err) => return failed(&format!("{path}: the microVM: {err}")),
         }

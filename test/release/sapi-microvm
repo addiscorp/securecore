@@ -4,6 +4,14 @@
 # the securecore-vm user), serving FastCGI on :9000 from a Firecracker guest. The container is
 # privileged with the host's /dev/kvm (docker/compose.release-check-kvm.yml) and stands in for a
 # server: only this start-up is the test's, not the product's.
+#   sapi-microvm             section 7: the database on the guest's loopback (the config's
+#                            connect entry sends 3306 on to the db service)
+#   sapi-microvm --as-site   section 7b (#100 review): the site exactly as it was before the
+#                            upgrade, its WORDPRESS_DB_HOST (db) unchanged; the operator's approval
+#                            of that database, when the check gives one, is SC_APPROVE_DB
+#                            (--db-address), as a server's unit would pass it
+# The server's unit always says where FastCGI goes (--listen 0.0.0.0:9000: nginx is another
+# container), as a php-fpm pool's own listen would.
 set -eu
 # cgroup v2 inside a container: the jailer puts each VM in a child of securecore/ with cpu and
 # memory limits, and a cgroup that holds processes can't hand controllers down. So every process
@@ -11,9 +19,13 @@ set -eu
 mkdir -p /sys/fs/cgroup/init
 while read -r p; do echo "$p" > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || :; done < /sys/fs/cgroup/cgroup.procs
 echo '+cpu +memory' > /sys/fs/cgroup/cgroup.subtree_control
-# The site's environment for the guest's php-fpm, with the database on the guest's loopback
-# (layer1.network.connect sends port 3306 on to the db service).
-export WORDPRESS_DB_HOST=127.0.0.1:3306
+if [ "${1:-}" = --as-site ]; then
+  set -- ${SC_APPROVE_DB:+--db-address "$SC_APPROVE_DB"}
+else
+  # The site's environment for the guest's php-fpm, with the database on the guest's loopback.
+  export WORDPRESS_DB_HOST=127.0.0.1:3306
+  set --
+fi
 # shellcheck disable=SC2046 # the names are plain words
-exec securecore-fpm --config /var/www/html/securecore.json --listen 0.0.0.0:9000 \
+exec securecore-fpm --config /var/www/html/securecore.json --listen 0.0.0.0:9000 "$@" \
   $(env | sed -n 's/^\(WORDPRESS_[A-Z_]*\)=.*/--guest-env \1/p')
