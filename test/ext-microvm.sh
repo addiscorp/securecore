@@ -380,7 +380,8 @@ auto_fallbacks() {
       fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" \
         --guest-root "$html" --php-root "$(php_root)" "$@"
     ) > "$dir/value-$name.log" 2>&1 &
-    bounded_wait $! 900
+    # A start that should fall back but serves (a revert proof's) is stopped at this bound.
+    bounded_wait $! "${SC_FALLBACK_BOUND:-900}"
     echo "exit=$?" >> "$dir/value-$name.log"
   }
   # gelada_ran <name> <what>: the launcher fell back and execed php-fpm under gelada.
@@ -473,6 +474,22 @@ auto_fallbacks() {
   has "$dir/value-auto-redis.log" "$fell (layer1.network.connect port(s) 6379 have no \"socket\" or \"address\"" "auto, a Redis on the loopback by a bare 6379: gelada, naming the port"
   has "$dir/value-auto-redis.log" "{ \"port\": 6379, \"address\": \"127.0.0.1:6379\" }" "and the fix"
   gelada_ran auto-redis "auto, a bare 6379"
+  # Mail submission (#100 second re-review): a bare 587 goes to a public relay by name unless a
+  # relay listens on this host's loopback.
+  sed 's|"connect": \[|"connect": [{ "port": 587 }, |' "$dir/auto.json" > "$dir/auto-mail.json"
+  echo secret > "$site/sc-root-only.txt"
+  chmod 600 "$site/sc-root-only.txt"
+  fellback auto-mail-public "$dir/auto-mail.json" --listen "$listen"
+  rm -f "$site/sc-root-only.txt"
+  has "$dir/value-auto-mail-public.log" "as uid 1234" "auto, a bare 587 with no relay on this host: a public relay's, the microVM (it got to the site disk)"
+  lacks "$dir/value-auto-mail-public.log" "port(s) 587" "and 587 is no reason to stay on gelada"
+  python3 -I -c 'import socket, time; s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 587)); s.listen(1); time.sleep(900)' 2>/dev/null &
+  relay=$!
+  sleep 0.5
+  fellback auto-mail-local "$dir/auto-mail.json" --listen "$listen"
+  kill "$relay" 2>/dev/null
+  has "$dir/value-auto-mail-local.log" "$fell (layer1.network.connect port(s) 587 have no" "auto, a bare 587 with a relay on this host's loopback: gelada"
+  gelada_ran auto-mail-local "auto, a local mail relay"
   # 3. A start that runs past its deadline (--start-within 1, a fresh state folder: a full
   # capture and the layers to build) stops and stays on gelada; systemd is asked for no more.
   mkdir -p "$dir/fb-slow"
@@ -482,20 +499,49 @@ auto_fallbacks() {
     export NOTIFY_SOCKET
     fellback auto-slow "$dir/auto.json" --listen "$listen" --state-dir "$dir/fb-slow" --start-within 1
   )
-  has "$dir/value-auto-slow.log" "$fell (" "auto, a start past --start-within: gelada"
-  has "$dir/value-auto-slow.log" "(--start-within)" "because of its deadline"
+  has "$dir/value-auto-slow.log" "$fell (the start took longer than 1 s (--start-within)" "auto, a start past --start-within: gelada, at the deadline"
   gelada_ran auto-slow "auto, past its deadline"
+  # The next start of the same site and config goes straight to gelada, saying why (#100 second
+  # re-review), with no deadline of its own to wait out; a changed config tries again.
+  fellback auto-slow-again "$dir/auto.json" --listen "$listen" --state-dir "$dir/fb-slow"
+  has "$dir/value-auto-slow-again.log" "$fell (a start of this site ran past its deadline before (the start took longer than 1 s" \
+    "auto, the next start after one past its deadline: straight to gelada, saying why"
+  gelada_ran auto-slow-again "auto, after a start past its deadline"
+  lacks "$dir/value-auto-slow-again.log" "capturing the host's PHP" "with nothing captured or built"
+  sed 's|"isolation": "auto"|"isolation":  "auto"|' "$dir/auto.json" > "$dir/auto-changed.json"
+  echo secret > "$site/sc-root-only.txt"
+  chmod 600 "$site/sc-root-only.txt"
+  fellback auto-slow-changed "$dir/auto-changed.json" --listen "$listen" --state-dir "$dir/fb-slow"
+  rm -f "$site/sc-root-only.txt"
+  has "$dir/value-auto-slow-changed.log" "as uid 1234" "a changed config tries the microVM again (it got as far as the site disk)"
   find "$dir/fb-slow" -mindepth 1 -xdev -delete
   # 4. Other sites' starts keep space on this filesystem (the shared record, under its lock): a
   # living start that keeps 1 TiB there leaves this one no room, so auto stays on gelada.
   sleep 900 &
   other=$!
   ostart=$(awk '{ sub(/^.*\) /, ""); print $20 }' "/proc/$other/stat")
-  printf '[{"state":"/srv/another-site/state","dev":%s,"bytes":1099511627776,"pid":%s,"started":%s}]\n' "$(stat -c %d "$state")" "$other" "$ostart" > "$dir/space.json"
+  boot=$(cat /proc/sys/kernel/random/boot_id)
+  printf '[{"state":"/srv/another-site/state","dev":%s,"bytes":1099511627776,"pid":%s,"started":%s,"boot":"%s"}]\n' "$(stat -c %d "$state")" "$other" "$ostart" "$boot" > "$dir/space.json"
   fellback auto-ledger "$dir/auto.json" --listen "$listen"
   has "$dir/value-auto-ledger.log" "$fell (this start needs " "auto, another start keeping the space: gelada"
   has "$dir/value-auto-ledger.log" "1048576 MiB of which other sites' starts keep for their disks" "counting what the other start keeps"
   gelada_ran auto-ledger "auto, space kept by another start"
+  # The same entry from an earlier boot (its pid and start time this boot's): it counts for nothing.
+  printf '[{"state":"/srv/another-site/state","dev":%s,"bytes":1099511627776,"pid":%s,"started":%s,"boot":"an-earlier-boot"}]\n' "$(stat -c %d "$state")" "$other" "$ostart" > "$dir/space.json"
+  echo secret > "$site/sc-root-only.txt"
+  chmod 600 "$site/sc-root-only.txt"
+  fellback auto-ledger-boot "$dir/auto.json" --listen "$listen"
+  rm -f "$site/sc-root-only.txt"
+  has "$dir/value-auto-ledger-boot.log" "as uid 1234" "an entry of an earlier boot keeps nothing: the start gets past the space check"
+  # Guest memory across the host (#100 second re-review): a running guest elsewhere (on another
+  # filesystem: memory is the host's) that already holds all of the guests' budget leaves this
+  # one none, so auto stays on gelada; each fits alone, not both.
+  printf '[{"state":"/srv/another-site/state","dev":1,"bytes":0,"mem_mib":%s,"pid":%s,"started":%s,"boot":"%s"}]\n' \
+    "$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo)" "$other" "$ostart" "$boot" > "$dir/space.json"
+  fellback auto-memory "$dir/auto.json" --listen "$listen"
+  has "$dir/value-auto-memory.log" "$fell (this guest's 896 MiB and the " "auto, the other guests holding the host's memory budget: gelada"
+  has "$dir/value-auto-memory.log" "MiB kept for the database and the host)" "naming the budget and what the host keeps"
+  gelada_ran auto-memory "auto, no memory left for another guest"
   kill "$other" 2>/dev/null
   wait "$other" 2>/dev/null
   # Its process gone, its entry counts for nothing: the next start passes the space check (and
@@ -549,7 +595,28 @@ auto_fallbacks() {
   fpm_env --config "$site/securecore.json" --vm-dir "$vm" --state-dir "$state" --vm-user "$vmuser" --pool-user "$pool" \
     --guest-root "$html" --php-root "$(php_root)" > "$dir/auto-sock.log" 2>&1 &
   PID=$!
+  # This first start makes the snapshot (#100 second re-review): from the choice until the
+  # snapshot is written, the shared record keeps its bytes besides the disks' growth. The most
+  # the record keeps for this site meanwhile, sampled (bounded: 300 s).
+  rm -f "$dir/snap-kept"
+  (
+    n=0
+    until grep -q 'php-fpm in a microVM' "$dir/auto-sock.log" || [ "$n" -ge 6000 ]; do n=$((n + 1)); sleep 0.05; done
+    most=0
+    until grep -q 'made the snapshot' "$dir/auto-sock.log" || [ "$n" -ge 6000 ]; do
+      b=$(jq --arg s "$state" '[.[] | select(.state == $s) | .bytes] | max // 0' "$dir/space.json" 2>/dev/null || echo 0)
+      [ "$b" -gt "$most" ] && most=$b
+      n=$((n + 1)); sleep 0.05
+    done
+    echo "$most" > "$dir/snap-kept"
+  ) &
+  sampler=$!
   eventually 3000 "grep -q 'serving FastCGI' \"$dir/auto-sock.log\" || ! kill -0 $PID 2>/dev/null" || true
+  bounded_wait "$sampler" 60 > /dev/null
+  kept_after=$(jq --arg s "$state" '[.[] | select(.state == $s) | .bytes] | max // 0' "$dir/space.json")
+  has "$dir/auto-sock.log" "made the snapshot" "auto, a pool on a unix socket: its first start makes the snapshot"
+  is "$( [ "$(cat "$dir/snap-kept" 2>/dev/null || echo 0)" -ge $((kept_after + (896 << 20))) ] && echo kept)" kept \
+    "until the snapshot is written, the record keeps its 896 MiB besides the disks' growth ($(cat "$dir/snap-kept" 2>/dev/null) then, $kept_after after)"
   has "$dir/auto-sock.log" "layer 1 isolation auto: microvm" "auto, a pool on a unix socket: the microVM"
   has "$dir/auto-sock.log" "serving FastCGI on unix:$sockdir/auto-www.sock" "listening at the pool's own socket"
   is "$(python3 test/ext/microvm/fcgi-ping.py "unix:$sockdir/auto-www.sock")" pong "php-fpm in the guest answers there"

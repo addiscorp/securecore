@@ -286,10 +286,49 @@ mod microvm {
 
     /// Everything before the boot (#100 review: before `auto` commits). Signals are blocked
     /// first, so no thread it starts can take a stop signal's default action.
-    pub fn prepare(loaded: &Loaded, a: &Args) -> Result<Ready, String> {
+    pub fn prepare(loaded: &Loaded, a: &Args, argv: &[std::ffi::OsString]) -> Result<Ready, String> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         vm::block_signals();
-        vm::extend_start_timeout(std::time::Duration::from_secs(u64::from(a.start_within)));
-        vm::prepare_all(loaded, &options(a)?).map(Ready)
+        let within = std::time::Duration::from_secs(u64::from(a.start_within));
+        vm::extend_start_timeout(within);
+        let opts = options(a)?;
+        let auto = loaded.config.layer1.isolation() == securecore_config::Isolation::Auto;
+        // An earlier start of this site and config ran past its deadline: straight to gelada.
+        if auto && let Some(why) = vm::deadline_fallback(loaded, &opts) {
+            return Err(why);
+        }
+        // The watchdog (#100 second re-review): at the deadline, whatever step the start is in
+        // (a tree walk on slow storage, the capture's hashing, a tool), `auto` runs gelada at once
+        // (the relaunch, from this thread: exec replaces the whole process) and records it, so the
+        // next start goes straight there; `microvm`, and a pool's own launcher, exit 125.
+        let done = Arc::new(AtomicBool::new(false));
+        {
+            let (done, argv, loaded, opts) = (done.clone(), argv.to_vec(), loaded.clone(), opts.clone());
+            let child = a.pool.is_some();
+            std::thread::spawn(move || {
+                let Some((at, _)) = vm::deadline() else { return };
+                while std::time::Instant::now() < at {
+                    if done.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+                let why = format!("the start took longer than {} s (--start-within), so the microVM gives up on it", within.as_secs());
+                if auto && !child {
+                    vm::record_deadline_fallback(&loaded, &opts, &why);
+                    let _ = super::relaunch(&argv, &format!("gelada, because the microVM can't run here ({why})"));
+                }
+                super::log(&format!("{}: {why}", loaded.path.display()));
+                std::process::exit(i32::from(securecore_fpm::FAILED));
+            });
+        }
+        let r = vm::prepare_all(loaded, &opts).map(Ready);
+        done.store(true, Ordering::SeqCst);
+        r
     }
 
     /// How a microVM start ended.
@@ -452,7 +491,7 @@ mod microvm {
 
     pub struct Ready;
 
-    pub fn prepare(_: &Loaded, _: &Args) -> Result<Ready, String> {
+    pub fn prepare(_: &Loaded, _: &Args, _: &[std::ffi::OsString]) -> Result<Ready, String> {
         Err("the microVM needs Linux with KVM".into())
     }
 
@@ -648,7 +687,7 @@ fn main() -> ExitCode {
                 return failed(&format!("{path}: layer1.isolation is now \"microvm\", which never falls back, and the microVM failed ({line})"));
             }
         },
-        None => match choose(layer1, || microvm::prepare(&loaded, &args).map(|r| ready = Some(r))) {
+        None => match choose(layer1, || microvm::prepare(&loaded, &args, &argv).map(|r| ready = Some(r))) {
             Ok(choice) => choice,
             Err(refusal) => {
                 microvm::stop_extending();

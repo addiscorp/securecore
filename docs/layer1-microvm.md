@@ -1140,6 +1140,26 @@ exactly there, under `auto` too.
   matter), and a config that changed to `gelada` or `off` in between runs as it says; only
   `microvm` refuses.
 
+**The third review of #100.**
+- *Guest memory across sites*: the shared record holds each running guest's memory too. Under
+  `auto`, all guests on the host together stay within its memory less a quarter of it (at least
+  2 GiB) kept for the database and the host, else gelada (`memory_ok`). A guest that has touched
+  memory keeps it (no balloon yet).
+- *The snapshot's bytes* stay kept in the record until the boot has written it (or failed); only
+  then does a start keep just its disks' growth.
+- *A watchdog at the deadline*: whatever the start is doing (a tree walk on slow storage, the
+  capture's hashing, a tool), at `--start-within` the launcher runs gelada at once (the relaunch,
+  from the watchdog thread), and records it in the state folder (`deadline-fallback.json`): the
+  next starts go straight to gelada, saying why, until `securecore.json` or the app root changes
+  (or the file is removed). systemd is asked for more time until the start serves or ends.
+  `microvm` exits 125 at the deadline.
+- *The record*: free space is measured under its lock, and each entry carries the boot it was
+  made in (`/proc/sys/kernel/random/boot_id`), so an entry of an earlier boot counts for nothing.
+  A running guest's growth isn't shrunk as its disks fill: counted twice over time, which errs on
+  the side of gelada for the next site's start.
+- *Mail*: a bare 25, 465 or 587 is a public relay's (by name, policed by layer 2's hosts) unless a
+  relay listens on this host's loopback; only then does it keep `auto` on gelada.
+
 **The space a start takes** (#100 review). The check counts the site disk, the PHP and config
 layers, the snapshot and each writable disk **as it may fill** (they are sparse: a new one up to
 its whole size, an existing one up to its size less what it holds), and keeps a twentieth of the
